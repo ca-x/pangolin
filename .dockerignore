@@ -1,0 +1,6 @@
+.git
+.github
+target
+data
+web/node_modules
+dogfood-output

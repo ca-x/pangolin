@@ -1,0 +1,14 @@
+services:
+  pangolin:
+    image: ghcr.io/ca-x/pangolin:latest
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - pangolin-data:/data
+    environment:
+      PANGOLIN_PUBLIC_URL: http://localhost:8080
+
+volumes:
+  pangolin-data:
