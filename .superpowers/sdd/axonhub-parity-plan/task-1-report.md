@@ -70,3 +70,50 @@ Results:
 ## Concerns
 
 None within the revised fresh-install scope. Later tasks still need CRUD/authorization/orchestration behavior over these schema contracts.
+
+## Fix round 1/5: authorization and scope invariants
+
+### Reviewer findings addressed
+
+- Changed API-key owner deletion from `SET NULL` to cascading revocation. User and personal keys now require an owner, and attempts to clear that owner are rejected.
+- Replaced the profile `SET NULL` relationship with a restrictive composite foreign key on `(profile_id, project_id)`. A referenced profile cannot be deleted, and a key cannot reference a profile from another project.
+- Added role scope shape checks plus symmetric insert/update triggers for memberships, invitations, and user-role bindings. Added a role-update trigger so moving the role cannot invalidate existing assignments.
+- Added NULL-aware partial unique indexes for global model price versions, global role bindings, and global retention policies.
+- Added focused enforcement tests for every reported invalid insert, update, and delete path, plus the equivalent invitation and role-update paths.
+
+### Red/green evidence
+
+The new tests reproduced the original defects before the DDL changes:
+
+- owner deletion left `personal-key` present (`left: 1`, `right: 0`);
+- a cross-project membership insert was accepted;
+- a duplicate global model-price version was accepted.
+
+After the schema fixes, each focused test passed individually.
+
+### Final verification
+
+Executed:
+
+```text
+cargo fmt --all
+pnpm --dir web build
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked db::
+```
+
+Results:
+
+- web build: passed;
+- rustfmt check: passed;
+- clippy all targets with warnings denied: passed;
+- focused DB tests: 8 passed, 0 failed.
+
+### Fix-round self-review
+
+- Owner deletion either fails because another restrictive ownership relationship applies or revokes dependent API keys; it never leaves an enabled key with a cleared owner.
+- Profile deletion is restricted while referenced and cannot erase routing/quota restrictions.
+- Membership, invitation, binding, API-key, role, and profile changes preserve project scope on both inserts and updates.
+- Partial indexes cover exactly the NULL scopes that ordinary SQLite composite uniqueness does not.
+- No unrelated pre-existing worktree changes are included in this fix commit.

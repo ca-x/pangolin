@@ -90,12 +90,14 @@ CREATE TABLE IF NOT EXISTS api_keys (
     last_used_at INTEGER,
     created_at INTEGER NOT NULL,
     project_id TEXT NOT NULL REFERENCES projects(id),
-    user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
-    profile_id TEXT REFERENCES api_key_profiles(id) ON DELETE SET NULL,
+    user_id TEXT REFERENCES users(id) ON DELETE CASCADE,
+    profile_id TEXT,
     key_type TEXT NOT NULL DEFAULT 'service' CHECK(key_type IN ('user','service','personal','no_auth')),
     expires_at INTEGER,
     allowed_ips_json TEXT NOT NULL DEFAULT '[]',
-    denied_ips_json TEXT NOT NULL DEFAULT '[]'
+    denied_ips_json TEXT NOT NULL DEFAULT '[]',
+    CHECK(key_type NOT IN ('user','personal') OR user_id IS NOT NULL),
+    FOREIGN KEY(profile_id,project_id) REFERENCES api_key_profiles(id,project_id) ON DELETE RESTRICT
 );
 CREATE INDEX IF NOT EXISTS idx_api_keys_prefix ON api_keys(key_prefix);
 CREATE TABLE IF NOT EXISTS audit_events (
@@ -138,7 +140,9 @@ CREATE TABLE roles (
     scope TEXT NOT NULL CHECK(scope IN ('system','project')),
     is_system INTEGER NOT NULL DEFAULT 0 CHECK(is_system IN (0,1)),
     created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL
+    updated_at INTEGER NOT NULL,
+    CHECK((scope='system' AND project_id IS NULL) OR (scope='project' AND project_id IS NOT NULL)),
+    CHECK(is_system=0 OR (scope='system' AND project_id IS NULL))
 );
 CREATE UNIQUE INDEX idx_roles_system_name ON roles(name) WHERE project_id IS NULL;
 CREATE UNIQUE INDEX idx_roles_project_name ON roles(project_id,name) WHERE project_id IS NOT NULL;
@@ -186,6 +190,80 @@ CREATE TABLE user_role_bindings (
 );
 CREATE INDEX idx_user_role_bindings_role ON user_role_bindings(role_id);
 CREATE INDEX idx_user_role_bindings_project ON user_role_bindings(project_id);
+CREATE UNIQUE INDEX idx_user_role_bindings_global_unique
+ON user_role_bindings(user_id,role_id) WHERE project_id IS NULL;
+
+CREATE TRIGGER project_memberships_role_scope_insert
+BEFORE INSERT ON project_memberships
+WHEN NOT EXISTS (
+    SELECT 1 FROM roles r
+    WHERE r.id=NEW.role_id AND (r.project_id IS NULL OR r.project_id=NEW.project_id)
+)
+BEGIN SELECT RAISE(ABORT,'membership role scope does not match project'); END;
+CREATE TRIGGER project_memberships_role_scope_update
+BEFORE UPDATE OF project_id,role_id ON project_memberships
+WHEN NOT EXISTS (
+    SELECT 1 FROM roles r
+    WHERE r.id=NEW.role_id AND (r.project_id IS NULL OR r.project_id=NEW.project_id)
+)
+BEGIN SELECT RAISE(ABORT,'membership role scope does not match project'); END;
+
+CREATE TRIGGER project_invitations_role_scope_insert
+BEFORE INSERT ON project_invitations
+WHEN NOT EXISTS (
+    SELECT 1 FROM roles r
+    WHERE r.id=NEW.role_id AND (r.project_id IS NULL OR r.project_id=NEW.project_id)
+)
+BEGIN SELECT RAISE(ABORT,'invitation role scope does not match project'); END;
+CREATE TRIGGER project_invitations_role_scope_update
+BEFORE UPDATE OF project_id,role_id ON project_invitations
+WHEN NOT EXISTS (
+    SELECT 1 FROM roles r
+    WHERE r.id=NEW.role_id AND (r.project_id IS NULL OR r.project_id=NEW.project_id)
+)
+BEGIN SELECT RAISE(ABORT,'invitation role scope does not match project'); END;
+
+CREATE TRIGGER user_role_bindings_scope_insert
+BEFORE INSERT ON user_role_bindings
+WHEN NOT EXISTS (
+    SELECT 1 FROM roles r
+    WHERE r.id=NEW.role_id AND (
+        (NEW.project_id IS NULL AND r.project_id IS NULL)
+        OR (NEW.project_id IS NOT NULL AND (r.project_id IS NULL OR r.project_id=NEW.project_id))
+    )
+)
+BEGIN SELECT RAISE(ABORT,'role binding scope does not match project'); END;
+CREATE TRIGGER user_role_bindings_scope_update
+BEFORE UPDATE OF project_id,role_id ON user_role_bindings
+WHEN NOT EXISTS (
+    SELECT 1 FROM roles r
+    WHERE r.id=NEW.role_id AND (
+        (NEW.project_id IS NULL AND r.project_id IS NULL)
+        OR (NEW.project_id IS NOT NULL AND (r.project_id IS NULL OR r.project_id=NEW.project_id))
+    )
+)
+BEGIN SELECT RAISE(ABORT,'role binding scope does not match project'); END;
+
+CREATE TRIGGER roles_scope_update
+BEFORE UPDATE OF project_id,scope ON roles
+WHEN (
+    NEW.project_id IS NOT NULL AND EXISTS (
+        SELECT 1 FROM project_memberships m
+        WHERE m.role_id=OLD.id AND m.project_id<>NEW.project_id
+    )
+) OR (
+    NEW.project_id IS NOT NULL AND EXISTS (
+        SELECT 1 FROM project_invitations i
+        WHERE i.role_id=OLD.id AND i.project_id<>NEW.project_id
+    )
+) OR EXISTS (
+    SELECT 1 FROM user_role_bindings b
+    WHERE b.role_id=OLD.id AND (
+        (b.project_id IS NULL AND NEW.project_id IS NOT NULL)
+        OR (b.project_id IS NOT NULL AND NEW.project_id IS NOT NULL AND b.project_id<>NEW.project_id)
+    )
+)
+BEGIN SELECT RAISE(ABORT,'role scope update conflicts with existing assignments'); END;
 
 CREATE TABLE oidc_providers (
     id TEXT PRIMARY KEY,
@@ -222,7 +300,8 @@ CREATE TABLE api_key_profiles (
     routing_policy_json TEXT NOT NULL DEFAULT '{"version":1}',
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
-    UNIQUE(project_id,name)
+    UNIQUE(project_id,name),
+    UNIQUE(id,project_id)
 );
 CREATE TABLE api_key_profile_model_mappings (
     id TEXT PRIMARY KEY,
@@ -302,6 +381,8 @@ CREATE TABLE model_prices (
 );
 CREATE INDEX idx_model_prices_model_schedule ON model_prices(model_id,valid_from,valid_until);
 CREATE INDEX idx_model_prices_provider ON model_prices(provider_id);
+CREATE UNIQUE INDEX idx_model_prices_global_version
+ON model_prices(model_id,version) WHERE provider_id IS NULL;
 CREATE TABLE model_price_components (
     id TEXT PRIMARY KEY,
     price_id TEXT NOT NULL REFERENCES model_prices(id) ON DELETE CASCADE,
@@ -513,6 +594,8 @@ CREATE TABLE data_retention_policies (
     UNIQUE(project_id,resource_type)
 );
 CREATE INDEX idx_data_retention_policies_project ON data_retention_policies(project_id);
+CREATE UNIQUE INDEX idx_data_retention_policies_global_resource
+ON data_retention_policies(resource_type) WHERE project_id IS NULL;
 CREATE TABLE backup_configs (
     id TEXT PRIMARY KEY,
     storage_id TEXT NOT NULL REFERENCES data_storage_configs(id) ON DELETE RESTRICT,
@@ -729,14 +812,17 @@ mod tests {
             "idx_project_memberships_user",
             "idx_oidc_identities_user",
             "idx_api_keys_project",
+            "idx_user_role_bindings_global_unique",
             "idx_channel_credentials_provider",
             "idx_model_associations_project",
             "idx_model_prices_model_schedule",
+            "idx_model_prices_global_version",
             "idx_traces_project_started",
             "idx_request_executions_provider",
             "idx_usage_logs_model",
             "idx_channel_probes_provider",
             "idx_webhook_deliveries_pending",
+            "idx_data_retention_policies_global_resource",
             "idx_backup_runs_storage",
         ] {
             assert_eq!(
@@ -816,5 +902,288 @@ mod tests {
             1
         );
         assert_eq!(scalar(&db, "SELECT COUNT(*) AS count FROM roles").await, 3);
+    }
+
+    #[tokio::test]
+    async fn api_key_owner_and_profile_deletion_fail_closed() {
+        let db = memory_database().await;
+        migrate(&db).await.unwrap();
+        db.execute_unprepared(
+            r#"
+            INSERT INTO users(id,email,password_hash,role,language,theme,created_at)
+            VALUES('user-delete','delete@example.com','hash','member','en','system:bronze',1);
+            INSERT INTO api_key_profiles(id,project_id,name,created_at,updated_at)
+            VALUES('profile-delete','00000000-0000-0000-0000-000000000001','restricted',1,1);
+            INSERT INTO api_keys(id,name,key_prefix,key_hash,created_at,project_id,user_id,key_type)
+            VALUES('personal-key','personal','personal','hash',1,'00000000-0000-0000-0000-000000000001','user-delete','personal');
+            INSERT INTO api_keys(id,name,key_prefix,key_hash,created_at,project_id,profile_id)
+            VALUES('profile-key','profiled','profiled','hash',1,'00000000-0000-0000-0000-000000000001','profile-delete');
+            "#,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            db.execute_unprepared("UPDATE api_keys SET user_id=NULL WHERE id='personal-key'")
+                .await
+                .is_err(),
+            "personal-key updates must not remove their owner"
+        );
+
+        db.execute_unprepared("DELETE FROM users WHERE id='user-delete'")
+            .await
+            .unwrap();
+        assert_eq!(
+            scalar(
+                &db,
+                "SELECT COUNT(*) AS count FROM api_keys WHERE id='personal-key'"
+            )
+            .await,
+            0,
+            "deleting a personal-key owner must revoke the key"
+        );
+
+        assert!(
+            db.execute_unprepared("DELETE FROM api_key_profiles WHERE id='profile-delete'")
+                .await
+                .is_err(),
+            "a profile still used by an API key must not be deleted"
+        );
+        assert_eq!(
+            one(
+                &db,
+                "SELECT profile_id FROM api_keys WHERE id='profile-key'"
+            )
+            .await
+            .try_get::<String>("", "profile_id")
+            .unwrap(),
+            "profile-delete"
+        );
+    }
+
+    #[tokio::test]
+    async fn role_scope_constraints_reject_cross_project_inserts_and_updates() {
+        let db = memory_database().await;
+        migrate(&db).await.unwrap();
+        db.execute_unprepared(
+            r#"
+            INSERT INTO users(id,email,password_hash,role,language,theme,created_at)
+            VALUES('scope-user','scope@example.com','hash','member','en','system:bronze',1);
+            INSERT INTO projects(id,name,slug,is_default,enabled,created_at,updated_at)
+            VALUES('project-b','Project B','project-b',0,1,1,1);
+            INSERT INTO roles(id,project_id,name,scope,is_system,created_at,updated_at) VALUES
+            ('role-a','00000000-0000-0000-0000-000000000001','role-a','project',0,1,1),
+            ('role-b','project-b','role-b','project',0,1,1);
+            "#,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            db.execute_unprepared(
+                "INSERT INTO project_memberships(id,project_id,user_id,role_id,created_at,updated_at) VALUES('bad-membership','00000000-0000-0000-0000-000000000001','scope-user','role-b',1,1)"
+            )
+            .await
+            .is_err(),
+            "a membership must not reference another project's role"
+        );
+        db.execute_unprepared(
+            "INSERT INTO project_memberships(id,project_id,user_id,role_id,created_at,updated_at) VALUES('membership-a','00000000-0000-0000-0000-000000000001','scope-user','role-a',1,1)",
+        )
+        .await
+        .unwrap();
+        assert!(
+            db.execute_unprepared(
+                "UPDATE project_memberships SET project_id='project-b' WHERE id='membership-a'"
+            )
+            .await
+            .is_err(),
+            "membership updates must preserve role scope"
+        );
+
+        assert!(
+            db.execute_unprepared(
+                "INSERT INTO project_invitations(id,project_id,email,role_id,token_hash,expires_at,created_at) VALUES('bad-invite','00000000-0000-0000-0000-000000000001','invite@example.com','role-b','bad-token',100,1)"
+            )
+            .await
+            .is_err(),
+            "an invitation must not reference another project's role"
+        );
+        db.execute_unprepared(
+            "INSERT INTO project_invitations(id,project_id,email,role_id,token_hash,expires_at,created_at) VALUES('invite-a','00000000-0000-0000-0000-000000000001','invite@example.com','role-a','good-token',100,1)",
+        )
+        .await
+        .unwrap();
+        assert!(
+            db.execute_unprepared(
+                "UPDATE project_invitations SET project_id='project-b' WHERE id='invite-a'"
+            )
+            .await
+            .is_err(),
+            "invitation updates must preserve role scope"
+        );
+        assert!(
+            db.execute_unprepared("UPDATE roles SET project_id='project-b' WHERE id='role-a'")
+                .await
+                .is_err(),
+            "role updates must preserve existing assignment scopes"
+        );
+    }
+
+    #[tokio::test]
+    async fn role_binding_scope_constraints_reject_invalid_inserts_and_updates() {
+        let db = memory_database().await;
+        migrate(&db).await.unwrap();
+        db.execute_unprepared(
+            r#"
+            INSERT INTO users(id,email,password_hash,role,language,theme,created_at)
+            VALUES('binding-user','binding@example.com','hash','member','en','system:bronze',1);
+            INSERT INTO projects(id,name,slug,is_default,enabled,created_at,updated_at)
+            VALUES('project-b','Project B','project-b',0,1,1,1);
+            INSERT INTO roles(id,project_id,name,scope,is_system,created_at,updated_at) VALUES
+            ('role-a','00000000-0000-0000-0000-000000000001','role-a','project',0,1,1),
+            ('role-b','project-b','role-b','project',0,1,1);
+            "#,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            db.execute_unprepared(
+                "INSERT INTO user_role_bindings(id,user_id,role_id,project_id,created_at) VALUES('bad-global','binding-user','role-a',NULL,1)"
+            )
+            .await
+            .is_err(),
+            "a project role must not receive a global binding"
+        );
+        assert!(
+            db.execute_unprepared(
+                "INSERT INTO user_role_bindings(id,user_id,role_id,project_id,created_at) VALUES('bad-project','binding-user','role-b','00000000-0000-0000-0000-000000000001',1)"
+            )
+            .await
+            .is_err(),
+            "a binding must not reference another project's role"
+        );
+        db.execute_unprepared(
+            "INSERT INTO user_role_bindings(id,user_id,role_id,project_id,created_at) VALUES('binding-a','binding-user','role-a','00000000-0000-0000-0000-000000000001',1)",
+        )
+        .await
+        .unwrap();
+        assert!(
+            db.execute_unprepared(
+                "UPDATE user_role_bindings SET project_id=NULL WHERE id='binding-a'"
+            )
+            .await
+            .is_err(),
+            "binding updates must not globalize project roles"
+        );
+        assert!(
+            db.execute_unprepared(
+                "UPDATE user_role_bindings SET project_id='project-b' WHERE id='binding-a'"
+            )
+            .await
+            .is_err(),
+            "binding updates must preserve project role scope"
+        );
+    }
+
+    #[tokio::test]
+    async fn api_keys_reject_cross_project_profiles_on_insert_and_update() {
+        let db = memory_database().await;
+        migrate(&db).await.unwrap();
+        db.execute_unprepared(
+            r#"
+            INSERT INTO projects(id,name,slug,is_default,enabled,created_at,updated_at)
+            VALUES('project-b','Project B','project-b',0,1,1,1);
+            INSERT INTO api_key_profiles(id,project_id,name,created_at,updated_at) VALUES
+            ('profile-a','00000000-0000-0000-0000-000000000001','profile-a',1,1),
+            ('profile-b','project-b','profile-b',1,1);
+            "#,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            db.execute_unprepared(
+                "INSERT INTO api_keys(id,name,key_prefix,key_hash,created_at,project_id,profile_id) VALUES('bad-key','bad','bad-key','hash',1,'00000000-0000-0000-0000-000000000001','profile-b')"
+            )
+            .await
+            .is_err(),
+            "an API key must not reference another project's profile"
+        );
+        db.execute_unprepared(
+            "INSERT INTO api_keys(id,name,key_prefix,key_hash,created_at,project_id,profile_id) VALUES('key-a','key-a','key-a','hash',1,'00000000-0000-0000-0000-000000000001','profile-a')",
+        )
+        .await
+        .unwrap();
+        assert!(
+            db.execute_unprepared("UPDATE api_keys SET profile_id='profile-b' WHERE id='key-a'")
+                .await
+                .is_err(),
+            "API-key profile updates must preserve project scope"
+        );
+        assert!(
+            db.execute_unprepared("UPDATE api_keys SET project_id='project-b' WHERE id='key-a'")
+                .await
+                .is_err(),
+            "API-key project updates must preserve profile scope"
+        );
+        assert!(
+            db.execute_unprepared(
+                "UPDATE api_key_profiles SET project_id='project-b' WHERE id='profile-a'"
+            )
+            .await
+            .is_err(),
+            "profile project updates must preserve API-key scope"
+        );
+    }
+
+    #[tokio::test]
+    async fn null_scoped_uniqueness_is_enforced() {
+        let db = memory_database().await;
+        migrate(&db).await.unwrap();
+        db.execute_unprepared(
+            r#"
+            INSERT INTO users(id,email,password_hash,role,language,theme,created_at)
+            VALUES('unique-user','unique@example.com','hash','member','en','system:bronze',1);
+            INSERT INTO providers(id,name,kind,base_url,enabled,created_at,updated_at,project_id)
+            VALUES('price-provider','Price Provider','openai','https://example.test',1,1,1,'00000000-0000-0000-0000-000000000001');
+            INSERT INTO models(id,provider_id,public_name,upstream_name,created_at)
+            VALUES('price-model','price-provider','price-model','price-model',1);
+            INSERT INTO model_prices(id,model_id,provider_id,version,valid_from,created_at)
+            VALUES('global-price-1','price-model',NULL,1,1,1);
+            INSERT INTO user_role_bindings(id,user_id,role_id,project_id,created_at)
+            VALUES('global-binding-1','unique-user','00000000-0000-0000-0000-000000000012',NULL,1);
+            INSERT INTO data_retention_policies(id,project_id,resource_type,retention_days,updated_at)
+            VALUES('global-retention-1',NULL,'request_body',30,1);
+            "#,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            db.execute_unprepared(
+                "INSERT INTO model_prices(id,model_id,provider_id,version,valid_from,created_at) VALUES('global-price-2','price-model',NULL,1,2,2)"
+            )
+            .await
+            .is_err(),
+            "global model-price versions must be unique"
+        );
+        assert!(
+            db.execute_unprepared(
+                "INSERT INTO user_role_bindings(id,user_id,role_id,project_id,created_at) VALUES('global-binding-2','unique-user','00000000-0000-0000-0000-000000000012',NULL,2)"
+            )
+            .await
+            .is_err(),
+            "global user-role bindings must be unique"
+        );
+        assert!(
+            db.execute_unprepared(
+                "INSERT INTO data_retention_policies(id,project_id,resource_type,retention_days,updated_at) VALUES('global-retention-2',NULL,'request_body',90,2)"
+            )
+            .await
+            .is_err(),
+            "global retention policies must be unique per resource"
+        );
     }
 }
