@@ -8,6 +8,10 @@ use uuid::Uuid;
 
 use crate::{crypto, models::*};
 
+mod schema;
+
+pub use schema::{DEFAULT_PROJECT_ID, SYSTEM_OWNER_ROLE_ID};
+
 pub async fn connect(url: &str) -> Result<DatabaseConnection> {
     let db = Database::connect(url)
         .await
@@ -17,96 +21,8 @@ pub async fn connect(url: &str) -> Result<DatabaseConnection> {
     )
     .await
     .context("failed to configure SQLite")?;
-    migrate(&db).await?;
+    schema::migrate(&db).await?;
     Ok(db)
-}
-
-async fn migrate(db: &DatabaseConnection) -> Result<()> {
-    db.execute_unprepared(
-        r#"
-        CREATE TABLE IF NOT EXISTS schema_migrations (
-            version INTEGER PRIMARY KEY,
-            applied_at INTEGER NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS instance_state (
-            id INTEGER PRIMARY KEY CHECK(id = 1),
-            initialized_at INTEGER NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS users (
-            id TEXT PRIMARY KEY,
-            email TEXT NOT NULL UNIQUE COLLATE NOCASE,
-            password_hash TEXT NOT NULL,
-            role TEXT NOT NULL DEFAULT 'admin',
-            language TEXT NOT NULL DEFAULT 'zh-CN',
-            theme TEXT NOT NULL DEFAULT 'system:bronze',
-            created_at INTEGER NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS sessions (
-            id TEXT PRIMARY KEY,
-            user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-            token_hash TEXT NOT NULL UNIQUE,
-            expires_at INTEGER NOT NULL,
-            created_at INTEGER NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_sessions_token ON sessions(token_hash);
-        CREATE INDEX IF NOT EXISTS idx_sessions_expiry ON sessions(expires_at);
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL,
-            updated_at INTEGER NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS providers (
-            id TEXT PRIMARY KEY,
-            name TEXT NOT NULL UNIQUE COLLATE NOCASE,
-            kind TEXT NOT NULL CHECK(kind IN ('openai','openai_compatible','anthropic')),
-            base_url TEXT NOT NULL,
-            secret_envelope TEXT NOT NULL,
-            enabled INTEGER NOT NULL DEFAULT 1,
-            created_at INTEGER NOT NULL,
-            updated_at INTEGER NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS models (
-            id TEXT PRIMARY KEY,
-            provider_id TEXT NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
-            public_name TEXT NOT NULL,
-            upstream_name TEXT NOT NULL,
-            capabilities TEXT NOT NULL DEFAULT '["chat"]',
-            input_price_micros INTEGER NOT NULL DEFAULT 0 CHECK(input_price_micros >= 0),
-            output_price_micros INTEGER NOT NULL DEFAULT 0 CHECK(output_price_micros >= 0),
-            priority INTEGER NOT NULL DEFAULT 100,
-            enabled INTEGER NOT NULL DEFAULT 1,
-            created_at INTEGER NOT NULL,
-            UNIQUE(provider_id, public_name, upstream_name)
-        );
-        CREATE INDEX IF NOT EXISTS idx_models_public_name ON models(public_name, enabled, priority);
-        CREATE TABLE IF NOT EXISTS api_keys (
-            id TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            key_prefix TEXT NOT NULL UNIQUE,
-            key_hash TEXT NOT NULL,
-            scopes TEXT NOT NULL DEFAULT '["gateway"]',
-            budget_micros INTEGER,
-            spent_micros INTEGER NOT NULL DEFAULT 0,
-            enabled INTEGER NOT NULL DEFAULT 1,
-            last_used_at INTEGER,
-            created_at INTEGER NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_api_keys_prefix ON api_keys(key_prefix);
-        CREATE TABLE IF NOT EXISTS audit_events (
-            id TEXT PRIMARY KEY,
-            actor_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
-            action TEXT NOT NULL,
-            resource_type TEXT NOT NULL,
-            resource_id TEXT,
-            details TEXT NOT NULL DEFAULT '{}',
-            created_at INTEGER NOT NULL
-        );
-        INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(1, unixepoch());
-        "#,
-    )
-    .await
-    .context("failed to migrate SQLite schema")?;
-    Ok(())
 }
 
 fn stmt(sql: impl Into<String>, values: Vec<sea_orm::Value>) -> Statement {
@@ -156,6 +72,37 @@ pub async fn create_initial_admin(db: &DatabaseConnection, request: &SetupReques
         "INSERT INTO users(id,email,password_hash,role,language,theme,created_at) VALUES(?,?,?,?,?,?,?)",
         vec![user.id.clone().into(), user.email.clone().into(), user.password_hash.clone().into(), user.role.clone().into(), user.language.clone().into(), user.theme.clone().into(), user.created_at.into()],
     )).await?;
+    transaction
+        .execute(stmt(
+            "UPDATE projects SET owner_user_id=? WHERE id=? AND owner_user_id IS NULL",
+            vec![user.id.clone().into(), DEFAULT_PROJECT_ID.into()],
+        ))
+        .await?;
+    transaction
+        .execute(stmt(
+            "INSERT OR IGNORE INTO project_memberships(id,project_id,user_id,role_id,status,created_at,updated_at) VALUES(?,?,?,?,\'active\',?,?)",
+            vec![
+                user.id.clone().into(),
+                DEFAULT_PROJECT_ID.into(),
+                user.id.clone().into(),
+                SYSTEM_OWNER_ROLE_ID.into(),
+                user.created_at.into(),
+                user.created_at.into(),
+            ],
+        ))
+        .await?;
+    transaction
+        .execute(stmt(
+            "INSERT OR IGNORE INTO user_role_bindings(id,user_id,role_id,project_id,created_at) VALUES(?,?,?,?,?)",
+            vec![
+                user.id.clone().into(),
+                user.id.clone().into(),
+                SYSTEM_OWNER_ROLE_ID.into(),
+                DEFAULT_PROJECT_ID.into(),
+                user.created_at.into(),
+            ],
+        ))
+        .await?;
     if let Some(name) = request
         .instance_name
         .as_ref()
@@ -234,10 +181,30 @@ pub async fn create_provider(
     }
     let id = Uuid::new_v4().to_string();
     let timestamp = now();
-    db.execute(stmt(
-        "INSERT INTO providers(id,name,kind,base_url,secret_envelope,enabled,created_at,updated_at) VALUES(?,?,?,?,?,1,?,?)",
-        vec![id.clone().into(), input.name.trim().to_owned().into(), kind.into(), input.base_url.trim_end_matches('/').to_owned().into(), secret_envelope.into(), timestamp.into(), timestamp.into()],
+    let transaction = db.begin().await?;
+    transaction.execute(stmt(
+        "INSERT INTO providers(id,name,kind,base_url,enabled,created_at,updated_at,project_id) VALUES(?,?,?,?,1,?,?,?)",
+        vec![id.clone().into(), input.name.trim().to_owned().into(), kind.into(), input.base_url.trim_end_matches('/').to_owned().into(), timestamp.into(), timestamp.into(), DEFAULT_PROJECT_ID.into()],
     )).await?;
+    transaction
+        .execute(stmt(
+            "INSERT INTO channel_credentials(id,provider_id,credential_type,secret_envelope,suffix,priority,enabled,created_at,updated_at) VALUES(?,?,'api_key',?,'',100,1,?,?)",
+            vec![
+                id.clone().into(),
+                id.clone().into(),
+                secret_envelope.into(),
+                timestamp.into(),
+                timestamp.into(),
+            ],
+        ))
+        .await?;
+    transaction
+        .execute(stmt(
+            "INSERT INTO channel_settings(provider_id,updated_at) VALUES(?,?)",
+            vec![id.clone().into(), timestamp.into()],
+        ))
+        .await?;
+    transaction.commit().await?;
     Ok(Provider::find_by_statement(stmt(
         "SELECT id,name,kind,base_url,enabled,created_at,updated_at FROM providers WHERE id=?",
         vec![id.into()],
@@ -293,7 +260,7 @@ pub async fn resolve_targets(
     endpoint: &str,
 ) -> Result<Vec<RouteTarget>> {
     let targets = RouteTarget::find_by_statement(stmt(
-        "SELECT m.public_name,m.upstream_name,m.capabilities,p.name AS provider_name,p.kind AS provider_kind,p.base_url,p.secret_envelope,m.input_price_micros,m.output_price_micros FROM models m JOIN providers p ON p.id=m.provider_id WHERE m.public_name=? AND m.enabled=1 AND p.enabled=1 ORDER BY m.priority,p.name",
+        "SELECT m.public_name,m.upstream_name,m.capabilities,p.name AS provider_name,p.kind AS provider_kind,p.base_url,c.secret_envelope,m.input_price_micros,m.output_price_micros FROM models m JOIN providers p ON p.id=m.provider_id JOIN channel_credentials c ON c.id=(SELECT cc.id FROM channel_credentials cc WHERE cc.provider_id=p.id AND cc.enabled=1 ORDER BY cc.priority,cc.id LIMIT 1) WHERE m.public_name=? AND m.enabled=1 AND p.enabled=1 ORDER BY m.priority,p.name",
         vec![public_name.into()],
     )).all(db).await?;
     Ok(targets
@@ -333,8 +300,8 @@ pub async fn create_api_key(
     let hash = crypto::hash_password(&token)?;
     let id = Uuid::new_v4().to_string();
     db.execute(stmt(
-        "INSERT INTO api_keys(id,name,key_prefix,key_hash,scopes,budget_micros,spent_micros,enabled,created_at) VALUES(?,?,?,?,'[\"gateway\"]',?,0,1,?)",
-        vec![id.clone().into(), input.name.trim().to_owned().into(), prefix.into(), hash.into(), input.budget_micros.into(), now().into()],
+        "INSERT INTO api_keys(id,name,key_prefix,key_hash,scopes,budget_micros,spent_micros,enabled,created_at,project_id) VALUES(?,?,?,?,'[\"gateway\"]',?,0,1,?,?)",
+        vec![id.clone().into(), input.name.trim().to_owned().into(), prefix.into(), hash.into(), input.budget_micros.into(), now().into(), DEFAULT_PROJECT_ID.into()],
     )).await?;
     let key = ApiKey::find_by_statement(stmt("SELECT id,name,key_prefix,scopes,budget_micros,spent_micros,enabled,last_used_at,created_at FROM api_keys WHERE id=?", vec![id.into()])).one(db).await?.expect("inserted API key exists");
     Ok((key, token))
@@ -426,6 +393,11 @@ pub async fn record_audit_event(
 mod tests {
     use super::*;
 
+    #[derive(FromQueryResult)]
+    struct TestCount {
+        count: i64,
+    }
+
     #[tokio::test]
     async fn setup_is_one_time_and_api_keys_verify() {
         let db = connect("sqlite::memory:").await.unwrap();
@@ -436,6 +408,16 @@ mod tests {
             language: None,
         };
         create_initial_admin(&db, &request).await.unwrap();
+        let owner_count = TestCount::find_by_statement(stmt(
+            "SELECT COUNT(*) AS count FROM projects p JOIN project_memberships pm ON pm.project_id=p.id AND pm.user_id=p.owner_user_id WHERE p.id=? AND pm.role_id=?",
+            vec![DEFAULT_PROJECT_ID.into(), SYSTEM_OWNER_ROLE_ID.into()],
+        ))
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap()
+        .count;
+        assert_eq!(owner_count, 1);
         assert!(create_initial_admin(&db, &request).await.is_err());
         let (_, token) = create_api_key(
             &db,
@@ -446,6 +428,28 @@ mod tests {
         )
         .await
         .unwrap();
+        let provider = create_provider(
+            &db,
+            &ProviderInput {
+                name: "test provider".into(),
+                kind: "openai".into(),
+                base_url: "https://example.test".into(),
+                api_key: "unused".into(),
+            },
+            "encrypted-secret".into(),
+        )
+        .await
+        .unwrap();
+        let normalized_provider_count = TestCount::find_by_statement(stmt(
+            "SELECT COUNT(*) AS count FROM channel_credentials c JOIN channel_settings s ON s.provider_id=c.provider_id WHERE c.provider_id=? AND c.secret_envelope='encrypted-secret'",
+            vec![provider.id.into()],
+        ))
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap()
+        .count;
+        assert_eq!(normalized_provider_count, 1);
         assert!(authenticate_api_key(&db, &token).await.unwrap().is_some());
         assert!(
             authenticate_api_key(&db, "pg_invalid_token")
