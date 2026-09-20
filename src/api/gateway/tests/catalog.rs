@@ -33,11 +33,7 @@ async fn admin(
         request = request.header("x-pangolin-csrf", "1");
     }
     router(f.state.clone())
-        .oneshot(
-            request
-                .body(Body::from(body.to_string()))
-                .unwrap(),
-        )
+        .oneshot(request.body(Body::from(body.to_string())).unwrap())
         .await
         .unwrap()
 }
