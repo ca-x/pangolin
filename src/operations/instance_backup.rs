@@ -445,12 +445,15 @@ pub async fn reset_projection(state: &AppState) -> Result<bool, ApiError> {
     if !reset {
         return Ok(state.observations.is_available());
     }
-    let cleared = tokio::time::timeout(
+    let mut cleared = tokio::time::timeout(
         Duration::from_secs(5),
         state.observations.clear_for_restore(),
     )
     .await
     .unwrap_or(false);
+    if cleared {
+        cleared = super::runtime::sync_retention(state).await?;
+    }
     if cleared {
         state
             .db

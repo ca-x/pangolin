@@ -503,8 +503,8 @@ async fn execute_inner(
                 let output = async_stream::stream! {
                     let mut event=first;
                     loop {
-                        if let Ok(value)=serde_json::from_str::<Value>(&event.data) {attempt.stream_event(&value);}
                         let terminal=terminal_state.terminal(&event,endpoint);
+                        if let Ok(value)=serde_json::from_str::<Value>(&event.data) {attempt.stream_event(&value,terminal);}
                         let failed=sse::failed(&event);
                         if let Some(response)=sse::completed_response(&event)
                             && runtime.sessions.persist(&database,&secrets,&session_credential,&session_request,&response).await.is_err() {
@@ -677,6 +677,7 @@ pub(super) async fn discovery_response(
     lifecycle.complete_local(&value).await?;
     if lifecycle.logs_enabled() {
         lifecycle.record_event(RequestEvent {
+            project_id: key.project_id.clone(),
             request_id: request_id.clone(),
             trace_id: trace_id.clone(),
             started_at: db::now(),

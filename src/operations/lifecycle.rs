@@ -226,6 +226,7 @@ impl Request {
             guard: Some(guard),
             price,
             usage: Usage::default(),
+            final_usage: false,
             provider: candidate.target.provider_name.clone(),
             provider_id: candidate.provider_id.clone(),
             credential_id: candidate.credential_id.clone(),
@@ -255,6 +256,7 @@ pub struct Attempt {
     guard: Option<AttemptGuard>,
     price: Price,
     pub usage: Usage,
+    final_usage: bool,
     provider: String,
     provider_id: String,
     credential_id: String,
@@ -276,6 +278,7 @@ impl Attempt {
         self.price.components.clear();
         self.reserved = 0;
         self.usage.reported = true;
+        self.final_usage = true;
         self.context
             .state
             .db
@@ -304,6 +307,7 @@ impl Attempt {
             value,
             self.context.endpoint == "/v1/messages",
         ));
+        self.final_usage = self.usage.reported;
         self.body = self.context.level.body(value);
     }
     pub fn media(&mut self, endpoint: &str, payload: &Value) {
@@ -318,9 +322,57 @@ impl Attempt {
         } else if self.price.components.iter().all(|c| c.kind == "flat") {
             self.usage.reported = true;
         }
+        self.final_usage |= self.usage.reported;
     }
-    pub fn stream_event(&mut self, value: &Value) {
+    pub fn stream_event(&mut self, value: &Value, terminal: bool) {
         self.capture_response_id(value);
+        let parsed = Usage::parse_for(value, self.context.endpoint == "/v1/messages");
+        // A valid cumulative/initial report is not proof that generation has ended.
+        // Anthropic's final delta and OpenAI's aggregate chunk precede their stop
+        // events; Responses/Gemini carry final usage on a protocol terminal event.
+        let final_report = match self.context.endpoint.as_str() {
+            "/v1/messages" => {
+                value["type"] == "message_delta"
+                    && value
+                        .pointer("/delta/stop_reason")
+                        .is_some_and(Value::is_string)
+                    && value
+                        .pointer("/usage/output_tokens")
+                        .and_then(Value::as_i64)
+                        .is_some_and(|n| n >= 0)
+            }
+            "/v1/chat/completions" | "/v1/completions" => {
+                value["choices"].as_array().is_some_and(Vec::is_empty)
+                    && value
+                        .pointer("/usage/completion_tokens")
+                        .and_then(Value::as_i64)
+                        .is_some_and(|n| n >= 0)
+            }
+            "/v1/responses" => {
+                terminal
+                    && value
+                        .pointer("/response/usage/output_tokens")
+                        .and_then(Value::as_i64)
+                        .is_some_and(|n| n >= 0)
+            }
+            "/v1beta/models:streamGenerateContent" => {
+                terminal
+                    && value.get("error").is_none()
+                    && [
+                        "/usageMetadata/totalTokenCount",
+                        "/usageMetadata/candidatesTokenCount",
+                    ]
+                    .iter()
+                    .any(|pointer| {
+                        value
+                            .pointer(pointer)
+                            .and_then(Value::as_i64)
+                            .is_some_and(|n| n >= 0)
+                    })
+            }
+            _ => false,
+        };
+        self.final_usage |= parsed.reported && final_report;
         self.usage
             .merge_event(value, self.context.endpoint == "/v1/messages");
         if let Some(event) = self.context.level.body(value) {
@@ -402,6 +454,7 @@ impl Attempt {
                 Ok(value) => value,
                 Err(_) => {
                     self.usage.reported = false;
+                    self.final_usage = false;
                     (0, vec![])
                 }
             }
@@ -410,7 +463,7 @@ impl Attempt {
         };
         // A lost terminal usage report cannot release a hard-budget reservation. Keep
         // an explicit conservative settlement for cancellation, transport loss or crash.
-        if !self.usage.reported && self.contacted && self.reserved > 0 {
+        if !self.final_usage && self.contacted && self.reserved > 0 {
             cost = self.reserved;
             items.clear();
         }
@@ -428,7 +481,7 @@ impl Attempt {
             return Ok(());
         }
         let usage_id = id();
-        let mut kind = if self.usage.reported {
+        let mut kind = if self.final_usage {
             "reported"
         } else if self.contacted && self.reserved > 0 {
             "conservative"
@@ -457,7 +510,7 @@ impl Attempt {
         uncached.cache_read = 0;
         uncached.cache_write = 0;
         uncached.cache_write_1h = 0;
-        let savings = if self.usage.reported && kind != "duplicate" {
+        let savings = if self.final_usage && kind != "duplicate" {
             self.price
                 .calculate(&uncached)?
                 .0
@@ -510,6 +563,7 @@ impl Attempt {
         if ctx.level != Level::Off {
             ctx.state.observations.record_at(
                 RequestEvent {
+                    project_id: ctx.key.project_id.clone(),
                     request_id: ctx.external_request.clone(),
                     trace_id: ctx.external_trace.clone(),
                     started_at: ctx.started_at,
@@ -520,8 +574,8 @@ impl Attempt {
                     requested_model: Some(ctx.model.clone()),
                     resolved_model: Some(self.model.clone()),
                     status_code: if status == "succeeded" { 200 } else { 502 },
-                    error_kind: (status != "succeeded" || !self.usage.reported).then(|| {
-                        if !self.usage.reported {
+                    error_kind: (status != "succeeded" || !self.final_usage).then(|| {
+                        if !self.final_usage {
                             "usage_unavailable".into()
                         } else {
                             status.into()
@@ -554,6 +608,7 @@ impl Drop for Attempt {
             guard: self.guard.take(),
             price: self.price.clone(),
             usage: self.usage.clone(),
+            final_usage: self.final_usage,
             provider: self.provider.clone(),
             provider_id: self.provider_id.clone(),
             credential_id: self.credential_id.clone(),

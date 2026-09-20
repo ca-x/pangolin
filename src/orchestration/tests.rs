@@ -2,6 +2,7 @@ use super::*;
 
 #[test]
 fn review_tpm_counts_choices_and_rejects_invalid_output_limits() {
+    let estimate_tokens = |payload: &Value| super::estimate_tokens(payload, "/v1/chat/completions");
     let single = json!({"model":"public","messages":[],"max_completion_tokens":100,"n":1});
     let mut multiple = single.clone();
     multiple["n"] = json!(4);

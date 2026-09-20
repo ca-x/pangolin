@@ -14,6 +14,7 @@ use tokio::sync::{mpsc, oneshot};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestEvent {
+    pub project_id: String,
     pub request_id: String,
     pub trace_id: String,
     pub started_at: i64,
@@ -83,6 +84,45 @@ enum Command {
     Record(Box<RequestEvent>, u64),
     Flush(oneshot::Sender<()>),
     Reset(u64, oneshot::Sender<bool>),
+    Retain(Vec<Retention>, oneshot::Sender<bool>),
+}
+
+#[derive(Clone)]
+pub struct Retention {
+    pub project_id: Option<String>,
+    pub days: i64,
+    pub payloads_only: bool,
+}
+impl Retention {
+    fn cutoff(&self) -> i64 {
+        time::OffsetDateTime::now_utc()
+            .unix_timestamp()
+            .saturating_sub(self.days.saturating_mul(86400))
+    }
+    fn matches(&self, event: &RequestEvent) -> bool {
+        event.started_at < self.cutoff()
+            && self
+                .project_id
+                .as_ref()
+                .is_none_or(|project| project == &event.project_id || event.project_id.is_empty())
+    }
+}
+
+fn retain(connection: &Connection, rules: &[Retention]) -> Result<()> {
+    for rule in rules {
+        let mutation = if rule.payloads_only {
+            "UPDATE request_events SET payload_captured=false,request_json=NULL,response_json=NULL"
+        } else {
+            "DELETE FROM request_events"
+        };
+        connection.execute(
+            &format!(
+                "{mutation} WHERE started_at<? AND (? IS NULL OR project_id=? OR project_id='')"
+            ),
+            params![rule.cutoff(), rule.project_id, rule.project_id],
+        )?;
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -115,6 +155,7 @@ impl ObservationStore {
                 }
             };
             let mut pending=None;let mut epoch=0;
+            let mut retention=vec![Retention {project_id:None,days:retention_days.min(i64::MAX as u64) as i64,payloads_only:false}];
             while let Some(command) = pending.take().or_else(||receiver.blocking_recv()) {
                 match command {
                     Command::Record(event,version) => {
@@ -128,6 +169,15 @@ impl ObservationStore {
                                 Err(_) => break,
                             }
                         }
+                        batch.retain_mut(|event| {
+                            for rule in &retention {
+                                if rule.matches(event) {
+                                    if !rule.payloads_only {return false;}
+                                    event.payload_captured=false;event.request_json=None;event.response_json=None;
+                                }
+                            }
+                            true
+                        });
                         if let Err(error) = insert_batch(&connection, &batch) {
                             writer_dropped.fetch_add(batch.len() as u64, Ordering::Relaxed);
                             tracing::warn!(%error, count = batch.len(), "observation event batch was dropped");
@@ -140,6 +190,12 @@ impl ObservationStore {
                     Command::Reset(version,done)=>{
                         epoch=version;let cleared=connection.execute_batch("DELETE FROM request_events; CHECKPOINT;").is_ok();
                         writer_poisoned.store(!cleared,Ordering::Release);let _=done.send(cleared);
+                    }
+                    Command::Retain(rules,done)=>{
+                        retention=rules;
+                        let applied=retain(&connection,&retention).is_ok();
+                        if !applied {writer_poisoned.store(true,Ordering::Release);}
+                        let _=done.send(applied);
                     }
                 }
             }
@@ -206,6 +262,21 @@ impl ObservationStore {
         {
             return result.await.unwrap_or(false);
         }
+        false
+    }
+
+    pub async fn apply_retention(&self, rules: Vec<Retention>) -> bool {
+        let (done, result) = oneshot::channel();
+        if let Some(sender) = &self.sender
+            && sender.send(Command::Retain(rules, done)).await.is_ok()
+        {
+            let applied = result.await.unwrap_or(false);
+            if !applied {
+                self.poisoned.store(true, Ordering::Release);
+            }
+            return applied;
+        }
+        self.poisoned.store(true, Ordering::Release);
         false
     }
 
@@ -277,6 +348,7 @@ fn initialize(path: &Path, retention_days: u64) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_request_events_started ON request_events(started_at);
         CREATE INDEX IF NOT EXISTS idx_request_events_model ON request_events(requested_model);
         INSERT INTO observation_schema SELECT 1, epoch(current_timestamp)::BIGINT WHERE NOT EXISTS (SELECT 1 FROM observation_schema WHERE version=1);
+        ALTER TABLE request_events ADD COLUMN IF NOT EXISTS project_id VARCHAR DEFAULT '';
         "#,
     ).context("failed to migrate DuckDB observation schema")?;
     let retention_seconds = retention_days.min((i64::MAX / 86_400) as u64) as i64 * 86_400;
@@ -301,7 +373,7 @@ fn insert_batch(connection: &Connection, events: &[Box<RequestEvent>]) -> Result
 
 fn insert(connection: &Connection, event: &RequestEvent) -> Result<()> {
     connection.execute(
-        "INSERT OR REPLACE INTO request_events VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT OR REPLACE INTO request_events VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         params![
             event.request_id,
             event.trace_id,
@@ -322,7 +394,8 @@ fn insert(connection: &Connection, event: &RequestEvent) -> Result<()> {
             event.cost_micros,
             event.payload_captured,
             event.request_json,
-            event.response_json
+            event.response_json,
+            event.project_id
         ],
     )?;
     Ok(())
@@ -403,6 +476,7 @@ fn query_one(path: &Path, request_id: &str) -> Result<Option<RequestEvent>> {
         return Ok(None);
     };
     Ok(Some(RequestEvent {
+        project_id: row.get(20)?,
         request_id: row.get(0)?,
         trace_id: row.get(1)?,
         started_at: row.get(2)?,
@@ -436,6 +510,7 @@ mod tests {
         let store =
             ObservationStore::open(directory.path().join("observations.duckdb"), 30).unwrap();
         store.record(RequestEvent {
+            project_id: "test-project".into(),
             request_id: "req-1".into(),
             trace_id: "trace-1".into(),
             started_at: time::OffsetDateTime::now_utc().unix_timestamp(),
@@ -483,6 +558,7 @@ mod tests {
     async fn degraded_store_drops_without_blocking_gateway_work() {
         let store = ObservationStore::degraded("/unavailable", "permission denied");
         store.record(RequestEvent {
+            project_id: "test-project".into(),
             request_id: "req-degraded".into(),
             trace_id: "trace-degraded".into(),
             started_at: 0,

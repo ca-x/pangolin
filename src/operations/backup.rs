@@ -296,6 +296,8 @@ pub async fn restore_as(
         return Ok(0);
     }
     let mut count = 0;
+    let mut imported_requests = vec![];
+    let mut imported_executions = vec![];
     let mut remappings = BTreeMap::<String, String>::new();
     for (table, scope) in TABLES {
         let Some(records) = contents.tables.get(*table) else {
@@ -485,6 +487,18 @@ pub async fn restore_as(
             ))
             .await?;
             count += 1;
+            if !existing && matches!(*table, "request_facts" | "execution_facts") {
+                let id = object
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .ok_or(ApiError::NotFound)?
+                    .to_owned();
+                if *table == "request_facts" {
+                    imported_requests.push(id);
+                } else {
+                    imported_executions.push(id);
+                }
+            }
             // Validate every restored relationship with the same scoped selection used by export.
             let mut args = primary
                 .iter()
@@ -503,6 +517,7 @@ pub async fn restore_as(
             }
         }
     }
+    super::runtime::recover_in(&tx, Some(&imported_executions), Some(&imported_requests)).await?;
     super::audit(&tx, actor, project, "backup.restore", &artifact.id).await?;
     tx.commit().await?;
     Ok(count)

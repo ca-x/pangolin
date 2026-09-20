@@ -96,6 +96,7 @@ pub struct Plan {
     pub affinity: Option<affinity::Binding>,
     pub decisions: Vec<Decision>,
     pub estimated_tokens: u32,
+    hard_budget: bool,
     protection: Vec<protection::Rule>,
     context: Value,
 }
@@ -288,7 +289,8 @@ pub async fn prepare(
     // Until a provider tokenizer is available, UTF-8 bytes plus the requested output
     // ceiling is a conservative text reservation. Non-text inputs require an explicit
     // provider token estimate before they can use TPM-limited policies.
-    let estimated_tokens = estimate_tokens(&payload)?;
+    let estimated_tokens = estimate_tokens(&payload, endpoint)?;
+    let hard_budget = key.budget_micros.is_some() || profile.budget.is_some();
     let mut plan = Plan {
         candidates,
         payload,
@@ -298,6 +300,7 @@ pub async fn prepare(
         affinity,
         decisions,
         estimated_tokens,
+        hard_budget,
         protection,
         context,
     };
@@ -357,10 +360,28 @@ fn completion_count(payload: &Value) -> Result<u32> {
         .map(|n| n.unwrap_or(1))
 }
 
-fn estimate_tokens(payload: &Value) -> Result<u32> {
-    let output = output_limit(payload)?
-        .checked_mul(completion_count(payload)?)
-        .ok_or(Error::Invalid("request token reservation is too large"))?;
+fn reserved_output(payload: &Value, endpoint: &str) -> Result<u32> {
+    let (output, count) = if crate::providers::capability(endpoint) == "gemini" {
+        let positive = |field: &str, default| {
+            payload.pointer(field).map(|value| {
+                value.as_u64().and_then(|n| u32::try_from(n).ok()).filter(|n| *n > 0)
+                    .ok_or(Error::Invalid("Gemini output limit and candidate count must be positive 32-bit integers"))
+            }).transpose().map(|value| value.unwrap_or(default))
+        };
+        (
+            positive("/generationConfig/maxOutputTokens", 4096)?,
+            positive("/generationConfig/candidateCount", 1)?,
+        )
+    } else {
+        (output_limit(payload)?, completion_count(payload)?)
+    };
+    output
+        .checked_mul(count)
+        .ok_or(Error::Invalid("request token reservation is too large"))
+}
+
+fn estimate_tokens(payload: &Value, endpoint: &str) -> Result<u32> {
+    let output = reserved_output(payload, endpoint)?;
     let input = serde_json::to_vec(payload)
         .map_err(|_| Error::Configuration)?
         .len() as u64;
@@ -393,16 +414,36 @@ impl Plan {
         {
             return Err(Error::Invalid("generationConfig must be an object"));
         }
-        if self.routing.limits.tpm.is_some() || candidate.limits.tpm.is_some() {
-            if crate::providers::is_media(&candidate.protocol_endpoint) {
-                return Err(Error::Invalid(
-                    "TPM admission for media requires a provider token estimator",
-                ));
-            }
-            let mut checked = payload.clone();
-            validate_token_reservation(&mut checked)?;
+        let tpm = self.routing.limits.tpm.is_some() || candidate.limits.tpm.is_some();
+        let media = crate::providers::is_media(&candidate.protocol_endpoint);
+        if tpm && media {
+            return Err(Error::Invalid(
+                "TPM admission for media requires a provider token estimator",
+            ));
+        }
+        if (tpm || self.hard_budget) && !media {
+            validate_token_reservation(&payload)?;
             match crate::providers::capability(&candidate.protocol_endpoint) {
-                "chat" | "messages" | "completions" | "responses" => payload = checked,
+                kind @ ("chat" | "messages" | "completions" | "responses") => {
+                    let mut limit = output_limit(&payload)?;
+                    let field = if kind == "responses" {
+                        "max_output_tokens"
+                    } else if kind != "messages" && payload.get("max_completion_tokens").is_some() {
+                        "max_completion_tokens"
+                    } else {
+                        "max_tokens"
+                    };
+                    if let Some(native) = payload.get(field).and_then(Value::as_u64) {
+                        limit = native as u32; // All aliases were validated by output_limit.
+                    }
+                    for alias in ["max_tokens", "max_completion_tokens", "max_output_tokens"] {
+                        payload
+                            .as_object_mut()
+                            .ok_or(Error::Configuration)?
+                            .remove(alias);
+                    }
+                    payload[field] = serde_json::json!(limit);
+                }
                 "gemini"
                     if payload
                         .pointer("/generationConfig/maxOutputTokens")
@@ -413,58 +454,22 @@ impl Plan {
                 _ => {}
             }
         }
-        let mut tokens = if let Some(input) = crate::providers::tokens::input_tokens(
+        let tokens = if let Some(input) = crate::providers::tokens::input_tokens(
             &candidate.target.provider_kind,
             &candidate.target.upstream_name,
             &payload,
         ) {
             input
-                .checked_add(
-                    output_limit(&payload)?
-                        .checked_mul(completion_count(&payload)?)
-                        .ok_or(Error::Invalid("request token reservation is too large"))?,
-                )
+                .checked_add(reserved_output(&payload, &candidate.protocol_endpoint)?)
                 .ok_or(Error::Invalid("request token reservation is too large"))?
         } else {
-            estimate_tokens(&payload)?
+            estimate_tokens(&payload, &candidate.protocol_endpoint)?
         };
-        if crate::providers::capability(&candidate.protocol_endpoint) == "gemini" {
-            let output = payload
-                .pointer("/generationConfig/maxOutputTokens")
-                .map(|value| {
-                    value
-                        .as_u64()
-                        .and_then(|n| u32::try_from(n).ok())
-                        .filter(|n| *n > 0)
-                        .ok_or(Error::Invalid(
-                            "maxOutputTokens must be a positive 32-bit integer",
-                        ))
-                })
-                .transpose()?
-                .unwrap_or(4096);
-            let count = payload
-                .pointer("/generationConfig/candidateCount")
-                .map(|value| {
-                    value
-                        .as_u64()
-                        .and_then(|n| u32::try_from(n).ok())
-                        .filter(|n| *n > 0)
-                        .ok_or(Error::Invalid(
-                            "candidateCount must be a positive 32-bit integer",
-                        ))
-                })
-                .transpose()?
-                .unwrap_or(1);
-            tokens = tokens
-                .checked_sub(4096)
-                .and_then(|n| n.checked_add(output.checked_mul(count)?))
-                .ok_or(Error::Invalid("request token reservation is too large"))?;
-        }
         Ok((payload, headers, tokens))
     }
 }
 
-fn validate_token_reservation(payload: &mut Value) -> Result<()> {
+fn validate_token_reservation(payload: &Value) -> Result<()> {
     fn non_text(value: &Value) -> bool {
         match value {
             Value::Object(map) => {
@@ -502,18 +507,6 @@ fn validate_token_reservation(payload: &mut Value) -> Result<()> {
         return Err(Error::Invalid(
             "TPM admission for media requires a provider token estimator",
         ));
-    }
-    // Enforce the reserved output ceiling at the provider boundary.
-    if payload.get("max_tokens").is_none()
-        && payload.get("max_completion_tokens").is_none()
-        && payload.get("max_output_tokens").is_none()
-    {
-        let field = if payload.get("input").is_some() {
-            "max_output_tokens"
-        } else {
-            "max_tokens"
-        };
-        payload[field] = serde_json::json!(4096);
     }
     Ok(())
 }

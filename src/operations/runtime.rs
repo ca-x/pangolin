@@ -123,28 +123,59 @@ pub async fn recover(state: &AppState) -> Result<(), ApiError> {
     // Single-node startup only. A crash after provider commitment has ambiguous
     // usage; charge the durable reservation once and retain an explicit status.
     let tx = state.db.begin().await?;
-    let rows=tx.query_all(sql("UPDATE execution_facts SET status='interrupted',finished_at=? WHERE status='running' RETURNING id,request_id,model_id,json_extract(price_json,'$.id') AS price_id,CASE WHEN contacted=1 THEN reserved_micros ELSE 0 END AS reserved_micros",vec![db::now().into()])).await?;
+    recover_in(&tx, None, None).await?;
+    tx.commit().await?;
+    sync_retention(state).await?;
+    Ok(())
+}
+
+/// The caller owns the transaction. Restore supplies only newly inserted IDs;
+/// startup supplies no scope because no live request tasks exist yet.
+pub(super) async fn recover_in(
+    tx: &impl ConnectionTrait,
+    executions: Option<&[String]>,
+    requests: Option<&[String]>,
+) -> Result<(), ApiError> {
+    let execution_scope = json!(executions).to_string();
+    let request_scope = json!(requests).to_string();
+    let rows=tx.query_all(sql("UPDATE execution_facts SET status='interrupted',finished_at=? WHERE status='running' AND (?='null' OR id IN (SELECT value FROM json_each(?))) RETURNING id,request_id,model_id,json_extract(price_json,'$.id') AS price_id,CASE WHEN contacted=1 THEN reserved_micros ELSE 0 END AS reserved_micros",vec![db::now().into(),execution_scope.clone().into(),execution_scope.into()])).await?;
     for row in rows {
         let execution: String = row.try_get("", "id")?;
         let request: String = row.try_get("", "request_id")?;
         let cost: i64 = row.try_get("", "reserved_micros")?;
         let usage = id();
-        tx.execute(sql("INSERT INTO usage_logs(id,execution_id,model_id,price_id,total_cost_micros,created_at,settlement_kind) VALUES(?,?,?,?,?,?,'interrupted') ON CONFLICT(execution_id) DO NOTHING",vec![usage.clone().into(),execution.clone().into(),row.try_get::<Option<String>>("","model_id")?.into(),row.try_get::<Option<String>>("","price_id")?.into(),cost.into(),db::now().into()])).await?;
-        if cost > 0 {
+        let inserted=tx.execute(sql("INSERT INTO usage_logs(id,execution_id,model_id,price_id,total_cost_micros,created_at,settlement_kind) VALUES(?,?,?,?,?,?,'interrupted') ON CONFLICT(execution_id) DO NOTHING",vec![usage.clone().into(),execution.clone().into(),row.try_get::<Option<String>>("","model_id")?.into(),row.try_get::<Option<String>>("","price_id")?.into(),cost.into(),db::now().into()])).await?.rows_affected();
+        if inserted > 0 && cost > 0 {
             tx.execute(sql("INSERT INTO usage_cost_items(id,usage_log_id,quantity,subtotal_micros) VALUES(?,?,1,?)",vec![id().into(),usage.into(),cost.into()])).await?;
+            tx.execute(sql("UPDATE api_keys SET spent_micros=spent_micros+? WHERE id=(SELECT api_key_id FROM request_facts WHERE id=?)",vec![cost.into(),request.into()])).await?;
         }
-        tx.execute(sql("UPDATE api_keys SET spent_micros=spent_micros+? WHERE id=(SELECT api_key_id FROM request_facts WHERE id=?)",vec![cost.into(),request.into()])).await?;
         tx.execute(sql("UPDATE request_executions SET status='interrupted',retry_reason='process_restart',finished_at=? WHERE id=?",vec![db::now().into(),execution.into()])).await?;
     }
-    for table in ["request_facts", "requests", "traces"] {
+    for table in ["request_facts", "requests"] {
         tx.execute(sql(
-            format!("UPDATE {table} SET status='interrupted',finished_at=? WHERE status='running'"),
-            vec![db::now().into()],
+            format!("UPDATE {table} SET status='interrupted',finished_at=? WHERE status='running' AND (?='null' OR id IN (SELECT value FROM json_each(?))) AND NOT EXISTS(SELECT 1 FROM execution_facts WHERE request_id={table}.id AND status='running')"),
+            vec![db::now().into(),request_scope.clone().into(),request_scope.clone().into()],
         ))
         .await?;
     }
-    tx.commit().await?;
+    tx.execute(sql("UPDATE traces SET status='interrupted',finished_at=? WHERE status='running' AND (?='null' OR id IN(SELECT trace_id FROM requests WHERE id IN(SELECT value FROM json_each(?)))) AND NOT EXISTS(SELECT 1 FROM requests WHERE trace_id=traces.id AND status='running')",vec![db::now().into(),request_scope.clone().into(),request_scope.into()])).await?;
     Ok(())
+}
+
+pub(super) async fn sync_retention(state: &AppState) -> Result<bool, ApiError> {
+    let mut rules = vec![crate::observability::Retention {
+        project_id: None,
+        days: state.config.observation_retention_days.min(i64::MAX as u64) as i64,
+        payloads_only: false,
+    }];
+    for row in state.db.query_all(sql("SELECT project_id,resource_type,retention_days FROM data_retention_policies WHERE resource_type IN ('requests','payloads')",vec![])).await? {
+        rules.push(crate::observability::Retention {
+            project_id: row.try_get("", "project_id")?,
+            days: row.try_get("", "retention_days")?,
+            payloads_only: row.try_get::<String>("", "resource_type")? == "payloads",
+        });
+    }
+    Ok(state.observations.apply_retention(rules).await)
 }
 async fn target(
     state: &AppState,
@@ -649,6 +680,9 @@ pub async fn gc(state: &AppState) -> Result<(), ApiError> {
     .await?;
     tx.commit().await?;
     // No network calls or active transaction while checkpointing/reclaiming storage.
+    if !sync_retention(state).await? {
+        tracing::warn!("derived retention unavailable; analytics remain degraded");
+    }
     state
         .db
         .execute_unprepared("PRAGMA wal_checkpoint(PASSIVE); PRAGMA incremental_vacuum;")
