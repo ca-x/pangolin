@@ -1,23 +1,29 @@
-import { Activity, Boxes, Gauge, KeyRound, Menu, Settings, Unplug, X } from 'lucide-react'
+import { Activity, Boxes, FlaskConical, Gauge, KeyRound, Menu, MessageSquareText, Settings, Unplug, X } from 'lucide-react'
 import { useEffect, useRef, useState, type KeyboardEvent } from 'react'
 import { useTranslation } from 'react-i18next'
 import { NavLink, Outlet, useNavigate } from 'react-router'
 import { api } from './api'
+import type { User } from './api'
+import { ProjectProvider, useProject } from './project'
 
-export default function Shell() {
+export default function Shell({ user }: { user: User }) {
+  return <ProjectProvider><ShellContent user={user}/></ProjectProvider>
+}
+
+function ShellContent({ user }: { user: User }) {
   const { t } = useTranslation()
+  const { project, projects, permissions, setProjectId } = useProject()
   const navigate = useNavigate()
   const [mobileOpen, setMobileOpen] = useState(false)
   const menuButton = useRef<HTMLButtonElement>(null)
   const closeButton = useRef<HTMLButtonElement>(null)
   const menuWasOpened = useRef(false)
-  const links = [
-    { to: '/', label: t('overview'), icon: Gauge, end: true },
-    { to: '/providers', label: t('providers'), icon: Unplug },
-    { to: '/models', label: t('models'), icon: Boxes },
-    { to: '/keys', label: t('apiKeys'), icon: KeyRound },
-    { to: '/requests', label: t('requests'), icon: Activity },
-    { to: '/settings', label: t('settings'), icon: Settings },
+  const can = (permission: string) => permissions.has('*') || permissions.has(permission)
+  const canAccess = ['api_key:manage','role:manage','user:manage','oidc:manage'].some(can)
+  const groups = [
+    { label: t('workspace'), links: [{ to: '/', label: t('overview'), icon: Gauge, end: true },...(can('project:manage')?[{ to: '/channels', label: t('channels'), icon: Unplug },{ to: '/models', label: t('models'), icon: Boxes },{ to: '/prompts', label: t('prompts'), icon: MessageSquareText }]:[]),{ to: '/playground', label: t('playground'), icon: FlaskConical }] },
+    { label: t('observe'), links: [{ to: '/operations', label: t('operations'), icon: Activity }] },
+    ...((canAccess||can('catalog:manage')) ? [{ label: t('administration'), links: [...(canAccess?[{ to: '/access', label: t('access'), icon: KeyRound }]:[]),...(can('catalog:manage')?[{ to: '/system', label: t('systemSettings'), icon: Settings }]:[])] }] : []),
   ]
   useEffect(() => {
     if (mobileOpen) {
@@ -43,8 +49,9 @@ export default function Shell() {
     {mobileOpen && <button className="nav-scrim" onClick={() => setMobileOpen(false)} aria-label={t('close')} />}
     <aside className={`sidebar ${mobileOpen ? 'sidebar-open' : ''}`} role={mobileOpen ? 'dialog' : undefined} aria-modal={mobileOpen || undefined} aria-label={mobileOpen ? t('menu') : undefined} onKeyDown={trapNavigationFocus}>
       <div className="sidebar-top"><Brand /><button ref={closeButton} className="icon-button sidebar-close" onClick={() => setMobileOpen(false)} aria-label={t('close')}><X size={18} /></button></div>
-      <nav aria-label="Primary">{links.map(({ to, label, icon: Icon, end }) => <NavLink onClick={() => setMobileOpen(false)} className={({ isActive }) => isActive ? 'nav-link nav-link-active' : 'nav-link'} key={to} to={to} end={end}><Icon size={18} strokeWidth={1.8} /><span>{label}</span></NavLink>)}</nav>
-      <button className="signout" onClick={signOut}>{t('signOut')}</button>
+      {projects.length > 1 && <label className="project-switcher"><span>{t('project')}</span><select value={project.id} onChange={(event) => setProjectId(event.target.value)}>{projects.filter((item)=>item.enabled).map((item)=><option key={item.id} value={item.id}>{item.name}</option>)}</select></label>}
+      <nav aria-label={t('primaryNavigation')}>{groups.map((group)=><section className="nav-group" key={group.label}><h2>{group.label}</h2>{group.links.map(({ to, label, icon: Icon, end }) => <NavLink onClick={() => setMobileOpen(false)} className={({ isActive }) => isActive ? 'nav-link nav-link-active' : 'nav-link'} key={to} to={to} end={end}><Icon size={18} strokeWidth={1.8} /><span>{label}</span></NavLink>)}</section>)}</nav>
+      <div className="account-block"><span>{user.email}</span><button className="signout" onClick={signOut}>{t('signOut')}</button></div>
     </aside>
     <main id="main-content" className="content" tabIndex={-1} inert={mobileOpen || undefined} aria-hidden={mobileOpen || undefined}><Outlet /></main>
   </div>

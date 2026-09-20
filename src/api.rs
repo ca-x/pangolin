@@ -186,10 +186,43 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/chat/completions", post(gateway_chat))
         .route("/v1/responses", post(gateway_responses))
         .route("/v1/messages", post(gateway_messages))
+        .layer(middleware::from_fn(browser_csrf))
         .layer(middleware::from_fn(errors::native_errors))
         .layer(middleware::from_fn(capture_trusted_client_ip))
         .layer(middleware::from_fn_with_state(state.clone(), maintenance))
         .with_state(state)
+}
+
+async fn browser_csrf(request: axum::extract::Request, next: Next) -> Response {
+    let unsafe_method = !matches!(
+        *request.method(),
+        axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS
+    );
+    let browser_session = request
+        .headers()
+        .get(header::COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|cookies| {
+            cookies
+                .split(';')
+                .any(|cookie| cookie.trim().starts_with("pangolin_session="))
+        });
+    if request.uri().path().starts_with("/api/admin/v1/")
+        && unsafe_method
+        && browser_session
+        && (request
+            .headers()
+            .get("x-pangolin-csrf")
+            .and_then(|value| value.to_str().ok())
+            != Some("1")
+            || request
+                .headers()
+                .get("sec-fetch-site")
+                .is_some_and(|value| value == "cross-site"))
+    {
+        return ApiError::Forbidden.into_response();
+    }
+    next.run(request).await
 }
 async fn maintenance(
     State(state): State<AppState>,
@@ -439,6 +472,7 @@ async fn create_api_key(
     if input.name.trim().is_empty() {
         return Err(ApiError::BadRequest("name is required".into()));
     }
+    let imported = input.token_mode == crate::models::ApiKeyTokenMode::ImportExisting;
     let (key, token) = db::create_api_key(&state.db, &input)
         .await
         .map_err(bad_request)?;
@@ -448,12 +482,16 @@ async fn create_api_key(
         "create",
         "api_key",
         &key.id,
-        json!({"name":key.name,"prefix":key.key_prefix}),
+        json!({"name":key.name,"fingerprint":key.key_prefix,"token_mode":if imported {"import_existing"} else {"generated"}}),
     )
     .await?;
     Ok((
         StatusCode::CREATED,
-        Json(json!({ "key": key, "token": token })),
+        Json(if imported {
+            json!({ "key": key, "mode": "import_existing" })
+        } else {
+            json!({ "key": key, "mode": "generated", "token": token })
+        }),
     ))
 }
 
@@ -1193,6 +1231,7 @@ mod tests {
             &ApiKeyInput {
                 name: "test".into(),
                 budget_micros: None,
+                ..Default::default()
             },
         )
         .await

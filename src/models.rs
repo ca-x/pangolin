@@ -115,10 +115,21 @@ pub struct ModelInput {
     pub priority: Option<i32>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct ApiKeyInput {
     pub name: String,
     pub budget_micros: Option<i64>,
+    #[serde(default)]
+    pub token_mode: ApiKeyTokenMode,
+    pub token: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiKeyTokenMode {
+    #[default]
+    Generated,
+    ImportExisting,
 }
 
 #[allow(dead_code)]

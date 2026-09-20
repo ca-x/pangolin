@@ -83,6 +83,7 @@ CREATE TABLE IF NOT EXISTS api_keys (
     name TEXT NOT NULL,
     key_prefix TEXT NOT NULL UNIQUE,
     key_hash TEXT NOT NULL,
+    lookup_digest TEXT NOT NULL UNIQUE,
     scopes TEXT NOT NULL DEFAULT '["gateway"]',
     budget_micros INTEGER,
     spent_micros INTEGER NOT NULL DEFAULT 0 CHECK(typeof(spent_micros)='integer' AND spent_micros>=0),
@@ -100,6 +101,7 @@ CREATE TABLE IF NOT EXISTS api_keys (
     FOREIGN KEY(profile_id,project_id) REFERENCES api_key_profiles(id,project_id) ON DELETE RESTRICT
 );
 CREATE INDEX IF NOT EXISTS idx_api_keys_prefix ON api_keys(key_prefix);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_api_keys_lookup_digest ON api_keys(lookup_digest);
 CREATE TABLE IF NOT EXISTS audit_events (
     id TEXT PRIMARY KEY,
     actor_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
@@ -1051,6 +1053,7 @@ mod tests {
             "idx_project_memberships_user",
             "idx_oidc_identities_user",
             "idx_api_keys_project",
+            "idx_api_keys_lookup_digest",
             "idx_response_sessions_expiry",
             "idx_user_role_bindings_global_unique",
             "idx_channel_credentials_provider",
@@ -1154,10 +1157,10 @@ mod tests {
             VALUES('user-delete','delete@example.com','hash','member','en','system:bronze',1);
             INSERT INTO api_key_profiles(id,project_id,name,created_at,updated_at)
             VALUES('profile-delete','00000000-0000-0000-0000-000000000001','restricted',1,1);
-            INSERT INTO api_keys(id,name,key_prefix,key_hash,created_at,project_id,user_id,key_type)
-            VALUES('personal-key','personal','personal','hash',1,'00000000-0000-0000-0000-000000000001','user-delete','personal');
-            INSERT INTO api_keys(id,name,key_prefix,key_hash,created_at,project_id,profile_id)
-            VALUES('profile-key','profiled','profiled','hash',1,'00000000-0000-0000-0000-000000000001','profile-delete');
+            INSERT INTO api_keys(id,name,key_prefix,key_hash,lookup_digest,created_at,project_id,user_id,key_type)
+            VALUES('personal-key','personal','personal','hash','personal-digest',1,'00000000-0000-0000-0000-000000000001','user-delete','personal');
+            INSERT INTO api_keys(id,name,key_prefix,key_hash,lookup_digest,created_at,project_id,profile_id)
+            VALUES('profile-key','profiled','profiled','hash','profile-digest',1,'00000000-0000-0000-0000-000000000001','profile-delete');
             "#,
         )
         .await
@@ -1345,14 +1348,14 @@ mod tests {
 
         assert!(
             db.execute_unprepared(
-                "INSERT INTO api_keys(id,name,key_prefix,key_hash,created_at,project_id,profile_id) VALUES('bad-key','bad','bad-key','hash',1,'00000000-0000-0000-0000-000000000001','profile-b')"
+                "INSERT INTO api_keys(id,name,key_prefix,key_hash,lookup_digest,created_at,project_id,profile_id) VALUES('bad-key','bad','bad-key','hash','bad-digest',1,'00000000-0000-0000-0000-000000000001','profile-b')"
             )
             .await
             .is_err(),
             "an API key must not reference another project's profile"
         );
         db.execute_unprepared(
-            "INSERT INTO api_keys(id,name,key_prefix,key_hash,created_at,project_id,profile_id) VALUES('key-a','key-a','key-a','hash',1,'00000000-0000-0000-0000-000000000001','profile-a')",
+            "INSERT INTO api_keys(id,name,key_prefix,key_hash,lookup_digest,created_at,project_id,profile_id) VALUES('key-a','key-a','key-a','hash','key-a-digest',1,'00000000-0000-0000-0000-000000000001','profile-a')",
         )
         .await
         .unwrap();

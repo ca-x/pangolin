@@ -27,6 +27,10 @@ pub fn router() -> Router<AppState> {
                 .delete(delete_project),
         )
         .route(
+            "/api/admin/v1/projects/{project_id}/permissions",
+            get(project_permissions),
+        )
+        .route(
             "/api/admin/v1/projects/{project_id}/members",
             get(list_members).post(upsert_member),
         )
@@ -184,6 +188,24 @@ async fn get_project(
         access::get_project(&state.db, &actor, &project_id)
             .await
             .map_err(map_access)?,
+    ))
+}
+
+async fn project_permissions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+) -> Result<Json<Vec<String>>, ApiError> {
+    let actor = principal(&state, &headers).await?;
+    access::authorize(&state.db, &actor, Some(&project_id), "project:read")
+        .await
+        .map_err(map_access)?;
+    Ok(Json(
+        access::effective_scopes(&state.db, &actor, Some(&project_id))
+            .await
+            .map_err(map_access)?
+            .into_iter()
+            .collect(),
     ))
 }
 
@@ -505,10 +527,18 @@ async fn create_api_key(
         ));
     }
     input.project_id = project_id;
+    let imported = input.token_mode == access::ApiKeyTokenMode::ImportExisting;
     let (key, token) = access::create_scoped_api_key(&state.db, &actor, &input)
         .await
         .map_err(map_access)?;
-    Ok((StatusCode::CREATED, Json(json!({"key":key,"token":token}))))
+    Ok((
+        StatusCode::CREATED,
+        Json(if imported {
+            json!({"key":key,"mode":"import_existing"})
+        } else {
+            json!({"key":key,"mode":"generated","token":token})
+        }),
+    ))
 }
 
 async fn list_api_keys(
@@ -926,6 +956,65 @@ mod tests {
         )
     }
 
+    #[tokio::test]
+    async fn imported_api_keys_authenticate_by_digest_without_returning_plaintext() {
+        let (app, database, _directory, owner) = test_app().await;
+        let session = db::create_session(&database, &owner.subject_id)
+            .await
+            .unwrap();
+        let token = "sk-existing_4Fh9pQ2xR7mV6nK3cD8sJ5wL1zB0YtUa";
+        let request = || {
+            Request::post(format!("/api/admin/v1/projects/{}/api-keys", db::DEFAULT_PROJECT_ID))
+            .header(header::COOKIE, format!("pangolin_session={session}"))
+            .header("x-pangolin-csrf", "1")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(json!({"name":"imported","token_mode":"import_existing","token":token,"key_type":"service","scopes":["gateway:use"]}).to_string()))
+            .unwrap()
+        };
+        let response = app.clone().oneshot(request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = String::from_utf8(
+            to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(!body.contains(token));
+        assert!(
+            db::authenticate_api_key(&database, token, None)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            app.oneshot(request()).await.unwrap().status(),
+            StatusCode::CONFLICT
+        );
+    }
+
+    #[tokio::test]
+    async fn browser_admin_mutations_require_csrf_header() {
+        let (app, database, _directory, owner) = test_app().await;
+        let session = db::create_session(&database, &owner.subject_id)
+            .await
+            .unwrap();
+        let response = app
+            .oneshot(
+                Request::post("/api/admin/v1/users")
+                    .header(header::COOKIE, format!("pangolin_session={session}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({"email":"blocked@example.com","password":"a secure password"})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
     #[derive(Clone)]
     struct MockIdp {
         issuer: String,
@@ -1140,6 +1229,7 @@ mod tests {
                 expires_at: None,
                 allowed_ips: vec![],
                 denied_ips: vec![],
+                ..Default::default()
             },
         )
         .await
@@ -1211,6 +1301,7 @@ mod tests {
                 expires_at: None,
                 allowed_ips: vec![],
                 denied_ips: vec![],
+                ..Default::default()
             },
         )
         .await
@@ -1245,6 +1336,7 @@ mod tests {
                 expires_at: None,
                 allowed_ips: vec!["10.0.0.1".into(), "192.0.2.0/24".into()],
                 denied_ips: vec!["192.0.2.10".into()],
+                ..Default::default()
             },
         )
         .await
@@ -1342,6 +1434,7 @@ mod tests {
                     db::DEFAULT_PROJECT_ID
                 ))
                 .header(header::COOKIE, format!("pangolin_session={session}"))
+                .header("x-pangolin-csrf", "1")
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     json!({"user_id":target.id,"role_id":db::SYSTEM_OWNER_ROLE_ID}).to_string(),
@@ -1359,6 +1452,7 @@ mod tests {
                     db::DEFAULT_PROJECT_ID
                 ))
                 .header(header::COOKIE, format!("pangolin_session={session}"))
+                .header("x-pangolin-csrf", "1")
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     json!({"email":"new@example.com","role_id":db::SYSTEM_OWNER_ROLE_ID})
@@ -1376,6 +1470,7 @@ mod tests {
                     target.id
                 ))
                 .header(header::COOKIE, format!("pangolin_session={session}"))
+                .header("x-pangolin-csrf", "1")
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     json!({"role_id":db::SYSTEM_OWNER_ROLE_ID,"project_id":db::DEFAULT_PROJECT_ID})
@@ -1429,6 +1524,7 @@ mod tests {
                 expires_at: None,
                 allowed_ips: vec![],
                 denied_ips: vec![],
+                ..Default::default()
             },
         )
         .await
@@ -1447,6 +1543,7 @@ mod tests {
                 expires_at: None,
                 allowed_ips: vec![],
                 denied_ips: vec![],
+                ..Default::default()
             },
         )
         .await
@@ -1460,6 +1557,7 @@ mod tests {
             .oneshot(
                 Request::patch(format!("/api/admin/v1/users/{}", user.id))
                     .header(header::COOKIE, format!("pangolin_session={owner_session}"))
+                    .header("x-pangolin-csrf", "1")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         json!({"password":"a replacement password"}).to_string(),
@@ -1481,6 +1579,7 @@ mod tests {
             .oneshot(
                 Request::patch(format!("/api/admin/v1/users/{}", user.id))
                     .header(header::COOKIE, format!("pangolin_session={owner_session}"))
+                    .header("x-pangolin-csrf", "1")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(json!({"enabled":false}).to_string()))
                     .unwrap(),
@@ -1521,6 +1620,7 @@ mod tests {
                     expires_at: None,
                     allowed_ips: vec![],
                     denied_ips: vec![],
+                    ..Default::default()
                 }
             )
             .await,
@@ -1565,11 +1665,12 @@ mod tests {
                 expires_at: None,
                 allowed_ips: vec![],
                 denied_ips: vec![],
+                ..Default::default()
             },
         )
         .await
         .unwrap();
-        let suspended = app.clone().oneshot(Request::post(format!("/api/admin/v1/projects/{}/members", db::DEFAULT_PROJECT_ID)).header(header::COOKIE, format!("pangolin_session={owner_session}")).header(header::CONTENT_TYPE, "application/json").body(Body::from(json!({"user_id":member.id,"role_id":access::SYSTEM_MEMBER_ROLE_ID,"status":"suspended"}).to_string())).unwrap()).await.unwrap();
+        let suspended = app.clone().oneshot(Request::post(format!("/api/admin/v1/projects/{}/members", db::DEFAULT_PROJECT_ID)).header(header::COOKIE, format!("pangolin_session={owner_session}")).header("x-pangolin-csrf", "1").header(header::CONTENT_TYPE, "application/json").body(Body::from(json!({"user_id":member.id,"role_id":access::SYSTEM_MEMBER_ROLE_ID,"status":"suspended"}).to_string())).unwrap()).await.unwrap();
         assert_eq!(suspended.status(), StatusCode::OK);
         assert!(
             db::authenticate_api_key(&database, &suspended_key, None)
@@ -1604,6 +1705,7 @@ mod tests {
                 expires_at: None,
                 allowed_ips: vec![],
                 denied_ips: vec![],
+                ..Default::default()
             },
         )
         .await
@@ -1616,6 +1718,7 @@ mod tests {
                     member.id
                 ))
                 .header(header::COOKIE, format!("pangolin_session={owner_session}"))
+                .header("x-pangolin-csrf", "1")
                 .body(Body::empty())
                 .unwrap(),
             )
@@ -1639,6 +1742,7 @@ mod tests {
                     enabled: Some(true),
                     expires_at: None,
                     scopes: None,
+                    ..Default::default()
                 }
             )
             .await,
@@ -1669,6 +1773,7 @@ mod tests {
             .oneshot(
                 Request::patch(format!("/api/admin/v1/projects/{}", db::DEFAULT_PROJECT_ID))
                     .header(header::COOKIE, format!("pangolin_session={owner_session}"))
+                    .header("x-pangolin-csrf", "1")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         json!({"owner_user_id":new_owner.id}).to_string(),
@@ -1686,7 +1791,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let demotion = app.oneshot(Request::post(format!("/api/admin/v1/projects/{}/members", db::DEFAULT_PROJECT_ID)).header(header::COOKIE, format!("pangolin_session={owner_session}")).header(header::CONTENT_TYPE, "application/json").body(Body::from(json!({"user_id":new_owner.id,"role_id":access::SYSTEM_MEMBER_ROLE_ID,"status":"suspended"}).to_string())).unwrap()).await.unwrap();
+        let demotion = app.oneshot(Request::post(format!("/api/admin/v1/projects/{}/members", db::DEFAULT_PROJECT_ID)).header(header::COOKIE, format!("pangolin_session={owner_session}")).header("x-pangolin-csrf", "1").header(header::CONTENT_TYPE, "application/json").body(Body::from(json!({"user_id":new_owner.id,"role_id":access::SYSTEM_MEMBER_ROLE_ID,"status":"suspended"}).to_string())).unwrap()).await.unwrap();
         assert_eq!(demotion.status(), StatusCode::BAD_REQUEST);
     }
 

@@ -74,6 +74,8 @@ pub struct RequestListItem {
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct RequestFilter {
+    #[serde(skip)]
+    pub project_id: Option<String>,
     pub status_code: Option<i32>,
     pub provider: Option<String>,
     pub model: Option<String>,
@@ -295,6 +297,12 @@ impl ObservationStore {
         tokio::task::spawn_blocking(move || query_summary(&path)).await?
     }
 
+    pub async fn summary_for(&self, project_id: String) -> Result<Summary> {
+        self.ensure_available()?;
+        let path = Arc::clone(&self.path);
+        tokio::task::spawn_blocking(move || query_summary_for(&path, Some(&project_id))).await?
+    }
+
     pub async fn list(&self, filter: RequestFilter) -> Result<Vec<RequestListItem>> {
         self.ensure_available()?;
         let path = Arc::clone(&self.path);
@@ -305,6 +313,17 @@ impl ObservationStore {
         self.ensure_available()?;
         let path = Arc::clone(&self.path);
         tokio::task::spawn_blocking(move || query_one(&path, &request_id)).await?
+    }
+
+    pub async fn get_for(
+        &self,
+        project_id: String,
+        request_id: String,
+    ) -> Result<Option<RequestEvent>> {
+        Ok(self
+            .get(request_id)
+            .await?
+            .filter(|event| event.project_id == project_id))
     }
 
     fn ensure_available(&self) -> Result<()> {
@@ -402,11 +421,15 @@ fn insert(connection: &Connection, event: &RequestEvent) -> Result<()> {
 }
 
 fn query_summary(path: &Path) -> Result<Summary> {
+    query_summary_for(path, None)
+}
+
+fn query_summary_for(path: &Path, project_id: Option<&str>) -> Result<Summary> {
     let connection = Connection::open(path)?;
     let since = time::OffsetDateTime::now_utc().unix_timestamp() - 24 * 3600;
     let mut summary = connection.query_row(
-        "SELECT count(*),count(*) FILTER (WHERE status_code >= 400),coalesce(quantile_cont(latency_ms,0.95),0),coalesce(sum(input_tokens),0),coalesce(sum(output_tokens),0),coalesce(sum(cost_micros),0) FROM request_events WHERE started_at >= ?",
-        [since],
+        "SELECT count(*),count(*) FILTER (WHERE status_code >= 400),coalesce(quantile_cont(latency_ms,0.95),0),coalesce(sum(input_tokens),0),coalesce(sum(output_tokens),0),coalesce(sum(cost_micros),0) FROM request_events WHERE started_at >= ? AND (? IS NULL OR project_id=?)",
+        params![since, project_id, project_id],
         |row| Ok(Summary {
             requests: row.get(0)?, errors: row.get(1)?, error_rate: 0.0,
             p95_latency_ms: row.get(2)?, input_tokens: row.get(3)?, output_tokens: row.get(4)?, cost_micros: row.get(5)?, series: vec![],
@@ -418,9 +441,9 @@ fn query_summary(path: &Path) -> Result<Summary> {
         summary.errors as f64 / summary.requests as f64
     };
     let mut statement = connection.prepare(
-        "SELECT floor(started_at/3600)*3600 AS bucket,count(*),count(*) FILTER (WHERE status_code >= 400),avg(latency_ms) FROM request_events WHERE started_at >= ? GROUP BY bucket ORDER BY bucket",
+        "SELECT floor(started_at/3600)*3600 AS bucket,count(*),count(*) FILTER (WHERE status_code >= 400),avg(latency_ms) FROM request_events WHERE started_at >= ? AND (? IS NULL OR project_id=?) GROUP BY bucket ORDER BY bucket",
     )?;
-    let points = statement.query_map([since], |row| {
+    let points = statement.query_map(params![since, project_id, project_id], |row| {
         Ok(SummaryPoint {
             bucket: row.get(0)?,
             requests: row.get(1)?,
@@ -436,10 +459,12 @@ fn query_list(path: &Path, filter: &RequestFilter) -> Result<Vec<RequestListItem
     let connection = Connection::open(path)?;
     let limit = filter.limit.unwrap_or(100).clamp(1, 500) as i64;
     let mut statement = connection.prepare(
-        "SELECT request_id,started_at,endpoint,provider,requested_model,resolved_model,status_code,latency_ms,input_tokens,output_tokens,cost_micros FROM request_events WHERE (? IS NULL OR status_code=?) AND (? IS NULL OR provider=?) AND (? IS NULL OR requested_model=? OR resolved_model=?) ORDER BY started_at DESC LIMIT ?",
+        "SELECT request_id,started_at,endpoint,provider,requested_model,resolved_model,status_code,latency_ms,input_tokens,output_tokens,cost_micros FROM request_events WHERE (? IS NULL OR project_id=?) AND (? IS NULL OR status_code=?) AND (? IS NULL OR provider=?) AND (? IS NULL OR requested_model=? OR resolved_model=?) ORDER BY started_at DESC LIMIT ?",
     )?;
     let rows = statement.query_map(
         params![
+            filter.project_id,
+            filter.project_id,
             filter.status_code,
             filter.status_code,
             filter.provider,

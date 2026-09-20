@@ -121,6 +121,28 @@ pub fn token_hash(token: &str) -> String {
     blake3::hash(token.as_bytes()).to_hex().to_string()
 }
 
+pub fn imported_token_has_entropy(token: &str) -> bool {
+    if !(32..=1024).contains(&token.len())
+        || token.chars().any(char::is_whitespace)
+        || token.chars().any(char::is_control)
+    {
+        return false;
+    }
+    let mut counts = [0_u16; 256];
+    for byte in token.bytes() {
+        counts[usize::from(byte)] += 1;
+    }
+    let length = token.len() as f64;
+    let entropy = counts
+        .into_iter()
+        .filter(|count| *count > 0)
+        .fold(0.0, |sum, count| {
+            let probability = f64::from(count) / length;
+            sum - probability * probability.log2()
+        });
+    entropy >= 3.0
+}
+
 fn decode_key(encoded: &str) -> Result<[u8; 32]> {
     let bytes = STANDARD_NO_PAD.decode(encoded)?;
     bytes
@@ -148,5 +170,18 @@ mod tests {
             secret_box.decrypt(&encrypted).unwrap().as_str(),
             "sk-secret"
         );
+    }
+
+    #[test]
+    fn imported_tokens_require_real_symbol_entropy() {
+        assert!(imported_token_has_entropy(
+            "sk-existing_4Fh9pQ2xR7mV6nK3cD8sJ5wL1zB0YtUa"
+        ));
+        assert!(!imported_token_has_entropy(
+            "aaaaaaaaaaaaaaaaaaaaaaaa12345678"
+        ));
+        assert!(!imported_token_has_entropy(
+            "high entropy token still has spaces 123456789"
+        ));
     }
 }

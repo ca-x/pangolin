@@ -207,6 +207,7 @@ async fn async_tasks_are_key_owned_pinned_and_deleted() {
         &ApiKeyInput {
             name: "other".into(),
             budget_micros: None,
+            ..Default::default()
         },
     )
     .await

@@ -331,14 +331,26 @@ pub async fn create_api_key(
     db: &DatabaseConnection,
     input: &ApiKeyInput,
 ) -> Result<(ApiKey, String)> {
-    let prefix_random = crypto::opaque_token("");
-    let prefix = prefix_random.chars().take(8).collect::<String>();
-    let token = format!("pg_{prefix}_{}", crypto::opaque_token(""));
+    let token = match input.token_mode {
+        ApiKeyTokenMode::Generated => crypto::opaque_token("pg_"),
+        ApiKeyTokenMode::ImportExisting => {
+            let token = input
+                .token
+                .as_deref()
+                .context("token is required for import")?;
+            if !crypto::imported_token_has_entropy(token) {
+                bail!("imported token must contain 32–1024 high-entropy, non-whitespace characters")
+            }
+            token.to_owned()
+        }
+    };
+    let lookup_digest = crypto::token_hash(&token);
+    let prefix = lookup_digest[..8].to_owned();
     let hash = crypto::hash_password(&token)?;
     let id = Uuid::new_v4().to_string();
     db.execute(stmt(
-        "INSERT INTO api_keys(id,name,key_prefix,key_hash,scopes,budget_micros,spent_micros,enabled,created_at,project_id) VALUES(?,?,?,?,'[\"gateway\"]',?,0,1,?,?)",
-        vec![id.clone().into(), input.name.trim().to_owned().into(), prefix.into(), hash.into(), input.budget_micros.into(), now().into(), DEFAULT_PROJECT_ID.into()],
+        "INSERT INTO api_keys(id,name,key_prefix,key_hash,lookup_digest,scopes,budget_micros,spent_micros,enabled,created_at,project_id) VALUES(?,?,?,?,?,'[\"gateway\"]',?,0,1,?,?)",
+        vec![id.clone().into(), input.name.trim().to_owned().into(), prefix.into(), hash.into(), lookup_digest.into(), input.budget_micros.into(), now().into(), DEFAULT_PROJECT_ID.into()],
     )).await?;
     let key = ApiKey::find_by_statement(stmt("SELECT id,name,key_prefix,scopes,budget_micros,spent_micros,enabled,last_used_at,created_at FROM api_keys WHERE id=?", vec![id.into()])).one(db).await?.expect("inserted API key exists");
     Ok((key, token))
@@ -360,19 +372,10 @@ pub async fn authenticate_api_key(
     token: &str,
     client_ip: Option<IpAddr>,
 ) -> Result<Option<ApiKeyCredential>> {
-    let mut parts = token.splitn(3, '_');
-    if parts.next() != Some("pg") {
-        return Ok(None);
-    }
-    let Some(prefix) = parts.next() else {
-        return Ok(None);
-    };
-    if parts.next().is_none() {
-        return Ok(None);
-    }
+    let lookup_digest = crypto::token_hash(token);
     let credential = ApiKeyCredential::find_by_statement(stmt(
-        "SELECT k.id,k.project_id,k.user_id,k.key_hash,k.scopes,k.budget_micros,k.spent_micros,k.enabled,k.expires_at,k.allowed_ips_json,k.denied_ips_json FROM api_keys k LEFT JOIN users u ON u.id=k.user_id WHERE k.key_prefix=? AND (k.key_type NOT IN ('user','personal') OR (u.enabled=1 AND EXISTS (SELECT 1 FROM project_memberships membership WHERE membership.project_id=k.project_id AND membership.user_id=k.user_id AND membership.status='active')))",
-        vec![prefix.into()],
+        "SELECT k.id,k.project_id,k.user_id,k.key_hash,k.scopes,k.budget_micros,k.spent_micros,k.enabled,k.expires_at,k.allowed_ips_json,k.denied_ips_json FROM api_keys k LEFT JOIN users u ON u.id=k.user_id WHERE k.lookup_digest=? AND (k.key_type NOT IN ('user','personal') OR (u.enabled=1 AND EXISTS (SELECT 1 FROM project_memberships membership WHERE membership.project_id=k.project_id AND membership.user_id=k.user_id AND membership.status='active')))",
+        vec![lookup_digest.into()],
     )).one(db).await?;
     let Some(credential) = credential else {
         return Ok(None);
@@ -398,6 +401,17 @@ pub async fn authenticate_api_key(
     ))
     .await?;
     Ok(Some(credential))
+}
+
+pub async fn api_key_credential_by_id(
+    db: &DatabaseConnection,
+    project_id: &str,
+    id: &str,
+) -> Result<Option<ApiKeyCredential>> {
+    Ok(ApiKeyCredential::find_by_statement(stmt(
+        "SELECT k.id,k.project_id,k.user_id,k.key_hash,k.scopes,k.budget_micros,k.spent_micros,k.enabled,k.expires_at,k.allowed_ips_json,k.denied_ips_json FROM api_keys k LEFT JOIN users u ON u.id=k.user_id WHERE k.id=? AND k.project_id=? AND k.enabled=1 AND (k.expires_at IS NULL OR k.expires_at>unixepoch()) AND (k.key_type NOT IN ('user','personal') OR (u.enabled=1 AND EXISTS (SELECT 1 FROM project_memberships membership WHERE membership.project_id=k.project_id AND membership.user_id=k.user_id AND membership.status='active')))",
+        vec![id.into(), project_id.into()],
+    )).one(db).await?)
 }
 
 fn api_key_ip_allowed(credential: &ApiKeyCredential, client_ip: Option<IpAddr>) -> bool {
@@ -491,6 +505,7 @@ mod tests {
             &ApiKeyInput {
                 name: "test".into(),
                 budget_micros: None,
+                ..Default::default()
             },
         )
         .await

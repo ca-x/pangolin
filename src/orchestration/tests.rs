@@ -132,7 +132,7 @@ async fn database_fixture() -> DatabaseFixture {
     );
     let db = db::connect(&url).await.unwrap();
     let secrets = SecretBox::load(directory.path(), None).unwrap();
-    db.execute(repository::statement("INSERT INTO api_keys(id,name,key_prefix,key_hash,created_at,project_id) VALUES('key-a','test','prefix','unused',0,?)",vec![db::DEFAULT_PROJECT_ID.into()])).await.unwrap();
+    db.execute(repository::statement("INSERT INTO api_keys(id,name,key_prefix,key_hash,lookup_digest,created_at,project_id) VALUES('key-a','test','prefix','unused','test-digest',0,?)",vec![db::DEFAULT_PROJECT_ID.into()])).await.unwrap();
     DatabaseFixture {
         db,
         key: ApiKeyCredential {

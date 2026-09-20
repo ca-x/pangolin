@@ -289,6 +289,7 @@ pub struct RoleView {
     pub is_system: bool,
     pub created_at: i64,
     pub updated_at: i64,
+    pub permissions: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -362,7 +363,7 @@ pub struct AcceptInvitationInput {
     pub language: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct ScopedApiKeyInput {
     pub name: String,
     #[serde(default)]
@@ -379,14 +380,29 @@ pub struct ScopedApiKeyInput {
     pub allowed_ips: Vec<String>,
     #[serde(default)]
     pub denied_ips: Vec<String>,
+    #[serde(default)]
+    pub token_mode: ApiKeyTokenMode,
+    pub token: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiKeyTokenMode {
+    #[default]
+    Generated,
+    ImportExisting,
+}
+
+#[derive(Debug, Default, Deserialize)]
 pub struct ScopedApiKeyUpdate {
     pub name: Option<String>,
     pub enabled: Option<bool>,
     pub expires_at: Option<i64>,
     pub scopes: Option<Vec<String>>,
+    pub profile_id: Option<String>,
+    pub budget_micros: Option<i64>,
+    pub allowed_ips: Option<Vec<String>>,
+    pub denied_ips: Option<Vec<String>>,
 }
 
 fn service_key_type() -> String {
@@ -829,7 +845,7 @@ pub async fn list_roles(
 ) -> Result<Vec<RoleView>, AccessError> {
     authorize(db, actor, Some(project_id), "project:read").await?;
     Ok(RoleView::find_by_statement(statement(
-        "SELECT id,project_id,name,scope,is_system,created_at,updated_at FROM roles WHERE project_id IS NULL OR project_id=? ORDER BY is_system DESC,name",
+        "SELECT id,project_id,name,scope,is_system,created_at,updated_at,COALESCE((SELECT json_group_array(permission.slug) FROM role_permissions assignment JOIN permissions permission ON permission.id=assignment.permission_id WHERE assignment.role_id=roles.id),'[]') AS permissions FROM roles WHERE project_id IS NULL OR project_id=? ORDER BY is_system DESC,name",
         vec![project_id.into()],
     )).all(db).await?)
 }
@@ -874,7 +890,7 @@ pub async fn create_role(
     .await?;
     transaction.commit().await?;
     RoleView::find_by_statement(statement(
-        "SELECT id,project_id,name,scope,is_system,created_at,updated_at FROM roles WHERE id=?",
+        "SELECT id,project_id,name,scope,is_system,created_at,updated_at,COALESCE((SELECT json_group_array(permission.slug) FROM role_permissions assignment JOIN permissions permission ON permission.id=assignment.permission_id WHERE assignment.role_id=roles.id),'[]') AS permissions FROM roles WHERE id=?",
         vec![id.into()],
     ))
     .one(db)
@@ -935,7 +951,7 @@ pub async fn update_role(
     .await?;
     transaction.commit().await?;
     RoleView::find_by_statement(statement(
-        "SELECT id,project_id,name,scope,is_system,created_at,updated_at FROM roles WHERE id=?",
+        "SELECT id,project_id,name,scope,is_system,created_at,updated_at,COALESCE((SELECT json_group_array(permission.slug) FROM role_permissions assignment JOIN permissions permission ON permission.id=assignment.permission_id WHERE assignment.role_id=roles.id),'[]') AS permissions FROM roles WHERE id=?",
         vec![role_id.into()],
     ))
     .one(db)
@@ -1296,18 +1312,51 @@ pub async fn create_scoped_api_key(
         }
         authorize(db, actor, Some(&input.project_id), scope).await?;
     }
-    let prefix = crypto::opaque_token("").chars().take(8).collect::<String>();
-    let token = format!("pg_{prefix}_{}", crypto::opaque_token(""));
+    let token = match input.token_mode {
+        ApiKeyTokenMode::Generated => {
+            if input.token.is_some() {
+                return Err(AccessError::Invalid(
+                    "token is only accepted in import_existing mode".into(),
+                ));
+            }
+            crypto::opaque_token("pg_")
+        }
+        ApiKeyTokenMode::ImportExisting => {
+            let token = input
+                .token
+                .as_deref()
+                .ok_or_else(|| AccessError::Invalid("token is required for import".into()))?;
+            validate_imported_token(token)?;
+            token.to_owned()
+        }
+    };
+    let lookup_digest = crypto::token_hash(&token);
+    let prefix = lookup_digest[..8].to_owned();
     let id = Uuid::new_v4().to_string();
     let transaction = db.begin().await?;
     transaction.execute(statement(
-        "INSERT INTO api_keys(id,name,key_prefix,key_hash,scopes,budget_micros,spent_micros,enabled,created_at,project_id,user_id,profile_id,key_type,expires_at,allowed_ips_json,denied_ips_json) VALUES(?,?,?,?,?,?,0,1,?,?,?,?,?,?,?,?)",
-        vec![id.clone().into(), name.clone().into(), prefix.clone().into(), crypto::hash_password(&token).map_err(AccessError::Internal)?.into(), serde_json::to_string(&scopes).map_err(|e| AccessError::Internal(e.into()))?.into(), input.budget_micros.into(), db::now().into(), input.project_id.clone().into(), input.user_id.clone().into(), input.profile_id.clone().into(), input.key_type.clone().into(), input.expires_at.into(), serde_json::to_string(&input.allowed_ips).map_err(|e| AccessError::Internal(e.into()))?.into(), serde_json::to_string(&input.denied_ips).map_err(|e| AccessError::Internal(e.into()))?.into()],
-    )).await.map_err(|error| AccessError::Invalid(error.to_string()))?;
-    audit(&transaction, actor, "create", "api_key", &id, json!({"project_id":input.project_id,"name":name,"prefix":prefix,"key_type":input.key_type})).await?;
+        "INSERT INTO api_keys(id,name,key_prefix,key_hash,lookup_digest,scopes,budget_micros,spent_micros,enabled,created_at,project_id,user_id,profile_id,key_type,expires_at,allowed_ips_json,denied_ips_json) VALUES(?,?,?,?,?,?,?,0,1,?,?,?,?,?,?,?,?)",
+        vec![id.clone().into(), name.clone().into(), prefix.clone().into(), crypto::hash_password(&token).map_err(AccessError::Internal)?.into(), lookup_digest.into(), serde_json::to_string(&scopes).map_err(|e| AccessError::Internal(e.into()))?.into(), input.budget_micros.into(), db::now().into(), input.project_id.clone().into(), input.user_id.clone().into(), input.profile_id.clone().into(), input.key_type.clone().into(), input.expires_at.into(), serde_json::to_string(&input.allowed_ips).map_err(|e| AccessError::Internal(e.into()))?.into(), serde_json::to_string(&input.denied_ips).map_err(|e| AccessError::Internal(e.into()))?.into()],
+    )).await.map_err(|error| {
+        if error.to_string().contains("lookup_digest") {
+            AccessError::Conflict("API token is already registered".into())
+        } else {
+            AccessError::Invalid("API key could not be created".into())
+        }
+    })?;
+    audit(&transaction, actor, "create", "api_key", &id, json!({"project_id":input.project_id,"name":name,"fingerprint":prefix,"key_type":input.key_type,"token_mode":match input.token_mode { ApiKeyTokenMode::Generated => "generated", ApiKeyTokenMode::ImportExisting => "import_existing" }})).await?;
     transaction.commit().await?;
     let view = ScopedApiKeyView::find_by_statement(statement("SELECT id,name,key_prefix,scopes,budget_micros,enabled,created_at,project_id,user_id,profile_id,key_type,expires_at,allowed_ips_json,denied_ips_json FROM api_keys WHERE id=?", vec![id.into()])).one(db).await?.ok_or(AccessError::NotFound)?;
     Ok((view, token))
+}
+
+fn validate_imported_token(token: &str) -> Result<(), AccessError> {
+    if !crypto::imported_token_has_entropy(token) {
+        return Err(AccessError::Invalid(
+            "imported token must contain 32–1024 high-entropy, non-whitespace characters".into(),
+        ));
+    }
+    Ok(())
 }
 
 pub async fn list_scoped_api_keys(
@@ -1385,15 +1434,52 @@ pub async fn update_scoped_api_key(
         .map(|name| validate_nonempty(name, "name"))
         .transpose()?
         .unwrap_or(current.name);
+    if input.budget_micros.is_some_and(|value| value < 0) {
+        return Err(AccessError::Invalid("budget must be non-negative".into()));
+    }
+    if let Some(profile) = input
+        .profile_id
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        && PermissionRow::find_by_statement(statement(
+            "SELECT 'profile' AS slug FROM api_key_profiles WHERE id=? AND project_id=?",
+            vec![profile.into(), project_id.into()],
+        ))
+        .one(db)
+        .await?
+        .is_none()
+    {
+        return Err(AccessError::Invalid(
+            "profile does not belong to the project".into(),
+        ));
+    }
+    for rule in input
+        .allowed_ips
+        .iter()
+        .chain(input.denied_ips.iter())
+        .flatten()
+    {
+        if rule.parse::<ipnet::IpNet>().is_err() && rule.parse::<std::net::IpAddr>().is_err() {
+            return Err(AccessError::Invalid(format!("invalid IP policy `{rule}`")));
+        }
+    }
+    let current_allowed: Vec<String> =
+        serde_json::from_str(&current.allowed_ips_json).unwrap_or_default();
+    let current_denied: Vec<String> =
+        serde_json::from_str(&current.denied_ips_json).unwrap_or_default();
+    let allowed = serde_json::to_string(input.allowed_ips.as_ref().unwrap_or(&current_allowed))
+        .map_err(|error| AccessError::Internal(error.into()))?;
+    let denied = serde_json::to_string(input.denied_ips.as_ref().unwrap_or(&current_denied))
+        .map_err(|error| AccessError::Internal(error.into()))?;
     let transaction = db.begin().await?;
-    transaction.execute(statement("UPDATE api_keys SET name=?,enabled=?,expires_at=?,scopes=? WHERE id=? AND project_id=?", vec![name.clone().into(), input.enabled.unwrap_or(current.enabled).into(), input.expires_at.or(current.expires_at).into(), scopes.into(), key_id.into(), project_id.into()])).await?;
+    transaction.execute(statement("UPDATE api_keys SET name=?,enabled=?,expires_at=?,scopes=?,profile_id=COALESCE(?,profile_id),budget_micros=COALESCE(?,budget_micros),allowed_ips_json=?,denied_ips_json=? WHERE id=? AND project_id=?", vec![name.clone().into(), input.enabled.unwrap_or(current.enabled).into(), input.expires_at.or(current.expires_at).into(), scopes.into(), input.profile_id.clone().filter(|value|!value.is_empty()).into(), input.budget_micros.into(), allowed.into(), denied.into(), key_id.into(), project_id.into()])).await?;
     audit(
         &transaction,
         actor,
         "update",
         "api_key",
         key_id,
-        json!({"project_id":project_id,"name":name,"enabled":input.enabled}),
+        json!({"project_id":project_id,"name":name,"enabled":input.enabled,"profile_id":input.profile_id,"budget_micros":input.budget_micros,"ip_policy_changed":input.allowed_ips.is_some()||input.denied_ips.is_some()}),
     )
     .await?;
     transaction.commit().await?;
@@ -1731,6 +1817,7 @@ mod tests {
                 expires_at: None,
                 allowed_ips: vec![],
                 denied_ips: vec![],
+                ..Default::default()
             },
         )
         .await

@@ -1,7 +1,7 @@
 use super::*;
 use crate::operations::{self, backup, id, jobs, logging, pricing, sql, storage};
 use sea_orm::{ConnectionTrait, TransactionTrait};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 pub(super) fn router(state: AppState) -> Router<AppState> {
     let instance = Router::new()
@@ -21,6 +21,10 @@ pub(super) fn router(state: AppState) -> Router<AppState> {
             get(log_policy).put(set_log_policy),
         )
         .route(
+            "/api/admin/v1/settings/system",
+            get(system_settings).put(set_system_settings),
+        )
+        .route(
             "/api/admin/v1/projects/{project}/operations/{resource}",
             get(list).post(mutate),
         )
@@ -29,6 +33,22 @@ pub(super) fn router(state: AppState) -> Router<AppState> {
             get(detail).delete(remove),
         )
         .route("/api/admin/v1/projects/{project}/analytics", get(analytics))
+        .route(
+            "/api/admin/v1/projects/{project}/observability/summary",
+            get(observation_summary),
+        )
+        .route(
+            "/api/admin/v1/projects/{project}/observability/requests",
+            get(observation_list),
+        )
+        .route(
+            "/api/admin/v1/projects/{project}/observability/requests/{id}",
+            get(observation_detail),
+        )
+        .route(
+            "/api/admin/v1/projects/{project}/routing-preview",
+            post(routing_preview),
+        )
         .route(
             "/api/admin/v1/projects/{project}/backup/export",
             post(export),
@@ -166,6 +186,61 @@ async fn set_log_policy(
     tx.commit().await?;
     Ok(Json(json!({"ok":true})))
 }
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SystemSettings {
+    instance_name: String,
+    branding_name: String,
+    favicon_url: String,
+    onboarding_complete: bool,
+}
+impl Default for SystemSettings {
+    fn default() -> Self {
+        Self {
+            instance_name: "Pangolin".into(),
+            branding_name: "Pangolin / 鲮鲤".into(),
+            favicon_url: "/logo.webp".into(),
+            onboarding_complete: false,
+        }
+    }
+}
+async fn system_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<SystemSettings>, ApiError> {
+    actor(&state, &headers, None, false).await?;
+    let row = state
+        .db
+        .query_one(sql("SELECT value FROM settings WHERE key='system'", vec![]))
+        .await?;
+    let value = match row {
+        Some(row) => serde_json::from_str(&row.try_get::<String>("", "value")?)
+            .map_err(|error| ApiError::Internal(error.into()))?,
+        None => SystemSettings::default(),
+    };
+    Ok(Json(value))
+}
+async fn set_system_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<SystemSettings>,
+) -> Result<Json<Value>, ApiError> {
+    let user = actor(&state, &headers, None, true).await?;
+    if input.instance_name.trim().is_empty()
+        || input.instance_name.len() > 128
+        || input.branding_name.trim().is_empty()
+        || input.branding_name.len() > 128
+        || input.favicon_url.len() > 2048
+        || !(input.favicon_url.starts_with('/') || input.favicon_url.starts_with("https://"))
+    {
+        return Err(ApiError::BadRequest("invalid system settings".into()));
+    }
+    let tx = state.db.begin().await?;
+    tx.execute(sql("INSERT INTO settings(key,value,updated_at) VALUES('system',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",vec![serde_json::to_string(&input).unwrap().into(),db::now().into()])).await?;
+    audit_in(&tx, &user, "", "system.update", "system").await?;
+    tx.commit().await?;
+    Ok(Json(json!({"ok":true})))
+}
 #[derive(Deserialize, Default)]
 struct Filter {
     #[serde(default)]
@@ -177,10 +252,51 @@ struct Filter {
     model: Option<String>,
     provider: Option<String>,
     api_key: Option<String>,
+    q: Option<String>,
 }
 fn query(resource: &str) -> Result<(&'static str, &'static str, &'static str), ApiError> {
     // Public projections deliberately omit encrypted secrets and raw job payloads.
     Ok(match resource {
+        "channels" => (
+            "providers",
+            "project_id=?",
+            "json_object('id',id,'name',name,'kind',kind,'base_url',base_url,'enabled',enabled,'settings',json(settings_json),'created_at',created_at,'updated_at',updated_at)",
+        ),
+        "credentials" => (
+            "channel_credentials",
+            "provider_id IN (SELECT id FROM providers WHERE project_id=?)",
+            "json_object('id',id,'provider_id',provider_id,'credential_type',credential_type,'suffix',suffix,'priority',priority,'enabled',enabled,'settings',json(settings_json),'created_at',created_at,'updated_at',updated_at)",
+        ),
+        "channel-settings" => (
+            "channel_settings",
+            "provider_id IN (SELECT id FROM providers WHERE project_id=?)",
+            "json_object('id',provider_id,'provider_id',provider_id,'endpoint_mappings',json(endpoint_mappings_json),'model_rules',json(model_rules_json),'parameter_overrides',json(parameter_overrides_json),'retry_statuses',json(retry_statuses_json),'auto_disable_policy',json(auto_disable_policy_json),'proxy_settings',json(proxy_settings_json),'updated_at',updated_at)",
+        ),
+        "models" => (
+            "models",
+            "provider_id IN (SELECT id FROM providers WHERE project_id=?)",
+            "json_object('id',id,'provider_id',provider_id,'public_name',public_name,'upstream_name',upstream_name,'capabilities',json(capabilities),'input_price_micros',input_price_micros,'output_price_micros',output_price_micros,'priority',priority,'enabled',enabled,'catalog_metadata',json(catalog_metadata_json),'created_at',created_at)",
+        ),
+        "associations" => (
+            "model_associations",
+            "project_id=?",
+            "json_object('id',id,'model_id',model_id,'provider_id',provider_id,'match_type',match_type,'pattern',pattern,'conditions',json(conditions_json),'priority',priority,'weight',weight,'enabled',enabled,'created_at',created_at,'updated_at',updated_at)",
+        ),
+        "key-profiles" => (
+            "api_key_profiles",
+            "project_id=?",
+            "json_object('id',id,'name',name,'rpm_limit',rpm_limit,'tpm_limit',tpm_limit,'budget_micros',budget_micros,'routing_policy',json(routing_policy_json),'mappings',json(COALESCE((SELECT json_group_array(json_object('source_model',source_model,'target_model',target_model,'priority',priority)) FROM api_key_profile_model_mappings WHERE profile_id=api_key_profiles.id),'[]')),'allowed_models',json(COALESCE((SELECT json_group_array(json_object('pattern',model_pattern,'match_type',match_type)) FROM api_key_profile_allowed_models WHERE profile_id=api_key_profiles.id),'[]')),'created_at',created_at,'updated_at',updated_at)",
+        ),
+        "prompts" => (
+            "prompts",
+            "project_id=?",
+            "json_object('id',id,'name',name,'role',role,'content',content,'activation',json(activation_json),'enabled',enabled,'created_at',created_at,'updated_at',updated_at)",
+        ),
+        "protection" => (
+            "prompt_protection_rules",
+            "project_id=?",
+            "json_object('id',id,'name',name,'role_pattern',role_pattern,'content_pattern',content_pattern,'action',action,'replacement',replacement,'scopes',json(scopes_json),'test_mode',test_mode,'enabled',enabled,'created_at',created_at,'updated_at',updated_at)",
+        ),
         "health" => (
             "channel_health_state",
             "provider_id IN (SELECT id FROM providers WHERE project_id=?)",
@@ -292,8 +408,15 @@ async fn list(
 ) -> Result<Json<Value>, ApiError> {
     actor(&state, &headers, Some(&project), false).await?;
     let (table, scope, projection) = query(&resource)?;
-    let rows=state.db.query_all(sql(format!("SELECT {projection} AS document FROM {table} WHERE {scope} ORDER BY rowid DESC LIMIT ? OFFSET ?"),vec![project.into(),i64::from(filter.limit.unwrap_or(100).clamp(1,500)).into(),i64::from(filter.offset).into()])).await?;
-    Ok(Json(json!({"data":documents(rows)?})))
+    let query = filter
+        .q
+        .filter(|value| !value.trim().is_empty() && value.len() <= 128)
+        .map(|value| format!("%{}%", value.trim()));
+    let rows=state.db.query_all(sql(format!("SELECT document FROM (SELECT {projection} AS document,rowid AS source_rowid FROM {table} WHERE {scope}) WHERE (? IS NULL OR document LIKE ?) ORDER BY source_rowid DESC LIMIT ? OFFSET ?"),vec![project.clone().into(),query.clone().into(),query.clone().into(),i64::from(filter.limit.unwrap_or(100).clamp(1,500)).into(),i64::from(filter.offset).into()])).await?;
+    let total=state.db.query_one(sql(format!("SELECT COUNT(*) AS total FROM (SELECT {projection} AS document FROM {table} WHERE {scope}) WHERE (? IS NULL OR document LIKE ?)"),vec![project.into(),query.clone().into(),query.into()])).await?.map(|row|row.try_get::<i64>("","total")).transpose()?.unwrap_or(0);
+    Ok(Json(
+        json!({"data":documents(rows)?,"total":total,"offset":filter.offset,"limit":filter.limit.unwrap_or(100).clamp(1,500)}),
+    ))
 }
 fn documents(rows: Vec<sea_orm::QueryResult>) -> Result<Vec<Value>, ApiError> {
     rows.into_iter()
@@ -316,7 +439,7 @@ async fn detail(
         ));
     }
     let id_column = match resource.as_str() {
-        "health" => "provider_id",
+        "health" | "channel-settings" => "provider_id",
         "credential-health" => "credential_id",
         _ => "id",
     };
@@ -358,6 +481,108 @@ async fn analytics(
         json!({"data":documents(rows)?,"source":"sqlite","derived_available":state.observations.is_available()}),
     ))
 }
+
+async fn observation_summary(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project): Path<String>,
+) -> Result<Json<crate::observability::Summary>, ApiError> {
+    actor(&state, &headers, Some(&project), false).await?;
+    Ok(Json(
+        state
+            .observations
+            .summary_for(project)
+            .await
+            .map_err(ApiError::Internal)?,
+    ))
+}
+
+async fn observation_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project): Path<String>,
+    Query(mut filter): Query<crate::observability::RequestFilter>,
+) -> Result<Json<Vec<crate::observability::RequestListItem>>, ApiError> {
+    actor(&state, &headers, Some(&project), false).await?;
+    filter.project_id = Some(project);
+    Ok(Json(
+        state
+            .observations
+            .list(filter)
+            .await
+            .map_err(ApiError::Internal)?,
+    ))
+}
+
+async fn observation_detail(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((project, id)): Path<(String, String)>,
+) -> Result<Json<crate::observability::RequestEvent>, ApiError> {
+    actor(&state, &headers, Some(&project), false).await?;
+    state
+        .observations
+        .get_for(project, id)
+        .await
+        .map_err(ApiError::Internal)?
+        .map(Json)
+        .ok_or(ApiError::NotFound)
+}
+
+#[derive(Deserialize)]
+struct RoutingPreviewInput {
+    api_key_id: String,
+    model: String,
+    #[serde(default = "preview_endpoint")]
+    endpoint: String,
+    #[serde(default)]
+    body: Value,
+}
+fn preview_endpoint() -> String {
+    "/v1/chat/completions".into()
+}
+async fn routing_preview(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project): Path<String>,
+    Json(input): Json<RoutingPreviewInput>,
+) -> Result<Json<Value>, ApiError> {
+    actor(&state, &headers, Some(&project), false).await?;
+    if !crate::providers::ENDPOINTS.contains(&input.endpoint.as_str()) {
+        return Err(ApiError::BadRequest("unsupported preview endpoint".into()));
+    }
+    let key = db::api_key_credential_by_id(&state.db, &project, &input.api_key_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    let profile = crate::orchestration::load_profile(&state.db, &key).await?;
+    let mut payload = if input.body.is_object() {
+        input.body
+    } else {
+        json!({})
+    };
+    payload["model"] = Value::String(input.model);
+    if payload.get("messages").is_none() && input.endpoint == "/v1/chat/completions" {
+        payload["messages"] = json!([{"role":"user","content":"routing preview"}]);
+    }
+    let plan = crate::orchestration::prepare(
+        &state.db,
+        &state.orchestrator,
+        &key,
+        profile,
+        payload,
+        &HeaderMap::new(),
+        &input.endpoint,
+    )
+    .await?;
+    let candidates = plan.candidates.iter().map(|candidate| json!({
+        "id":candidate.id(),"provider_id":candidate.provider_id,"model_id":candidate.model_id,
+        "upstream_model":candidate.target.upstream_name,"provider":candidate.target.provider_name,
+        "priority":candidate.priority,"weight":candidate.weight,"endpoint":candidate.endpoint,
+    })).collect::<Vec<_>>();
+    Ok(Json(
+        json!({"candidates":candidates,"decisions":plan.decisions,"estimated_tokens":plan.estimated_tokens}),
+    ))
+}
 fn text<'a>(v: &'a Value, key: &str) -> Result<&'a str, ApiError> {
     v.get(key)
         .and_then(Value::as_str)
@@ -378,6 +603,224 @@ async fn mutate(
         .unwrap_or_else(id);
     let transaction = state.db.begin().await?;
     match resource.as_str() {
+        "channels" => {
+            let kind = text(&value, "kind")?;
+            if !matches!(
+                kind,
+                "openai"
+                    | "openai_compatible"
+                    | "anthropic"
+                    | "gemini"
+                    | "azure"
+                    | "bedrock"
+                    | "vertex"
+                    | "gcp"
+                    | "openrouter"
+                    | "deepseek"
+                    | "moonshot"
+                    | "zhipu"
+                    | "doubao"
+                    | "xai"
+                    | "groq"
+                    | "ollama"
+                    | "nanogpt"
+                    | "jina"
+            ) {
+                return Err(ApiError::BadRequest("unsupported channel kind".into()));
+            }
+            let base_url = text(&value, "base_url")?;
+            validate_http_url(base_url)?;
+            let changed = transaction.execute(sql("INSERT INTO providers(id,name,kind,base_url,enabled,created_at,updated_at,project_id,settings_json) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,kind=excluded.kind,base_url=excluded.base_url,enabled=excluded.enabled,updated_at=excluded.updated_at,settings_json=excluded.settings_json WHERE providers.project_id=excluded.project_id",vec![resource_id.clone().into(),text(&value,"name")?.into(),kind.into(),base_url.into(),value["enabled"].as_bool().unwrap_or(true).into(),db::now().into(),db::now().into(),project.clone().into(),value.get("settings").cloned().unwrap_or(json!({"version":1})).to_string().into()])).await?.rows_affected();
+            if changed != 1 {
+                return Err(ApiError::Forbidden);
+            }
+            transaction
+                .execute(sql(
+                    "INSERT OR IGNORE INTO channel_settings(provider_id,updated_at) VALUES(?,?)",
+                    vec![resource_id.clone().into(), db::now().into()],
+                ))
+                .await?;
+        }
+        "credentials" => {
+            let provider = text(&value, "provider_id")?;
+            if transaction
+                .query_one(sql(
+                    "SELECT id FROM providers WHERE id=? AND project_id=?",
+                    vec![provider.into(), project.clone().into()],
+                ))
+                .await?
+                .is_none()
+            {
+                return Err(ApiError::NotFound);
+            }
+            let secret = value
+                .get("secret")
+                .and_then(Value::as_str)
+                .filter(|secret| !secret.trim().is_empty());
+            let existing = transaction.query_one(sql("SELECT id FROM channel_credentials WHERE id=? AND provider_id IN (SELECT id FROM providers WHERE project_id=?)",vec![resource_id.clone().into(),project.clone().into()])).await?.is_some();
+            if !existing && secret.is_none() {
+                return Err(ApiError::BadRequest(
+                    "secret is required for a new credential".into(),
+                ));
+            }
+            let envelope = secret
+                .map(|secret| state.secrets.encrypt(secret))
+                .transpose()?;
+            let suffix = secret.map(|secret| {
+                secret
+                    .chars()
+                    .rev()
+                    .take(4)
+                    .collect::<String>()
+                    .chars()
+                    .rev()
+                    .collect::<String>()
+            });
+            let changed = if existing {
+                transaction.execute(sql("UPDATE channel_credentials SET provider_id=?,credential_type=?,secret_envelope=COALESCE(?,secret_envelope),suffix=COALESCE(?,suffix),priority=?,enabled=?,settings_json=?,updated_at=? WHERE id=? AND provider_id IN (SELECT id FROM providers WHERE project_id=?)",vec![provider.into(),value["credential_type"].as_str().unwrap_or("api_key").into(),envelope.into(),suffix.into(),value["priority"].as_i64().unwrap_or(100).into(),value["enabled"].as_bool().unwrap_or(true).into(),value.get("settings").cloned().unwrap_or(json!({"version":1})).to_string().into(),db::now().into(),resource_id.clone().into(),project.clone().into()])).await?.rows_affected()
+            } else {
+                transaction.execute(sql("INSERT INTO channel_credentials(id,provider_id,credential_type,secret_envelope,suffix,priority,enabled,settings_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",vec![resource_id.clone().into(),provider.into(),value["credential_type"].as_str().unwrap_or("api_key").into(),envelope.into(),suffix.into(),value["priority"].as_i64().unwrap_or(100).into(),value["enabled"].as_bool().unwrap_or(true).into(),value.get("settings").cloned().unwrap_or(json!({"version":1})).to_string().into(),db::now().into(),db::now().into()])).await?.rows_affected()
+            };
+            if changed != 1 {
+                return Err(ApiError::Forbidden);
+            }
+        }
+        "channel-settings" => {
+            let provider = text(&value, "provider_id")?;
+            let changed = transaction.execute(sql("UPDATE channel_settings SET endpoint_mappings_json=?,model_rules_json=?,parameter_overrides_json=?,retry_statuses_json=?,auto_disable_policy_json=?,proxy_settings_json=?,updated_at=? WHERE provider_id=? AND provider_id IN (SELECT id FROM providers WHERE project_id=?)",vec![value.get("endpoint_mappings").cloned().unwrap_or(json!({"version":1})).to_string().into(),value.get("model_rules").cloned().unwrap_or(json!({"version":1})).to_string().into(),value.get("parameter_overrides").cloned().unwrap_or(json!({"version":1})).to_string().into(),value.get("retry_statuses").cloned().unwrap_or(json!({"version":1,"statuses":[408,409,429,500,502,503,504]})).to_string().into(),value.get("auto_disable_policy").cloned().unwrap_or(json!({"version":1,"enabled":false})).to_string().into(),value.get("proxy_settings").cloned().unwrap_or(json!({"version":1})).to_string().into(),db::now().into(),provider.into(),project.clone().into()])).await?.rows_affected();
+            if changed != 1 {
+                return Err(ApiError::NotFound);
+            }
+        }
+        "models" => {
+            let provider = text(&value, "provider_id")?;
+            if transaction
+                .query_one(sql(
+                    "SELECT id FROM providers WHERE id=? AND project_id=?",
+                    vec![provider.into(), project.clone().into()],
+                ))
+                .await?
+                .is_none()
+            {
+                return Err(ApiError::NotFound);
+            }
+            let capabilities = value
+                .get("capabilities")
+                .cloned()
+                .unwrap_or(json!(["chat"]));
+            if !capabilities.is_array() {
+                return Err(ApiError::BadRequest("capabilities must be an array".into()));
+            }
+            let changed = transaction.execute(sql("INSERT INTO models(id,provider_id,public_name,upstream_name,capabilities,input_price_micros,output_price_micros,priority,enabled,created_at,catalog_metadata_json) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET provider_id=excluded.provider_id,public_name=excluded.public_name,upstream_name=excluded.upstream_name,capabilities=excluded.capabilities,input_price_micros=excluded.input_price_micros,output_price_micros=excluded.output_price_micros,priority=excluded.priority,enabled=excluded.enabled,catalog_metadata_json=excluded.catalog_metadata_json WHERE models.provider_id IN (SELECT id FROM providers WHERE project_id=?)",vec![resource_id.clone().into(),provider.into(),text(&value,"public_name")?.into(),text(&value,"upstream_name")?.into(),capabilities.to_string().into(),value["input_price_micros"].as_i64().unwrap_or(0).max(0).into(),value["output_price_micros"].as_i64().unwrap_or(0).max(0).into(),value["priority"].as_i64().unwrap_or(100).into(),value["enabled"].as_bool().unwrap_or(true).into(),db::now().into(),value.get("catalog_metadata").cloned().unwrap_or(json!({})).to_string().into(),project.clone().into()])).await?.rows_affected();
+            if changed != 1 {
+                return Err(ApiError::Forbidden);
+            }
+        }
+        "associations" => {
+            let match_type = value["match_type"].as_str().unwrap_or("exact");
+            if !matches!(match_type, "exact" | "regex" | "tag") {
+                return Err(ApiError::BadRequest(
+                    "invalid association match type".into(),
+                ));
+            }
+            if match_type == "regex" {
+                crate::orchestration::policy::regex(text(&value, "pattern")?)?;
+            }
+            let changed = transaction.execute(sql("INSERT INTO model_associations(id,project_id,model_id,provider_id,match_type,pattern,conditions_json,priority,weight,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET model_id=excluded.model_id,provider_id=excluded.provider_id,match_type=excluded.match_type,pattern=excluded.pattern,conditions_json=excluded.conditions_json,priority=excluded.priority,weight=excluded.weight,enabled=excluded.enabled,updated_at=excluded.updated_at WHERE model_associations.project_id=excluded.project_id",vec![resource_id.clone().into(),project.clone().into(),value["model_id"].as_str().into(),value["provider_id"].as_str().into(),match_type.into(),text(&value,"pattern")?.into(),value.get("conditions").cloned().unwrap_or(json!({"version":1})).to_string().into(),value["priority"].as_i64().unwrap_or(100).into(),value["weight"].as_i64().unwrap_or(1).clamp(1,10000).into(),value["enabled"].as_bool().unwrap_or(true).into(),db::now().into(),db::now().into()])).await?.rows_affected();
+            if changed != 1 {
+                return Err(ApiError::Forbidden);
+            }
+        }
+        "key-profiles" => {
+            let changed = transaction.execute(sql("INSERT INTO api_key_profiles(id,project_id,name,rpm_limit,tpm_limit,budget_micros,routing_policy_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,rpm_limit=excluded.rpm_limit,tpm_limit=excluded.tpm_limit,budget_micros=excluded.budget_micros,routing_policy_json=excluded.routing_policy_json,updated_at=excluded.updated_at WHERE api_key_profiles.project_id=excluded.project_id",vec![resource_id.clone().into(),project.clone().into(),text(&value,"name")?.into(),value["rpm_limit"].as_i64().into(),value["tpm_limit"].as_i64().into(),value["budget_micros"].as_i64().into(),value.get("routing_policy").cloned().unwrap_or(json!({"version":1})).to_string().into(),db::now().into(),db::now().into()])).await?.rows_affected();
+            if changed != 1 {
+                return Err(ApiError::Forbidden);
+            }
+            if let Some(mappings) = value["mappings"].as_array() {
+                transaction
+                    .execute(sql(
+                        "DELETE FROM api_key_profile_model_mappings WHERE profile_id=?",
+                        vec![resource_id.clone().into()],
+                    ))
+                    .await?;
+                for mapping in mappings {
+                    transaction.execute(sql("INSERT INTO api_key_profile_model_mappings(id,profile_id,source_model,target_model,priority) VALUES(?,?,?,?,?)",vec![id().into(),resource_id.clone().into(),text(mapping,"source_model")?.into(),text(mapping,"target_model")?.into(),mapping["priority"].as_i64().unwrap_or(100).into()])).await?;
+                }
+            }
+            if let Some(allowed) = value["allowed_models"].as_array() {
+                transaction
+                    .execute(sql(
+                        "DELETE FROM api_key_profile_allowed_models WHERE profile_id=?",
+                        vec![resource_id.clone().into()],
+                    ))
+                    .await?;
+                for model in allowed {
+                    let kind = model["match_type"].as_str().unwrap_or("exact");
+                    if !matches!(kind, "exact" | "regex") {
+                        return Err(ApiError::BadRequest(
+                            "invalid allowed-model match type".into(),
+                        ));
+                    }
+                    if kind == "regex" {
+                        crate::orchestration::policy::regex(text(model, "pattern")?)?;
+                    }
+                    transaction.execute(sql("INSERT INTO api_key_profile_allowed_models(profile_id,model_pattern,match_type) VALUES(?,?,?)",vec![resource_id.clone().into(),text(model,"pattern")?.into(),kind.into()])).await?;
+                }
+            }
+        }
+        "prompts" => {
+            let changed = transaction.execute(sql("INSERT INTO prompts(id,project_id,name,role,content,activation_json,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,role=excluded.role,content=excluded.content,activation_json=excluded.activation_json,enabled=excluded.enabled,updated_at=excluded.updated_at WHERE prompts.project_id=excluded.project_id",vec![resource_id.clone().into(),project.clone().into(),text(&value,"name")?.into(),text(&value,"role")?.into(),text(&value,"content")?.into(),value.get("activation").cloned().unwrap_or(json!({"version":1})).to_string().into(),value["enabled"].as_bool().unwrap_or(true).into(),db::now().into(),db::now().into()])).await?.rows_affected();
+            if changed != 1 {
+                return Err(ApiError::Forbidden);
+            }
+        }
+        "protection" => {
+            let action = value["action"].as_str().unwrap_or("deny");
+            if !matches!(action, "deny" | "redact") {
+                return Err(ApiError::BadRequest("invalid protection action".into()));
+            }
+            crate::orchestration::policy::regex(text(&value, "content_pattern")?)?;
+            if let Some(pattern) = value["role_pattern"].as_str() {
+                crate::orchestration::policy::regex(pattern)?;
+            }
+            let changed = transaction.execute(sql("INSERT INTO prompt_protection_rules(id,project_id,name,role_pattern,content_pattern,action,replacement,scopes_json,test_mode,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,role_pattern=excluded.role_pattern,content_pattern=excluded.content_pattern,action=excluded.action,replacement=excluded.replacement,scopes_json=excluded.scopes_json,test_mode=excluded.test_mode,enabled=excluded.enabled,updated_at=excluded.updated_at WHERE prompt_protection_rules.project_id=excluded.project_id",vec![resource_id.clone().into(),project.clone().into(),text(&value,"name")?.into(),value["role_pattern"].as_str().into(),text(&value,"content_pattern")?.into(),action.into(),value["replacement"].as_str().into(),value.get("scopes").cloned().unwrap_or(json!({"version":1})).to_string().into(),value["test_mode"].as_bool().unwrap_or(false).into(),value["enabled"].as_bool().unwrap_or(true).into(),db::now().into(),db::now().into()])).await?.rows_affected();
+            if changed != 1 {
+                return Err(ApiError::Forbidden);
+            }
+        }
+        "bulk-toggle" => {
+            let target = text(&value, "resource")?;
+            let ids = value["ids"]
+                .as_array()
+                .filter(|ids| !ids.is_empty() && ids.len() <= 100)
+                .ok_or_else(|| ApiError::BadRequest("ids must contain 1–100 items".into()))?;
+            let enabled = value["enabled"]
+                .as_bool()
+                .ok_or_else(|| ApiError::BadRequest("enabled is required".into()))?;
+            let (table, scope) = match target {
+                "channels" => ("providers", "project_id=?"),
+                "models" => (
+                    "models",
+                    "provider_id IN (SELECT id FROM providers WHERE project_id=?)",
+                ),
+                "credentials" => (
+                    "channel_credentials",
+                    "provider_id IN (SELECT id FROM providers WHERE project_id=?)",
+                ),
+                _ => return Err(ApiError::BadRequest("unsupported bulk resource".into())),
+            };
+            for item in ids {
+                let item = item
+                    .as_str()
+                    .ok_or_else(|| ApiError::BadRequest("invalid id".into()))?;
+                transaction
+                    .execute(sql(
+                        format!("UPDATE {table} SET enabled=? WHERE ({scope}) AND id=?"),
+                        vec![enabled.into(), project.clone().into(), item.into()],
+                    ))
+                    .await?;
+            }
+        }
         "health-policy" => {
             let provider = text(&value, "provider_id")?;
             let policy = &value["policy"];
@@ -637,7 +1080,18 @@ async fn remove(
     let user = actor(&state, &headers, Some(&project), true).await?;
     if !matches!(
         resource.as_str(),
-        "storage" | "schedules" | "webhooks" | "retention" | "groups"
+        "storage"
+            | "schedules"
+            | "webhooks"
+            | "retention"
+            | "groups"
+            | "channels"
+            | "credentials"
+            | "models"
+            | "associations"
+            | "key-profiles"
+            | "prompts"
+            | "protection"
     ) {
         return Err(ApiError::BadRequest("resource is immutable".into()));
     }

@@ -41,6 +41,7 @@ async fn fixture(mock: Router) -> Fixture {
         &ApiKeyInput {
             name: "test".into(),
             budget_micros: None,
+            ..Default::default()
         },
     )
     .await

@@ -1,11 +1,53 @@
-import { render, screen } from '@testing-library/react'
-import { describe, expect, it } from 'vitest'
-import { EmptyState } from './components'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { render, screen, waitFor } from '@testing-library/react'
+import { MemoryRouter } from 'react-router'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+import App from './App'
+import i18n from './i18n'
 
-describe('shared UI', () => {
-  it('renders an explicit empty state', () => {
-    render(<EmptyState icon={<span />} title="No requests" copy="Send one request to begin." />)
-    expect(screen.getByRole('heading', { name: 'No requests' })).toBeInTheDocument()
-    expect(screen.getByText('Send one request to begin.')).toBeInTheDocument()
+const response = (value: unknown, status = 200) => Promise.resolve(new Response(JSON.stringify(value), { status, headers: { 'Content-Type': 'application/json' } }))
+function renderApp(path: string) {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+  return render(<QueryClientProvider client={client}><MemoryRouter initialEntries={[path]}><App/></MemoryRouter></QueryClientProvider>)
+}
+
+describe('application routing', () => {
+  beforeEach(() => { void i18n.changeLanguage('en'); vi.restoreAllMocks() })
+
+  it('keeps direct /login outside the authenticated admin shell', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => response({ initialized: true, authenticated: false, user: null, capture_payloads: false })))
+    renderApp('/login')
+    expect(await screen.findByRole('heading', { name: 'Sign in to Pangolin' })).toBeInTheDocument()
+    expect(screen.queryByRole('navigation')).not.toBeInTheDocument()
+  })
+
+  it('redirects initialized anonymous admin routes to /login', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => response({ initialized: true, authenticated: false, user: null, capture_payloads: false })))
+    renderApp('/channels')
+    expect(await screen.findByRole('heading', { name: 'Sign in to Pangolin' })).toBeInTheDocument()
+  })
+
+  it('redirects authenticated /login visits into the admin overview', async () => {
+    vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
+      const path = String(input)
+      if (path.includes('bootstrap')) return response({ initialized: true, authenticated: true, user: { id:'owner', email:'owner@example.test', role:'admin', language:'en', theme:'system:bronze', created_at:1 }, capture_payloads:false })
+      if (path.endsWith('/projects')) return response([{id:'project-a',name:'Project A',slug:'project-a',owner_user_id:'owner',is_default:true,enabled:true}])
+      if (path.includes('/permissions')) return response(['project:read','project:manage','api_key:manage','catalog:manage'])
+      if (path.includes('summary')) return response({ requests:0, errors:0, error_rate:null, p95_latency_ms:null, input_tokens:0, output_tokens:0, cost_micros:0, series:[] })
+      return response([])
+    }))
+    renderApp('/login')
+    expect(await screen.findByRole('heading', { name: 'Overview' })).toBeInTheDocument()
+    expect(screen.getByRole('navigation', { name: 'Primary navigation' })).toBeInTheDocument()
+    expect(await screen.findByText('No requests in the last 24 hours')).toBeInTheDocument()
+    expect(screen.getAllByText('—').length).toBeGreaterThanOrEqual(2)
+    await waitFor(() => expect(screen.queryByRole('heading', { name: 'Sign in to Pangolin' })).not.toBeInTheDocument())
+  })
+
+  it('routes an uninitialized instance to the distinct setup wizard', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => response({ initialized: false, authenticated: false, user: null, capture_payloads: false })))
+    renderApp('/login')
+    expect(await screen.findByRole('heading', { name: 'Initialize Pangolin' })).toBeInTheDocument()
+    expect(screen.queryByRole('heading', { name: 'Sign in to Pangolin' })).not.toBeInTheDocument()
   })
 })

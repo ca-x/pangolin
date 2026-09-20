@@ -74,6 +74,7 @@ async fn fill(f: &mut Fixture, owner: &access::Principal) {
         &ApiKeyInput {
             name: "full-key".into(),
             budget_micros: Some(100000),
+            ..Default::default()
         },
     )
     .await

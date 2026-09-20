@@ -533,6 +533,136 @@ async fn json_body(response: Response) -> Value {
 }
 
 #[tokio::test]
+async fn task6_control_plane_crud_redacts_credentials_and_audits_changes() {
+    let f = fixture(success()).await;
+    let cookie = owner(&f).await;
+    let base = format!(
+        "/api/admin/v1/projects/{}/operations",
+        db::DEFAULT_PROJECT_ID
+    );
+    let credential = admin(
+        &f,
+        &cookie,
+        http::Method::POST,
+        &format!("{base}/credentials"),
+        json!({"provider_id":f.providers[0],"credential_type":"api_key","secret":"sk-control-plane-credential","priority":5}),
+        true,
+    )
+    .await;
+    assert_eq!(credential.status(), StatusCode::OK);
+    let credentials = json_body(
+        admin(
+            &f,
+            &cookie,
+            http::Method::GET,
+            &format!("{base}/credentials"),
+            Value::Null,
+            false,
+        )
+        .await,
+    )
+    .await;
+    assert!(credentials["data"].as_array().unwrap().len() >= 2);
+    assert!(credentials["total"].as_i64().unwrap() >= 2);
+    assert!(!credentials.to_string().contains("control-plane-credential"));
+    assert!(!credentials.to_string().contains("secret_envelope"));
+
+    for (resource, document) in [
+        (
+            "key-profiles",
+            json!({"name":"mobile clients","rpm_limit":60,"tpm_limit":120000,"budget_micros":5000000,"routing_policy":{"version":1}}),
+        ),
+        (
+            "prompts",
+            json!({"name":"support policy","role":"system","content":"Answer with cited facts.","activation":{"version":1},"enabled":true}),
+        ),
+        (
+            "protection",
+            json!({"name":"credential guard","content_pattern":"(?i)api[_ -]?key","action":"redact","replacement":"[redacted]","scopes":{"version":1},"enabled":true}),
+        ),
+    ] {
+        assert_eq!(
+            admin(
+                &f,
+                &cookie,
+                http::Method::POST,
+                &format!("{base}/{resource}"),
+                document,
+                true,
+            )
+            .await
+            .status(),
+            StatusCode::OK,
+            "{resource}"
+        );
+        assert_eq!(
+            json_body(
+                admin(
+                    &f,
+                    &cookie,
+                    http::Method::GET,
+                    &format!("{base}/{resource}"),
+                    Value::Null,
+                    false,
+                )
+                .await
+            )
+            .await["data"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1,
+            "{resource}"
+        );
+    }
+    let key = db::authenticate_api_key(&f.state.db, &f.token, None)
+        .await
+        .unwrap()
+        .unwrap();
+    let preview = json_body(
+        admin(
+            &f,
+            &cookie,
+            http::Method::POST,
+            &format!(
+                "/api/admin/v1/projects/{}/routing-preview",
+                db::DEFAULT_PROJECT_ID
+            ),
+            json!({"api_key_id":key.id,"model":"public","endpoint":"/v1/chat/completions"}),
+            true,
+        )
+        .await,
+    )
+    .await;
+    assert!(!preview["candidates"].as_array().unwrap().is_empty());
+    assert_eq!(preview["decisions"][0]["stage"], "access");
+    assert_eq!(admin(&f,&cookie,http::Method::PUT,"/api/admin/v1/settings/system",json!({"instance_name":"Operations","branding_name":"Pangolin / 鲮鲤","favicon_url":"/logo.webp","onboarding_complete":true}),true).await.status(),StatusCode::OK);
+    assert_eq!(
+        json_body(
+            admin(
+                &f,
+                &cookie,
+                http::Method::GET,
+                "/api/admin/v1/settings/system",
+                Value::Null,
+                false
+            )
+            .await
+        )
+        .await["onboarding_complete"],
+        true
+    );
+    assert!(
+        count(
+            &f,
+            "SELECT COUNT(*) AS n FROM audit_events WHERE action LIKE '%.save'"
+        )
+        .await
+            >= 4
+    );
+}
+
+#[tokio::test]
 async fn task5_management_api_prices_groups_logs_csrf_and_scope() {
     let f = fixture(success()).await;
     let cookie = owner(&f).await;
@@ -943,6 +1073,7 @@ async fn task5_file_reopen_recovers_interrupted_execution_once() {
         &ApiKeyInput {
             name: "persisted".into(),
             budget_micros: None,
+            ..Default::default()
         },
     )
     .await
@@ -1169,6 +1300,7 @@ async fn cc_switch_response_ids_deduplicate_settlement_without_cross_key_collisi
         &ApiKeyInput {
             name: "other-dedup-scope".into(),
             budget_micros: None,
+            ..Default::default()
         },
     )
     .await
