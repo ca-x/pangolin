@@ -102,8 +102,9 @@ pub fn error_event(mut event: Event, policy: &Retry, endpoint: &str) -> Event {
         event.event = format!("response.{status}");
         json!({"type":event.event,"response":{"status":status,"error":error}})
     } else {
+        let status = event_status(&event);
         event.event = "error".into();
-        json!({"type":"error","error":error})
+        native_error(endpoint, message, status)
     };
     event.id.clear();
     event.retry = None;
@@ -134,18 +135,84 @@ pub fn interrupted_event(policy: &Retry, endpoint: &str) -> Event {
     } else {
         Event {
             event: "error".into(),
-            data: json!({
-                "type": "error",
-                "error": {
-                    "type": "upstream_error",
-                    "message": "upstream stream interrupted"
-                }
-            })
+            data: native_error(
+                endpoint,
+                "upstream stream interrupted",
+                http::StatusCode::BAD_GATEWAY,
+            )
             .to_string(),
             ..Event::default()
         }
     };
     error_event(event, policy, endpoint)
+}
+
+fn event_status(event: &Event) -> http::StatusCode {
+    let value: Value = serde_json::from_str(&event.data).unwrap_or(Value::Null);
+    if let Some(status) = value
+        .pointer("/error/code")
+        .and_then(Value::as_u64)
+        .and_then(|code| u16::try_from(code).ok())
+        .and_then(|code| http::StatusCode::from_u16(code).ok())
+        .filter(|status| status.is_client_error() || status.is_server_error())
+    {
+        return status;
+    }
+    match value.pointer("/error/type").and_then(Value::as_str) {
+        Some("authentication_error") => http::StatusCode::UNAUTHORIZED,
+        Some("permission_error") => http::StatusCode::FORBIDDEN,
+        Some("rate_limit_error") => http::StatusCode::TOO_MANY_REQUESTS,
+        Some("overloaded_error") => http::StatusCode::from_u16(529).unwrap(),
+        Some("invalid_request_error") => http::StatusCode::BAD_REQUEST,
+        _ => http::StatusCode::BAD_GATEWAY,
+    }
+}
+
+fn native_error(endpoint: &str, message: &str, status: http::StatusCode) -> Value {
+    let protocol = crate::api::errors::protocol(endpoint);
+    let mut value = crate::api::errors::document(protocol, status, "upstream_error", message);
+    if matches!(protocol, crate::api::errors::Protocol::OpenAi) {
+        value["type"] = json!("error");
+    }
+    value
+}
+
+pub struct TerminalState {
+    expected: usize,
+    finished: std::collections::BTreeSet<u64>,
+}
+impl TerminalState {
+    pub fn new(payload: &Value) -> Self {
+        Self {
+            expected: payload
+                .pointer("/generationConfig/candidateCount")
+                .and_then(Value::as_u64)
+                .and_then(|count| usize::try_from(count).ok())
+                .unwrap_or(1),
+            finished: Default::default(),
+        }
+    }
+    pub fn terminal(&mut self, event: &Event, endpoint: &str) -> bool {
+        if endpoint != "/v1beta/models:streamGenerateContent" || failed(event) {
+            return terminal(event, endpoint);
+        }
+        if let Ok(value) = serde_json::from_str::<Value>(&event.data)
+            && let Some(candidates) = value["candidates"].as_array()
+        {
+            for candidate in candidates {
+                let index = candidate["index"]
+                    .as_u64()
+                    .or_else(|| (self.expected == 1).then_some(0));
+                if candidate["finishReason"].is_string()
+                    && let Some(index) = index
+                    && index < self.expected as u64
+                {
+                    self.finished.insert(index);
+                }
+            }
+        }
+        self.finished.len() == self.expected
+    }
 }
 
 pub fn failed(event: &Event) -> bool {

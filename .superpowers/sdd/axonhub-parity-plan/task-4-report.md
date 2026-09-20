@@ -68,3 +68,24 @@ Providers are contract-tested, never live-tested. Cross-protocol Gemini/Anthropi
 Token counting uses a supplied `PANGOLIN_TOKENIZER_CL100K` vocabulary for recognized GPT-4/GPT-3.5 text shapes and conservatively falls back elsewhere. Media, cached context and multimodal TPM requests require a provider estimator. Budget-limited streaming/media remains disabled pending Task 5 settlement. Media streaming variants are explicitly rejected. Multipart input is bounded to 64 MiB/128 fields; upstream buffered response bound remains 16 MiB. Subscription documents/merged exports are capped at 4 MiB, at most 32 HTTPS sources are configured, and refresh history is bounded.
 
 Self-review fixed multipart duplicate Content-Type, encoded Gemini key handling, custom-endpoint TPM identity, strict cross-protocol tool fields, native Gemini tool/protection coverage, original task credential binding, normalized protocol errors, source activation fencing/aggregate validation and discovery tracing. The DDIA skill informed snapshot transactions/revision fencing; verification-before-completion gates back the completion evidence. No external publishing or paid provider requests were made.
+
+## Fix round 1/5 — review findings 2–5
+
+Finding 1 (preserving old V2–V5 provider CHECK schemas) was explicitly ruled out of scope by the controller/user: this unreleased software may rebuild its fresh schema. No provider preservation migration was added.
+
+The four in-scope findings are addressed:
+
+1. **Internal-error disclosure:** one `ApiError` public projection strips internal anyhow/database/decryption/session causes. Anthropic/Gemini wrappers and WebSocket per-event errors use it, as do catalog batch/last-error reporting. Internal API logging no longer serializes the cause. A SQLite-trigger sentinel test proves HTTP native aliases/model lists and an already-upgraded WebSocket all return a generic message without the cause; direct wrapper tests cover arbitrary anyhow sentinels.
+2. **Gemini query-key logging:** the production TraceLayer explicitly records method and URI path only. Captured debug/trace logging verifies both the Gemini `key` sentinel and unrelated query sentinels are absent while method/path remain observable.
+3. **Native error contracts:** a shared protocol mapper covers handler failures, early JSON validation, extractor/body-limit failures and normalized upstream HTTP errors. Gemini uses canonical `UNAUTHENTICATED`, `PERMISSION_DENIED`, `RESOURCE_EXHAUSTED`, `INTERNAL`, `UNAVAILABLE` and related statuses. Anthropic uses authentication/permission/rate-limit/request/API types. Native SSE errors retain rate-limit classification while removing private details. Explicit upstream pass-through remains an intentional exception for provider response bodies, never for local internal causes.
+4. **Document-level extensions:** fresh schema v7 now includes `catalog_document_extensions`. Local imports persist extension keys transactionally. Effective catalogs merge whole JSON values by top-level key in the same built-in → ascending subscription priority → local order as entries. Omitted keys do not delete local values; explicit null is preserved. Runtime provenance no longer overwrites publisher keys such as `applied_sources` or `builtin_version`. Dedicated tests verify subscription precedence, local precedence and export/import equality independently of model capability extensions.
+
+Additional reviewed edges now have executable coverage:
+
+- WebSocket lanes execute concurrently while each lane preserves FIFO. Reads remain independent of bounded writes, so disconnect cancels backpressured attempts promptly instead of waiting for the per-event timeout.
+- Gemini terminal state accumulates completed candidate indices across frames and waits for every requested candidate.
+- Multipart repeated file names retain each file's name, MIME and binary bytes; aggregate requests above 64 MiB are rejected before upstream contact.
+- AWS signing matches the exact public botocore golden signature vector through Pangolin's cloud-auth boundary.
+- A real TCP HTTP fixture exercises the production reqwest builder's DNS override and no-redirect behavior; HTTPS/public-address validation is separately tested. No real-cloud or external TLS-provider verification is claimed.
+
+Validation for this round: `cargo fmt --all -- --check`, strict all-target clippy and the full **107-test** Rust suite pass. Web lint, the web test, production build and final stable-assets release rebuild pass. Fresh-binary smoke verified readiness/Web 200, Gemini 401 with `UNAUTHENTICATED`, catalog import/export 200 and document-extension preservation with 59 providers/453 models. Captured release debug logs contain method/path but no Gemini query-key sentinel; the isolated server stopped cleanly.

@@ -15,6 +15,7 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 use uuid::Uuid;
 
 mod catalog_api;
+pub(crate) mod errors;
 mod gateway;
 mod protocols;
 
@@ -72,9 +73,17 @@ pub enum ApiError {
     Internal(#[from] anyhow::Error),
 }
 
-impl IntoResponse for ApiError {
-    fn into_response(self) -> Response {
-        let (status, kind, message) = match self {
+impl ApiError {
+    pub(crate) fn public_message(&self) -> String {
+        match self {
+            Self::Internal(_) => "An internal error occurred".into(),
+            _ => self.to_string(),
+        }
+    }
+    /// The only boundary that converts local failures into client-visible data.
+    /// Internal causes may contain database rows, credentials or stored payloads.
+    pub(crate) fn public_parts(self) -> (StatusCode, &'static str, String) {
+        match self {
             Self::BadRequest(message) => {
                 (StatusCode::BAD_REQUEST, "invalid_request_error", message)
             }
@@ -90,15 +99,21 @@ impl IntoResponse for ApiError {
             Self::RateLimited(message) => {
                 (StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", message)
             }
-            Self::Internal(error) => {
-                tracing::error!(%error, "internal API error");
+            Self::Internal(_) => {
+                tracing::error!("internal API error");
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "internal_error",
                     "An internal error occurred".into(),
                 )
             }
-        };
+        }
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let (status, kind, message) = self.public_parts();
         (
             status,
             Json(json!({ "error": { "type": kind, "message": message } })),
@@ -168,6 +183,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/chat/completions", post(gateway_chat))
         .route("/v1/responses", post(gateway_responses))
         .route("/v1/messages", post(gateway_messages))
+        .layer(middleware::from_fn(errors::native_errors))
         .layer(middleware::from_fn(capture_trusted_client_ip))
         .with_state(state)
 }

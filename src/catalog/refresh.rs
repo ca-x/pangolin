@@ -30,6 +30,15 @@ pub trait Transport: Send + Sync {
 }
 pub struct HttpsTransport;
 
+fn pinned_client(host: &str, addresses: &[SocketAddr]) -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .resolve_to_addrs(host, addresses)
+        .timeout(Duration::from_secs(15))
+        .connect_timeout(Duration::from_secs(5))
+}
+
 pub fn public_address(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => {
@@ -121,12 +130,7 @@ impl Transport for HttpsTransport {
             }
             // Pin this resolution for the entire request. Redirects and proxy
             // environment variables cannot bypass the address checks.
-            let client = reqwest::Client::builder()
-                .no_proxy()
-                .redirect(reqwest::redirect::Policy::none())
-                .resolve_to_addrs(host, &addresses)
-                .timeout(Duration::from_secs(15))
-                .connect_timeout(Duration::from_secs(5))
+            let client = pinned_client(host, &addresses)
                 .build()
                 .map_err(|e| ApiError::Internal(e.into()))?;
             let mut request = client.get(url).header("accept", "application/json");
@@ -190,6 +194,83 @@ impl Transport for HttpsTransport {
                 signature,
             })
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{
+        Router,
+        http::{HeaderMap, StatusCode},
+        routing::get,
+    };
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    #[tokio::test]
+    async fn task4_real_client_pins_dns_and_refuses_redirects() {
+        let reached = Arc::new(AtomicUsize::new(0));
+        let seen = reached.clone();
+        let redirected = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let redirect_address = redirected.local_addr().unwrap();
+        let second = tokio::spawn(async move {
+            axum::serve(
+                redirected,
+                Router::new().route(
+                    "/leak",
+                    get(move || {
+                        let seen = seen.clone();
+                        async move {
+                            seen.fetch_add(1, Ordering::SeqCst);
+                            "unreachable"
+                        }
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let first = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/catalog",
+                    get(move |headers: HeaderMap| async move {
+                        assert_eq!(
+                            headers["host"],
+                            format!("catalog-pin.invalid:{}", address.port())
+                        );
+                        (
+                            StatusCode::FOUND,
+                            [("location", format!("http://{redirect_address}/leak"))],
+                        )
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+        });
+        // Public-address/HTTPS policy is tested independently. This local HTTP
+        // fixture exercises the exact production reqwest builder over real TCP.
+        let client = pinned_client("catalog-pin.invalid", &[address])
+            .build()
+            .unwrap();
+        let response = client
+            .get(format!(
+                "http://catalog-pin.invalid:{}/catalog",
+                address.port()
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FOUND);
+        assert_eq!(reached.load(Ordering::SeqCst), 0);
+        first.abort();
+        second.abort();
     }
 }
 
@@ -288,7 +369,7 @@ pub async fn refresh_with<T: Transport>(
     }
     .await;
     if let Err(error) = &result {
-        repository::failed(db, &source, &error.to_string()).await?;
+        repository::failed(db, &source, &error.public_message()).await?;
     }
     result
 }

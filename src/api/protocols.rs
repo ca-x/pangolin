@@ -448,15 +448,14 @@ pub(super) fn protocol_error(
 ) -> Result<Response, ApiError> {
     match result {
         Ok(response) => Ok(response),
-        Err(error) => {
-            let message = error.to_string();
-            let status = error.into_response().status();
+        Err(error) => Ok(super::errors::response(
+            error,
             if gemini {
-                Ok((status,Json(json!({"error":{"code":status.as_u16(),"status":status.canonical_reason().unwrap_or("ERROR").to_ascii_uppercase().replace(' ',"_"),"message":message}}))).into_response())
+                super::errors::Protocol::Gemini
             } else {
-                Ok((status,Json(json!({"type":"error","error":{"type":"invalid_request_error","message":message}}))).into_response())
-            }
-        }
+                super::errors::Protocol::Anthropic
+            },
+        )),
     }
 }
 

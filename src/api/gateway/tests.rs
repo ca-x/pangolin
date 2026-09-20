@@ -3,6 +3,7 @@ use super::*;
 mod catalog;
 mod protocols;
 mod review;
+mod task4_review;
 use axum::{
     body::{Bytes, to_bytes},
     http::Request,

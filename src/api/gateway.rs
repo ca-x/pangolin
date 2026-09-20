@@ -465,10 +465,11 @@ pub(super) async fn execute_input(
                 let session_request = plan.session_request.clone();
                 let timeout = candidate.retry.event_timeout_ms;
                 let error_policy = candidate.retry.clone();
+                let mut terminal_state = sse::TerminalState::new(&payload);
                 let output = async_stream::stream! {
                     let mut event=first;
                     loop {
-                        let terminal=sse::terminal(&event,endpoint);
+                        let terminal=terminal_state.terminal(&event,endpoint);
                         let failed=sse::failed(&event);
                         if let Some(response)=sse::completed_response(&event)
                             && runtime.sessions.persist(&database,&secrets,&session_credential,&session_request,&response).await.is_err() {
@@ -724,7 +725,10 @@ fn error_response(
     if matches!(policy.error_mode, ErrorMode::PassThrough)
         && let Some(bytes) = bytes
     {
-        return (status, [(header::CONTENT_TYPE, "application/json")], bytes).into_response();
+        let mut response =
+            (status, [(header::CONTENT_TYPE, "application/json")], bytes).into_response();
+        response.extensions_mut().insert(super::errors::PassThrough);
+        return response;
     }
     let message = if matches!(policy.error_mode, ErrorMode::Custom) {
         policy
@@ -734,13 +738,12 @@ fn error_response(
     } else {
         "upstream request failed"
     };
-    let value = if endpoint == "/v1/messages" {
-        json!({"type":"error","error":{"type":"api_error","message":message}})
-    } else if endpoint.starts_with("/v1beta/models:") {
-        json!({"error":{"code":status.as_u16(),"status":"UNAVAILABLE","message":message}})
-    } else {
-        json!({"error":{"type":"upstream_error","message":message}})
-    };
+    let value = super::errors::document(
+        super::errors::protocol(endpoint),
+        status,
+        super::errors::openai_type(status),
+        message,
+    );
     (status, Json(value)).into_response()
 }
 

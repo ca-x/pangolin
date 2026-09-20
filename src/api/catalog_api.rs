@@ -307,8 +307,9 @@ async fn refresh_due(
     for source in repo::due_sources(&state.db, db::now()).await? {
         match catalog::refresh::refresh(&state.db, &source.id).await {
             Ok(outcome) => results.push(json!(outcome)),
-            Err(error) => results
-                .push(json!({"source_id":source.id,"status":"failed","error":error.to_string()})),
+            Err(error) => results.push(
+                json!({"source_id":source.id,"status":"failed","error":error.public_message()}),
+            ),
         }
     }
     audit(&state, &user, "refresh_due", "sources").await?;

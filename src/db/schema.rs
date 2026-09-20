@@ -750,6 +750,11 @@ CREATE TABLE catalog_overrides (
     updated_at INTEGER NOT NULL,
     PRIMARY KEY(kind,entry_id)
 );
+CREATE TABLE catalog_document_extensions (
+    extension_key TEXT PRIMARY KEY,
+    value_json TEXT NOT NULL CHECK(json_valid(value_json)),
+    updated_at INTEGER NOT NULL
+);
 ALTER TABLE models ADD COLUMN catalog_metadata_json TEXT NOT NULL DEFAULT '{}';
 INSERT INTO permissions(id,slug,level,description,created_at) VALUES('00000000-0000-0000-0000-000000000028','catalog:manage','system','Manage global catalog sources and overrides',unixepoch());
 INSERT INTO role_permissions(role_id,permission_id,created_at) VALUES('00000000-0000-0000-0000-000000000011','00000000-0000-0000-0000-000000000028',unixepoch());
@@ -955,6 +960,7 @@ mod tests {
             "catalog_sources",
             "catalog_snapshots",
             "catalog_overrides",
+            "catalog_document_extensions",
             "channel_credentials",
             "channel_settings",
             "model_associations",

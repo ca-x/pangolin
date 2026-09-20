@@ -24,6 +24,17 @@ pub async fn authenticate(
     url: &mut String,
     headers: &mut HeaderMap,
 ) -> Result<(), ApiError> {
+    authenticate_at(target, secret, payload, url, headers, SystemTime::now()).await
+}
+
+pub(super) async fn authenticate_at(
+    target: &RouteTarget,
+    secret: &str,
+    payload: &Value,
+    url: &mut String,
+    headers: &mut HeaderMap,
+    signing_time: SystemTime,
+) -> Result<(), ApiError> {
     let unavailable = |_| ApiError::Upstream("channel credential could not be resolved".into());
     match target.provider_kind.as_str() {
         "anthropic" => {
@@ -164,7 +175,7 @@ pub async fn authenticate(
                 &signing_headers,
                 &region,
                 &credentials,
-                SystemTime::now(),
+                signing_time,
             )
             .map_err(|_| ApiError::Upstream("AWS request signing failed".into()))?;
             for (name, value) in signed {

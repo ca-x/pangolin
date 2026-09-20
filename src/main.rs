@@ -67,7 +67,7 @@ async fn main() -> Result<()> {
         .fallback(web::serve)
         .layer(CompressionLayer::new())
         .layer(CatchPanicLayer::new())
-        .layer(TraceLayer::new_for_http());
+        .layer(TraceLayer::new_for_http().make_span_with(http_span));
     let listener = tokio::net::TcpListener::bind(config.bind)
         .await
         .with_context(|| format!("failed to bind {}", config.bind))?;
@@ -80,6 +80,10 @@ async fn main() -> Result<()> {
     .await?;
     observations.flush().await;
     Ok(())
+}
+
+fn http_span<B>(request: &http::Request<B>) -> tracing::Span {
+    tracing::debug_span!("http.request",method=%request.method(),path=%request.uri().path())
 }
 
 async fn bootstrap_from_environment(

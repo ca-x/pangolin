@@ -17,6 +17,65 @@ fn document(version: &str, name: &str) -> Catalog {
 fn encoded(doc: &Catalog) -> Vec<u8> {
     serde_json::to_vec(doc).unwrap()
 }
+
+#[tokio::test]
+async fn task4_document_extensions_merge_atomically_and_roundtrip_separately_from_capabilities() {
+    let db = db::connect("sqlite::memory:").await.unwrap();
+    let low = repository::create_source(&db, source_input(1))
+        .await
+        .unwrap();
+    let high = repository::create_source(&db, source_input(2))
+        .await
+        .unwrap();
+    let mut lower = document("extensions-low", "Low");
+    lower.extensions=serde_json::from_value(json!({"collision":{"lower":true},"lower_only":[1,2],"applied_sources":{"publisher":"low"}})).unwrap();
+    let mut higher = document("extensions-high", "High");
+    higher.extensions =
+        serde_json::from_value(json!({"collision":{"higher":true},"higher_only":"preserve"}))
+            .unwrap();
+    repository::activate(&db, &low, &encoded(&lower), None, None, false)
+        .await
+        .unwrap();
+    repository::activate(&db, &high, &encoded(&higher), None, None, false)
+        .await
+        .unwrap();
+    let merged = repository::effective(&db).await.unwrap();
+    assert_eq!(merged.extensions["collision"], json!({"higher":true}));
+    assert_eq!(merged.extensions["lower_only"], json!([1, 2]));
+    assert_eq!(
+        merged.extensions["applied_sources"],
+        json!({"publisher":"low"})
+    );
+    let mut local = document("extensions-local", "Local");
+    local.providers.clear();
+    local.models.clear();
+    local.extensions = serde_json::from_value(
+        json!({"collision":null,"local_only":{"unknown":true},"builtin_version":"publisher-value"}),
+    )
+    .unwrap();
+    repository::import(&db, &encoded(&local)).await.unwrap();
+    let current = repository::source(&db, &high.id).await.unwrap();
+    higher
+        .extensions
+        .insert("collision".into(), json!("new subscription value"));
+    repository::activate(&db, &current, &encoded(&higher), None, None, false)
+        .await
+        .unwrap();
+    let exported = repository::effective(&db).await.unwrap();
+    assert_eq!(exported.extensions["collision"], serde_json::Value::Null);
+    assert_eq!(
+        exported.extensions["builtin_version"],
+        json!("publisher-value")
+    );
+    let imported = db::connect("sqlite::memory:").await.unwrap();
+    repository::import(&imported, &encoded(&exported))
+        .await
+        .unwrap();
+    assert_eq!(
+        repository::effective(&imported).await.unwrap().extensions,
+        exported.extensions
+    );
+}
 fn source_input(priority: i32) -> repository::SourceInput {
     repository::SourceInput {
         name: format!("source-{priority}"),

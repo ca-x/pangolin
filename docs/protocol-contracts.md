@@ -28,6 +28,10 @@ Model capabilities are explicit: `chat`, `completions`, `responses`, `messages`,
 
 Responses WebSocket supports a long-lived `response.create` loop with a separate processing timeout per event. Optional `stream_id` values have independent FIFO queues, bounded to 16 streams and 8 queued requests per stream. The stream ID is returned on events and is never sent upstream. `stream` is forced on and `background` is a transport-only field. Completed responses use the same encrypted durable session store as HTTP/SSE. The optional `generate` control is explicitly unsupported. Errors do not close other streams. Disconnect cancels owned attempts.
 
+Local internal failures share one sanitized error projection across HTTP, native aliases and WebSocket. Gemini errors use canonical statuses such as `UNAUTHENTICATED`, `PERMISSION_DENIED`, `RESOURCE_EXHAUSTED`, `INTERNAL` and `UNAVAILABLE`; Anthropic errors use the corresponding authentication, permission, rate-limit, request and API error types. Extractor/JSON failures are also wrapped in the requested protocol. An explicitly configured upstream pass-through policy retains its original error body. Request tracing records method and path only; query parameters, including Gemini `key`, are excluded.
+
+WebSocket reads and writes run independently so a slow consumer cannot prevent disconnect cancellation; output buffering and write duration are bounded. Gemini streaming tracks terminal candidates across events and waits for every requested candidate.
+
 Task ownership is durable in SQLite. A task cannot be retrieved or deleted by a different API key, even in the same project. Disabling the original channel, key, credential or model prevents further access through that route. This layer preserves provider asset URLs; storage/retention policy belongs to the operations layer.
 
 ## Providers and authentication

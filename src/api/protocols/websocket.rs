@@ -31,27 +31,45 @@ async fn run(socket: WebSocket, state: AppState, mut headers: HeaderMap) {
     headers.insert("x-session-id", HeaderValue::from_str(&session).unwrap());
     let (mut sink, mut source) = socket.split();
     let (output, mut events) = mpsc::channel::<Value>(32);
+    let (control, mut controls) = mpsc::channel::<Message>(8);
+    let write_timeout = state
+        .config
+        .upstream_timeout
+        .min(std::time::Duration::from_secs(30));
+    let mut writer = tokio::spawn(async move {
+        loop {
+            let message = tokio::select! {
+                value=events.recv()=>match value{Some(value)=>Message::Text(value.to_string().into()),None=>break},
+                control=controls.recv()=>match control{Some(message)=>message,None=>break},
+            };
+            if !matches!(
+                tokio::time::timeout(write_timeout, sink.send(message)).await,
+                Ok(Ok(()))
+            ) {
+                break;
+            }
+        }
+    });
     let mut lanes: HashMap<String, mpsc::Sender<Value>> = HashMap::new();
     let mut workers = JoinSet::new();
     loop {
         tokio::select! {
+            _=&mut writer=>break,
             message=source.next()=>{
                 let Some(Ok(message))=message else{break;};
                 let text=match message{
                     Message::Text(text)=>text,
                     Message::Close(_)=>break,
-                    Message::Ping(data)=>{if sink.send(Message::Pong(data)).await.is_err(){break;}continue;},
+                    Message::Ping(data)=>{if control.try_send(Message::Pong(data)).is_err(){break;}continue;},
                     Message::Pong(_)=>continue,
-                    Message::Binary(_)=>{if sink.send(Message::Text(error(None,"invalid_event","response.create requires a text frame").to_string().into())).await.is_err(){break;}continue;}
+                    Message::Binary(_)=>{if output.try_send(error(None,"invalid_event","response.create requires a text frame")).is_err(){break;}continue;}
                 };
                 let result=enqueue(&state,&headers,&session,&text,&output,&mut lanes,&mut workers);
-                if let Err(value)=result && sink.send(Message::Text(value.to_string().into())).await.is_err(){break;}
-            }
-            value=events.recv()=>{
-                if let Some(value)=value && sink.send(Message::Text(value.to_string().into())).await.is_err(){break;}
+                if let Err(value)=result && output.try_send(value).is_err(){break;}
             }
         }
     }
+    writer.abort();
     workers.abort_all();
     while workers.join_next().await.is_some() {}
 }
@@ -132,9 +150,7 @@ fn enqueue(
                 .await;
                 let failure = match result {
                     Ok(Ok(())) => None,
-                    Ok(Err(cause)) => {
-                        Some(error(lane.as_ref(), "request_failed", &cause.to_string()))
-                    }
+                    Ok(Err(cause)) => Some(request_error(lane.as_ref(), cause)),
                     Err(_) => Some(error(
                         lane.as_ref(),
                         "timeout_error",
@@ -157,6 +173,15 @@ fn enqueue(
             "WebSocket request queue is full",
         )
     })
+}
+
+pub(super) fn request_error(lane: Option<&Value>, cause: ApiError) -> Value {
+    let (status, kind, message) = cause.public_parts();
+    let mut value = json!({"type":"error","status":status.as_u16(),"error":{"type":kind,"code":"request_failed","message":message}});
+    if let Some(lane) = lane {
+        value["stream_id"] = lane.clone();
+    }
+    value
 }
 
 async fn process(

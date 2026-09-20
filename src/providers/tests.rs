@@ -177,3 +177,30 @@ fn join_handles_version_prefixes_without_losing_model_slashes() {
     assert_eq!(segment("org/model?secret#"), "org%2Fmodel%3Fsecret%23");
     assert!(anthropic_text_request("claude-test",&json!({"model":"claude-test","messages":[{"role":"user","content":"hello"}],"max_tokens":32})).is_some());
 }
+
+#[tokio::test]
+async fn task4_sigv4_matches_the_botocore_canonical_signature_fixture() {
+    // Public AWS example credentials and LiteLLM's independently generated
+    // botocore golden vector, exercised through Pangolin's signing boundary.
+    let credentials=json!({"region":"us-east-1","access_key_id":"AKIDEXAMPLE","secret_access_key":"wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY","session_token":"session-token"}).to_string();
+    let mut url =
+        "https://bedrock-runtime.us-east-1.amazonaws.com/model/amazon.titan-text-express-v1/invoke"
+            .to_owned();
+    let mut headers = HeaderMap::new();
+    headers.insert("content-type", HeaderValue::from_static("application/json"));
+    cloud::authenticate_at(
+        &target("bedrock"),
+        &credentials,
+        &json!({"input":"hello"}),
+        &mut url,
+        &mut headers,
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_704_164_645),
+    )
+    .await
+    .unwrap();
+    assert_eq!(headers["x-amz-date"], "20240102T030405Z");
+    assert_eq!(
+        headers["authorization"],
+        "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20240102/us-east-1/bedrock/aws4_request, SignedHeaders=content-type;host;x-amz-date;x-amz-security-token, Signature=55c027ef47527d3ad63f1735f9d099efdbc99f296ff914bd94e727e24ec0e464"
+    );
+}

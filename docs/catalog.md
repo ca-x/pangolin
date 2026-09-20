@@ -18,6 +18,8 @@ Entries merge by stable ID in this order:
 
 Import upserts local entries. It never deletes local entries that are absent from the imported document. A subscription replacing or removing one of its entries cannot delete local custom data. Removing a local override reveals the next applicable source. Export returns a complete versioned merged catalog that can be imported into another instance.
 
+Document-level `extensions` use the same precedence, independently of provider/model capabilities. They merge by top-level key; a higher-priority value replaces the entire JSON value at that key (including explicit `null`). Import upserts these local extension keys without deleting omitted ones. Publisher/application keys such as `applied_sources` or `builtin_version` are preserved; runtime merge provenance is represented by `source.revision` and the effective catalog version, not by overwriting extension keys.
+
 ## API
 
 Reads require a signed-in session. Global source/override mutations require the system `catalog:manage` permission (owner/admin by default); project API keys cannot mutate global catalog state.

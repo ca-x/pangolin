@@ -247,6 +247,9 @@ pub async fn import(db: &DatabaseConnection, body: &[u8]) -> Result<(usize, usiz
     let document = Catalog::parse(body)?;
     let counts = (document.providers.len(), document.models.len());
     let tx = db.begin().await?;
+    for (key, value) in &document.extensions {
+        tx.execute(sql("INSERT INTO catalog_document_extensions(extension_key,value_json,updated_at) VALUES(?,?,?) ON CONFLICT(extension_key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at",vec![key.clone().into(),value.to_string().into(),db::now().into()])).await?;
+    }
     for (kind, entries) in [
         (
             "provider",
@@ -332,6 +335,7 @@ async fn assemble<C: ConnectionTrait>(connection: &C) -> Result<Catalog, ApiErro
         applied.push(json!({"id":row.try_get::<String>("","id")?,"version":document.version,"priority":row.try_get::<i32>("","priority")?}));
         providers.extend(document.providers.into_iter().map(|p| (p.id.clone(), p)));
         models.extend(document.models.into_iter().map(|m| (m.id.clone(), m)));
+        result.extensions.extend(document.extensions);
     }
     for row in overrides {
         let entry: String = row.try_get("", "entry_json")?;
@@ -351,12 +355,20 @@ async fn assemble<C: ConnectionTrait>(connection: &C) -> Result<Catalog, ApiErro
     }
     result.providers = providers.into_values().collect();
     result.models = models.into_values().collect();
-    result
-        .extensions
-        .insert("applied_sources".into(), json!(applied));
-    result
-        .extensions
-        .insert("builtin_version".into(), json!(super::builtin().version));
+    for row in connection.query_all(sql("SELECT extension_key,value_json FROM catalog_document_extensions ORDER BY extension_key",vec![])).await? {
+        let key:String=row.try_get("","extension_key")?;
+        let value:String=row.try_get("","value_json")?;
+        result.extensions.insert(key,serde_json::from_str(&value).map_err(|error|ApiError::Internal(error.into()))?);
+    }
+    // Runtime provenance is owned by the service, outside the extension map.
+    // Feed/application extension keys must survive lossless JSON value roundtrips.
+    result.source.revision = blake3::hash(
+        json!({"builtin":super::builtin().version,"sources":applied})
+            .to_string()
+            .as_bytes(),
+    )
+    .to_hex()
+    .to_string();
     result.validate()?;
     let bytes = serde_json::to_vec(&result).map_err(|e| ApiError::Internal(e.into()))?;
     if bytes.len() > MAX_BYTES {
