@@ -41,6 +41,29 @@ pub struct Rule {
     #[serde(default = "yes")]
     pub release_on_failure: bool,
 }
+impl Rule {
+    pub fn validate(&self) -> Result<()> {
+        if self.ttl_secs == 0 || self.ttl_secs > 86400 || self.id.is_empty() || self.id.len() > 128
+        {
+            return Err(Error::Configuration);
+        }
+        for pattern in [&self.model, &self.path, &self.user_agent]
+            .into_iter()
+            .flatten()
+        {
+            super::policy::regex(pattern)?;
+        }
+        match &self.source {
+            Source::Header(name) if name != crate::api::TRUSTED_CLIENT_IP_HEADER => Err(
+                Error::Invalid("affinity headers must be middleware-trusted"),
+            ),
+            Source::Pointer(pointer) if !pointer.starts_with('/') || pointer.len() > 256 => {
+                Err(Error::Configuration)
+            }
+            _ => Ok(()),
+        }
+    }
+}
 fn yes() -> bool {
     true
 }
@@ -148,9 +171,7 @@ impl Cache {
             return Err(Error::Configuration);
         }
         for rule in rules {
-            if rule.ttl_secs == 0 || rule.ttl_secs > 86400 || rule.id.len() > 128 {
-                return Err(Error::Configuration);
-            }
+            rule.validate()?;
             let mut matched = true;
             for (pattern, value) in [
                 (&rule.model, body["model"].as_str().unwrap_or("")),

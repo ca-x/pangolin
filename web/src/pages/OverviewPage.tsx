@@ -2,7 +2,7 @@ import { useQuery } from '@tanstack/react-query'
 import { Activity, CircleDollarSign, Clock3, Server, ShieldCheck } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { Link } from 'react-router'
-import { api, type RequestItem, type Summary } from '../api'
+import { api, type Paged, type RequestItem, type Summary } from '../api'
 import { EmptyState, SkeletonRows } from '../components'
 import { PageHeader, QueryError, displayValue, formatDate } from './shared'
 import { useProject } from '../project'
@@ -14,7 +14,7 @@ export default function OverviewPage() {
   const { project } = useProject()
   const base = `/api/admin/v1/projects/${encodeURIComponent(project.id)}/observability`
   const summary = useQuery({ queryKey: ['summary', project.id], queryFn: () => api<Summary>(`${base}/summary`) })
-  const requests = useQuery({ queryKey: ['requests', project.id, 'recent'], queryFn: () => api<RequestItem[]>(`${base}/requests?limit=6`) })
+  const requests = useQuery({ queryKey: ['requests', project.id, 'recent'], queryFn: () => api<Paged<RequestItem>>(`${base}/requests?limit=6`) })
   const value = summary.data
   if (summary.isError || requests.isError) return <><PageHeader title={t('overview')} description={t('last24h')} /><QueryError retry={() => { void summary.refetch(); void requests.refetch() }} /></>
   return <><PageHeader title={t('overview')} description={t('last24h')} />
@@ -24,7 +24,7 @@ export default function OverviewPage() {
       <Stat icon={<Clock3 />} label={t('p95Latency')} value={value && value.requests > 0 && value.p95_latency_ms != null ? `${Math.round(value.p95_latency_ms)} ms` : '—'} />
       <Stat icon={<CircleDollarSign />} label={t('cost')} value={value ? `$${(value.cost_micros / 1_000_000).toFixed(4)}` : '—'} />
     </section>
-    {summary.isLoading || requests.isLoading ? <SkeletonRows count={5}/> : value?.requests === 0 ? <section className="overview-empty"><div><Server aria-hidden="true"/><h2>{t('overviewEmptyTitle')}</h2><p>{t('overviewEmptyCopy')}</p></div><Link className="button button-primary" to="/channels">{t('configureChannel')}</Link></section> : <div className="overview-grid"><section className="panel chart-panel"><div className="panel-heading"><div><h2>{t('requestTrend')}</h2><p>{`${formatNumber(value?.requests || 0)} · ${formatNumber((value?.input_tokens || 0) + (value?.output_tokens || 0))} ${t('tokens')}`}</p></div></div><TrendChart series={value?.series || []}/><details className="chart-table"><summary>{t('dataTable')}</summary><table><tbody>{value?.series.map((point) => <tr key={point.bucket}><td>{formatDate(point.bucket)}</td><td>{point.requests}</td></tr>)}</tbody></table></details></section><section className="panel"><div className="panel-heading"><h2>{t('recentRequests')}</h2><Link to="/operations">{t('viewAll')}</Link></div><CompactRequests rows={requests.data || []}/></section></div>}
+    {summary.isLoading || requests.isLoading ? <SkeletonRows count={5}/> : value?.requests === 0 ? <section className="overview-empty"><div><Server aria-hidden="true"/><h2>{t('overviewEmptyTitle')}</h2><p>{t('overviewEmptyCopy')}</p></div><Link className="button button-primary" to="/channels">{t('configureChannel')}</Link></section> : <div className="overview-grid"><section className="panel chart-panel"><div className="panel-heading"><div><h2>{t('requestTrend')}</h2><p>{`${formatNumber(value?.requests || 0)} · ${formatNumber((value?.input_tokens || 0) + (value?.output_tokens || 0))} ${t('tokens')}`}</p></div></div><TrendChart series={value?.series || []}/><details className="chart-table"><summary>{t('dataTable')}</summary><table><tbody>{value?.series.map((point) => <tr key={point.bucket}><td>{formatDate(point.bucket)}</td><td>{point.requests}</td></tr>)}</tbody></table></details></section><section className="panel"><div className="panel-heading"><h2>{t('recentRequests')}</h2><Link to="/operations">{t('viewAll')}</Link></div><CompactRequests rows={requests.data?.data || []}/></section></div>}
   </>
 }
 

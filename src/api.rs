@@ -9,7 +9,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{delete, get, post},
 };
-use sea_orm::DatabaseConnection;
+use sea_orm::{ConnectionTrait, DatabaseConnection};
 use serde_json::{Map, Value, json};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use uuid::Uuid;
@@ -295,6 +295,27 @@ async fn bootstrap(
 ) -> Result<impl IntoResponse, ApiError> {
     let initialized = db::is_initialized(&state.db).await?;
     let user = optional_user(&state, &headers).await?;
+    let system = state
+        .db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DbBackend::Sqlite,
+            "SELECT value FROM settings WHERE key='system'",
+        ))
+        .await?
+        .map(|row| row.try_get::<String>("", "value"))
+        .transpose()?
+        .and_then(|value| serde_json::from_str::<Value>(&value).ok());
+    let legacy_name = state
+        .db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DbBackend::Sqlite,
+            "SELECT value FROM settings WHERE key='instance_name'",
+        ))
+        .await?
+        .map(|row| row.try_get::<String>("", "value"))
+        .transpose()?
+        .unwrap_or_else(|| "Pangolin".into());
+    let system=system.unwrap_or_else(||json!({"instance_name":legacy_name,"branding_name":legacy_name,"favicon_url":"/logo.webp","onboarding_complete":false}));
     Ok(Json(json!({
         "initialized": initialized,
         "authenticated": user.is_some(),
@@ -303,6 +324,7 @@ async fn bootstrap(
         "public_url": state.config.public_url,
         "capture_payloads": state.config.capture_payloads,
         "observability_available": state.observations.is_available(),
+        "branding": system,
     })))
 }
 

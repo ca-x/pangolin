@@ -652,6 +652,20 @@ async fn task6_control_plane_crud_redacts_credentials_and_audits_changes() {
         .await["onboarding_complete"],
         true
     );
+    let bootstrap = json_body(
+        admin(
+            &f,
+            &cookie,
+            http::Method::GET,
+            "/api/v1/bootstrap",
+            Value::Null,
+            false,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(bootstrap["branding"]["instance_name"], "Operations");
+    assert_eq!(bootstrap["branding"]["onboarding_complete"], true);
     assert!(
         count(
             &f,
@@ -659,6 +673,163 @@ async fn task6_control_plane_crud_redacts_credentials_and_audits_changes() {
         )
         .await
             >= 4
+    );
+}
+
+#[tokio::test]
+async fn task6_patch_preserves_omitted_secrets_and_channel_settings() {
+    let f = fixture(success()).await;
+    let cookie = owner(&f).await;
+    let base = format!(
+        "/api/admin/v1/projects/{}/operations",
+        db::DEFAULT_PROJECT_ID
+    );
+    let created = json_body(
+        admin(
+            &f,
+            &cookie,
+            http::Method::POST,
+            &format!("{base}/storage"),
+            json!({"name":"secure target","config":{"kind":"local","directory":"secure"},"secret":{"token":"never-print"}}),
+            true,
+        )
+        .await,
+    )
+    .await;
+    let storage_id = created["id"].as_str().unwrap();
+    let before_storage = f
+        .state
+        .db
+        .query_one(ops::sql(
+            "SELECT secret_envelope FROM data_storage_configs WHERE id=?",
+            vec![storage_id.into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get::<String>("", "secret_envelope")
+        .unwrap();
+    assert_eq!(admin(&f,&cookie,http::Method::POST,&format!("{base}/storage"),json!({"id":storage_id,"revision":1,"name":"renamed","config":{"kind":"local","directory":"secure"},"secret":null}),true).await.status(),StatusCode::OK);
+    let after_storage = f
+        .state
+        .db
+        .query_one(ops::sql(
+            "SELECT secret_envelope FROM data_storage_configs WHERE id=?",
+            vec![storage_id.into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get::<String>("", "secret_envelope")
+        .unwrap();
+    assert_eq!(before_storage, after_storage);
+
+    let webhook = json_body(admin(&f,&cookie,http::Method::POST,&format!("{base}/webhooks"),json!({"name":"secure hook","url":"https://example.test/hook","events":["test"],"secret_headers":{"authorization":"never-print"}}),true).await).await;
+    let webhook_id = webhook["id"].as_str().unwrap();
+    let before_webhook = f
+        .state
+        .db
+        .query_one(ops::sql(
+            "SELECT secret_envelope FROM webhooks WHERE id=?",
+            vec![webhook_id.into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get::<String>("", "secret_envelope")
+        .unwrap();
+    assert_eq!(admin(&f,&cookie,http::Method::POST,&format!("{base}/webhooks"),json!({"id":webhook_id,"name":"renamed hook","url":"https://example.test/hook","events":["test"],"secret_headers":null}),true).await.status(),StatusCode::OK);
+    let after_webhook = f
+        .state
+        .db
+        .query_one(ops::sql(
+            "SELECT secret_envelope FROM webhooks WHERE id=?",
+            vec![webhook_id.into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get::<String>("", "secret_envelope")
+        .unwrap();
+    assert_eq!(before_webhook, after_webhook);
+
+    let settings = json!({"version":1,"tags":["priority"],"limits":{"rpm":17},"catalog_provider_id":"fixture"});
+    sql(
+        &f,
+        "UPDATE providers SET settings_json=? WHERE id=?",
+        vec![settings.to_string().into(), f.providers[0].clone().into()],
+    )
+    .await;
+    assert_eq!(admin(&f,&cookie,http::Method::POST,&format!("{base}/channels"),json!({"id":f.providers[0],"name":"renamed channel","kind":"openai","base_url":"https://example.test","enabled":true}),true).await.status(),StatusCode::OK);
+    let preserved = f
+        .state
+        .db
+        .query_one(ops::sql(
+            "SELECT settings_json FROM providers WHERE id=?",
+            vec![f.providers[0].clone().into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get::<String>("", "settings_json")
+        .unwrap();
+    assert_eq!(serde_json::from_str::<Value>(&preserved).unwrap(), settings);
+
+    let orchestration = json!({"version":1,"affinity_rules":[{"id":"cache","mode":"prefer","source":{"kind":"pointer","value":"/prompt_cache_key"},"ttl_secs":900,"release_on_failure":true}],"session_compaction":{"enabled":true,"threshold_tokens":4096,"retain_items":12,"native":true,"summarizer_model":null}});
+    assert_eq!(
+        admin(
+            &f,
+            &cookie,
+            http::Method::PUT,
+            &format!(
+                "/api/admin/v1/projects/{}/settings/orchestration",
+                db::DEFAULT_PROJECT_ID
+            ),
+            orchestration.clone(),
+            true
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    let fetched = json_body(
+        admin(
+            &f,
+            &cookie,
+            http::Method::GET,
+            &format!(
+                "/api/admin/v1/projects/{}/settings/orchestration",
+                db::DEFAULT_PROJECT_ID
+            ),
+            Value::Null,
+            false,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(fetched["affinity_rules"][0]["id"], "cache");
+    assert_eq!(fetched["affinity_rules"][0]["ttl_secs"], 900);
+    assert_eq!(
+        fetched["session_compaction"],
+        orchestration["session_compaction"]
+    );
+    let mut invalid = orchestration;
+    invalid["affinity_rules"][0]["ttl_secs"] = json!(0);
+    assert_eq!(
+        admin(
+            &f,
+            &cookie,
+            http::Method::PUT,
+            &format!(
+                "/api/admin/v1/projects/{}/settings/orchestration",
+                db::DEFAULT_PROJECT_ID
+            ),
+            invalid,
+            true
+        )
+        .await
+        .status(),
+        StatusCode::BAD_REQUEST
     );
 }
 

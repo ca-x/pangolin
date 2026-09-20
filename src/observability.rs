@@ -80,6 +80,7 @@ pub struct RequestFilter {
     pub provider: Option<String>,
     pub model: Option<String>,
     pub limit: Option<usize>,
+    pub offset: Option<usize>,
 }
 
 enum Command {
@@ -308,6 +309,11 @@ impl ObservationStore {
         let path = Arc::clone(&self.path);
         tokio::task::spawn_blocking(move || query_list(&path, &filter)).await?
     }
+    pub async fn count(&self, filter: RequestFilter) -> Result<i64> {
+        self.ensure_available()?;
+        let path = Arc::clone(&self.path);
+        tokio::task::spawn_blocking(move || query_count(&path, &filter)).await?
+    }
 
     pub async fn get(&self, request_id: String) -> Result<Option<RequestEvent>> {
         self.ensure_available()?;
@@ -459,7 +465,7 @@ fn query_list(path: &Path, filter: &RequestFilter) -> Result<Vec<RequestListItem
     let connection = Connection::open(path)?;
     let limit = filter.limit.unwrap_or(100).clamp(1, 500) as i64;
     let mut statement = connection.prepare(
-        "SELECT request_id,started_at,endpoint,provider,requested_model,resolved_model,status_code,latency_ms,input_tokens,output_tokens,cost_micros FROM request_events WHERE (? IS NULL OR project_id=?) AND (? IS NULL OR status_code=?) AND (? IS NULL OR provider=?) AND (? IS NULL OR requested_model=? OR resolved_model=?) ORDER BY started_at DESC LIMIT ?",
+        "SELECT request_id,started_at,endpoint,provider,requested_model,resolved_model,status_code,latency_ms,input_tokens,output_tokens,cost_micros FROM request_events WHERE (? IS NULL OR project_id=?) AND (? IS NULL OR status_code=?) AND (? IS NULL OR provider=?) AND (? IS NULL OR requested_model=? OR resolved_model=?) ORDER BY started_at DESC LIMIT ? OFFSET ?",
     )?;
     let rows = statement.query_map(
         params![
@@ -473,6 +479,7 @@ fn query_list(path: &Path, filter: &RequestFilter) -> Result<Vec<RequestListItem
             filter.model,
             filter.model,
             limit,
+            filter.offset.unwrap_or(0).min(100_000) as i64,
         ],
         |row| {
             Ok(RequestListItem {
@@ -491,6 +498,15 @@ fn query_list(path: &Path, filter: &RequestFilter) -> Result<Vec<RequestListItem
         },
     )?;
     Ok(rows.collect::<duckdb::Result<Vec<_>>>()?)
+}
+
+fn query_count(path: &Path, filter: &RequestFilter) -> Result<i64> {
+    let connection = Connection::open(path)?;
+    Ok(connection.query_row(
+        "SELECT count(*) FROM request_events WHERE (? IS NULL OR project_id=?) AND (? IS NULL OR status_code=?) AND (? IS NULL OR provider=?) AND (? IS NULL OR requested_model=? OR resolved_model=?)",
+        params![filter.project_id,filter.project_id,filter.status_code,filter.status_code,filter.provider,filter.provider,filter.model,filter.model,filter.model],
+        |row| row.get(0),
+    )?)
 }
 
 fn query_one(path: &Path, request_id: &str) -> Result<Option<RequestEvent>> {

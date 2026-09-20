@@ -34,6 +34,10 @@ pub(super) fn router(state: AppState) -> Router<AppState> {
         )
         .route("/api/admin/v1/projects/{project}/analytics", get(analytics))
         .route(
+            "/api/admin/v1/projects/{project}/settings/orchestration",
+            get(orchestration_settings).put(set_orchestration_settings),
+        )
+        .route(
             "/api/admin/v1/projects/{project}/observability/summary",
             get(observation_summary),
         )
@@ -237,6 +241,7 @@ async fn set_system_settings(
     }
     let tx = state.db.begin().await?;
     tx.execute(sql("INSERT INTO settings(key,value,updated_at) VALUES('system',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",vec![serde_json::to_string(&input).unwrap().into(),db::now().into()])).await?;
+    tx.execute(sql("INSERT INTO settings(key,value,updated_at) VALUES('instance_name',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",vec![input.instance_name.clone().into(),db::now().into()])).await?;
     audit_in(&tx, &user, "", "system.update", "system").await?;
     tx.commit().await?;
     Ok(Json(json!({"ok":true})))
@@ -265,7 +270,7 @@ fn query(resource: &str) -> Result<(&'static str, &'static str, &'static str), A
         "credentials" => (
             "channel_credentials",
             "provider_id IN (SELECT id FROM providers WHERE project_id=?)",
-            "json_object('id',id,'provider_id',provider_id,'credential_type',credential_type,'suffix',suffix,'priority',priority,'enabled',enabled,'settings',json(settings_json),'created_at',created_at,'updated_at',updated_at)",
+            "json_object('id',id,'provider_id',provider_id,'provider_name',(SELECT name FROM providers WHERE id=channel_credentials.provider_id),'credential_type',credential_type,'suffix',suffix,'priority',priority,'enabled',enabled,'settings',json(settings_json),'created_at',created_at,'updated_at',updated_at)",
         ),
         "channel-settings" => (
             "channel_settings",
@@ -275,12 +280,12 @@ fn query(resource: &str) -> Result<(&'static str, &'static str, &'static str), A
         "models" => (
             "models",
             "provider_id IN (SELECT id FROM providers WHERE project_id=?)",
-            "json_object('id',id,'provider_id',provider_id,'public_name',public_name,'upstream_name',upstream_name,'capabilities',json(capabilities),'input_price_micros',input_price_micros,'output_price_micros',output_price_micros,'priority',priority,'enabled',enabled,'catalog_metadata',json(catalog_metadata_json),'created_at',created_at)",
+            "json_object('id',id,'provider_id',provider_id,'provider_name',(SELECT name FROM providers WHERE id=models.provider_id),'public_name',public_name,'upstream_name',upstream_name,'capabilities',json(capabilities),'input_price_micros',input_price_micros,'output_price_micros',output_price_micros,'priority',priority,'enabled',enabled,'catalog_metadata',json(catalog_metadata_json),'created_at',created_at)",
         ),
         "associations" => (
             "model_associations",
             "project_id=?",
-            "json_object('id',id,'model_id',model_id,'provider_id',provider_id,'match_type',match_type,'pattern',pattern,'conditions',json(conditions_json),'priority',priority,'weight',weight,'enabled',enabled,'created_at',created_at,'updated_at',updated_at)",
+            "json_object('id',id,'model_id',model_id,'model_name',(SELECT public_name FROM models WHERE id=model_associations.model_id),'provider_id',provider_id,'provider_name',(SELECT name FROM providers WHERE id=model_associations.provider_id),'match_type',match_type,'pattern',pattern,'conditions',json(conditions_json),'priority',priority,'weight',weight,'enabled',enabled,'created_at',created_at,'updated_at',updated_at)",
         ),
         "key-profiles" => (
             "api_key_profiles",
@@ -340,7 +345,7 @@ fn query(resource: &str) -> Result<(&'static str, &'static str, &'static str), A
         "prices" => (
             "model_prices",
             "model_id IN (SELECT m.id FROM models m JOIN providers p ON p.id=m.provider_id WHERE p.project_id=?)",
-            "json_object('id',id,'model_id',model_id,'provider_id',provider_id,'version',version,'valid_from',valid_from,'valid_until',valid_until,'schedule',json(schedule_json))",
+            "json_object('id',id,'model_id',model_id,'model_name',(SELECT public_name FROM models WHERE id=model_prices.model_id),'provider_id',provider_id,'version',version,'valid_from',valid_from,'valid_until',valid_until,'schedule',json(schedule_json))",
         ),
         "probes" => (
             "channel_probes",
@@ -432,6 +437,16 @@ async fn detail(
     Path((project, resource, id)): Path<(String, String, String)>,
 ) -> Result<Json<Value>, ApiError> {
     actor(&state, &headers, Some(&project), false).await?;
+    if resource == "trace-detail" {
+        let trace=state.db.query_one(sql("SELECT json_object('id',id,'thread_id',thread_id,'external_id',external_id,'status',status,'started_at',started_at,'finished_at',finished_at) AS document FROM traces WHERE project_id=? AND id=?",vec![project.clone().into(),id.clone().into()])).await?.ok_or(ApiError::NotFound)?;
+        let trace: Value = serde_json::from_str(&trace.try_get::<String>("", "document")?)
+            .map_err(|error| ApiError::Internal(error.into()))?;
+        let requests=documents(state.db.query_all(sql("SELECT json_object('id',id,'protocol',protocol,'endpoint',endpoint,'model',requested_model,'status',status,'started_at',started_at,'finished_at',finished_at) AS document FROM requests WHERE trace_id=? ORDER BY started_at",vec![id.clone().into()])).await?)?;
+        let executions=documents(state.db.query_all(sql("SELECT json_object('id',id,'request_id',request_id,'provider_id',provider_id,'attempt',attempt,'model',model,'status',status,'retry_reason',retry_reason,'latency_ms',latency_ms,'started_at',started_at,'finished_at',finished_at) AS document FROM request_executions WHERE request_id IN (SELECT id FROM requests WHERE trace_id=?) ORDER BY started_at",vec![id.into()])).await?)?;
+        return Ok(Json(
+            json!({"trace":trace,"requests":requests,"executions":executions}),
+        ));
+    }
     if resource == "content" {
         let row=state.db.query_one(sql("SELECT c.request_json,c.response_json FROM request_contents c JOIN requests r ON r.id=c.request_id JOIN traces t ON t.id=r.trace_id WHERE t.project_id=? AND r.id=?",vec![project.into(),id.into()])).await?.ok_or(ApiError::NotFound)?;
         return Ok(Json(
@@ -482,6 +497,140 @@ async fn analytics(
     ))
 }
 
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SessionCompactionSettings {
+    enabled: bool,
+    threshold_tokens: u64,
+    retain_items: usize,
+    native: bool,
+    summarizer_model: Option<String>,
+}
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct OrchestrationSettings {
+    version: u8,
+    affinity_rules: Vec<crate::orchestration::affinity::Rule>,
+    session_compaction: SessionCompactionSettings,
+}
+impl Default for OrchestrationSettings {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            affinity_rules: vec![],
+            session_compaction: SessionCompactionSettings {
+                enabled: false,
+                threshold_tokens: 8192,
+                retain_items: 16,
+                native: true,
+                summarizer_model: None,
+            },
+        }
+    }
+}
+fn validate_orchestration_settings(input: &OrchestrationSettings) -> Result<(), ApiError> {
+    if input.version != 1
+        || input.affinity_rules.len() > 64
+        || input.session_compaction.threshold_tokens < 128
+        || input.session_compaction.threshold_tokens > 10_000_000
+        || input.session_compaction.retain_items > 128
+        || input.session_compaction.enabled
+            && !input.session_compaction.native
+            && input
+                .session_compaction
+                .summarizer_model
+                .as_deref()
+                .is_none_or(str::is_empty)
+    {
+        return Err(ApiError::BadRequest(
+            "invalid orchestration settings".into(),
+        ));
+    }
+    for rule in &input.affinity_rules {
+        rule.validate()
+            .map_err(|_| ApiError::BadRequest("invalid affinity rule".into()))?;
+    }
+    Ok(())
+}
+async fn orchestration_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project): Path<String>,
+) -> Result<Json<OrchestrationSettings>, ApiError> {
+    actor(&state, &headers, Some(&project), false).await?;
+    let row = state
+        .db
+        .query_one(sql(
+            "SELECT settings_json FROM projects WHERE id=?",
+            vec![project.into()],
+        ))
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    let settings: Value = serde_json::from_str(&row.try_get::<String>("", "settings_json")?)
+        .map_err(|error| ApiError::Internal(error.into()))?;
+    let default = OrchestrationSettings::default();
+    let output = OrchestrationSettings {
+        version: 1,
+        affinity_rules: serde_json::from_value(
+            settings
+                .get("affinity_rules")
+                .cloned()
+                .unwrap_or(json!(default.affinity_rules)),
+        )
+        .map_err(|_| ApiError::BadRequest("invalid stored affinity settings".into()))?,
+        session_compaction: serde_json::from_value(
+            settings
+                .get("session_compaction")
+                .cloned()
+                .unwrap_or(json!(default.session_compaction)),
+        )
+        .map_err(|_| ApiError::BadRequest("invalid stored compaction settings".into()))?,
+    };
+    Ok(Json(output))
+}
+async fn set_orchestration_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project): Path<String>,
+    Json(input): Json<OrchestrationSettings>,
+) -> Result<Json<Value>, ApiError> {
+    let user = actor(&state, &headers, Some(&project), true).await?;
+    validate_orchestration_settings(&input)?;
+    let tx = state.db.begin().await?;
+    let row = tx
+        .query_one(sql(
+            "SELECT settings_json FROM projects WHERE id=?",
+            vec![project.clone().into()],
+        ))
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    let mut settings: Value = serde_json::from_str(&row.try_get::<String>("", "settings_json")?)
+        .map_err(|error| ApiError::Internal(error.into()))?;
+    settings["affinity_rules"] = json!(input.affinity_rules);
+    settings["session_compaction"] = json!(input.session_compaction);
+    settings["version"] = json!(1);
+    tx.execute(sql(
+        "UPDATE projects SET settings_json=?,updated_at=? WHERE id=?",
+        vec![
+            settings.to_string().into(),
+            db::now().into(),
+            project.clone().into(),
+        ],
+    ))
+    .await?;
+    audit_in(
+        &tx,
+        &user,
+        &project,
+        "orchestration-settings.update",
+        "orchestration-settings",
+    )
+    .await?;
+    tx.commit().await?;
+    state.orchestrator.affinity_rules.reset();
+    Ok(Json(json!({"ok":true})))
+}
+
 async fn observation_summary(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -502,15 +651,21 @@ async fn observation_list(
     headers: HeaderMap,
     Path(project): Path<String>,
     Query(mut filter): Query<crate::observability::RequestFilter>,
-) -> Result<Json<Vec<crate::observability::RequestListItem>>, ApiError> {
+) -> Result<Json<Value>, ApiError> {
     actor(&state, &headers, Some(&project), false).await?;
     filter.project_id = Some(project);
+    let total = state
+        .observations
+        .count(filter.clone())
+        .await
+        .map_err(ApiError::Internal)?;
+    let data = state
+        .observations
+        .list(filter.clone())
+        .await
+        .map_err(ApiError::Internal)?;
     Ok(Json(
-        state
-            .observations
-            .list(filter)
-            .await
-            .map_err(ApiError::Internal)?,
+        json!({"data":data,"total":total,"offset":filter.offset.unwrap_or(0),"limit":filter.limit.unwrap_or(100).clamp(1,500)}),
     ))
 }
 
@@ -630,7 +785,21 @@ async fn mutate(
             }
             let base_url = text(&value, "base_url")?;
             validate_http_url(base_url)?;
-            let changed = transaction.execute(sql("INSERT INTO providers(id,name,kind,base_url,enabled,created_at,updated_at,project_id,settings_json) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,kind=excluded.kind,base_url=excluded.base_url,enabled=excluded.enabled,updated_at=excluded.updated_at,settings_json=excluded.settings_json WHERE providers.project_id=excluded.project_id",vec![resource_id.clone().into(),text(&value,"name")?.into(),kind.into(),base_url.into(),value["enabled"].as_bool().unwrap_or(true).into(),db::now().into(),db::now().into(),project.clone().into(),value.get("settings").cloned().unwrap_or(json!({"version":1})).to_string().into()])).await?.rows_affected();
+            let current_settings = transaction
+                .query_one(sql(
+                    "SELECT settings_json FROM providers WHERE id=? AND project_id=?",
+                    vec![resource_id.clone().into(), project.clone().into()],
+                ))
+                .await?
+                .map(|row| row.try_get::<String>("", "settings_json"))
+                .transpose()?;
+            let settings = value
+                .get("settings")
+                .filter(|settings| !settings.is_null())
+                .map(Value::to_string)
+                .or(current_settings)
+                .unwrap_or_else(|| json!({"version":1}).to_string());
+            let changed = transaction.execute(sql("INSERT INTO providers(id,name,kind,base_url,enabled,created_at,updated_at,project_id,settings_json) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,kind=excluded.kind,base_url=excluded.base_url,enabled=excluded.enabled,updated_at=excluded.updated_at,settings_json=excluded.settings_json WHERE providers.project_id=excluded.project_id",vec![resource_id.clone().into(),text(&value,"name")?.into(),kind.into(),base_url.into(),value["enabled"].as_bool().unwrap_or(true).into(),db::now().into(),db::now().into(),project.clone().into(),settings.into()])).await?.rows_affected();
             if changed != 1 {
                 return Err(ApiError::Forbidden);
             }
@@ -687,7 +856,15 @@ async fn mutate(
         }
         "channel-settings" => {
             let provider = text(&value, "provider_id")?;
-            let changed = transaction.execute(sql("UPDATE channel_settings SET endpoint_mappings_json=?,model_rules_json=?,parameter_overrides_json=?,retry_statuses_json=?,auto_disable_policy_json=?,proxy_settings_json=?,updated_at=? WHERE provider_id=? AND provider_id IN (SELECT id FROM providers WHERE project_id=?)",vec![value.get("endpoint_mappings").cloned().unwrap_or(json!({"version":1})).to_string().into(),value.get("model_rules").cloned().unwrap_or(json!({"version":1})).to_string().into(),value.get("parameter_overrides").cloned().unwrap_or(json!({"version":1})).to_string().into(),value.get("retry_statuses").cloned().unwrap_or(json!({"version":1,"statuses":[408,409,429,500,502,503,504]})).to_string().into(),value.get("auto_disable_policy").cloned().unwrap_or(json!({"version":1,"enabled":false})).to_string().into(),value.get("proxy_settings").cloned().unwrap_or(json!({"version":1})).to_string().into(),db::now().into(),provider.into(),project.clone().into()])).await?.rows_affected();
+            let current=transaction.query_one(sql("SELECT endpoint_mappings_json,model_rules_json,parameter_overrides_json,retry_statuses_json,auto_disable_policy_json,proxy_settings_json FROM channel_settings WHERE provider_id=? AND provider_id IN (SELECT id FROM providers WHERE project_id=?)",vec![provider.into(),project.clone().into()])).await?.ok_or(ApiError::NotFound)?;
+            let document = |key: &str, column: &str| -> Result<String, ApiError> {
+                Ok(value
+                    .get(key)
+                    .filter(|item| !item.is_null())
+                    .map(Value::to_string)
+                    .unwrap_or(current.try_get::<String>("", column)?))
+            };
+            let changed = transaction.execute(sql("UPDATE channel_settings SET endpoint_mappings_json=?,model_rules_json=?,parameter_overrides_json=?,retry_statuses_json=?,auto_disable_policy_json=?,proxy_settings_json=?,updated_at=? WHERE provider_id=? AND provider_id IN (SELECT id FROM providers WHERE project_id=?)",vec![document("endpoint_mappings","endpoint_mappings_json")?.into(),document("model_rules","model_rules_json")?.into(),document("parameter_overrides","parameter_overrides_json")?.into(),document("retry_statuses","retry_statuses_json")?.into(),document("auto_disable_policy","auto_disable_policy_json")?.into(),document("proxy_settings","proxy_settings_json")?.into(),db::now().into(),provider.into(),project.clone().into()])).await?.rows_affected();
             if changed != 1 {
                 return Err(ApiError::NotFound);
             }
@@ -881,6 +1058,7 @@ async fn mutate(
             storage::validate(&config)?;
             let secret = value
                 .get("secret")
+                .filter(|secret| !secret.is_null())
                 .map(|secret| storage::envelope(&state.secrets, &project, &resource_id, secret))
                 .transpose()?;
             let exists = transaction
@@ -1034,7 +1212,10 @@ async fn mutate(
                     "webhook credentials belong in encrypted secret_headers".into(),
                 ));
             }
-            let secret = if let Some(secret) = value.get("secret_headers") {
+            let secret = if let Some(secret) = value
+                .get("secret_headers")
+                .filter(|secret| !secret.is_null())
+            {
                 Some(
                     state.secrets.encrypt(
                         &json!({"project_id":project,"webhook_id":resource_id,"headers":secret})

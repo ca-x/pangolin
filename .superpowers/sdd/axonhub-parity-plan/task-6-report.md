@@ -127,3 +127,45 @@ Screenshots were kept as ephemeral verification artifacts. Task 7 owns sanitized
 - Rechecked the GPT-6 baseline items: non-nested useful empty overview, explicit 24-hour window, no invented error-rate/latency zeroes, 14px operational rows, stronger control borders and compact mobile metrics.
 - Rechecked motion for transform/opacity-only transitions, fine-pointer press gating, symmetric drawer timing and reduced-motion behavior.
 - `git diff --check` is clean. Controller-owned specification, ADR, capability and earlier task-report changes were not staged or modified by this task.
+
+## Fix round 1
+
+Commit base: `93a7f5b`.
+
+The confirmed GPT-6 review findings were addressed as one focused correction pass. The public test seams were the project operations API, scoped API-key PATCH API, OIDC public projection, embedded bootstrap payload, React route/forms, and the real embedded browser render.
+
+| Finding | Correction | Focused evidence |
+| --- | --- | --- |
+| 1. Blank secrets replaced envelopes | Optional secret fields are omitted by form serialization; storage and webhook handlers also treat explicit JSON null as omission. | `task6_patch_preserves_omitted_secrets_and_channel_settings` compares encrypted envelopes before/after null edits without printing secrets; React resource test asserts blank secret is absent from request JSON. |
+| 2. Channel edit erased settings | Channel upsert reads and preserves existing `settings_json` when settings are omitted. The channel form exposes tags/limits/circuit JSON, and a named Channel policies tab manages endpoint maps, model rules, overrides, retries, proxy and auto-disable documents. | Focused Rust test seeds non-default tags/limits/catalog metadata, performs routine edit, and asserts the full document is unchanged. |
+| 3. OIDC field mismatch | Public OIDC projection now serializes `scopes` and `claim_mapping`, matching create/update input names; blank client secret is omitted. | Focused OIDC test asserts old `*_json` names are absent and custom JIT mapping/scopes round-trip under normalized names. |
+| 4. Invitation token lost | Invitation administration is a dedicated workflow that reveals one delivery URL once and offers copy. `/invite?token=…` is an unauthenticated inspect/accept route with password onboarding for a new user and session-aware acceptance for an existing user. | Vitest exercises direct unauthenticated inspection and verifies the acceptance password form. Existing Rust invitation one-time token contracts remain targeted by the access module. |
+| 5. Fixed limit/no pagination | Generic resources now send `offset`, `limit` and `q`, honor server totals, expose previous/next/page-size controls, and client-page legacy array endpoints. Scoped request browsing returns `{data,total,offset,limit}` and supports SQL offset. | React test advances to offset 25 and asserts the server query. Observability test and Task 6 operations tests cover the amended contract. |
+| 6. Restrictions could not clear | Added explicit Missing/Null/Value PATCH semantics for profile, budget and expiry. Blank console values intentionally serialize to null; omitted fields retain current values. | `scoped_api_key_patch_distinguishes_omitted_and_explicit_null` proves both retention and clearing through HTTP responses. |
+| 7. Hidden project orchestration settings | Added versioned, validated GET/PUT for `affinity_rules` and `session_compaction`, preserving unrelated project settings and resetting affinity cache after update. Console exposes both documents. | Focused Task 6 Rust test accepts a valid rule/compaction document, reads it back, and rejects TTL zero. |
+| 8. Placebo branding controls | Bootstrap loads persisted system branding with legacy instance-name fallback. Runtime applies document title/favicon and Shell brand; onboarding state controls a visible setup banner. Saving invalidates bootstrap data and synchronizes the legacy instance-name key. | Vitest asserts Shell label, title and favicon from bootstrap. Task 6 Rust test confirms persisted branding/onboarding appears in `/api/v1/bootstrap`. |
+| 9. 375px document overflow | Content descendants are min-width constrained; tables own their horizontal overflow; mobile generic resources switch to compact cards; identifiers/headings wrap; hidden labels cannot affect layout width. | Embedded 375px checks: channels `documentWidth=375`, routing `documentWidth=375`, trace detail `documentWidth=375`; all report `overflow=false`. |
+| 10. UUID-first rows/forms | Human names, credential suffixes and states lead desktop/mobile rows. IDs move to copy actions and raw-detail disclosure. Channel/model/profile/role relationships use named Radix selectors; generic mobile cards retain edit/delete actions. | 375px populated channel/model/routing inspection plus 1440px model action visibility. |
+| 11. 12px operational code | Table/detail monospace descendants, JSON blocks, URLs, IDs and preset URLs are at least 14px. | Computed browser values: channels monospace `14px`; routing code `14px`; trace IDs `14px`; desktop table body/monospace `14px`. |
+| 12. Raw routing/trace UX | Routing stages/reasons are localized and humanized. Trace detail prioritizes outcome, measured duration and start time; links related requests and lists executions; raw IDs are secondary disclosure; navigation state returns to the originating trace tab. | Populated routing explanation and trace-detail browser workflows at 375px and 1440px. |
+| 13. Dialog focus restoration | Resource launch buttons are recorded and focus is restored after save, Escape or close after the dialog unmounts. | React test covers save and Escape restoration to the actual Edit trigger. |
+
+### Fix-round verification
+
+- `cargo test --locked task6_ --no-fail-fast`
+  - passed: 2 Task 6 control-plane tests.
+- `cargo test --locked scoped_api_key_patch_distinguishes_omitted_and_explicit_null --no-fail-fast`
+  - passed: 1 tri-state PATCH test.
+- `cargo test --locked oidc::tests::pkce_state_is_encrypted_expiring_one_time_and_jit_maps_roles --no-fail-fast`
+  - passed: normalized projection plus existing OIDC/PKCE/JIT contract.
+- `cargo test --locked observability::tests::records_and_queries_events --no-fail-fast`
+  - passed: amended request filter/count projection contract.
+- `pnpm --dir web lint && pnpm --dir web test && pnpm --dir web build`
+  - passed: TypeScript clean, 9 Vitest tests passed, production assets built.
+- Representative embedded browser checks:
+  - 375px populated channels: `documentWidth=375`, no document overflow, mobile cards `grid`, desktop table `none`, monospace `14px`.
+  - 375px populated routing: `documentWidth=375`, no document overflow, mobile cards `grid`, code `14px`.
+  - 375px trace detail: `documentWidth=375`, no document overflow, all inspected IDs `14px`.
+  - 1440px populated models: `documentWidth=1440`, no document overflow, table client/scroll width both `1075`, status/actions visible, body and monospace `14px`.
+
+No full Tasks 1–5 suite, full 12-case browser matrix, release build or actionlint run was repeated in this fix round.

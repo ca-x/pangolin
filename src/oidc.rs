@@ -22,7 +22,9 @@ pub struct OidcProviderView {
     pub name: String,
     pub issuer_url: String,
     pub client_id: String,
+    #[serde(rename = "scopes")]
     pub scopes_json: String,
+    #[serde(rename = "claim_mapping")]
     pub claim_mapping_json: String,
     pub enabled: bool,
     pub created_at: i64,
@@ -636,6 +638,16 @@ mod tests {
             name: "SSO".into(), issuer_url: "https://id.example.test".into(), client_id: "client".into(), client_secret, scopes: default_scopes(), enabled: true,
             claim_mapping: json!({"version":1,"jit":true,"project_id":db::DEFAULT_PROJECT_ID,"default_role_id":SYSTEM_MEMBER_ROLE_ID,"role_mappings":{"admins":crate::db::SYSTEM_OWNER_ROLE_ID}}),
         }).await.unwrap();
+        let public = serde_json::to_value(&provider).unwrap();
+        assert!(public.get("scopes_json").is_none());
+        assert!(public.get("claim_mapping_json").is_none());
+        assert_eq!(
+            public["scopes"],
+            serde_json::to_string(&default_scopes()).unwrap()
+        );
+        let public_mapping: Value =
+            serde_json::from_str(public["claim_mapping"].as_str().unwrap()).unwrap();
+        assert_eq!(public_mapping["jit"], true);
         assert!(matches!(
             link_or_create_identity(
                 &database,

@@ -1,4 +1,5 @@
-export type Bootstrap = { initialized: boolean; authenticated: boolean; user: User | null; capture_payloads: boolean }
+export type Branding = { instance_name: string; branding_name: string; favicon_url: string; onboarding_complete: boolean }
+export type Bootstrap = { initialized: boolean; authenticated: boolean; user: User | null; capture_payloads: boolean; branding: Branding }
 export type User = { id: string; email: string; role: string; language: string; theme: string; created_at: number }
 export type Provider = { id: string; name: string; kind: string; base_url: string; enabled: boolean; created_at: number; updated_at: number }
 export type Model = { id: string; provider_id: string; provider_name: string; public_name: string; upstream_name: string; capabilities: string; input_price_micros: number; output_price_micros: number; priority: number; enabled: boolean; created_at: number }

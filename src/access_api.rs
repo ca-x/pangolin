@@ -887,7 +887,8 @@ mod tests {
         http::Request,
         response::Redirect,
     };
-    use sea_orm::{DbBackend, FromQueryResult, Statement};
+    use sea_orm::{ConnectionTrait, DbBackend, FromQueryResult, Statement};
+    use serde_json::Value;
     use tower::ServiceExt as _;
 
     use crate::{
@@ -991,6 +992,76 @@ mod tests {
             app.oneshot(request()).await.unwrap().status(),
             StatusCode::CONFLICT
         );
+    }
+
+    #[tokio::test]
+    async fn scoped_api_key_patch_distinguishes_omitted_and_explicit_null() {
+        let (app, database, _directory, owner) = test_app().await;
+        database.execute(Statement::from_string(DbBackend::Sqlite,format!("INSERT INTO api_key_profiles(id,project_id,name,created_at,updated_at) VALUES('clear-profile','{}','clearable',1,1)",db::DEFAULT_PROJECT_ID))).await.unwrap();
+        let (key, _) = access::create_scoped_api_key(
+            &database,
+            &owner,
+            &ScopedApiKeyInput {
+                name: "clearable".into(),
+                project_id: db::DEFAULT_PROJECT_ID.into(),
+                profile_id: Some("clear-profile".into()),
+                key_type: "service".into(),
+                scopes: vec!["gateway:use".into()],
+                budget_micros: Some(9000),
+                expires_at: Some(db::now() + 3600),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let session = db::create_session(&database, &owner.subject_id)
+            .await
+            .unwrap();
+        let path = format!(
+            "/api/admin/v1/projects/{}/api-keys/{}",
+            db::DEFAULT_PROJECT_ID,
+            key.id
+        );
+        let omitted = app
+            .clone()
+            .oneshot(
+                Request::patch(&path)
+                    .header(header::COOKIE, format!("pangolin_session={session}"))
+                    .header("x-pangolin-csrf", "1")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({"name":"still constrained"}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(omitted.status(), StatusCode::OK);
+        let omitted: Value =
+            serde_json::from_slice(&to_bytes(omitted.into_body(), 1024 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(omitted["profile_id"], "clear-profile");
+        assert_eq!(omitted["budget_micros"], 9000);
+        assert!(omitted["expires_at"].as_i64().is_some());
+        let cleared = app
+            .oneshot(
+                Request::patch(&path)
+                    .header(header::COOKIE, format!("pangolin_session={session}"))
+                    .header("x-pangolin-csrf", "1")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({"profile_id":null,"budget_micros":null,"expires_at":null})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cleared.status(), StatusCode::OK);
+        let cleared: Value =
+            serde_json::from_slice(&to_bytes(cleared.into_body(), 1024 * 1024).await.unwrap())
+                .unwrap();
+        assert!(cleared["profile_id"].is_null());
+        assert!(cleared["budget_micros"].is_null());
+        assert!(cleared["expires_at"].is_null());
     }
 
     #[tokio::test]
@@ -1617,7 +1688,7 @@ mod tests {
                     key_type: "user".into(),
                     scopes: vec!["gateway:use".into()],
                     budget_micros: None,
-                    expires_at: None,
+                    expires_at: Default::default(),
                     allowed_ips: vec![],
                     denied_ips: vec![],
                     ..Default::default()
@@ -1740,7 +1811,7 @@ mod tests {
                 &access::ScopedApiKeyUpdate {
                     name: None,
                     enabled: Some(true),
-                    expires_at: None,
+                    expires_at: Default::default(),
                     scopes: None,
                     ..Default::default()
                 }

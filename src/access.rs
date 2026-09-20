@@ -397,12 +397,31 @@ pub enum ApiKeyTokenMode {
 pub struct ScopedApiKeyUpdate {
     pub name: Option<String>,
     pub enabled: Option<bool>,
-    pub expires_at: Option<i64>,
+    #[serde(default)]
+    pub expires_at: Patch<i64>,
     pub scopes: Option<Vec<String>>,
-    pub profile_id: Option<String>,
-    pub budget_micros: Option<i64>,
+    #[serde(default)]
+    pub profile_id: Patch<String>,
+    #[serde(default)]
+    pub budget_micros: Patch<i64>,
     pub allowed_ips: Option<Vec<String>>,
     pub denied_ips: Option<Vec<String>>,
+}
+
+#[derive(Debug, Default)]
+pub enum Patch<T> {
+    #[default]
+    Missing,
+    Null,
+    Value(T),
+}
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for Patch<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(match Option::<T>::deserialize(deserializer)? {
+            Some(value) => Self::Value(value),
+            None => Self::Null,
+        })
+    }
 }
 
 fn service_key_type() -> String {
@@ -1376,7 +1395,7 @@ pub async fn update_scoped_api_key(
     input: &ScopedApiKeyUpdate,
 ) -> Result<ScopedApiKeyView, AccessError> {
     authorize(db, actor, Some(project_id), "api_key:manage").await?;
-    if input.expires_at.is_some_and(|expires| expires <= db::now()) {
+    if matches!(input.expires_at,Patch::Value(expires) if expires <= db::now()) {
         return Err(AccessError::Invalid(
             "expiration must be in the future".into(),
         ));
@@ -1434,13 +1453,11 @@ pub async fn update_scoped_api_key(
         .map(|name| validate_nonempty(name, "name"))
         .transpose()?
         .unwrap_or(current.name);
-    if input.budget_micros.is_some_and(|value| value < 0) {
+    if matches!(input.budget_micros,Patch::Value(value) if value < 0) {
         return Err(AccessError::Invalid("budget must be non-negative".into()));
     }
-    if let Some(profile) = input
-        .profile_id
-        .as_deref()
-        .filter(|value| !value.is_empty())
+    if let Patch::Value(profile) = &input.profile_id
+        && !profile.is_empty()
         && PermissionRow::find_by_statement(statement(
             "SELECT 'profile' AS slug FROM api_key_profiles WHERE id=? AND project_id=?",
             vec![profile.into(), project_id.into()],
@@ -1472,14 +1489,29 @@ pub async fn update_scoped_api_key(
     let denied = serde_json::to_string(input.denied_ips.as_ref().unwrap_or(&current_denied))
         .map_err(|error| AccessError::Internal(error.into()))?;
     let transaction = db.begin().await?;
-    transaction.execute(statement("UPDATE api_keys SET name=?,enabled=?,expires_at=?,scopes=?,profile_id=COALESCE(?,profile_id),budget_micros=COALESCE(?,budget_micros),allowed_ips_json=?,denied_ips_json=? WHERE id=? AND project_id=?", vec![name.clone().into(), input.enabled.unwrap_or(current.enabled).into(), input.expires_at.or(current.expires_at).into(), scopes.into(), input.profile_id.clone().filter(|value|!value.is_empty()).into(), input.budget_micros.into(), allowed.into(), denied.into(), key_id.into(), project_id.into()])).await?;
+    let (expires_set, expires_at) = match &input.expires_at {
+        Patch::Missing => (false, current.expires_at),
+        Patch::Null => (true, None),
+        Patch::Value(value) => (true, Some(*value)),
+    };
+    let (profile_set, profile_id) = match &input.profile_id {
+        Patch::Missing => (false, current.profile_id.clone()),
+        Patch::Null => (true, None),
+        Patch::Value(value) => (true, Some(value.clone())),
+    };
+    let (budget_set, budget) = match &input.budget_micros {
+        Patch::Missing => (false, current.budget_micros),
+        Patch::Null => (true, None),
+        Patch::Value(value) => (true, Some(*value)),
+    };
+    transaction.execute(statement("UPDATE api_keys SET name=?,enabled=?,expires_at=CASE WHEN ? THEN ? ELSE expires_at END,scopes=?,profile_id=CASE WHEN ? THEN ? ELSE profile_id END,budget_micros=CASE WHEN ? THEN ? ELSE budget_micros END,allowed_ips_json=?,denied_ips_json=? WHERE id=? AND project_id=?", vec![name.clone().into(), input.enabled.unwrap_or(current.enabled).into(), expires_set.into(),expires_at.into(), scopes.into(),profile_set.into(),profile_id.into(),budget_set.into(),budget.into(), allowed.into(), denied.into(), key_id.into(), project_id.into()])).await?;
     audit(
         &transaction,
         actor,
         "update",
         "api_key",
         key_id,
-        json!({"project_id":project_id,"name":name,"enabled":input.enabled,"profile_id":input.profile_id,"budget_micros":input.budget_micros,"ip_policy_changed":input.allowed_ips.is_some()||input.denied_ips.is_some()}),
+        json!({"project_id":project_id,"name":name,"enabled":input.enabled,"profile_changed":profile_set,"budget_changed":budget_set,"expiration_changed":expires_set,"ip_policy_changed":input.allowed_ips.is_some()||input.denied_ips.is_some()}),
     )
     .await?;
     transaction.commit().await?;

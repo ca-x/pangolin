@@ -3,14 +3,14 @@ import { useEffect, useRef, useState, type KeyboardEvent } from 'react'
 import { useTranslation } from 'react-i18next'
 import { NavLink, Outlet, useNavigate } from 'react-router'
 import { api } from './api'
-import type { User } from './api'
+import type { Branding, User } from './api'
 import { ProjectProvider, useProject } from './project'
 
-export default function Shell({ user }: { user: User }) {
-  return <ProjectProvider><ShellContent user={user}/></ProjectProvider>
+export default function Shell({ user,branding }: { user: User; branding: Branding }) {
+  return <ProjectProvider><ShellContent user={user} branding={branding}/></ProjectProvider>
 }
 
-function ShellContent({ user }: { user: User }) {
+function ShellContent({ user,branding }: { user: User; branding: Branding }) {
   const { t } = useTranslation()
   const { project, projects, permissions, setProjectId } = useProject()
   const navigate = useNavigate()
@@ -45,19 +45,19 @@ function ShellContent({ user }: { user: User }) {
   const signOut = async () => { await api('/api/v1/auth/logout', { method: 'POST' }); navigate('/login'); location.reload() }
   return <div className="app-shell">
     <a className="skip-link" href="#main-content">{t('skipToContent')}</a>
-    <header className="mobile-header"><Brand compact /><button ref={menuButton} className="icon-button" onClick={() => setMobileOpen(true)} aria-label={t('menu')}><Menu size={20} /></button></header>
+    <header className="mobile-header"><Brand compact name={branding.branding_name}/><button ref={menuButton} className="icon-button" onClick={() => setMobileOpen(true)} aria-label={t('menu')}><Menu size={20} /></button></header>
     {mobileOpen && <button className="nav-scrim" onClick={() => setMobileOpen(false)} aria-label={t('close')} />}
     <aside className={`sidebar ${mobileOpen ? 'sidebar-open' : ''}`} role={mobileOpen ? 'dialog' : undefined} aria-modal={mobileOpen || undefined} aria-label={mobileOpen ? t('menu') : undefined} onKeyDown={trapNavigationFocus}>
-      <div className="sidebar-top"><Brand /><button ref={closeButton} className="icon-button sidebar-close" onClick={() => setMobileOpen(false)} aria-label={t('close')}><X size={18} /></button></div>
+      <div className="sidebar-top"><Brand name={branding.branding_name}/><button ref={closeButton} className="icon-button sidebar-close" onClick={() => setMobileOpen(false)} aria-label={t('close')}><X size={18} /></button></div>
       {projects.length > 1 && <label className="project-switcher"><span>{t('project')}</span><select value={project.id} onChange={(event) => setProjectId(event.target.value)}>{projects.filter((item)=>item.enabled).map((item)=><option key={item.id} value={item.id}>{item.name}</option>)}</select></label>}
       <nav aria-label={t('primaryNavigation')}>{groups.map((group)=><section className="nav-group" key={group.label}><h2>{group.label}</h2>{group.links.map(({ to, label, icon: Icon, end }) => <NavLink onClick={() => setMobileOpen(false)} className={({ isActive }) => isActive ? 'nav-link nav-link-active' : 'nav-link'} key={to} to={to} end={end}><Icon size={18} strokeWidth={1.8} /><span>{label}</span></NavLink>)}</section>)}</nav>
       <div className="account-block"><span>{user.email}</span><button className="signout" onClick={signOut}>{t('signOut')}</button></div>
     </aside>
-    <main id="main-content" className="content" tabIndex={-1} inert={mobileOpen || undefined} aria-hidden={mobileOpen || undefined}><Outlet /></main>
+    <main id="main-content" className="content" tabIndex={-1} inert={mobileOpen || undefined} aria-hidden={mobileOpen || undefined}>{!branding.onboarding_complete&&<aside className="onboarding-banner"><div><strong>{t('onboardingTitle')}</strong><span>{t('onboardingHint')}</span></div><NavLink className="button" to="/channels">{t('configureChannel')}</NavLink></aside>}<Outlet /></main>
   </div>
 }
 
-function Brand({ compact = false }: { compact?: boolean }) {
+function Brand({ compact = false,name }: { compact?: boolean;name:string }) {
   const { t } = useTranslation()
-  return <div className={`brand ${compact ? 'brand-compact' : ''}`}><img src="/logo.webp" alt="" /><div><strong>{t('product')}</strong><span>{t('productSubtitle')}</span></div></div>
+  return <div className={`brand ${compact ? 'brand-compact' : ''}`}><img src="/logo.webp" alt="" /><div><strong>{name||t('product')}</strong><span>{t('productSubtitle')}</span></div></div>
 }
