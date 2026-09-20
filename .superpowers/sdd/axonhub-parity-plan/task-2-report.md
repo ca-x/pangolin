@@ -151,3 +151,15 @@ Commit scope: follow-up hardening after `ba317fa`, with composed Axum HTTP tests
 - `cargo clippy --locked --all-targets -- -D warnings` — clean.
 - `cargo test --locked --no-fail-fast` — 29 passed, 0 failed.
 - `cargo build --release --locked` — succeeded.
+
+## Defensive review fix round 2/5
+
+- Root cause: the repeat-OIDC-login membership upsert unconditionally wrote `status='active'` on conflict. An explicit administrator suspension was therefore silently undone as part of successful SSO authentication.
+- Fix: repeat login still updates the mapped role and timestamp, but preserves an existing non-owner membership status. The conflict clause keeps the official project owner active, retaining the owner-role invariant even if a legacy/corrupt row is encountered. New JIT memberships remain active.
+- Regression: the composed mock-IdP test now creates an active linked identity, suspends it through the administrator membership operation, then completes a repeat OIDC login with changed claims. It proves the mapped role updates, membership remains `suspended`, `project:read` remains denied, and exactly two OIDC login audits exist.
+- Red evidence: before the SQL change, `cargo test --locked access_api::tests::repeat_oidc_login_preserves_admin_suspension_while_reapplying_role_mapping -- --nocapture` failed with `left: "active"`, `right: "suspended"`.
+- Green evidence: the same focused test passed after the fix.
+- `cargo fmt --all -- --check` — clean.
+- `cargo clippy --locked --all-targets -- -D warnings` — clean.
+- `cargo test --locked --no-fail-fast` — 29 passed, 0 failed.
+- `cargo build --release --locked` — succeeded.

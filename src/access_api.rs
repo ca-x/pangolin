@@ -1727,7 +1727,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repeat_oidc_login_reapplies_role_mapping_and_audits_atomically() {
+    async fn repeat_oidc_login_preserves_admin_suspension_while_reapplying_role_mapping() {
         let (idp, server) = mock_idp().await;
         *idp.claims.write().await = json!({
             "sub":"repeat-user","email":"repeat@example.com","email_verified":true,
@@ -1742,6 +1742,22 @@ mod tests {
                 .status(),
             StatusCode::OK
         );
+        let repeat_user = db::find_user_by_email(&database, "repeat@example.com")
+            .await
+            .unwrap()
+            .unwrap();
+        access::upsert_membership(
+            &database,
+            &owner,
+            db::DEFAULT_PROJECT_ID,
+            &MembershipInput {
+                user_id: repeat_user.id.clone(),
+                role_id: db::SYSTEM_OWNER_ROLE_ID.into(),
+                status: "suspended".into(),
+            },
+        )
+        .await
+        .unwrap();
         *idp.claims.write().await = json!({
             "sub":"repeat-user","email":"repeat@example.com","groups":[]
         });
@@ -1755,12 +1771,13 @@ mod tests {
         #[derive(FromQueryResult)]
         struct MappingResult {
             role_id: String,
+            status: String,
             audits: i64,
         }
         let result = MappingResult::find_by_statement(Statement::from_string(
             DbBackend::Sqlite,
             format!(
-                "SELECT membership.role_id,(SELECT COUNT(*) FROM audit_events audit WHERE audit.action='login' AND audit.resource_type='oidc_identity' AND audit.actor_user_id=user.id) AS audits FROM users user JOIN project_memberships membership ON membership.user_id=user.id AND membership.project_id='{}' WHERE user.email='repeat@example.com'",
+                "SELECT membership.role_id,membership.status,(SELECT COUNT(*) FROM audit_events audit WHERE audit.action='login' AND audit.resource_type='oidc_identity' AND audit.actor_user_id=user.id) AS audits FROM users user JOIN project_memberships membership ON membership.user_id=user.id AND membership.project_id='{}' WHERE user.email='repeat@example.com'",
                 db::DEFAULT_PROJECT_ID
             ),
         ))
@@ -1769,7 +1786,18 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(result.role_id, access::SYSTEM_MEMBER_ROLE_ID);
+        assert_eq!(result.status, "suspended");
         assert_eq!(result.audits, 2);
+        assert!(matches!(
+            access::authorize(
+                &database,
+                &Principal::session(repeat_user.id),
+                Some(db::DEFAULT_PROJECT_ID),
+                "project:read",
+            )
+            .await,
+            Err(AccessError::Forbidden)
+        ));
         server.abort();
     }
 }

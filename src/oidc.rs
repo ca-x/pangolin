@@ -593,7 +593,7 @@ pub async fn link_or_create_identity(
         role_id = crate::db::SYSTEM_OWNER_ROLE_ID.into();
     }
     transaction.execute(statement(
-        "INSERT INTO project_memberships(id,project_id,user_id,role_id,status,created_at,updated_at) VALUES(?,?,?,?,\'active\',?,?) ON CONFLICT(project_id,user_id) DO UPDATE SET role_id=excluded.role_id,status='active',updated_at=excluded.updated_at",
+        "INSERT INTO project_memberships(id,project_id,user_id,role_id,status,created_at,updated_at) VALUES(?,?,?,?,\'active\',?,?) ON CONFLICT(project_id,user_id) DO UPDATE SET role_id=excluded.role_id,status=CASE WHEN EXISTS (SELECT 1 FROM projects project WHERE project.id=project_memberships.project_id AND project.owner_user_id=project_memberships.user_id) THEN 'active' ELSE project_memberships.status END,updated_at=excluded.updated_at",
         vec![Uuid::new_v4().to_string().into(), project_id.into(), user_id.clone().into(), role_id.clone().into(), timestamp.into(), timestamp.into()],
     )).await.map_err(|error| AccessError::Invalid(format!("OIDC role mapping is invalid: {error}")))?;
     write_audit(
