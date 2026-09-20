@@ -695,10 +695,7 @@ async fn call_anthropic_chat(
     request.insert("messages".into(), Value::Array(messages));
     request.insert(
         "max_tokens".into(),
-        object
-            .get("max_tokens")
-            .cloned()
-            .unwrap_or(Value::from(4096)),
+        Value::from(crate::orchestration::output_limit(payload)?),
     );
     if !system.is_empty() {
         request.insert("system".into(), Value::String(system.join("\n\n")));

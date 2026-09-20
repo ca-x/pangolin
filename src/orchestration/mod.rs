@@ -84,6 +84,8 @@ pub struct Profile {
 pub struct Plan {
     pub candidates: Vec<Candidate>,
     pub payload: Value,
+    /// Protected client history before current prompts or channel transformations.
+    pub session_request: Value,
     pub routing: Routing,
     pub sticky: Option<String>,
     pub decisions: Vec<Decision>,
@@ -250,8 +252,14 @@ pub async fn prepare(
             reason: "ordered_candidate",
         });
     }
-    protection::inject(db, &key.project_id, &mut payload, &context, endpoint).await?;
     let protection = protection::load(db, &key.project_id).await?;
+    let mut session_request = payload.clone();
+    protection::apply(&protection, &mut session_request, &context, &mut vec![])?;
+    protection::tools(
+        &mut session_request,
+        profile.routing.allowed_tools.as_deref(),
+    )?;
+    protection::inject(db, &key.project_id, &mut payload, &context, endpoint).await?;
     protection::apply(&protection, &mut payload, &context, &mut decisions)?;
     protection::tools(&mut payload, profile.routing.allowed_tools.as_deref())?;
     // Until a provider tokenizer is available, UTF-8 bytes plus the requested output
@@ -261,6 +269,7 @@ pub async fn prepare(
     Ok(Plan {
         candidates,
         payload,
+        session_request,
         routing: profile.routing,
         sticky,
         decisions,
@@ -270,25 +279,47 @@ pub async fn prepare(
     })
 }
 
-fn estimate_tokens(payload: &Value) -> Result<u32> {
-    let output = payload
-        .get("max_completion_tokens")
-        .or_else(|| payload.get("max_tokens"))
-        .or_else(|| payload.get("max_output_tokens"))
-        .map(|v| {
-            v.as_u64().ok_or(Error::Invalid(
-                "output token limit must be a positive integer",
-            ))
-        })
-        .transpose()?
-        .unwrap_or(4096);
-    if output == 0 {
-        return Err(Error::Invalid("output token limit must be positive"));
+/// Shared by admission and protocol adapters; never infer a different output
+/// ceiling after admission. Validate all supplied aliases, including shadowed ones.
+pub fn output_limit(payload: &Value) -> Result<u32> {
+    let mut selected = None;
+    for field in ["max_completion_tokens", "max_tokens", "max_output_tokens"] {
+        if let Some(value) = payload.get(field) {
+            let limit = value
+                .as_u64()
+                .and_then(|n| u32::try_from(n).ok())
+                .filter(|n| *n > 0)
+                .ok_or(Error::Invalid(
+                    "output token limit must be a positive 32-bit integer",
+                ))?;
+            selected.get_or_insert(limit);
+        }
     }
+    Ok(selected.unwrap_or(4096))
+}
+
+fn completion_count(payload: &Value) -> Result<u32> {
+    payload
+        .get("n")
+        .map(|value| {
+            value
+                .as_u64()
+                .and_then(|n| u32::try_from(n).ok())
+                .filter(|n| *n > 0)
+                .ok_or(Error::Invalid("n must be a positive 32-bit integer"))
+        })
+        .transpose()
+        .map(|n| n.unwrap_or(1))
+}
+
+fn estimate_tokens(payload: &Value) -> Result<u32> {
+    let output = output_limit(payload)?
+        .checked_mul(completion_count(payload)?)
+        .ok_or(Error::Invalid("request token reservation is too large"))?;
     let input = serde_json::to_vec(payload)
         .map_err(|_| Error::Configuration)?
         .len() as u64;
-    u32::try_from(input.saturating_add(output))
+    u32::try_from(input.saturating_add(u64::from(output)))
         .map_err(|_| Error::Invalid("request token reservation is too large"))
 }
 
@@ -302,6 +333,11 @@ impl Plan {
         // Overrides and injected prompts cannot bypass protection/tool restrictions.
         protection::apply(&self.protection, &mut payload, &self.context, &mut vec![])?;
         protection::tools(&mut payload, self.routing.allowed_tools.as_deref())?;
+        if candidate.target.provider_kind == "anthropic" && completion_count(&payload)? != 1 {
+            return Err(Error::Invalid(
+                "Anthropic requests support exactly one completion",
+            ));
+        }
         if self.routing.limits.tpm.is_some() || candidate.limits.tpm.is_some() {
             validate_token_reservation(&mut payload)?;
         }
@@ -359,6 +395,14 @@ pub struct AttemptGuard {
     candidate: Candidate,
 }
 
+#[derive(Clone, Copy)]
+pub enum AttemptOutcome {
+    Success,
+    UpstreamFailure,
+    /// The request failed locally; do not treat it as provider health evidence.
+    LocalFailure,
+}
+
 impl AttemptGuard {
     pub async fn acquire(
         runtime: Arc<Runtime>,
@@ -378,11 +422,16 @@ impl AttemptGuard {
             candidate: candidate.clone(),
         })
     }
-    pub fn finish(&mut self, success: bool) {
-        self.channel.finish(success);
-        self.circuit.finish(success);
-        if success {
-            self.runtime.bind(self.sticky.as_deref(), &self.candidate);
+    pub fn finish(&mut self, outcome: AttemptOutcome) {
+        self.channel
+            .finish(matches!(outcome, AttemptOutcome::Success));
+        match outcome {
+            AttemptOutcome::Success => {
+                self.circuit.finish(true);
+                self.runtime.bind(self.sticky.as_deref(), &self.candidate);
+            }
+            AttemptOutcome::UpstreamFailure => self.circuit.finish(false),
+            AttemptOutcome::LocalFailure => (),
         }
     }
 }

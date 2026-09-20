@@ -1,4 +1,6 @@
 use super::*;
+
+mod review;
 use axum::{
     body::{Bytes, to_bytes},
     http::Request,
@@ -217,7 +219,7 @@ async fn empty_first_stream_retries_before_downstream_commit() {
 }
 
 #[tokio::test]
-async fn no_retry_after_first_event_and_eof_is_not_success() {
+async fn no_retry_after_first_event_and_eof_emits_a_terminal_error() {
     let calls = Arc::new(AtomicUsize::new(0));
     let count = calls.clone();
     let mock = Router::new().route(
@@ -237,7 +239,8 @@ async fn no_retry_after_first_event_and_eof_is_not_success() {
     let mut stream = response.into_body().into_data_stream();
     let first = stream.next().await.unwrap().unwrap();
     assert!(String::from_utf8_lossy(&first).contains("partial"));
-    assert!(stream.next().await.unwrap().is_err());
+    let terminal = stream.next().await.unwrap().unwrap();
+    assert!(String::from_utf8_lossy(&terminal).contains("upstream request failed"));
     assert_eq!(calls.load(Ordering::Relaxed), 1);
     f.state.observations.flush().await;
     assert_eq!(f.state.observations.summary().await.unwrap().errors, 1);

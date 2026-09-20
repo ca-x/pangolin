@@ -24,7 +24,7 @@ use super::{
 pub struct Runtime {
     resources: DashMap<String, Arc<Resource>>,
     circuits: DashMap<String, Arc<Mutex<Circuit>>>,
-    rotations: DashMap<String, Arc<AtomicU64>>,
+    rotations: Cache<String, Arc<AtomicU64>>,
     affinity: Cache<String, String>,
     pub sessions: super::session::Sessions,
 }
@@ -34,7 +34,10 @@ impl Default for Runtime {
         Self {
             resources: DashMap::new(),
             circuits: DashMap::new(),
-            rotations: DashMap::new(),
+            rotations: Cache::builder()
+                .max_capacity(10_000)
+                .time_to_idle(Duration::from_secs(1800))
+                .build(),
             affinity: Cache::builder()
                 .max_capacity(10_000)
                 .time_to_idle(Duration::from_secs(1800))
@@ -84,6 +87,13 @@ impl Resource {
 }
 
 impl Runtime {
+    #[cfg(test)]
+    pub fn measured_latency(&self, resource: &str) -> u64 {
+        self.resources
+            .get(resource)
+            .map_or(0, |resource| resource.latency_us.load(Ordering::Relaxed))
+    }
+
     pub fn metrics(&self) -> String {
         // The existing metrics endpoint is public. Aggregate by resource kind so
         // it never reveals project, channel or API-key identifiers.
@@ -183,14 +193,21 @@ impl Runtime {
         strategy: Strategy,
         sticky: Option<&str>,
     ) {
+        if candidates.is_empty() {
+            return;
+        }
         // Priority tiers remain strict for every strategy. IDs break every score tie.
         candidates.sort_by(|a, b| a.priority.cmp(&b.priority).then(a.id().cmp(&b.id())));
-        let rotation = self
-            .rotations
-            .entry(scope.to_owned())
-            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
-            .clone();
-        let tick = rotation.fetch_add(1, Ordering::Relaxed) as usize;
+        let tick = if strategy == Strategy::RoundRobin && candidates.len() > 1 {
+            // A fixed-size digest also bounds memory for unusually long model IDs.
+            self.rotations
+                .get_with(blake3::hash(scope.as_bytes()).to_hex().to_string(), || {
+                    Arc::new(AtomicU64::new(0))
+                })
+                .fetch_add(1, Ordering::Relaxed) as usize
+        } else {
+            0
+        };
         let mut offset = 0;
         while offset < candidates.len() {
             let len = candidates[offset..]
@@ -405,5 +422,60 @@ impl Drop for CircuitPermit {
         if self.probe && !self.settled {
             self.state.lock().unwrap_or_else(|e| e.into_inner()).probing = false;
         }
+    }
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::*;
+    #[test]
+    fn review_unknown_models_do_not_allocate_rotation_state() {
+        let runtime = Runtime::default();
+        for i in 0..20_000 {
+            runtime.order(&format!("unknown-{i}"), &mut [], Strategy::RoundRobin, None);
+        }
+        runtime.rotations.run_pending_tasks();
+        assert_eq!(runtime.rotations.entry_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn review_rotation_cache_is_bounded_expiring_and_only_used_for_round_robin() {
+        let runtime = Runtime {
+            rotations: Cache::builder()
+                .max_capacity(16)
+                .time_to_idle(Duration::from_millis(20))
+                .build(),
+            ..Runtime::default()
+        };
+        let mut candidates = vec![
+            super::super::tests::candidate("a", 1),
+            super::super::tests::candidate("b", 1),
+        ];
+        for strategy in [
+            Strategy::Failover,
+            Strategy::Weighted,
+            Strategy::Latency,
+            Strategy::LeastInflight,
+            Strategy::Adaptive,
+        ] {
+            for i in 0..100 {
+                runtime.order(&format!("unused-{i}"), &mut candidates, strategy, None);
+            }
+        }
+        runtime.rotations.run_pending_tasks();
+        assert_eq!(runtime.rotations.entry_count(), 0);
+        for i in 0..100 {
+            runtime.order(
+                &format!("used-{i}"),
+                &mut candidates,
+                Strategy::RoundRobin,
+                None,
+            );
+        }
+        runtime.rotations.run_pending_tasks();
+        assert!(runtime.rotations.entry_count() <= 16);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        runtime.rotations.run_pending_tasks();
+        assert_eq!(runtime.rotations.entry_count(), 0);
     }
 }

@@ -1,4 +1,80 @@
 use super::*;
+
+#[test]
+fn review_tpm_counts_choices_and_rejects_invalid_output_limits() {
+    let single = json!({"model":"public","messages":[],"max_completion_tokens":100,"n":1});
+    let mut multiple = single.clone();
+    multiple["n"] = json!(4);
+    assert_eq!(
+        estimate_tokens(&multiple).unwrap() - estimate_tokens(&single).unwrap(),
+        300
+    );
+    for n in [json!(0), json!(-1), json!(1.5), json!(u64::MAX)] {
+        let mut body = single.clone();
+        body["n"] = n;
+        assert!(estimate_tokens(&body).is_err());
+    }
+    assert!(estimate_tokens(&json!({"max_tokens":u32::MAX,"n":2})).is_err());
+    assert!(estimate_tokens(&json!({"max_completion_tokens":1,"max_tokens":-10})).is_err());
+}
+
+#[test]
+fn review_allowed_tools_cannot_be_bypassed_with_legacy_functions() {
+    for legacy in [
+        json!({"functions":[{"name":"forbidden"}]}),
+        json!({"function_call":{"name":"forbidden"}}),
+    ] {
+        assert!(protection::tools(&mut legacy.clone(), Some(&[])).is_err());
+        assert!(protection::tools(&mut legacy.clone(), None).is_ok());
+    }
+}
+
+#[tokio::test]
+async fn review_prompt_protection_covers_nested_and_response_tool_outputs() {
+    let f = database_fixture().await;
+    add_model(&f, "a", "public", "actual").await;
+    sql(&f,"INSERT INTO prompt_protection_rules(id,project_id,name,role_pattern,content_pattern,action,replacement,created_at,updated_at) VALUES('tool',?,'Tool','^tool$','secret-[0-9]+','redact','[MASKED]',0,0)",vec![f.key.project_id.clone().into()]).await;
+    for body in [
+        json!({"model":"public","messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":[{"type":"text","text":"secret-123"}]}]}]}),
+        json!({"model":"public","input":[{"type":"function_call_output","call_id":"t1","output":"secret-123"},{"type":"custom_tool_call_output","call_id":"t2","output":[{"type":"text","text":"secret-456"}]}]}),
+    ] {
+        let result = plan(&f, body.clone()).await.unwrap();
+        assert!(!result.payload.to_string().contains("secret-"));
+        assert!(result.payload.to_string().contains("[MASKED]"));
+        assert_eq!(
+            result.payload,
+            serde_json::from_str::<Value>(
+                &body
+                    .to_string()
+                    .replace("secret-123", "[MASKED]")
+                    .replace("secret-456", "[MASKED]")
+            )
+            .unwrap()
+        );
+        assert!(
+            result
+                .decisions
+                .iter()
+                .any(|decision| decision.reason == "redacted")
+        );
+        sql(
+            &f,
+            "UPDATE prompt_protection_rules SET action='deny'",
+            vec![],
+        )
+        .await;
+        assert!(matches!(
+            plan(&f, body.clone()).await,
+            Err(Error::Forbidden)
+        ));
+        sql(
+            &f,
+            "UPDATE prompt_protection_rules SET action='redact'",
+            vec![],
+        )
+        .await;
+    }
+}
 use crate::{
     crypto::SecretBox,
     db,
@@ -11,7 +87,7 @@ use std::{
     time::Duration,
 };
 
-fn candidate(id: &str, weight: u32) -> Candidate {
+pub(super) fn candidate(id: &str, weight: u32) -> Candidate {
     Candidate {
         target: RouteTarget {
             public_name: "public".into(),

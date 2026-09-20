@@ -1,5 +1,5 @@
 use super::*;
-use crate::orchestration::{self, AttemptGuard, policy::ErrorMode, stream as sse};
+use crate::orchestration::{self, AttemptGuard, AttemptOutcome, policy::ErrorMode, stream as sse};
 use futures_util::StreamExt;
 use std::time::Duration;
 
@@ -186,7 +186,7 @@ pub(super) async fn execute(
                             let retry = candidate
                                 .retry
                                 .retry_status(http.status.as_u16(), &http.body);
-                            attempt.finish(!retry);
+                            attempt.finish(AttemptOutcome::UpstreamFailure);
                             if retry {
                                 continue;
                             }
@@ -199,7 +199,7 @@ pub(super) async fn execute(
                         if error.downcast_ref::<reqwest::Error>().is_some()
                             && candidate.retry.transport
                         {
-                            attempt.finish(false);
+                            attempt.finish(AttemptOutcome::UpstreamFailure);
                             continue;
                         }
                         return Err(ApiError::BadRequest(
@@ -209,7 +209,7 @@ pub(super) async fn execute(
                 };
                 let bytes = serde_json::to_vec(&value).map_err(|e| ApiError::Internal(e.into()))?;
                 if candidate.retry.empty_success && empty_success(Some(&value), &bytes) {
-                    attempt.finish(false);
+                    attempt.finish(AttemptOutcome::UpstreamFailure);
                     continue;
                 }
                 let event = build_event(
@@ -233,7 +233,7 @@ pub(super) async fn execute(
                 );
                 db::add_api_key_spend(&state.db, &credential.id, event.cost_micros).await?;
                 state.observations.record(event);
-                attempt.finish(true);
+                attempt.finish(AttemptOutcome::Success);
                 if let Some(permit) = &mut key_permit {
                     permit.finish(true);
                 }
@@ -265,7 +265,7 @@ pub(super) async fn execute(
             let upstream = match request.body(body_from_json(&payload)?).send().await {
                 Ok(upstream) => upstream,
                 Err(_) => {
-                    attempt.finish(false);
+                    attempt.finish(AttemptOutcome::UpstreamFailure);
                     if candidate.retry.transport {
                         continue;
                     }
@@ -283,7 +283,7 @@ pub(super) async fn execute(
                 let retry = candidate
                     .retry
                     .retry_status(status.as_u16(), &String::from_utf8_lossy(&bytes));
-                attempt.finish(!retry);
+                attempt.finish(AttemptOutcome::UpstreamFailure);
                 if retry {
                     continue;
                 }
@@ -320,7 +320,7 @@ pub(super) async fn execute(
                     .to_str()
                     .is_ok_and(|v| v.starts_with("text/event-stream"))
                 {
-                    attempt.finish(false);
+                    attempt.finish(AttemptOutcome::UpstreamFailure);
                     if candidate.retry.transport {
                         continue;
                     }
@@ -331,7 +331,7 @@ pub(super) async fn execute(
                     match sse::next(&mut events, candidate.retry.first_event_timeout_ms).await {
                         Ok(Some(event)) if !sse::failed(&event) => event,
                         _ => {
-                            attempt.finish(false);
+                            attempt.finish(AttemptOutcome::UpstreamFailure);
                             if candidate.retry.transport {
                                 continue;
                             }
@@ -372,27 +372,45 @@ pub(super) async fn execute(
                 let database = state.db.clone();
                 let secrets = state.secrets.clone();
                 let session_credential = credential.clone();
+                let session_request = plan.session_request.clone();
                 let timeout = candidate.retry.event_timeout_ms;
+                let error_policy = candidate.retry.clone();
                 let output = async_stream::stream! {
                     let mut event=first;
                     loop {
                         let terminal=sse::terminal(&event,endpoint);
                         let failed=sse::failed(&event);
                         if let Some(response)=sse::completed_response(&event)
-                            && runtime.sessions.persist(&database,&secrets,&session_credential,&payload,&response).await.is_err() {
-                            attempt.finish(true);key.finish(false);guard.fail("session_storage_error");
+                            && runtime.sessions.persist(&database,&secrets,&session_credential,&session_request,&response).await.is_err() {
+                            attempt.finish(AttemptOutcome::LocalFailure);key.finish(false);guard.fail("session_storage_error");
                             yield Err(std::io::Error::other("could not persist response session"));return;
                         }
-                        if failed {attempt.finish(false);key.finish(false);guard.fail("upstream_stream_error");}
-                        if terminal&&!failed {attempt.finish(true);key.finish(true);guard.complete();}
+                        if failed {attempt.finish(AttemptOutcome::UpstreamFailure);key.finish(false);guard.fail("upstream_stream_error");}
+                        if terminal&&!failed {attempt.finish(AttemptOutcome::Success);key.finish(true);guard.complete();}
+                        if failed {event=sse::error_event(event,&error_policy,endpoint);}
+                        if terminal||failed {
+                            // Terminal delivery must not hold upstream permits or a
+                            // socket open while the client pauses after this event.
+                            drop(events);drop(attempt);drop(key);
+                            yield Ok::<_,std::io::Error>(sse::encode(&event));return;
+                        }
                         // Once this yield is reached this body owns the attempt permanently.
                         // There is deliberately no path back into the candidate/retry loop.
                         yield Ok::<_,std::io::Error>(sse::encode(&event));
-                        if terminal||failed {return;}
                         event=match sse::next(&mut events,timeout).await {
                             Ok(Some(event))=>event,
-                            Ok(None)=>{attempt.finish(false);key.finish(false);guard.fail("incomplete_stream");yield Err(std::io::Error::other("upstream stream ended before terminal event"));return;},
-                            Err(error)=>{attempt.finish(false);key.finish(false);guard.fail("stream_error");yield Err(error);return;}
+                            Ok(None)=>{
+                                attempt.finish(AttemptOutcome::UpstreamFailure);key.finish(false);guard.fail("incomplete_stream");
+                                let error=sse::interrupted_event(&error_policy,endpoint);
+                                drop(events);drop(attempt);drop(key);
+                                yield Ok::<_,std::io::Error>(sse::encode(&error));return;
+                            },
+                            Err(_)=>{
+                                attempt.finish(AttemptOutcome::UpstreamFailure);key.finish(false);guard.fail("stream_error");
+                                let error=sse::interrupted_event(&error_policy,endpoint);
+                                drop(events);drop(attempt);drop(key);
+                                yield Ok::<_,std::io::Error>(sse::encode(&error));return;
+                            }
                         };
                     }
                 };
@@ -412,7 +430,7 @@ pub(super) async fn execute(
             let bytes = match read_body(upstream).await {
                 Ok(bytes) => bytes,
                 Err(_) => {
-                    attempt.finish(false);
+                    attempt.finish(AttemptOutcome::UpstreamFailure);
                     if candidate.retry.transport {
                         continue;
                     }
@@ -421,7 +439,7 @@ pub(super) async fn execute(
             };
             let response_json = serde_json::from_slice::<Value>(&bytes).ok();
             if candidate.retry.empty_success && empty_success(response_json.as_ref(), &bytes) {
-                attempt.finish(false);
+                attempt.finish(AttemptOutcome::UpstreamFailure);
                 continue;
             }
             let event = build_event(
@@ -451,10 +469,16 @@ pub(super) async fn execute(
                 state
                     .orchestrator
                     .sessions
-                    .persist(&state.db, &state.secrets, &credential, &payload, value)
+                    .persist(
+                        &state.db,
+                        &state.secrets,
+                        &credential,
+                        &plan.session_request,
+                        value,
+                    )
                     .await?;
             }
-            attempt.finish(true);
+            attempt.finish(AttemptOutcome::Success);
             if let Some(permit) = &mut key_permit {
                 permit.finish(true);
             }

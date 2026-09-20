@@ -116,13 +116,24 @@ pub fn apply(
             if let Some(value) = body.get_mut(field) {
                 if let Value::Array(messages) = value {
                     for message in messages {
-                        let role = message
-                            .get("role")
-                            .and_then(Value::as_str)
-                            .unwrap_or("user")
-                            .to_owned();
+                        let is_tool_output = matches!(
+                            message.get("type").and_then(Value::as_str),
+                            Some("function_call_output" | "custom_tool_call_output")
+                        );
+                        let role = if is_tool_output {
+                            "tool"
+                        } else {
+                            message
+                                .get("role")
+                                .and_then(Value::as_str)
+                                .unwrap_or("user")
+                        }
+                        .to_owned();
                         if let Some(content) = message.get_mut("content") {
                             protect_content(rule, &role, content, &mut hit)?;
+                        }
+                        if is_tool_output && let Some(output) = message.get_mut("output") {
+                            protect_content(rule, "tool", output, &mut hit)?;
                         }
                     }
                 } else {
@@ -147,11 +158,11 @@ pub fn apply(
 }
 
 fn protect_content(rule: &Rule, role: &str, content: &mut Value, hit: &mut bool) -> Result<()> {
-    if rule.roles.as_ref().is_some_and(|r| !r.is_match(role)) {
-        return Ok(());
-    }
     match content {
         Value::String(text) => {
+            if rule.roles.as_ref().is_some_and(|r| !r.is_match(role)) {
+                return Ok(());
+            }
             if rule.content.is_match(text) {
                 *hit = true;
                 if !rule.test {
@@ -167,9 +178,22 @@ fn protect_content(rule: &Rule, role: &str, content: &mut Value, hit: &mut bool)
         }
         Value::Array(parts) => {
             for part in parts {
-                if let Some(text) = part.get_mut("text") {
-                    protect_content(rule, role, text, hit)?;
-                }
+                protect_content(rule, role, part, hit)?;
+            }
+        }
+        Value::Object(part) => {
+            // Anthropic represents tool output inside a user message. Role
+            // filtering applies to the semantic tool output, not its wrapper.
+            let role = if part.get("type").and_then(Value::as_str) == Some("tool_result") {
+                "tool"
+            } else {
+                role
+            };
+            if let Some(text) = part.get_mut("text") {
+                protect_content(rule, role, text, hit)?;
+            }
+            if let Some(nested) = part.get_mut("content") {
+                protect_content(rule, role, nested, hit)?;
             }
         }
         _ => (),
@@ -187,6 +211,13 @@ pub fn tools(body: &mut Value, allowed: Option<&[String]>) -> Result<()> {
     let Some(allowed) = allowed else {
         return Ok(());
     };
+    // Legacy fields are a separate upstream execution surface. Reject them when
+    // a tool policy is active, including fields added by channel overrides.
+    if body.get("functions").is_some() || body.get("function_call").is_some() {
+        return Err(Error::Invalid(
+            "use tools and tool_choice when an allowed-tools policy is active",
+        ));
+    }
     let permitted =
         |tool: &Value| tool_name(tool).is_some_and(|name| allowed.iter().any(|a| a == name));
     if let Some(choice) = body.get("tool_choice") {

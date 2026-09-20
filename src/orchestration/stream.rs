@@ -1,9 +1,10 @@
 //! SSE framing uses a maintained parser. A complete first event is read before
 //! downstream commitment; terminal detection is protocol-aware.
+use super::policy::{ErrorMode, Retry};
 use axum::body::Bytes;
 use eventsource_stream::{Event, Eventsource};
 use futures_util::{Stream, StreamExt};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::{
     pin::Pin,
     sync::{
@@ -69,23 +70,110 @@ pub fn encode(event: &Event) -> Bytes {
     Bytes::from(frame)
 }
 
+pub fn error_event(mut event: Event, policy: &Retry, endpoint: &str) -> Event {
+    if matches!(policy.error_mode, ErrorMode::PassThrough) {
+        return event;
+    }
+    let message = if matches!(policy.error_mode, ErrorMode::Custom) {
+        policy
+            .error_message
+            .as_deref()
+            .unwrap_or("upstream request failed")
+    } else {
+        "upstream request failed"
+    };
+    let error = json!({"type":"upstream_error","message":message});
+    // Build a new minimal error envelope: upstream IDs, output, debugging fields
+    // and nested error metadata may also contain sensitive material.
+    let data = if endpoint == "/v1/responses" {
+        let status = response_failure(&event).unwrap_or("failed");
+        event.event = format!("response.{status}");
+        json!({"type":event.event,"response":{"status":status,"error":error}})
+    } else {
+        event.event = "error".into();
+        json!({"type":"error","error":error})
+    };
+    event.id.clear();
+    event.retry = None;
+    event.data = data.to_string();
+    event
+}
+
+/// A transport failure after the first downstream event has no upstream error
+/// envelope to pass through.  Give every policy a protocol-valid, safe terminal
+/// event instead of tearing down the client stream with an I/O error.
+pub fn interrupted_event(policy: &Retry, endpoint: &str) -> Event {
+    let event = if endpoint == "/v1/responses" {
+        Event {
+            event: "response.failed".into(),
+            data: json!({
+                "type": "response.failed",
+                "response": {
+                    "status": "failed",
+                    "error": {
+                        "type": "upstream_error",
+                        "message": "upstream stream interrupted"
+                    }
+                }
+            })
+            .to_string(),
+            ..Event::default()
+        }
+    } else {
+        Event {
+            event: "error".into(),
+            data: json!({
+                "type": "error",
+                "error": {
+                    "type": "upstream_error",
+                    "message": "upstream stream interrupted"
+                }
+            })
+            .to_string(),
+            ..Event::default()
+        }
+    };
+    error_event(event, policy, endpoint)
+}
+
 pub fn failed(event: &Event) -> bool {
-    if event.event == "error"
-        || event.event == "response.failed"
-        || event.event == "response.incomplete"
-    {
+    if event.event == "error" || response_failure(event).is_some() {
         return true;
     }
-    serde_json::from_str::<Value>(&event.data).is_ok_and(|v| {
-        v.get("error").is_some()
-            || matches!(
-                v.get("type").and_then(Value::as_str),
-                Some("error" | "response.failed" | "response.incomplete")
-            )
-    })
+    serde_json::from_str::<Value>(&event.data)
+        .is_ok_and(|v| v.get("error").is_some_and(|error| !error.is_null()) || v["type"] == "error")
+}
+
+fn response_failure(event: &Event) -> Option<&'static str> {
+    let value = serde_json::from_str::<Value>(&event.data).unwrap_or(Value::Null);
+    for kind in [
+        event.event.as_str(),
+        value.get("type").and_then(Value::as_str).unwrap_or(""),
+    ] {
+        match kind {
+            "response.failed" => return Some("failed"),
+            "response.incomplete" => return Some("incomplete"),
+            "response.cancelled" | "response.canceled" => return Some("cancelled"),
+            _ => (),
+        }
+    }
+    if event.event == "response.completed" || value["type"] == "response.completed" {
+        return match value.pointer("/response/status").and_then(Value::as_str) {
+            Some("completed") if value.pointer("/response/error").is_none_or(Value::is_null) => {
+                None
+            }
+            Some("incomplete") => Some("incomplete"),
+            Some("cancelled" | "canceled") => Some("cancelled"),
+            _ => Some("failed"),
+        };
+    }
+    None
 }
 
 pub fn terminal(event: &Event, endpoint: &str) -> bool {
+    if failed(event) {
+        return true;
+    }
     match endpoint {
         "/v1/chat/completions" => event.data.trim() == "[DONE]",
         "/v1/messages" => {
@@ -99,6 +187,9 @@ pub fn terminal(event: &Event, endpoint: &str) -> bool {
 }
 
 pub fn completed_response(event: &Event) -> Option<Value> {
+    if failed(event) {
+        return None;
+    }
     let value: Value = serde_json::from_str(&event.data).ok()?;
     if value["type"] != "response.completed" && event.event != "response.completed" {
         return None;
