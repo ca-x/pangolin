@@ -63,6 +63,8 @@ pub struct ApiKeyCredential {
     pub spent_micros: i64,
     pub enabled: bool,
     pub expires_at: Option<i64>,
+    pub allowed_ips_json: String,
+    pub denied_ips_json: String,
 }
 
 #[derive(Debug, Clone, FromQueryResult)]

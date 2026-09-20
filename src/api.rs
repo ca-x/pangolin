@@ -1,10 +1,11 @@
-use std::{collections::HashMap, sync::Arc, time::Instant};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Instant};
 
 use axum::{
     Json, Router,
     body::Body,
-    extract::{Path, Query, State},
+    extract::{ConnectInfo, Path, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
 };
@@ -29,6 +30,7 @@ pub struct AppState {
     pub secrets: SecretBox,
     pub observations: ObservationStore,
     pub client: reqwest::Client,
+    pub oidc_client: reqwest::Client,
     pub budget_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
 
@@ -140,7 +142,31 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/chat/completions", post(gateway_chat))
         .route("/v1/responses", post(gateway_responses))
         .route("/v1/messages", post(gateway_messages))
+        .layer(middleware::from_fn(capture_trusted_client_ip))
         .with_state(state)
+}
+
+pub(crate) const TRUSTED_CLIENT_IP_HEADER: &str = "x-pangolin-trusted-client-ip";
+
+async fn capture_trusted_client_ip(mut request: axum::extract::Request, next: Next) -> Response {
+    request.headers_mut().remove(TRUSTED_CLIENT_IP_HEADER);
+    if let Some(ConnectInfo(address)) = request.extensions().get::<ConnectInfo<SocketAddr>>()
+        && let Ok(value) = HeaderValue::from_str(&address.ip().to_string())
+    {
+        request
+            .headers_mut()
+            .insert(TRUSTED_CLIENT_IP_HEADER, value);
+    }
+    next.run(request).await
+}
+
+pub(crate) fn trusted_client_ip(headers: &HeaderMap) -> Option<std::net::IpAddr> {
+    headers
+        .get(TRUSTED_CLIENT_IP_HEADER)?
+        .to_str()
+        .ok()?
+        .parse()
+        .ok()
 }
 
 async fn live() -> impl IntoResponse {
@@ -1217,7 +1243,7 @@ async fn gateway_key(
                 .and_then(|value| value.to_str().ok())
         })
         .ok_or(ApiError::Unauthorized)?;
-    let credential = db::authenticate_api_key(&state.db, token)
+    let credential = db::authenticate_api_key(&state.db, token, trusted_client_ip(headers))
         .await?
         .ok_or(ApiError::Unauthorized)?;
     let scopes = serde_json::from_str::<Vec<String>>(&credential.scopes).unwrap_or_default();
@@ -1292,6 +1318,10 @@ mod tests {
             secrets,
             observations,
             client: reqwest::Client::new(),
+            oidc_client: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap(),
             budget_locks: Arc::new(Mutex::new(HashMap::new())),
         });
         let response = app
@@ -1407,6 +1437,10 @@ mod tests {
             secrets,
             observations: observations.clone(),
             client: reqwest::Client::new(),
+            oidc_client: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap(),
             budget_locks: Arc::new(Mutex::new(HashMap::new())),
         });
         let response = app

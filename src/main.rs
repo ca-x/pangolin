@@ -54,6 +54,12 @@ async fn main() -> Result<()> {
             .connect_timeout(std::time::Duration::from_secs(10))
             .timeout(config.upstream_timeout)
             .build()?,
+        oidc_client: reqwest::Client::builder()
+            .user_agent(concat!("pangolin/", env!("CARGO_PKG_VERSION")))
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(config.upstream_timeout)
+            .build()?,
         budget_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
     };
     let app = Router::new()
@@ -66,9 +72,12 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("failed to bind {}", config.bind))?;
     tracing::info!(address = %config.bind, product = "Pangolin / 鲮鲤", "server listening");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
     observations.flush().await;
     Ok(())
 }

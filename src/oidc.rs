@@ -1,11 +1,9 @@
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use rand::RngCore as _;
+use oauth2::{CsrfToken, PkceCodeChallenge};
 use sea_orm::{
     ConnectionTrait, DatabaseConnection, DbBackend, FromQueryResult, Statement, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
 use crate::{
@@ -84,6 +82,7 @@ pub struct OidcProviderSecret {
 pub struct PkceState {
     pub state: String,
     pub code_challenge: String,
+    pub browser_binding: String,
 }
 
 #[derive(Debug, FromQueryResult)]
@@ -387,18 +386,19 @@ pub async fn create_pkce_state(
         ));
     }
     provider_secret(db, provider_id).await?;
-    let state = crypto::opaque_token("os_");
-    let mut verifier_bytes = [0_u8; 32];
-    rand::rng().fill_bytes(&mut verifier_bytes);
-    let verifier = URL_SAFE_NO_PAD.encode(verifier_bytes);
-    let code_challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+    let state = CsrfToken::new_random().into_secret();
+    let browser_binding = CsrfToken::new_random().into_secret();
+    let (challenge, verifier) = PkceCodeChallenge::new_random_sha256();
+    let verifier = verifier.into_secret();
+    let code_challenge = challenge.as_str().to_owned();
     db.execute(statement(
-        "INSERT INTO oidc_auth_states(state_hash,provider_id,code_verifier_envelope,redirect_uri,expires_at,created_at) VALUES(?,?,?,?,?,?)",
-        vec![crypto::token_hash(&state).into(), provider_id.into(), secrets.encrypt(&verifier).map_err(AccessError::Internal)?.into(), redirect_uri.into(), (db::now() + ttl_seconds).into(), db::now().into()],
+        "INSERT INTO oidc_auth_states(state_hash,provider_id,code_verifier_envelope,redirect_uri,expires_at,created_at,browser_binding_hash) VALUES(?,?,?,?,?,?,?)",
+        vec![crypto::token_hash(&state).into(), provider_id.into(), secrets.encrypt(&verifier).map_err(AccessError::Internal)?.into(), redirect_uri.into(), (db::now() + ttl_seconds).into(), db::now().into(), crypto::token_hash(&browser_binding).into()],
     )).await?;
     Ok(PkceState {
         state,
         code_challenge,
+        browser_binding,
     })
 }
 
@@ -406,10 +406,11 @@ pub async fn consume_pkce_state(
     db: &DatabaseConnection,
     secrets: &SecretBox,
     state: &str,
+    browser_binding: &str,
 ) -> Result<ConsumedState, AccessError> {
     let row = StateRow::find_by_statement(statement(
-        "DELETE FROM oidc_auth_states WHERE state_hash=? AND expires_at>? RETURNING provider_id,code_verifier_envelope,redirect_uri",
-        vec![crypto::token_hash(state).into(), db::now().into()],
+        "DELETE FROM oidc_auth_states WHERE state_hash=? AND browser_binding_hash=? AND expires_at>? RETURNING provider_id,code_verifier_envelope,redirect_uri",
+        vec![crypto::token_hash(state).into(), crypto::token_hash(browser_binding).into(), db::now().into()],
     )).one(db).await?.ok_or(AccessError::Invalid("OIDC state is invalid, expired, or already used".into()))?;
     Ok(ConsumedState {
         provider_id: row.provider_id,
@@ -470,7 +471,7 @@ pub async fn link_or_create_identity(
     provider_id: &str,
     claims: &OidcClaims,
 ) -> Result<UserView, AccessError> {
-    if claims.sub.trim().is_empty() || claims.email_verified == Some(false) {
+    if claims.sub.trim().is_empty() {
         return Err(AccessError::Forbidden);
     }
     let provider = provider_secret(db, provider_id).await?;
@@ -486,37 +487,59 @@ pub async fn link_or_create_identity(
     #[derive(FromQueryResult)]
     struct IdentityUser {
         user_id: String,
+        enabled: bool,
     }
-    if let Some(identity) = IdentityUser::find_by_statement(statement(
-        "SELECT user_id FROM oidc_identities WHERE provider_id=? AND subject=?",
+    let identity = IdentityUser::find_by_statement(statement(
+        "SELECT identity.user_id,user.enabled FROM oidc_identities identity JOIN users user ON user.id=identity.user_id WHERE identity.provider_id=? AND identity.subject=?",
         vec![provider_id.into(), claims.sub.clone().into()],
     ))
     .one(db)
-    .await?
-    {
-        let transaction = db.begin().await?;
-        transaction.execute(statement("UPDATE oidc_identities SET claims_json=?,last_login_at=? WHERE provider_id=? AND subject=?", vec![serde_json::to_string(claims).map_err(|e| AccessError::Internal(e.into()))?.into(), db::now().into(), provider_id.into(), claims.sub.clone().into()])).await?;
-        transaction.commit().await?;
-        return access::get_user(db, &identity.user_id).await;
+    .await?;
+    if identity.as_ref().is_some_and(|identity| !identity.enabled) {
+        return Err(AccessError::Forbidden);
     }
     let jit = mapping.get("jit").and_then(Value::as_bool).unwrap_or(false);
     #[derive(FromQueryResult)]
     struct ExistingUser {
         id: String,
+        enabled: bool,
     }
-    let existing = ExistingUser::find_by_statement(statement(
-        "SELECT id FROM users WHERE email=? COLLATE NOCASE AND enabled=1",
-        vec![email.clone().into()],
-    ))
-    .one(db)
-    .await?;
-    if existing.is_none() && !jit {
-        return Err(AccessError::Forbidden);
-    }
-    let was_existing = existing.is_some();
+    let existing = if identity.is_none() {
+        let verified_claim = mapping
+            .get("email_verified_claim")
+            .and_then(Value::as_str)
+            .unwrap_or("email_verified");
+        let email_verified = if verified_claim == "email_verified" {
+            claims.email_verified == Some(true)
+        } else {
+            claims.extra.get(verified_claim).and_then(Value::as_bool) == Some(true)
+        };
+        if !email_verified {
+            return Err(AccessError::Forbidden);
+        }
+        let existing = ExistingUser::find_by_statement(statement(
+            "SELECT id,enabled FROM users WHERE email=? COLLATE NOCASE",
+            vec![email.clone().into()],
+        ))
+        .one(db)
+        .await?;
+        if existing.as_ref().is_some_and(|user| !user.enabled) {
+            return Err(AccessError::Forbidden);
+        }
+        if existing.is_none() && !jit {
+            return Err(AccessError::Forbidden);
+        }
+        existing
+    } else {
+        None
+    };
+    let was_linked = identity.is_some();
+    let was_existing_user = existing.is_some();
     let timestamp = db::now();
     let transaction = db.begin().await?;
-    let user_id = if let Some(existing) = existing {
+    let user_id = if let Some(identity) = identity {
+        identity.user_id
+    } else if let Some(existing) = existing {
         existing.id
     } else {
         let id = Uuid::new_v4().to_string();
@@ -527,7 +550,13 @@ pub async fn link_or_create_identity(
         transaction.execute(statement("INSERT INTO users(id,email,password_hash,role,language,theme,created_at,display_name,enabled,updated_at) VALUES(?,?,?,'member','zh-CN','system:bronze',?,?,1,?)", vec![id.clone().into(), email.clone().into(), unusable_password.into(), timestamp.into(), display_name.into(), timestamp.into()])).await?;
         id
     };
-    transaction.execute(statement("INSERT INTO oidc_identities(id,provider_id,user_id,subject,claims_json,last_login_at,created_at) VALUES(?,?,?,?,?,?,?)", vec![Uuid::new_v4().to_string().into(), provider_id.into(), user_id.clone().into(), claims.sub.clone().into(), serde_json::to_string(claims).map_err(|e| AccessError::Internal(e.into()))?.into(), timestamp.into(), timestamp.into()])).await.map_err(|error| AccessError::Conflict(error.to_string()))?;
+    let claims_json =
+        serde_json::to_string(claims).map_err(|error| AccessError::Internal(error.into()))?;
+    if was_linked {
+        transaction.execute(statement("UPDATE oidc_identities SET claims_json=?,last_login_at=? WHERE provider_id=? AND subject=?", vec![claims_json.into(), timestamp.into(), provider_id.into(), claims.sub.clone().into()])).await?;
+    } else {
+        transaction.execute(statement("INSERT INTO oidc_identities(id,provider_id,user_id,subject,claims_json,last_login_at,created_at) VALUES(?,?,?,?,?,?,?)", vec![Uuid::new_v4().to_string().into(), provider_id.into(), user_id.clone().into(), claims.sub.clone().into(), claims_json.into(), timestamp.into(), timestamp.into()])).await.map_err(|error| AccessError::Conflict(error.to_string()))?;
+    }
 
     let project_id = mapping
         .get("project_id")
@@ -549,6 +578,20 @@ pub async fn link_or_create_identity(
             }
         }
     }
+    #[derive(FromQueryResult)]
+    struct ProjectOwner {
+        owner_user_id: Option<String>,
+    }
+    let project_owner = ProjectOwner::find_by_statement(statement(
+        "SELECT owner_user_id FROM projects WHERE id=?",
+        vec![project_id.into()],
+    ))
+    .one(&transaction)
+    .await?
+    .ok_or(AccessError::NotFound)?;
+    if project_owner.owner_user_id.as_deref() == Some(&user_id) {
+        role_id = crate::db::SYSTEM_OWNER_ROLE_ID.into();
+    }
     transaction.execute(statement(
         "INSERT INTO project_memberships(id,project_id,user_id,role_id,status,created_at,updated_at) VALUES(?,?,?,?,\'active\',?,?) ON CONFLICT(project_id,user_id) DO UPDATE SET role_id=excluded.role_id,status='active',updated_at=excluded.updated_at",
         vec![Uuid::new_v4().to_string().into(), project_id.into(), user_id.clone().into(), role_id.clone().into(), timestamp.into(), timestamp.into()],
@@ -559,7 +602,7 @@ pub async fn link_or_create_identity(
         "login",
         "oidc_identity",
         provider_id,
-        json!({"project_id":project_id,"role_id":role_id,"jit":!was_existing}),
+        json!({"project_id":project_id,"role_id":role_id,"jit":!was_linked && !was_existing_user,"repeat_login":was_linked}),
     )
     .await?;
     transaction.commit().await?;
@@ -593,6 +636,22 @@ mod tests {
             name: "SSO".into(), issuer_url: "https://id.example.test".into(), client_id: "client".into(), client_secret, scopes: default_scopes(), enabled: true,
             claim_mapping: json!({"version":1,"jit":true,"project_id":db::DEFAULT_PROJECT_ID,"default_role_id":SYSTEM_MEMBER_ROLE_ID,"role_mappings":{"admins":crate::db::SYSTEM_OWNER_ROLE_ID}}),
         }).await.unwrap();
+        assert!(matches!(
+            link_or_create_identity(
+                &database,
+                &provider.id,
+                &OidcClaims {
+                    sub: "unverified-subject".into(),
+                    email: "owner@example.com".into(),
+                    email_verified: None,
+                    name: None,
+                    groups: vec![],
+                    extra: Default::default(),
+                }
+            )
+            .await,
+            Err(AccessError::Forbidden)
+        ));
         let pkce = create_pkce_state(
             &database,
             &secrets,
@@ -603,8 +662,11 @@ mod tests {
         .await
         .unwrap();
         assert!(!pkce.state.is_empty());
-        assert_eq!(pkce.code_challenge.len(), 43);
-        let consumed = consume_pkce_state(&database, &secrets, &pkce.state)
+        assert!(matches!(
+            consume_pkce_state(&database, &secrets, &pkce.state, "wrong-browser").await,
+            Err(AccessError::Invalid(_))
+        ));
+        let consumed = consume_pkce_state(&database, &secrets, &pkce.state, &pkce.browser_binding)
             .await
             .unwrap();
         assert_eq!(consumed.provider_id, provider.id);
@@ -612,12 +674,9 @@ mod tests {
         assert!(consumed.code_verifier.chars().all(|character| {
             character.is_ascii_alphanumeric() || matches!(character, '-' | '.' | '_' | '~')
         }));
-        assert_eq!(
-            URL_SAFE_NO_PAD.encode(Sha256::digest(consumed.code_verifier.as_bytes())),
-            pkce.code_challenge
-        );
+        assert_eq!(pkce.code_challenge.len(), 43);
         assert!(matches!(
-            consume_pkce_state(&database, &secrets, &pkce.state).await,
+            consume_pkce_state(&database, &secrets, &pkce.state, &pkce.browser_binding).await,
             Err(AccessError::Invalid(_))
         ));
         let expired = create_pkce_state(
@@ -637,7 +696,13 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(
-            consume_pkce_state(&database, &secrets, &expired.state).await,
+            consume_pkce_state(
+                &database,
+                &secrets,
+                &expired.state,
+                &expired.browser_binding
+            )
+            .await,
             Err(AccessError::Invalid(_))
         ));
 
@@ -680,5 +745,24 @@ mod tests {
         .unwrap();
         assert_eq!(same.id, user.id);
         assert_eq!(same.email, "jit@example.com");
+        assert!(matches!(
+            access::authorize(
+                &database,
+                &Principal::session(user.id.clone()),
+                Some(db::DEFAULT_PROJECT_ID),
+                "project:manage"
+            )
+            .await,
+            Err(AccessError::Forbidden)
+        ));
+        #[derive(FromQueryResult)]
+        struct AuditCount {
+            count: i64,
+        }
+        let audits = AuditCount::find_by_statement(statement(
+            "SELECT COUNT(*) AS count FROM audit_events WHERE action='login' AND resource_type='oidc_identity' AND actor_user_id=?",
+            vec![user.id.into()],
+        )).one(&database).await.unwrap().unwrap();
+        assert_eq!(audits.count, 2);
     }
 }

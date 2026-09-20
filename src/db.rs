@@ -1,4 +1,7 @@
+use std::net::IpAddr;
+
 use anyhow::{Context, Result, bail};
+use ipnet::IpNet;
 use sea_orm::{
     ConnectionTrait, Database, DatabaseConnection, DbBackend, FromQueryResult, Statement,
     TransactionTrait,
@@ -321,6 +324,7 @@ pub async fn delete_api_key(db: &DatabaseConnection, id: &str) -> Result<bool> {
 pub async fn authenticate_api_key(
     db: &DatabaseConnection,
     token: &str,
+    client_ip: Option<IpAddr>,
 ) -> Result<Option<ApiKeyCredential>> {
     let mut parts = token.splitn(3, '_');
     if parts.next() != Some("pg") {
@@ -333,7 +337,7 @@ pub async fn authenticate_api_key(
         return Ok(None);
     }
     let credential = ApiKeyCredential::find_by_statement(stmt(
-        "SELECT id,project_id,user_id,key_hash,scopes,budget_micros,spent_micros,enabled,expires_at FROM api_keys WHERE key_prefix=?",
+        "SELECT k.id,k.project_id,k.user_id,k.key_hash,k.scopes,k.budget_micros,k.spent_micros,k.enabled,k.expires_at,k.allowed_ips_json,k.denied_ips_json FROM api_keys k LEFT JOIN users u ON u.id=k.user_id WHERE k.key_prefix=? AND (k.key_type NOT IN ('user','personal') OR (u.enabled=1 AND EXISTS (SELECT 1 FROM project_memberships membership WHERE membership.project_id=k.project_id AND membership.user_id=k.user_id AND membership.status='active')))",
         vec![prefix.into()],
     )).one(db).await?;
     let Some(credential) = credential else {
@@ -343,6 +347,7 @@ pub async fn authenticate_api_key(
         || credential
             .expires_at
             .is_some_and(|expires| expires <= now())
+        || !api_key_ip_allowed(&credential, client_ip)
         || !crypto::verify_password(token, &credential.key_hash)
     {
         return Ok(None);
@@ -359,6 +364,38 @@ pub async fn authenticate_api_key(
     ))
     .await?;
     Ok(Some(credential))
+}
+
+fn api_key_ip_allowed(credential: &ApiKeyCredential, client_ip: Option<IpAddr>) -> bool {
+    let Ok(allowed) = serde_json::from_str::<Vec<String>>(&credential.allowed_ips_json) else {
+        return false;
+    };
+    let Ok(denied) = serde_json::from_str::<Vec<String>>(&credential.denied_ips_json) else {
+        return false;
+    };
+    if allowed.is_empty() && denied.is_empty() {
+        return true;
+    }
+    let Some(client_ip) = client_ip else {
+        return false;
+    };
+    let matches = |rules: &[String]| -> Option<bool> {
+        let mut matched = false;
+        for rule in rules {
+            let network = rule.parse::<IpNet>().or_else(|_| {
+                rule.parse::<IpAddr>()
+                    .map(IpNet::from)
+                    .map_err(|_| "invalid IP policy")
+            });
+            let Ok(network) = network else { return None };
+            matched |= network.contains(&client_ip);
+        }
+        Some(matched)
+    };
+    if matches(&denied) != Some(false) {
+        return false;
+    }
+    allowed.is_empty() || matches(&allowed) == Some(true)
 }
 
 pub async fn add_api_key_spend(db: &DatabaseConnection, id: &str, cost_micros: i64) -> Result<()> {
@@ -458,9 +495,14 @@ mod tests {
         .unwrap()
         .count;
         assert_eq!(normalized_provider_count, 1);
-        assert!(authenticate_api_key(&db, &token).await.unwrap().is_some());
         assert!(
-            authenticate_api_key(&db, "pg_invalid_token")
+            authenticate_api_key(&db, &token, None)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            authenticate_api_key(&db, "pg_invalid_token", None)
                 .await
                 .unwrap()
                 .is_none()

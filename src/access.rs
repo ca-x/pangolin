@@ -95,6 +95,50 @@ struct PermissionRow {
     slug: String,
 }
 
+#[derive(FromQueryResult)]
+struct RoleScopeRow {
+    project_id: Option<String>,
+}
+
+#[derive(FromQueryResult)]
+struct ProjectOwnerRow {
+    owner_user_id: Option<String>,
+}
+
+async fn ensure_can_grant_role(
+    db: &DatabaseConnection,
+    actor: &Principal,
+    project_id: Option<&str>,
+    role_id: &str,
+) -> Result<(), AccessError> {
+    let role = RoleScopeRow::find_by_statement(statement(
+        "SELECT project_id FROM roles WHERE id=?",
+        vec![role_id.into()],
+    ))
+    .one(db)
+    .await?
+    .ok_or(AccessError::NotFound)?;
+    let valid_scope = match (project_id, role.project_id.as_deref()) {
+        (None, None) => true,
+        (Some(_), None) => true,
+        (Some(project), Some(role_project)) => project == role_project,
+        (None, Some(_)) => false,
+    };
+    if !valid_scope {
+        return Err(AccessError::Forbidden);
+    }
+    let permissions = PermissionRow::find_by_statement(statement(
+        "SELECT permission.slug FROM permissions permission JOIN role_permissions assignment ON assignment.permission_id=permission.id WHERE assignment.role_id=?",
+        vec![role_id.into()],
+    ))
+    .all(db)
+    .await?;
+    for permission in permissions {
+        authorize(db, actor, project_id, &permission.slug).await?;
+    }
+    Ok(())
+}
+
 pub async fn effective_scopes(
     db: &DatabaseConnection,
     principal: &Principal,
@@ -476,6 +520,14 @@ pub async fn create_project(
         .owner_user_id
         .clone()
         .or_else(|| actor.user_id.clone());
+    if let Some(owner_id) = owner.as_deref() {
+        ensure_can_grant_role(db, actor, None, db::SYSTEM_OWNER_ROLE_ID).await?;
+        if !get_user(db, owner_id).await?.enabled {
+            return Err(AccessError::Invalid(
+                "project owner must be an active user".into(),
+            ));
+        }
+    }
     let transaction = db.begin().await?;
     transaction
         .execute(statement(
@@ -524,6 +576,15 @@ pub async fn update_project(
         .transpose()?
         .unwrap_or(current.slug);
     let owner = input.owner_user_id.clone().or(current.owner_user_id);
+    if let Some(new_owner_id) = input.owner_user_id.as_deref() {
+        ensure_can_grant_role(db, actor, Some(project_id), db::SYSTEM_OWNER_ROLE_ID).await?;
+        let new_owner = get_user(db, new_owner_id).await?;
+        if !new_owner.enabled {
+            return Err(AccessError::Invalid(
+                "project owner must be an active user".into(),
+            ));
+        }
+    }
     let enabled = input.enabled.unwrap_or(current.enabled);
     let transaction = db.begin().await?;
     transaction
@@ -532,7 +593,7 @@ pub async fn update_project(
             vec![
                 name.clone().into(),
                 slug.clone().into(),
-                owner.into(),
+                owner.clone().into(),
                 enabled.into(),
                 db::now().into(),
                 project_id.into(),
@@ -540,6 +601,13 @@ pub async fn update_project(
         ))
         .await
         .map_err(|error| AccessError::Conflict(error.to_string()))?;
+    if let Some(new_owner_id) = input.owner_user_id.as_deref() {
+        let timestamp = db::now();
+        transaction.execute(statement(
+            "INSERT INTO project_memberships(id,project_id,user_id,role_id,status,created_at,updated_at) VALUES(?,?,?,?,\'active\',?,?) ON CONFLICT(project_id,user_id) DO UPDATE SET role_id=excluded.role_id,status='active',updated_at=excluded.updated_at",
+            vec![Uuid::new_v4().to_string().into(), project_id.into(), new_owner_id.into(), db::SYSTEM_OWNER_ROLE_ID.into(), timestamp.into(), timestamp.into()],
+        )).await?;
+    }
     audit(
         &transaction,
         actor,
@@ -645,7 +713,8 @@ pub async fn update_user(
     user_id: &str,
     input: &UserUpdate,
 ) -> Result<UserView, AccessError> {
-    let self_update = actor.user_id.as_deref() == Some(user_id);
+    let self_update =
+        actor.kind == PrincipalKind::Session && actor.user_id.as_deref() == Some(user_id);
     if !self_update {
         authorize(db, actor, None, "user:manage").await?;
     }
@@ -700,7 +769,15 @@ pub async fn update_user(
     if input.enabled == Some(false) {
         transaction
             .execute(statement(
-                "UPDATE api_keys SET enabled=0 WHERE user_id=? AND key_type='personal'",
+                "UPDATE api_keys SET enabled=0 WHERE user_id=? AND key_type IN ('user','personal')",
+                vec![user_id.into()],
+            ))
+            .await?;
+    }
+    if input.password.is_some() || input.enabled == Some(false) {
+        transaction
+            .execute(statement(
+                "DELETE FROM sessions WHERE user_id=?",
                 vec![user_id.into()],
             ))
             .await?;
@@ -913,9 +990,18 @@ pub async fn upsert_membership(
     input: &MembershipInput,
 ) -> Result<MembershipView, AccessError> {
     authorize(db, actor, Some(project_id), "project:manage").await?;
+    ensure_can_grant_role(db, actor, Some(project_id), &input.role_id).await?;
     if !matches!(input.status.as_str(), "active" | "suspended") {
         return Err(AccessError::Invalid(
             "status must be active or suspended".into(),
+        ));
+    }
+    let project = get_project(db, actor, project_id).await?;
+    if project.owner_user_id.as_deref() == Some(&input.user_id)
+        && (input.status != "active" || input.role_id != db::SYSTEM_OWNER_ROLE_ID)
+    {
+        return Err(AccessError::Invalid(
+            "project owner membership must remain active with the owner role".into(),
         ));
     }
     let id = Uuid::new_v4().to_string();
@@ -925,6 +1011,9 @@ pub async fn upsert_membership(
         "INSERT INTO project_memberships(id,project_id,user_id,role_id,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(project_id,user_id) DO UPDATE SET role_id=excluded.role_id,status=excluded.status,updated_at=excluded.updated_at",
         vec![id.into(), project_id.into(), input.user_id.clone().into(), input.role_id.clone().into(), input.status.clone().into(), timestamp.into(), timestamp.into()],
     )).await.map_err(|error| AccessError::Invalid(error.to_string()))?;
+    if input.status == "suspended" {
+        transaction.execute(statement("UPDATE api_keys SET enabled=0 WHERE project_id=? AND user_id=? AND key_type IN ('user','personal')", vec![project_id.into(), input.user_id.clone().into()])).await?;
+    }
     audit(
         &transaction,
         actor,
@@ -970,6 +1059,7 @@ pub async fn remove_membership(
     if result.rows_affected() == 0 {
         return Err(AccessError::NotFound);
     }
+    transaction.execute(statement("UPDATE api_keys SET enabled=0 WHERE project_id=? AND user_id=? AND key_type IN ('user','personal')", vec![project_id.into(), user_id.into()])).await?;
     transaction.commit().await?;
     Ok(())
 }
@@ -981,6 +1071,7 @@ pub async fn create_invitation(
     input: &InvitationInput,
 ) -> Result<(InvitationView, String), AccessError> {
     authorize(db, actor, Some(project_id), "project:manage").await?;
+    ensure_can_grant_role(db, actor, Some(project_id), &input.role_id).await?;
     let email = validate_email(&input.email)?;
     let ttl = input.expires_in_seconds.unwrap_or(7 * 24 * 3600);
     if !(60..=30 * 24 * 3600).contains(&ttl) {
@@ -1061,7 +1152,7 @@ pub async fn inspect_invitation(
 
 pub async fn accept_invitation(
     db: &DatabaseConnection,
-    authenticated_user_id: Option<&str>,
+    authenticated_principal: Option<&Principal>,
     input: &AcceptInvitationInput,
 ) -> Result<UserView, AccessError> {
     let invitation = inspect_invitation(db, &input.token).await?;
@@ -1078,11 +1169,17 @@ pub async fn accept_invitation(
     let timestamp = db::now();
     let transaction = db.begin().await?;
     let user_id = if let Some(existing) = existing {
-        if authenticated_user_id != Some(existing.id.as_str()) {
+        if authenticated_principal.is_none_or(|principal| {
+            principal.kind != PrincipalKind::Session
+                || principal.user_id.as_deref() != Some(existing.id.as_str())
+        }) {
             return Err(AccessError::Forbidden);
         }
         existing.id
     } else {
+        if authenticated_principal.is_some() {
+            return Err(AccessError::Forbidden);
+        }
         let password = input
             .password
             .as_deref()
@@ -1103,6 +1200,20 @@ pub async fn accept_invitation(
     if claimed.rows_affected() == 0 {
         return Err(AccessError::Conflict(
             "invitation was already used or expired".into(),
+        ));
+    }
+    let project_owner = ProjectOwnerRow::find_by_statement(statement(
+        "SELECT owner_user_id FROM projects WHERE id=?",
+        vec![invitation.project_id.clone().into()],
+    ))
+    .one(&transaction)
+    .await?
+    .ok_or(AccessError::NotFound)?;
+    if project_owner.owner_user_id.as_deref() == Some(&user_id)
+        && invitation.role_id != db::SYSTEM_OWNER_ROLE_ID
+    {
+        return Err(AccessError::Invalid(
+            "project owner membership must retain the owner role".into(),
         ));
     }
     transaction.execute(statement(
@@ -1141,15 +1252,17 @@ pub async fn create_scoped_api_key(
             "this API-key type requires a user owner".into(),
         ));
     }
-    if let Some(user_id) = &input.user_id {
+    if matches!(input.key_type.as_str(), "user" | "personal")
+        && let Some(user_id) = &input.user_id
+    {
         #[derive(FromQueryResult)]
         struct MembershipExists {
             present: i64,
         }
-        let membership = MembershipExists::find_by_statement(statement("SELECT 1 AS present FROM project_memberships WHERE project_id=? AND user_id=? AND status='active'", vec![input.project_id.clone().into(), user_id.clone().into()])).one(db).await?;
+        let membership = MembershipExists::find_by_statement(statement("SELECT 1 AS present FROM project_memberships membership JOIN users user ON user.id=membership.user_id AND user.enabled=1 WHERE membership.project_id=? AND membership.user_id=? AND membership.status='active'", vec![input.project_id.clone().into(), user_id.clone().into()])).one(db).await?;
         if !membership.is_some_and(|row| row.present == 1) {
             return Err(AccessError::Invalid(
-                "API-key owner must be an active project member".into(),
+                "user/personal API-key owner must be an active user and project member".into(),
             ));
         }
     }
@@ -1220,6 +1333,23 @@ pub async fn update_scoped_api_key(
         ));
     }
     let current = ScopedApiKeyView::find_by_statement(statement("SELECT id,name,key_prefix,scopes,budget_micros,enabled,created_at,project_id,user_id,profile_id,key_type,expires_at,allowed_ips_json,denied_ips_json FROM api_keys WHERE id=? AND project_id=?", vec![key_id.into(), project_id.into()])).one(db).await?.ok_or(AccessError::NotFound)?;
+    if input.enabled == Some(true) && matches!(current.key_type.as_str(), "user" | "personal") {
+        let Some(owner_id) = current.user_id.as_deref() else {
+            return Err(AccessError::Invalid("owned API key has no owner".into()));
+        };
+        let owner_active = PermissionRow::find_by_statement(statement(
+            "SELECT 'active' AS slug FROM users user JOIN project_memberships membership ON membership.user_id=user.id AND membership.project_id=? AND membership.status='active' WHERE user.id=? AND user.enabled=1",
+            vec![project_id.into(), owner_id.into()],
+        ))
+        .one(db)
+        .await?
+        .is_some();
+        if !owner_active {
+            return Err(AccessError::Invalid(
+                "cannot enable a user/personal key without an active owner membership".into(),
+            ));
+        }
+    }
     let scopes = if let Some(scopes) = &input.scopes {
         let scopes = scopes
             .iter()
@@ -1320,6 +1450,7 @@ pub async fn create_role_binding(
     } else {
         authorize(db, actor, None, "user:manage").await?;
     }
+    ensure_can_grant_role(db, actor, input.project_id.as_deref(), &input.role_id).await?;
     let id = Uuid::new_v4().to_string();
     let transaction = db.begin().await?;
     transaction.execute(statement("INSERT INTO user_role_bindings(id,user_id,role_id,project_id,created_at) VALUES(?,?,?,?,?)", vec![id.clone().into(), user_id.into(), input.role_id.clone().into(), input.project_id.clone().into(), db::now().into()])).await.map_err(|error| AccessError::Invalid(error.to_string()))?;
@@ -1548,7 +1679,7 @@ mod tests {
         assert!(matches!(
             accept_invitation(
                 &database,
-                Some(&accepted.id),
+                Some(&Principal::session(accepted.id.clone())),
                 &AcceptInvitationInput {
                     token,
                     password: None,

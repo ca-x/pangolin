@@ -672,6 +672,10 @@ INSERT INTO role_permissions(role_id,permission_id,created_at) VALUES
 ('00000000-0000-0000-0000-000000000011','00000000-0000-0000-0000-000000000027',unixepoch());
 "#;
 
+const V4_OIDC_BROWSER_BINDING: &str = r#"
+ALTER TABLE oidc_auth_states ADD COLUMN browser_binding_hash TEXT NOT NULL DEFAULT '';
+"#;
+
 #[derive(FromQueryResult)]
 struct Count {
     count: i64,
@@ -741,6 +745,25 @@ pub async fn migrate(db: &DatabaseConnection) -> Result<()> {
             .await?;
         transaction.commit().await?;
     }
+    let oidc_binding_applied = Count::find_by_statement(statement(
+        "SELECT COUNT(*) AS count FROM schema_migrations WHERE version=4",
+    ))
+    .one(db)
+    .await?
+    .is_some_and(|row| row.count > 0);
+    if !oidc_binding_applied {
+        let transaction = db.begin().await?;
+        transaction
+            .execute_unprepared(V4_OIDC_BROWSER_BINDING)
+            .await
+            .context("failed to initialize OIDC browser binding")?;
+        transaction
+            .execute(statement(
+                "INSERT INTO schema_migrations(version,applied_at) VALUES(4,unixepoch())",
+            ))
+            .await?;
+        transaction.commit().await?;
+    }
     Ok(())
 }
 
@@ -778,7 +801,7 @@ mod tests {
 
         assert_eq!(
             scalar(&db, "SELECT MAX(version) AS count FROM schema_migrations").await,
-            3
+            4
         );
         for table in [
             "projects",
@@ -927,7 +950,7 @@ mod tests {
 
         assert_eq!(
             scalar(&db, "SELECT COUNT(*) AS count FROM schema_migrations").await,
-            2
+            3
         );
         assert_eq!(
             scalar(
