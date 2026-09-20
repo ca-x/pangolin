@@ -7,6 +7,7 @@ import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 import { api, type Document, type Paged } from '../api'
 import { EmptyState, EnabledPill, Field, Modal, SelectField, SkeletonRows, Tip } from '../components'
+import i18n from '../i18n'
 import { projectOperationPath, useProject } from '../project'
 
 export function PageHeader({ title, description, action }: { title: string; description?: string; action?: ReactNode }) {
@@ -19,7 +20,7 @@ export function QueryError({ retry }: { retry: () => void }) {
 }
 
 export const formatDate = (value: unknown) => typeof value === 'number' && value > 0
-  ? new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(value * 1000))
+  ? new Intl.DateTimeFormat(i18n.language, { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(value * 1000))
   : '—'
 
 export const displayValue = (value: unknown) => {

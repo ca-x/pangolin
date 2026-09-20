@@ -25,17 +25,25 @@ Pangolin（中文正式名称“鲮鲤”）是一款单二进制 AI API 聚合�
 
 ## 界面预览
 
-### PC
+### 桌面端
 
-| 概览 | 渠道 | 模型路由与解释 |
+| 概览（浅色） | 概览（深色） | 渠道 |
 | --- | --- | --- |
-| ![Pangolin desktop overview](docs/screenshots/overview-desktop-light-en.png) | ![Pangolin desktop channels](docs/screenshots/channels-desktop-light-en.png) | ![鲮鲤桌面端模型路由](docs/screenshots/routing-desktop-dark-zh.png) |
+| ![鲮鲤桌面端概览](docs/screenshots/overview-desktop-light-en.png) | ![鲮鲤桌面端深色概览](docs/screenshots/overview-desktop-dark-zh.png) | ![鲮鲤桌面端渠道](docs/screenshots/channels-desktop-light-en.png) |
+
+| 模型路由 | 请求记录 | 请求详情 |
+| --- | --- | --- |
+| ![鲮鲤桌面端模型路由](docs/screenshots/routing-desktop-dark-zh.png) | ![鲮鲤桌面端请求记录](docs/screenshots/requests-desktop-light-en.png) | ![鲮鲤请求详情](docs/screenshots/request-detail-desktop-light-en.png) |
+
+| 追踪详情 | 访问控制 | 系统设置 |
+| --- | --- | --- |
+| ![鲮鲤追踪详情](docs/screenshots/trace-desktop-dark-en.png) | ![鲮鲤访问控制](docs/screenshots/access-desktop-light-zh.png) | ![鲮鲤系统设置](docs/screenshots/system-desktop-dark-zh.png) |
 
 ### 移动端
 
-| 概览 | 渠道多凭据 | 追踪详情 |
-| --- | --- | --- |
-| ![鲮鲤移动端概览](docs/screenshots/overview-mobile-dark-zh.png) | ![鲮鲤移动端多凭据管理](docs/screenshots/credentials-mobile-dark-zh.png) | ![鲮鲤移动端追踪详情](docs/screenshots/trace-mobile-dark-zh.png) |
+| 概览 | 渠道 | 多凭据 | 追踪详情 |
+| --- | --- | --- | --- |
+| ![鲮鲤移动端概览](docs/screenshots/overview-mobile-dark-zh.png) | ![鲮鲤移动端渠道](docs/screenshots/channels-mobile-light-en.png) | ![鲮鲤移动端多凭据管理](docs/screenshots/credentials-mobile-dark-zh.png) | ![鲮鲤移动端追踪详情](docs/screenshots/trace-mobile-dark-zh.png) |
 
 ## 快速开始
 

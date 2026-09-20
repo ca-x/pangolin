@@ -5,11 +5,12 @@ import { useTranslation } from 'react-i18next'
 import { Link } from 'react-router'
 import { api, type Paged, type RequestItem, type Summary } from '../api'
 import { EmptyState, SkeletonRows, Status } from '../components'
+import i18n from '../i18n'
 import { PageHeader, QueryError, displayValue, formatDate } from './shared'
 import { useProject } from '../project'
 
-const formatNumber = (value: number) => new Intl.NumberFormat(undefined, { notation: value > 9999 ? 'compact' : 'standard', maximumFractionDigits: 1 }).format(value)
-const formatShortDate = (value: number) => new Intl.DateTimeFormat(undefined, { month: 'numeric', day: 'numeric', hour: 'numeric' }).format(new Date(value * 1000))
+const formatNumber = (value: number) => new Intl.NumberFormat(i18n.language, { notation: value > 9999 ? 'compact' : 'standard', maximumFractionDigits: 1 }).format(value)
+const formatShortDate = (value: number) => new Intl.DateTimeFormat(i18n.language, { month: 'numeric', day: 'numeric', hour: 'numeric' }).format(new Date(value * 1000))
 /** Round an axis step up to a readable 1 / 1.5 / 2 / 2.5 / 3 / 4 / 5 / 6 / 8 / 10 ladder. */
 const niceStep = (value: number) => {
   const magnitude = 10 ** Math.floor(Math.log10(Math.max(value, 1)))
