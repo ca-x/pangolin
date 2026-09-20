@@ -285,7 +285,7 @@ fn query(resource: &str) -> Result<(&'static str, &'static str, &'static str), A
         "associations" => (
             "model_associations",
             "project_id=?",
-            "json_object('id',id,'model_id',model_id,'model_name',(SELECT public_name FROM models WHERE id=model_associations.model_id),'provider_id',provider_id,'provider_name',(SELECT name FROM providers WHERE id=model_associations.provider_id),'match_type',match_type,'pattern',pattern,'conditions',json(conditions_json),'priority',priority,'weight',weight,'enabled',enabled,'created_at',created_at,'updated_at',updated_at)",
+            "json_object('id',id,'model_id',model_id,'model_name',(SELECT m.public_name FROM models m JOIN providers p ON p.id=m.provider_id WHERE m.id=model_associations.model_id AND p.project_id=model_associations.project_id),'provider_id',provider_id,'provider_name',(SELECT name FROM providers WHERE id=model_associations.provider_id AND project_id=model_associations.project_id),'match_type',match_type,'pattern',pattern,'conditions',json(conditions_json),'priority',priority,'weight',weight,'enabled',enabled,'created_at',created_at,'updated_at',updated_at)",
         ),
         "key-profiles" => (
             "api_key_profiles",
@@ -441,7 +441,7 @@ async fn detail(
         let trace=state.db.query_one(sql("SELECT json_object('id',id,'thread_id',thread_id,'external_id',external_id,'status',status,'started_at',started_at,'finished_at',finished_at) AS document FROM traces WHERE project_id=? AND id=?",vec![project.clone().into(),id.clone().into()])).await?.ok_or(ApiError::NotFound)?;
         let trace: Value = serde_json::from_str(&trace.try_get::<String>("", "document")?)
             .map_err(|error| ApiError::Internal(error.into()))?;
-        let requests=documents(state.db.query_all(sql("SELECT json_object('id',id,'protocol',protocol,'endpoint',endpoint,'model',requested_model,'status',status,'started_at',started_at,'finished_at',finished_at) AS document FROM requests WHERE trace_id=? ORDER BY started_at",vec![id.clone().into()])).await?)?;
+        let requests=documents(state.db.query_all(sql("SELECT json_object('id',id,'public_id',COALESCE(json_extract(request_metadata_json,'$.external_id'),id),'protocol',protocol,'endpoint',endpoint,'model',requested_model,'status',status,'started_at',started_at,'finished_at',finished_at) AS document FROM requests WHERE trace_id=? ORDER BY started_at",vec![id.clone().into()])).await?)?;
         let executions=documents(state.db.query_all(sql("SELECT json_object('id',id,'request_id',request_id,'provider_id',provider_id,'attempt',attempt,'model',model,'status',status,'retry_reason',retry_reason,'latency_ms',latency_ms,'started_at',started_at,'finished_at',finished_at) AS document FROM request_executions WHERE request_id IN (SELECT id FROM requests WHERE trace_id=?) ORDER BY started_at",vec![id.into()])).await?)?;
         return Ok(Json(
             json!({"trace":trace,"requests":requests,"executions":executions}),
@@ -627,7 +627,7 @@ async fn set_orchestration_settings(
     )
     .await?;
     tx.commit().await?;
-    state.orchestrator.affinity_rules.reset();
+    state.orchestrator.affinity_rules.reset_project(&project);
     Ok(Json(json!({"ok":true})))
 }
 
@@ -903,7 +903,27 @@ async fn mutate(
             if match_type == "regex" {
                 crate::orchestration::policy::regex(text(&value, "pattern")?)?;
             }
-            let changed = transaction.execute(sql("INSERT INTO model_associations(id,project_id,model_id,provider_id,match_type,pattern,conditions_json,priority,weight,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET model_id=excluded.model_id,provider_id=excluded.provider_id,match_type=excluded.match_type,pattern=excluded.pattern,conditions_json=excluded.conditions_json,priority=excluded.priority,weight=excluded.weight,enabled=excluded.enabled,updated_at=excluded.updated_at WHERE model_associations.project_id=excluded.project_id",vec![resource_id.clone().into(),project.clone().into(),value["model_id"].as_str().into(),value["provider_id"].as_str().into(),match_type.into(),text(&value,"pattern")?.into(),value.get("conditions").cloned().unwrap_or(json!({"version":1})).to_string().into(),value["priority"].as_i64().unwrap_or(100).into(),value["weight"].as_i64().unwrap_or(1).clamp(1,10000).into(),value["enabled"].as_bool().unwrap_or(true).into(),db::now().into(),db::now().into()])).await?.rows_affected();
+            let model = value
+                .get("model_id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty());
+            let provider = value
+                .get("provider_id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty());
+            if let Some(model)=model&&transaction.query_one(sql("SELECT m.id FROM models m JOIN providers p ON p.id=m.provider_id WHERE m.id=? AND p.project_id=?",vec![model.into(),project.clone().into()])).await?.is_none(){return Err(ApiError::NotFound)}
+            if let Some(provider) = provider
+                && transaction
+                    .query_one(sql(
+                        "SELECT id FROM providers WHERE id=? AND project_id=?",
+                        vec![provider.into(), project.clone().into()],
+                    ))
+                    .await?
+                    .is_none()
+            {
+                return Err(ApiError::NotFound);
+            }
+            let changed = transaction.execute(sql("INSERT INTO model_associations(id,project_id,model_id,provider_id,match_type,pattern,conditions_json,priority,weight,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET model_id=excluded.model_id,provider_id=excluded.provider_id,match_type=excluded.match_type,pattern=excluded.pattern,conditions_json=excluded.conditions_json,priority=excluded.priority,weight=excluded.weight,enabled=excluded.enabled,updated_at=excluded.updated_at WHERE model_associations.project_id=excluded.project_id",vec![resource_id.clone().into(),project.clone().into(),model.into(),provider.into(),match_type.into(),text(&value,"pattern")?.into(),value.get("conditions").cloned().unwrap_or(json!({"version":1})).to_string().into(),value["priority"].as_i64().unwrap_or(100).into(),value["weight"].as_i64().unwrap_or(1).clamp(1,10000).into(),value["enabled"].as_bool().unwrap_or(true).into(),db::now().into(),db::now().into()])).await?.rows_affected();
             if changed != 1 {
                 return Err(ApiError::Forbidden);
             }

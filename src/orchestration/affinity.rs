@@ -77,6 +77,7 @@ pub struct Cache {
     backend: Arc<dyn BaseCache<Value = CacheEntry>>,
     pub hits: std::sync::atomic::AtomicU64,
     generation: std::sync::atomic::AtomicU64,
+    project_generations: std::sync::Mutex<std::collections::HashMap<String, u64>>,
     switches: std::sync::Mutex<
         std::collections::HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>,
     >,
@@ -99,6 +100,7 @@ impl Default for Cache {
             backend,
             hits: Default::default(),
             generation: Default::default(),
+            project_generations: Default::default(),
             switches: Default::default(),
         }
     }
@@ -107,6 +109,28 @@ impl Cache {
     pub fn reset(&self) {
         self.generation
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.project_generations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
+    }
+    pub fn reset_project(&self, project: &str) {
+        let mut generations = self
+            .project_generations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        *generations.entry(project.into()).or_default() += 1;
+    }
+    fn generation_for(&self, project: &str) -> (u64, u64) {
+        (
+            self.generation.load(std::sync::atomic::Ordering::Relaxed),
+            *self
+                .project_generations
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .get(project)
+                .unwrap_or(&0),
+        )
     }
     fn switch_lock(&self, key: &str) -> Option<Arc<tokio::sync::Mutex<()>>> {
         let mut locks = self.switches.lock().unwrap_or_else(|e| e.into_inner());
@@ -228,7 +252,7 @@ impl Cache {
             };
             let fingerprint = blake3::hash(
                 json!([
-                    self.generation.load(std::sync::atomic::Ordering::Relaxed),
+                    self.generation_for(&key.project_id),
                     key.project_id,
                     key.id,
                     rule.id,
@@ -317,6 +341,17 @@ impl Cache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn project_reset_does_not_invalidate_other_project_generation() {
+        let cache = Cache::default();
+        let a = cache.generation_for("a");
+        let b = cache.generation_for("b");
+        cache.reset_project("a");
+        assert_ne!(cache.generation_for("a"), a);
+        assert_eq!(cache.generation_for("b"), b);
+        cache.reset();
+        assert_ne!(cache.generation_for("b"), b);
+    }
     #[tokio::test]
     async fn cc_switch_scoped_switches_are_singleflight_and_old_failures_do_not_erase_new_success()
     {

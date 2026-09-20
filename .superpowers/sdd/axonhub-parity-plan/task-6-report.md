@@ -169,3 +169,31 @@ The confirmed GPT-6 review findings were addressed as one focused correction pas
   - 1440px populated models: `documentWidth=1440`, no document overflow, table client/scroll width both `1075`, status/actions visible, body and monospace `14px`.
 
 No full Tasks 1–5 suite, full 12-case browser matrix, release build or actionlint run was repeated in this fix round.
+
+## Fix round 2
+
+Commit base: `db2fcf7`.
+
+| Finding | Correction | Focused evidence |
+| --- | --- | --- |
+| Association project isolation | Association upsert validates optional model and provider references through the selected project before insert/update. Model/provider display-name subqueries are correlated with `model_associations.project_id`, so legacy cross-project rows cannot disclose foreign names. | `task6_associations_are_project_scoped_and_trace_exposes_public_request_id` rejects both foreign references with 404 and proves legacy foreign names project as null. |
+| Affinity invalidation isolation | Affinity cache now has global and per-project generation components. Project orchestration PUT increments only the selected project; instance restore/startup can still call the full reset, which increments global generation and clears project generations. | `project_reset_does_not_invalidate_other_project_generation` proves project A changes while B remains identical, then full reset changes B. |
+| Optional routing selectors | Routing association selectors contain an explicit localized `Unrestricted` option represented in the form by a non-empty sentinel and normalized to JSON null. Null projections select the sentinel on edit rather than the first channel/model. | `ModelsPage.test.tsx` edits an unrestricted association and asserts both submitted references remain null. |
+| Mobile trace action | Generic mobile resource cards now retain custom row actions. Trace cards expose an accessible `View trace` link at 375px while keeping IDs in the secondary copy action. | Live 375px trace list snapshot exposed two `View trace` links; clicking one reached trace detail with no document overflow. |
+| Public trace request link | Trace detail now returns both authoritative SQLite request UUID and `public_id` derived from the stored external request metadata. Request-detail links use `public_id`, which is the identifier accepted by project observability detail. | Rust test asserts `internal-request` plus `public-request`; React test asserts `/operations/requests/public-id`; live 375px click reached `/operations/requests/req_…`, rendered Request detail, had no alert/404 and kept `documentWidth=375`. |
+
+### Fix-round 2 verification
+
+- `cargo test --locked task6_associations_are_project_scoped_and_trace_exposes_public_request_id --no-fail-fast`
+  - passed: cross-project write rejection, read redaction and public request ID projection.
+- `cargo test --locked project_reset_does_not_invalidate_other_project_generation --no-fail-fast`
+  - passed: project-local and global affinity generation semantics.
+- `pnpm --dir web lint && pnpm --dir web test && pnpm --dir web build`
+  - passed: TypeScript clean, 11 Vitest tests passed, production assets built.
+- Live embedded 375px workflow:
+  - trace list showed accessible `View trace` actions;
+  - trace detail path had `documentWidth=375`, `overflow=false`;
+  - request link navigated to the public `req_…` identifier;
+  - request detail rendered without an alert or 404 and retained `documentWidth=375`, `overflow=false`.
+
+No full suite, full browser matrix, release build or actionlint run was repeated.

@@ -834,6 +834,73 @@ async fn task6_patch_preserves_omitted_secrets_and_channel_settings() {
 }
 
 #[tokio::test]
+async fn task6_associations_are_project_scoped_and_trace_exposes_public_request_id() {
+    let f = fixture(success()).await;
+    let cookie = owner(&f).await;
+    let project = db::DEFAULT_PROJECT_ID;
+    let base = format!("/api/admin/v1/projects/{project}/operations");
+    sql(&f,"INSERT INTO projects(id,name,slug,is_default,enabled,created_at,updated_at) VALUES('foreign-project','Foreign','foreign',0,1,1,1)",vec![]).await;
+    sql(&f,"INSERT INTO providers(id,name,kind,base_url,enabled,created_at,updated_at,project_id) VALUES('foreign-provider','Foreign provider','openai','https://foreign.test',1,1,1,'foreign-project')",vec![]).await;
+    sql(&f,"INSERT INTO models(id,provider_id,public_name,upstream_name,created_at) VALUES('foreign-model','foreign-provider','foreign-public','foreign-upstream',1)",vec![]).await;
+    for body in [
+        json!({"provider_id":"foreign-provider","match_type":"exact","pattern":"blocked"}),
+        json!({"model_id":"foreign-model","match_type":"exact","pattern":"blocked"}),
+    ] {
+        assert_eq!(
+            admin(
+                &f,
+                &cookie,
+                http::Method::POST,
+                &format!("{base}/associations"),
+                body,
+                true
+            )
+            .await
+            .status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+    sql(&f,"INSERT INTO model_associations(id,project_id,model_id,provider_id,match_type,pattern,created_at,updated_at) VALUES('legacy-cross',?,'foreign-model','foreign-provider','exact','legacy',1,1)",vec![project.into()]).await;
+    let listed = json_body(
+        admin(
+            &f,
+            &cookie,
+            http::Method::GET,
+            &format!("{base}/associations"),
+            Value::Null,
+            false,
+        )
+        .await,
+    )
+    .await;
+    let cross = listed["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == "legacy-cross")
+        .unwrap();
+    assert!(cross["model_name"].is_null());
+    assert!(cross["provider_name"].is_null());
+    sql(&f,"INSERT INTO traces(id,project_id,status,started_at,finished_at) VALUES('trace-public',?,'succeeded',1,2)",vec![project.into()]).await;
+    sql(&f,"INSERT INTO request_facts(id,project_id,log_level,started_at) VALUES('internal-request',?,'metadata',1)",vec![project.into()]).await;
+    sql(&f,"INSERT INTO requests(id,trace_id,protocol,endpoint,status,request_metadata_json,started_at,finished_at) VALUES('internal-request','trace-public','chat','/v1/chat/completions','succeeded',?,1,2)",vec![json!({"version":1,"external_id":"public-request"}).to_string().into()]).await;
+    let detail = json_body(
+        admin(
+            &f,
+            &cookie,
+            http::Method::GET,
+            &format!("{base}/trace-detail/trace-public"),
+            Value::Null,
+            false,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(detail["requests"][0]["id"], "internal-request");
+    assert_eq!(detail["requests"][0]["public_id"], "public-request");
+}
+
+#[tokio::test]
 async fn task5_management_api_prices_groups_logs_csrf_and_scope() {
     let f = fixture(success()).await;
     let cookie = owner(&f).await;
