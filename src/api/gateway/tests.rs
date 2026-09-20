@@ -1,6 +1,8 @@
 use super::*;
 
 mod catalog;
+mod instance_backup;
+mod operations;
 mod protocols;
 mod review;
 mod task4_review;
@@ -98,6 +100,7 @@ async fn fixture(mock: Router) -> Fixture {
                 .unwrap(),
             oidc_client: reqwest::Client::new(),
             budget_locks: Arc::new(Mutex::new(HashMap::new())),
+            maintenance: Arc::new(tokio::sync::RwLock::new(())),
             orchestrator: Arc::new(orchestration::Runtime::default()),
         },
         token,

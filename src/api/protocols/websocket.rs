@@ -28,7 +28,22 @@ fn error(lane: Option<&Value>, code: &str, message: &str) -> Value {
 
 async fn run(socket: WebSocket, state: AppState, mut headers: HeaderMap) {
     let session = format!("ws_{}", Uuid::new_v4().simple());
+    headers.insert(
+        "x-pangolin-websocket-generation",
+        HeaderValue::from_str(
+            &state
+                .orchestrator
+                .generation
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .to_string(),
+        )
+        .unwrap(),
+    );
     headers.insert("x-session-id", HeaderValue::from_str(&session).unwrap());
+    headers.insert(
+        "x-pangolin-websocket-session",
+        HeaderValue::from_str(&session).unwrap(),
+    );
     let (mut sink, mut source) = socket.split();
     let (output, mut events) = mpsc::channel::<Value>(32);
     let (control, mut controls) = mpsc::channel::<Message>(8);

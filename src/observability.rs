@@ -2,7 +2,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
 };
@@ -80,8 +80,9 @@ pub struct RequestFilter {
 }
 
 enum Command {
-    Record(Box<RequestEvent>),
+    Record(Box<RequestEvent>, u64),
     Flush(oneshot::Sender<()>),
+    Reset(u64, oneshot::Sender<bool>),
 }
 
 #[derive(Clone)]
@@ -90,6 +91,8 @@ pub struct ObservationStore {
     sender: Option<mpsc::Sender<Command>>,
     failure: Option<Arc<str>>,
     dropped: Arc<AtomicU64>,
+    generation: Arc<AtomicU64>,
+    poisoned: Arc<AtomicBool>,
 }
 
 impl ObservationStore {
@@ -100,6 +103,9 @@ impl ObservationStore {
         let writer_path = path.clone();
         let dropped = Arc::new(AtomicU64::new(0));
         let writer_dropped = Arc::clone(&dropped);
+        let generation = Arc::new(AtomicU64::new(0));
+        let poisoned = Arc::new(AtomicBool::new(false));
+        let writer_poisoned = poisoned.clone();
         thread::Builder::new().name("pangolin-observation-writer".into()).spawn(move || {
             let connection = match Connection::open(&writer_path) {
                 Ok(connection) => connection,
@@ -108,15 +114,17 @@ impl ObservationStore {
                     return;
                 }
             };
-            while let Some(command) = receiver.blocking_recv() {
+            let mut pending=None;let mut epoch=0;
+            while let Some(command) = pending.take().or_else(||receiver.blocking_recv()) {
                 match command {
-                    Command::Record(event) => {
+                    Command::Record(event,version) => {
+                        if version!=epoch {writer_dropped.fetch_add(1,Ordering::Relaxed);continue}
                         let mut batch = vec![event];
-                        let mut flush_after = None;
                         while batch.len() < 64 {
                             match receiver.try_recv() {
-                                Ok(Command::Record(event)) => batch.push(event),
-                                Ok(Command::Flush(done)) => { flush_after = Some(done); break; }
+                                Ok(Command::Record(event,version)) if version==epoch => batch.push(event),
+                                Ok(Command::Record(_, _))=>{writer_dropped.fetch_add(1,Ordering::Relaxed);},
+                                Ok(control) => { pending=Some(control);break; }
                                 Err(_) => break,
                             }
                         }
@@ -124,14 +132,14 @@ impl ObservationStore {
                             writer_dropped.fetch_add(batch.len() as u64, Ordering::Relaxed);
                             tracing::warn!(%error, count = batch.len(), "observation event batch was dropped");
                         }
-                        if let Some(done) = flush_after {
-                            let _ = connection.execute_batch("CHECKPOINT");
-                            let _ = done.send(());
-                        }
                     }
                     Command::Flush(done) => {
                         let _ = connection.execute_batch("CHECKPOINT");
                         let _ = done.send(());
+                    }
+                    Command::Reset(version,done)=>{
+                        epoch=version;let cleared=connection.execute_batch("DELETE FROM request_events; CHECKPOINT;").is_ok();
+                        writer_poisoned.store(!cleared,Ordering::Release);let _=done.send(cleared);
                     }
                 }
             }
@@ -141,6 +149,8 @@ impl ObservationStore {
             sender: Some(sender),
             failure: None,
             dropped,
+            generation,
+            poisoned,
         })
     }
 
@@ -150,26 +160,53 @@ impl ObservationStore {
             sender: None,
             failure: Some(Arc::from(error.to_string())),
             dropped: Arc::new(AtomicU64::new(0)),
+            generation: Arc::new(AtomicU64::new(0)),
+            poisoned: Arc::new(AtomicBool::new(true)),
         }
     }
 
     pub fn is_available(&self) -> bool {
-        self.failure.is_none()
+        self.failure.is_none() && !self.poisoned.load(Ordering::Acquire)
     }
 
     pub fn dropped_events(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
     }
 
+    #[cfg(test)]
     pub fn record(&self, event: RequestEvent) {
+        self.record_at(event, self.generation());
+    }
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+    pub fn record_at(&self, event: RequestEvent, generation: u64) {
+        if generation != self.generation() || self.poisoned.load(Ordering::Acquire) {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         let Some(sender) = &self.sender else {
             self.dropped.fetch_add(1, Ordering::Relaxed);
             return;
         };
-        if sender.try_send(Command::Record(Box::new(event))).is_err() {
+        if sender
+            .try_send(Command::Record(Box::new(event), generation))
+            .is_err()
+        {
             self.dropped.fetch_add(1, Ordering::Relaxed);
             tracing::warn!("observation queue is full; event dropped");
         }
+    }
+    pub async fn clear_for_restore(&self) -> bool {
+        self.poisoned.store(true, Ordering::Release);
+        let epoch = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        let (done, result) = oneshot::channel();
+        if let Some(sender) = &self.sender
+            && sender.send(Command::Reset(epoch, done)).await.is_ok()
+        {
+            return result.await.unwrap_or(false);
+        }
+        false
     }
 
     pub async fn flush(&self) {
@@ -200,6 +237,9 @@ impl ObservationStore {
     }
 
     fn ensure_available(&self) -> Result<()> {
+        if self.poisoned.load(Ordering::Acquire) {
+            anyhow::bail!("observation projection is unavailable")
+        }
         if let Some(error) = &self.failure {
             anyhow::bail!("observation store unavailable: {error}");
         }
@@ -425,6 +465,18 @@ mod tests {
             store.get("req-1".into()).await.unwrap().unwrap().latency_ms,
             42
         );
+        let old = store.get("req-1".into()).await.unwrap().unwrap();
+        let epoch = store.generation();
+        assert!(store.clear_for_restore().await);
+        store.record_at(old.clone(), epoch);
+        store.record(RequestEvent {
+            request_id: "req-new".into(),
+            ..old
+        });
+        store.flush().await;
+        assert!(store.get("req-1".into()).await.unwrap().is_none());
+        assert_eq!(store.summary().await.unwrap().requests, 1);
+        assert_eq!(store.dropped_events(), 1);
     }
 
     #[tokio::test]

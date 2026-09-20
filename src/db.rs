@@ -20,7 +20,7 @@ pub async fn connect(url: &str) -> Result<DatabaseConnection> {
         .await
         .context("failed to connect to SQLite")?;
     db.execute_unprepared(
-        "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;",
+        "PRAGMA auto_vacuum=INCREMENTAL; PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;",
     )
     .await
     .context("failed to configure SQLite")?;
@@ -430,18 +430,6 @@ fn api_key_ip_allowed(credential: &ApiKeyCredential, client_ip: Option<IpAddr>) 
         return false;
     }
     allowed.is_empty() || matches(&allowed) == Some(true)
-}
-
-pub async fn add_api_key_spend(db: &DatabaseConnection, id: &str, cost_micros: i64) -> Result<()> {
-    if cost_micros <= 0 {
-        return Ok(());
-    }
-    db.execute(stmt(
-        "UPDATE api_keys SET spent_micros=spent_micros+? WHERE id=?",
-        vec![cost_micros.into(), id.into()],
-    ))
-    .await?;
-    Ok(())
 }
 
 pub async fn record_audit_event(

@@ -22,16 +22,20 @@ use super::{
 };
 
 pub struct Runtime {
+    pub generation: AtomicU64,
     resources: DashMap<String, Arc<Resource>>,
     circuits: DashMap<String, Arc<Mutex<Circuit>>>,
     rotations: Cache<String, Arc<AtomicU64>>,
     affinity: Cache<String, String>,
     pub sessions: super::session::Sessions,
+    pub affinity_rules: super::affinity::Cache,
+    pub websocket_pins: Cache<String, String>,
 }
 
 impl Default for Runtime {
     fn default() -> Self {
         Self {
+            generation: AtomicU64::new(0),
             resources: DashMap::new(),
             circuits: DashMap::new(),
             rotations: Cache::builder()
@@ -43,6 +47,11 @@ impl Default for Runtime {
                 .time_to_idle(Duration::from_secs(1800))
                 .build(),
             sessions: Default::default(),
+            affinity_rules: Default::default(),
+            websocket_pins: Cache::builder()
+                .max_capacity(10000)
+                .time_to_idle(Duration::from_secs(86400))
+                .build(),
         }
     }
 }
@@ -87,6 +96,16 @@ impl Resource {
 }
 
 impl Runtime {
+    pub fn reset_derived(&self) {
+        self.generation.fetch_add(1, Ordering::Relaxed);
+        self.resources.clear();
+        self.circuits.clear();
+        self.rotations.invalidate_all();
+        self.affinity.invalidate_all();
+        self.websocket_pins.invalidate_all();
+        self.affinity_rules.reset();
+        self.sessions.clear();
+    }
     #[cfg(test)]
     pub fn measured_latency(&self, resource: &str) -> u64 {
         self.resources

@@ -131,15 +131,20 @@ pub async fn candidates(
         COALESCE(s.retry_statuses_json,'{"version":1}') AS retry_statuses_json,
         h.disabled_until,h.backoff_until,
         EXISTS(SELECT 1 FROM provider_quota_snapshots q WHERE q.remaining_micros<=0 AND (q.period_end IS NULL OR q.period_end>unixepoch())
-          AND q.provider_id=p.id AND (q.id=(SELECT qq.id FROM provider_quota_snapshots qq WHERE qq.provider_id=p.id AND qq.credential_id IS NULL ORDER BY qq.collected_at DESC,qq.id LIMIT 1)
-            OR q.id=(SELECT qq.id FROM provider_quota_snapshots qq WHERE qq.provider_id=p.id AND qq.credential_id=c.id ORDER BY qq.collected_at DESC,qq.id LIMIT 1))) AS quota_exhausted
+          AND q.provider_id=p.id AND (q.id=(SELECT qq.id FROM provider_quota_snapshots qq WHERE qq.provider_id=p.id AND qq.credential_id IS NULL ORDER BY qq.sequence DESC,qq.collected_at DESC,qq.id LIMIT 1)
+            OR q.id=(SELECT qq.id FROM provider_quota_snapshots qq WHERE qq.provider_id=p.id AND qq.credential_id=c.id ORDER BY qq.sequence DESC,qq.collected_at DESC,qq.id LIMIT 1))) AS quota_exhausted
         FROM models m JOIN providers p ON p.id=m.provider_id
         JOIN channel_credentials c ON c.id=(SELECT cc.id FROM channel_credentials cc WHERE cc.provider_id=p.id AND cc.enabled=1
-          AND NOT EXISTS(SELECT 1 FROM provider_quota_snapshots cq WHERE cq.id=(SELECT latest.id FROM provider_quota_snapshots latest WHERE latest.provider_id=p.id AND latest.credential_id=cc.id ORDER BY latest.collected_at DESC,latest.id LIMIT 1)
+          AND NOT EXISTS(SELECT 1 FROM credential_health_state ch WHERE ch.credential_id=cc.id AND ch.disabled_until>unixepoch())
+          AND NOT EXISTS(SELECT 1 FROM provider_quota_snapshots cq WHERE cq.id=(SELECT latest.id FROM provider_quota_snapshots latest WHERE latest.provider_id=p.id AND latest.credential_id=cc.id ORDER BY latest.sequence DESC,latest.collected_at DESC,latest.id LIMIT 1)
             AND cq.remaining_micros<=0 AND (cq.period_end IS NULL OR cq.period_end>unixepoch())) ORDER BY cc.priority,cc.id LIMIT 1)
         LEFT JOIN channel_settings s ON s.provider_id=p.id LEFT JOIN channel_health_state h ON h.provider_id=p.id
-        WHERE p.project_id=? ORDER BY m.priority,p.id,m.id
-    "#,vec![key.project_id.clone().into()])).all(db).await?;
+        WHERE p.project_id=? AND NOT EXISTS(
+          SELECT 1 FROM service_group_keys gk JOIN service_groups g ON g.id=gk.group_id
+          WHERE gk.api_key_id=? AND (g.enabled=0 OR EXISTS(SELECT 1 FROM service_group_channels gc WHERE gc.group_id=g.id)
+          AND NOT EXISTS(SELECT 1 FROM service_group_channels gc WHERE gc.group_id=g.id AND gc.provider_id=p.id)))
+        ORDER BY m.priority,p.id,m.id
+    "#,vec![key.project_id.clone().into(),key.id.clone().into()])).all(db).await?;
     let associations = Association::find_by_statement(statement("SELECT id,model_id,provider_id,match_type,pattern,conditions_json,priority,weight FROM model_associations WHERE project_id=? AND enabled=1 ORDER BY priority,id",vec![key.project_id.clone().into()])).all(db).await?;
     let mut result = vec![];
     for row in rows {

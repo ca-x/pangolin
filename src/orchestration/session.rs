@@ -59,6 +59,9 @@ fn normalize(items: &mut [Value]) {
 }
 
 impl Sessions {
+    pub fn clear(&self) {
+        self.records.invalidate_all();
+    }
     pub fn prepare(&self, scope: &str, body: &mut Value) -> Result<()> {
         let previous = body.get("previous_response_id").and_then(Value::as_str);
         if let Some(previous) = previous {

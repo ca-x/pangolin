@@ -85,7 +85,7 @@ CREATE TABLE IF NOT EXISTS api_keys (
     key_hash TEXT NOT NULL,
     scopes TEXT NOT NULL DEFAULT '["gateway"]',
     budget_micros INTEGER,
-    spent_micros INTEGER NOT NULL DEFAULT 0,
+    spent_micros INTEGER NOT NULL DEFAULT 0 CHECK(typeof(spent_micros)='integer' AND spent_micros>=0),
     enabled INTEGER NOT NULL DEFAULT 1,
     last_used_at INTEGER,
     created_at INTEGER NOT NULL,
@@ -430,7 +430,7 @@ CREATE TABLE threads (
     metadata_json TEXT NOT NULL DEFAULT '{"version":1}',
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
-    UNIQUE(project_id,external_id)
+    UNIQUE(project_id,api_key_id,external_id)
 );
 CREATE INDEX idx_threads_api_key ON threads(api_key_id);
 CREATE INDEX idx_threads_user ON threads(user_id);
@@ -485,7 +485,7 @@ CREATE INDEX idx_request_executions_provider ON request_executions(provider_id,s
 CREATE INDEX idx_request_executions_credential ON request_executions(credential_id,started_at);
 CREATE TABLE usage_logs (
     id TEXT PRIMARY KEY,
-    execution_id TEXT NOT NULL UNIQUE REFERENCES request_executions(id) ON DELETE CASCADE,
+    execution_id TEXT NOT NULL UNIQUE REFERENCES execution_facts(id) ON DELETE CASCADE,
     model_id TEXT REFERENCES models(id) ON DELETE SET NULL,
     price_id TEXT REFERENCES model_prices(id) ON DELETE SET NULL,
     input_tokens INTEGER NOT NULL DEFAULT 0 CHECK(input_tokens >= 0),
@@ -511,6 +511,7 @@ CREATE INDEX idx_usage_cost_items_component ON usage_cost_items(price_component_
 
 CREATE TABLE provider_quota_snapshots (
     id TEXT PRIMARY KEY,
+    sequence INTEGER NOT NULL DEFAULT 0 CHECK(sequence>=0),
     provider_id TEXT NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
     credential_id TEXT REFERENCES channel_credentials(id) ON DELETE CASCADE,
     period_start INTEGER,
@@ -521,6 +522,7 @@ CREATE TABLE provider_quota_snapshots (
 );
 CREATE INDEX idx_provider_quota_snapshots_provider ON provider_quota_snapshots(provider_id,collected_at);
 CREATE INDEX idx_provider_quota_snapshots_credential ON provider_quota_snapshots(credential_id,collected_at);
+CREATE INDEX idx_provider_quota_snapshots_sequence ON provider_quota_snapshots(provider_id,credential_id,sequence DESC,collected_at DESC,id);
 CREATE TABLE channel_probes (
     id TEXT PRIMARY KEY,
     provider_id TEXT NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
@@ -905,6 +907,25 @@ pub async fn migrate(db: &DatabaseConnection) -> Result<()> {
             .await?;
         transaction.commit().await?;
     }
+    let operations_applied = Count::find_by_statement(statement(
+        "SELECT COUNT(*) AS count FROM schema_migrations WHERE version=8",
+    ))
+    .one(db)
+    .await?
+    .is_some_and(|row| row.count > 0);
+    if !operations_applied {
+        let transaction = db.begin().await?;
+        transaction
+            .execute_unprepared(include_str!("../operations/schema.sql"))
+            .await
+            .context("failed to initialize authoritative operations schema")?;
+        transaction
+            .execute(statement(
+                "INSERT INTO schema_migrations(version,applied_at) VALUES(8,unixepoch())",
+            ))
+            .await?;
+        transaction.commit().await?;
+    }
     Ok(())
 }
 
@@ -942,7 +963,7 @@ mod tests {
 
         assert_eq!(
             scalar(&db, "SELECT MAX(version) AS count FROM schema_migrations").await,
-            7
+            8
         );
         for table in [
             "projects",
@@ -1098,7 +1119,7 @@ mod tests {
 
         assert_eq!(
             scalar(&db, "SELECT COUNT(*) AS count FROM schema_migrations").await,
-            6
+            7
         );
         assert_eq!(
             scalar(

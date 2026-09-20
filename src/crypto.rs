@@ -16,6 +16,24 @@ pub struct SecretBox {
 }
 
 impl SecretBox {
+    pub fn passphrase(passphrase: &str, salt: &[u8]) -> Result<Self> {
+        if passphrase.chars().count() < 12 || passphrase.len() > 1024 || salt.len() != 32 {
+            bail!("export passphrase must contain 12–1024 characters and use a 32-byte salt")
+        }
+        let params = argon2::Params::new(65536, 3, 1, Some(32))?;
+        let kdf = Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
+        let mut key = [0u8; 32];
+        kdf.hash_password_into(passphrase.as_bytes(), salt, &mut key)?;
+        Ok(Self { key })
+    }
+    pub fn wrap_key(&self, wrapping: &Self) -> Result<String> {
+        wrapping.encrypt(&STANDARD_NO_PAD.encode(self.key))
+    }
+    pub fn unwrap_key(wrapping: &Self, envelope: &str) -> Result<Self> {
+        Ok(Self {
+            key: decode_key(&wrapping.decrypt(envelope)?)?,
+        })
+    }
     pub fn load(data_dir: &Path, configured: Option<&str>) -> Result<Self> {
         let key = if let Some(encoded) = configured {
             decode_key(encoded)

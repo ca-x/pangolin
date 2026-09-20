@@ -8,6 +8,7 @@ mod db;
 mod models;
 mod observability;
 mod oidc;
+mod operations;
 mod orchestration;
 mod providers;
 mod web;
@@ -60,8 +61,12 @@ async fn main() -> Result<()> {
             .timeout(config.upstream_timeout)
             .build()?,
         budget_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        maintenance: Arc::new(tokio::sync::RwLock::new(())),
         orchestrator: Arc::new(orchestration::Runtime::default()),
     };
+    operations::instance_backup::reset_projection(&state).await?;
+    operations::runtime::recover(&state).await?;
+    let operations = operations::runtime::start(state.clone());
     let app = Router::new()
         .merge(api::router(state))
         .fallback(web::serve)
@@ -78,6 +83,8 @@ async fn main() -> Result<()> {
     )
     .with_graceful_shutdown(shutdown_signal())
     .await?;
+    operations.abort();
+    let _ = operations.await;
     observations.flush().await;
     Ok(())
 }

@@ -379,37 +379,33 @@ async fn model(
     Path(model): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
+    let _maintenance = state.maintenance.clone().read_owned().await;
     let key = gateway_key(&state, &headers).await?;
     let models = crate::orchestration::visible_models(&state.db, &key, &headers).await?;
     let value = models
         .into_iter()
         .find(|v| v["id"] == model)
         .ok_or(ApiError::NotFound)?;
-    Ok(gateway::discovery_response(
-        &state,
-        &headers,
-        &key,
-        value,
-        "/v1/models/{model}",
-    ))
+    gateway::discovery_response(&state, &headers, &key, value, "/v1/models/{model}").await
 }
 
 async fn anthropic_models(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
+    let _maintenance = state.maintenance.clone().read_owned().await;
     let key = gateway_key(&state, &headers).await?;
     let models =
         crate::orchestration::visible_models_for(&state.db, &key, &headers, &["/v1/messages"])
             .await?;
     let data=models.into_iter().map(|v|json!({"id":v["id"],"type":"model","display_name":v["id"],"created_at":time::OffsetDateTime::from_unix_timestamp(v["created"].as_i64().unwrap_or(0)).unwrap_or(time::OffsetDateTime::UNIX_EPOCH).format(&time::format_description::well_known::Rfc3339).unwrap()})).collect::<Vec<_>>();
-    Ok(gateway::discovery_response(
+    gateway::discovery_response(
         &state,
         &headers,
         &key,
         json!({"first_id":data.first().map(|v|&v["id"]),"last_id":data.last().map(|v|&v["id"]),"data":data,"has_more":false}),
         "/anthropic/v1/models",
-    ))
+    ).await
 }
 
 async fn gemini_models(
@@ -417,6 +413,7 @@ async fn gemini_models(
     OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
+    let _maintenance = state.maintenance.clone().read_owned().await;
     let headers = gemini_headers(headers, &uri)?;
     let key = gateway_key(&state, &headers).await?;
     let models = crate::orchestration::visible_models_for(
@@ -433,13 +430,13 @@ async fn gemini_models(
         &["/v1beta/models:streamGenerateContent"],
     )
     .await?;
-    Ok(gateway::discovery_response(
+    gateway::discovery_response(
         &state,
         &headers,
         &key,
         json!({"models":models.into_iter().map(|v|{let mut methods=vec!["generateContent"];if streaming.iter().any(|m|m["id"]==v["id"]){methods.push("streamGenerateContent");}json!({"name":format!("models/{}",v["id"].as_str().unwrap_or("")),"displayName":v["id"],"supportedGenerationMethods":methods})}).collect::<Vec<_>>()}),
         "/v1beta/models",
-    ))
+    ).await
 }
 
 pub(super) fn protocol_error(

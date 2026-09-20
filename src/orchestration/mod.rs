@@ -1,5 +1,7 @@
 //! Gateway orchestration boundary. Task 4 adapters consume `Plan`/`Candidate`;
 //! observability consumes redacted `Decision`s and terminal attempt outcomes.
+pub mod affinity;
+pub mod compaction;
 pub mod policy;
 mod protection;
 mod repository;
@@ -91,6 +93,7 @@ pub struct Plan {
     pub session_request: Value,
     pub routing: Routing,
     pub sticky: Option<String>,
+    pub affinity: Option<affinity::Binding>,
     pub decisions: Vec<Decision>,
     pub estimated_tokens: u32,
     protection: Vec<protection::Rule>,
@@ -250,13 +253,21 @@ pub async fn prepare(
         .and_then(|name| headers.get(name))
         .and_then(|v| v.to_str().ok())
         .filter(|v| !v.is_empty() && v.len() <= 256)
-        .map(|v| format!("{scope}:{}:{mapped}:{endpoint}:{v}", mapped.len()));
+        .map(|v| {
+            blake3::hash(format!("{scope}:{}:{mapped}:{endpoint}:{v}", mapped.len()).as_bytes())
+                .to_hex()
+                .to_string()
+        });
     runtime.order(
         &format!("{scope}:{}:{mapped}:{endpoint}", mapped.len()),
         &mut candidates,
         profile.routing.strategy,
         sticky.as_deref(),
     );
+    let affinity = runtime
+        .affinity_rules
+        .select(db, key, headers, &payload, endpoint, &mut candidates)
+        .await?;
     for candidate in &candidates {
         decisions.push(Decision {
             stage: "strategy",
@@ -284,6 +295,7 @@ pub async fn prepare(
         session_request,
         routing: profile.routing,
         sticky,
+        affinity,
         decisions,
         estimated_tokens,
         protection,

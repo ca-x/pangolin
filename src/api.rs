@@ -1,4 +1,4 @@
-use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Instant};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
 use axum::{
     Json, Router,
@@ -16,7 +16,8 @@ use uuid::Uuid;
 
 mod catalog_api;
 pub(crate) mod errors;
-mod gateway;
+pub(crate) mod gateway;
+mod operations_api;
 mod protocols;
 
 use crate::{
@@ -36,6 +37,7 @@ pub struct AppState {
     pub client: reqwest::Client,
     pub oidc_client: reqwest::Client,
     pub budget_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    pub maintenance: Arc<tokio::sync::RwLock<()>>,
     pub orchestrator: Arc<crate::orchestration::Runtime>,
 }
 
@@ -147,6 +149,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .merge(protocols::router())
         .merge(catalog_api::router())
+        .merge(operations_api::router(state.clone()))
         .merge(crate::access_api::router())
         .route("/api/health/live", get(live))
         .route("/api/health/ready", get(ready))
@@ -185,13 +188,40 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/messages", post(gateway_messages))
         .layer(middleware::from_fn(errors::native_errors))
         .layer(middleware::from_fn(capture_trusted_client_ip))
+        .layer(middleware::from_fn_with_state(state.clone(), maintenance))
         .with_state(state)
+}
+async fn maintenance(
+    State(state): State<AppState>,
+    request: axum::extract::Request,
+    next: Next,
+) -> Response {
+    let path = request.uri().path();
+    if path.starts_with("/api/") && !path.starts_with("/api/admin/v1/instance/restore") {
+        let guard = state.maintenance.clone().read_owned().await;
+        hold_maintenance(next.run(request).await, guard)
+    } else {
+        next.run(request).await
+    }
+}
+pub(crate) fn hold_maintenance(
+    response: Response,
+    guard: tokio::sync::OwnedRwLockReadGuard<()>,
+) -> Response {
+    use futures_util::StreamExt;
+    let (parts, body) = response.into_parts();
+    let output = async_stream::stream! {let _guard=guard;let mut stream=body.into_data_stream();while let Some(chunk)=stream.next().await{yield chunk;}};
+    Response::from_parts(parts, Body::from_stream(output))
 }
 
 pub(crate) const TRUSTED_CLIENT_IP_HEADER: &str = "x-pangolin-trusted-client-ip";
 
 async fn capture_trusted_client_ip(mut request: axum::extract::Request, next: Next) -> Response {
     request.headers_mut().remove(TRUSTED_CLIENT_IP_HEADER);
+    request.headers_mut().remove("x-pangolin-websocket-session");
+    request
+        .headers_mut()
+        .remove("x-pangolin-websocket-generation");
     if let Some(ConnectInfo(address)) = request.extensions().get::<ConnectInfo<SocketAddr>>()
         && let Ok(value) = HeaderValue::from_str(&address.ip().to_string())
     {
@@ -445,7 +475,7 @@ async fn observation_summary(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError> {
-    require_user_permission(&state, &headers, "project:read").await?;
+    operations_api::actor(&state, &headers, None, false).await?;
     Ok(Json(
         state
             .observations
@@ -460,7 +490,7 @@ async fn observation_list(
     headers: HeaderMap,
     Query(filter): Query<RequestFilter>,
 ) -> Result<impl IntoResponse, ApiError> {
-    require_user_permission(&state, &headers, "project:read").await?;
+    operations_api::actor(&state, &headers, None, false).await?;
     Ok(Json(
         state
             .observations
@@ -475,7 +505,7 @@ async fn observation_detail(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
-    require_user_permission(&state, &headers, "project:read").await?;
+    operations_api::actor(&state, &headers, None, false).await?;
     state
         .observations
         .get(id)
@@ -504,15 +534,17 @@ async fn gateway_models(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
+    let _maintenance = state.maintenance.clone().read_owned().await;
     let credential = gateway_key(&state, &headers).await?;
     let models = crate::orchestration::visible_models(&state.db, &credential, &headers).await?;
-    Ok(gateway::discovery_response(
+    gateway::discovery_response(
         &state,
         &headers,
         &credential,
         json!({"object":"list","data":models}),
         "/v1/models",
-    ))
+    )
+    .await
 }
 
 async fn gateway_chat(
@@ -551,67 +583,6 @@ async fn gateway_request(
     gateway::execute(state, headers, body, endpoint).await
 }
 
-struct StreamEventGuard {
-    store: ObservationStore,
-    event: Option<RequestEvent>,
-    started: Instant,
-}
-
-impl StreamEventGuard {
-    fn new(store: ObservationStore, event: RequestEvent, started: Instant) -> Self {
-        Self {
-            store,
-            event: Some(event),
-            started,
-        }
-    }
-
-    fn mark_first_byte(&mut self) {
-        if let Some(event) = &mut self.event
-            && event.ttft_ms.is_none()
-        {
-            event.ttft_ms = Some(self.started.elapsed().as_millis() as i64);
-        }
-    }
-
-    fn complete(&mut self) {
-        if let Some(event) = &mut self.event {
-            if event.status_code >= 400 {
-                event.error_kind = Some("upstream_http".into());
-            } else {
-                event.error_kind = Some("usage_unavailable".into());
-            }
-        }
-        self.publish();
-    }
-
-    fn fail(&mut self, kind: &str) {
-        if let Some(event) = &mut self.event {
-            event.status_code = StatusCode::BAD_GATEWAY.as_u16() as i32;
-            event.error_kind = Some(kind.into());
-        }
-        self.publish();
-    }
-
-    fn publish(&mut self) {
-        if let Some(mut event) = self.event.take() {
-            event.finished_at = db::now();
-            event.latency_ms = self.started.elapsed().as_millis() as i64;
-            self.store.record(event);
-        }
-    }
-}
-
-impl Drop for StreamEventGuard {
-    fn drop(&mut self) {
-        if let Some(event) = &mut self.event {
-            event.status_code = 499;
-            event.error_kind = Some("client_cancelled".into());
-        }
-        self.publish();
-    }
-}
-
 fn push_anthropic_message(messages: &mut Vec<Value>, role: &str, mut blocks: Vec<Value>) {
     if let Some(last) = messages.last_mut()
         && last.get("role").and_then(Value::as_str) == Some(role)
@@ -630,6 +601,7 @@ async fn call_anthropic_chat(
     secret: &str,
     headers: &HeaderMap,
     endpoint: &str,
+    mut accounting: Option<&mut crate::operations::lifecycle::Attempt>,
 ) -> anyhow::Result<Value> {
     crate::providers::ensure_fields(
         payload,
@@ -831,16 +803,28 @@ async fn call_anthropic_chat(
     {
         request = value.as_object().expect("LiteLLM emits an object").clone();
     }
-    let upstream = client
+    let request = client
         .post(upstream_url(&target.base_url, endpoint))
         .headers(headers.clone())
         .header("x-api-key", secret)
         .header("anthropic-version", "2023-06-01")
         .json(&request)
-        .send()
-        .await?;
+        .build()?;
+    if let Some(accounting) = accounting.as_deref_mut() {
+        accounting.contacted().await?;
+    }
+    let upstream = client.execute(request).await?;
     let status = upstream.status();
-    let body: Value = upstream.json().await?;
+    let bytes = gateway::read_body(upstream).await?;
+    let body: Value = serde_json::from_slice(&bytes)
+        .map_err(|_| std::io::Error::other("upstream JSON response is invalid"))?;
+    if status.is_success()
+        && let Some(accounting) = accounting
+    {
+        accounting
+            .usage
+            .merge(crate::operations::pricing::Usage::parse_for(&body, true));
+    }
     if !status.is_success() {
         return Err(AnthropicHttpError {
             status,
@@ -898,14 +882,9 @@ async fn call_anthropic_chat(
     if !tool_calls.is_empty() {
         message["tool_calls"] = Value::Array(tool_calls);
     }
-    let input_tokens = body
-        .pointer("/usage/input_tokens")
-        .and_then(Value::as_i64)
-        .unwrap_or(0);
-    let output_tokens = body
-        .pointer("/usage/output_tokens")
-        .and_then(Value::as_i64)
-        .unwrap_or(0);
+    let canonical_usage = crate::operations::pricing::Usage::parse_for(&body, true);
+    let input_tokens = canonical_usage.input;
+    let output_tokens = canonical_usage.output;
     Ok(json!({
         "id": body.get("id").cloned().unwrap_or_else(|| Value::String(format!("chatcmpl_{}", Uuid::new_v4().simple()))),
         "object": "chat.completion",
@@ -936,91 +915,7 @@ struct AnthropicHttpError {
     body: String,
 }
 
-#[allow(clippy::too_many_arguments)]
-fn build_event(
-    request_id: &str,
-    trace_id: &str,
-    started_at: i64,
-    latency_ms: i64,
-    endpoint: &str,
-    api_key_id: &str,
-    provider: &str,
-    requested_model: &str,
-    resolved_model: &str,
-    status_code: i32,
-    error_kind: Option<String>,
-    request: &Value,
-    response: Option<&Value>,
-    captured_request: Option<String>,
-    capture: bool,
-    input_price: i64,
-    output_price: i64,
-) -> RequestEvent {
-    let (input_tokens, output_tokens, cached_tokens) = usage(response);
-    let cost_micros = input_tokens
-        .saturating_mul(input_price)
-        .saturating_add(output_tokens.saturating_mul(output_price))
-        / 1_000_000;
-    RequestEvent {
-        request_id: request_id.into(),
-        trace_id: trace_id.into(),
-        started_at,
-        finished_at: db::now(),
-        endpoint: endpoint.into(),
-        api_key_id: Some(api_key_id.into()),
-        provider: Some(provider.into()),
-        requested_model: Some(requested_model.into()),
-        resolved_model: Some(resolved_model.into()),
-        status_code,
-        error_kind,
-        latency_ms,
-        ttft_ms: None,
-        input_tokens,
-        output_tokens,
-        cached_tokens,
-        cost_micros,
-        payload_captured: capture,
-        request_json: captured_request
-            .or_else(|| capture.then(|| redact_json(request.clone()).to_string())),
-        response_json: capture
-            .then(|| response.map(|value| redact_json(value.clone()).to_string()))
-            .flatten(),
-    }
-}
-
-fn usage(response: Option<&Value>) -> (i64, i64, i64) {
-    let usage =
-        response.and_then(|value| value.get("usage").or_else(|| value.get("usageMetadata")));
-    let input = usage
-        .and_then(|value| {
-            value
-                .get("prompt_tokens")
-                .or_else(|| value.get("input_tokens"))
-                .or_else(|| value.get("promptTokenCount"))
-        })
-        .and_then(Value::as_i64)
-        .unwrap_or(0);
-    let output = usage
-        .and_then(|value| {
-            value
-                .get("completion_tokens")
-                .or_else(|| value.get("output_tokens"))
-                .or_else(|| value.get("candidatesTokenCount"))
-        })
-        .and_then(Value::as_i64)
-        .unwrap_or(0);
-    let cached = usage
-        .and_then(|value| {
-            value
-                .pointer("/prompt_tokens_details/cached_tokens")
-                .or_else(|| value.get("cache_read_input_tokens"))
-                .or_else(|| value.get("cachedContentTokenCount"))
-        })
-        .and_then(Value::as_i64)
-        .unwrap_or(0);
-    (input, output, cached)
-}
-
+#[cfg(test)]
 fn redact_json(mut value: Value) -> Value {
     match &mut value {
         Value::Object(object) => {
@@ -1207,6 +1102,7 @@ mod tests {
                 .build()
                 .unwrap(),
             budget_locks: Arc::new(Mutex::new(HashMap::new())),
+            maintenance: Arc::new(tokio::sync::RwLock::new(())),
             orchestrator: Arc::new(crate::orchestration::Runtime::default()),
         });
         let response = app
@@ -1327,6 +1223,7 @@ mod tests {
                 .build()
                 .unwrap(),
             budget_locks: Arc::new(Mutex::new(HashMap::new())),
+            maintenance: Arc::new(tokio::sync::RwLock::new(())),
             orchestrator: Arc::new(crate::orchestration::Runtime::default()),
         });
         let response = app
@@ -1410,6 +1307,7 @@ mod tests {
             "test-key",
             &HeaderMap::new(),
             "/v1/messages",
+            None,
         )
         .await
         .unwrap();

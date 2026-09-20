@@ -153,7 +153,10 @@ async fn optional_principal(
     )))
 }
 
-async fn principal(state: &AppState, headers: &HeaderMap) -> Result<Principal, ApiError> {
+pub(crate) async fn principal(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<Principal, ApiError> {
     optional_principal(state, headers)
         .await?
         .ok_or(ApiError::Unauthorized)
@@ -911,6 +914,7 @@ mod tests {
                 .build()
                 .unwrap(),
             budget_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            maintenance: Arc::new(tokio::sync::RwLock::new(())),
             orchestrator: Arc::new(crate::orchestration::Runtime::default()),
         };
         let database = state.db.clone();

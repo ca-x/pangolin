@@ -3,7 +3,7 @@ use crate::orchestration::{self, AttemptGuard, AttemptOutcome, policy::ErrorMode
 use futures_util::StreamExt;
 use std::time::Duration;
 
-pub(super) async fn execute(
+pub(crate) async fn execute(
     state: AppState,
     headers: HeaderMap,
     body: axum::body::Bytes,
@@ -19,17 +19,46 @@ pub(super) async fn execute(
     .await
 }
 
-pub(super) async fn execute_input(
+pub(super) fn execute_input(
     state: AppState,
     headers: HeaderMap,
     input: super::protocols::Input,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Response, ApiError>> + Send>> {
+    Box::pin(async move {
+        let guard = state.maintenance.clone().read_owned().await;
+        execute_inner(state, headers, input)
+            .await
+            .map(|response| super::hold_maintenance(response, guard))
+    })
+}
+
+async fn execute_inner(
+    state: AppState,
+    mut headers: HeaderMap,
+    input: super::protocols::Input,
 ) -> Result<Response, ApiError> {
+    if headers.contains_key("x-pangolin-websocket-session")
+        && headers
+            .get("x-pangolin-websocket-generation")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+            != Some(
+                state
+                    .orchestrator
+                    .generation
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )
+    {
+        return Err(ApiError::Conflict(
+            "instance state changed; WebSocket reconnect required".into(),
+        ));
+    }
     use super::protocols::Wire;
     let endpoint = input.endpoint;
-    let started = Instant::now();
-    let started_at = db::now();
     let request_id = context_id(&headers, "x-request-id", "req_");
     let trace_id = context_id(&headers, "x-trace-id", "");
+    headers.insert("x-request-id", HeaderValue::from_str(&request_id).unwrap());
+    headers.insert("x-trace-id", HeaderValue::from_str(&trace_id).unwrap());
     let initial = gateway_key(&state, &headers).await?;
     let initial_profile = orchestration::load_profile(&state.db, &initial).await?;
     let mut payload = input.payload.clone();
@@ -77,13 +106,15 @@ pub(super) async fn execute_input(
             "streaming is unsupported for this endpoint".into(),
         ));
     }
-    if streaming && (initial.budget_micros.is_some() || initial_profile.budget.is_some()) {
-        return Err(ApiError::BadRequest("streaming requires reliable budget settlement and is disabled for budget-limited keys/profiles".into()));
+    if endpoint.starts_with("/v1/responses") {
+        state
+            .orchestrator
+            .sessions
+            .restore(&state.db, &state.secrets, &initial, &mut payload)
+            .await?;
     }
-    if crate::providers::is_media(endpoint)
-        && (initial.budget_micros.is_some() || initial_profile.budget.is_some())
-    {
-        return Err(ApiError::BadRequest("media requires unit-based budget settlement and is disabled for budget-limited keys/profiles".into()));
+    if endpoint == "/v1/responses" {
+        crate::orchestration::compaction::apply(&state, &initial, &headers, &mut payload).await;
     }
     let _profile_budget = if initial_profile.budget.is_some() {
         Some(
@@ -114,13 +145,6 @@ pub(super) async fn execute_input(
         ));
     }
     profile.map_model(&requested)?;
-    if endpoint.starts_with("/v1/responses") {
-        state
-            .orchestrator
-            .sessions
-            .restore(&state.db, &state.secrets, &credential, &mut payload)
-            .await?;
-    }
     let mut plan = orchestration::prepare(
         &state.db,
         &state.orchestrator,
@@ -147,6 +171,21 @@ pub(super) async fn execute_input(
     for decision in &plan.decisions {
         tracing::debug!(request_id,stage=decision.stage,candidate=?decision.candidate,reason=decision.reason,"routing decision");
     }
+    let websocket_scope = headers
+        .get("x-pangolin-websocket-session")
+        .and_then(|v| v.to_str().ok())
+        .map(|session| format!("{}:{}:{session}", credential.project_id, credential.id));
+    if let Some(scope) = &websocket_scope
+        && let Some(provider) = state.orchestrator.websocket_pins.get(scope)
+    {
+        plan.candidates
+            .retain(|candidate| candidate.provider_id == provider);
+        if plan.candidates.is_empty() {
+            return Err(ApiError::Conflict(
+                "WebSocket channel is unavailable; reconnect required".into(),
+            ));
+        }
+    }
     if plan.candidates.is_empty() {
         return Err(ApiError::BadRequest(
             "no eligible route for requested model and endpoint".into(),
@@ -166,21 +205,40 @@ pub(super) async fn execute_input(
             )
             .await?,
     );
-    let captured = state
-        .config
-        .capture_payloads
-        .then(|| redact_json(plan.payload.clone()).to_string());
+    let lifecycle = crate::operations::lifecycle::Request::begin(
+        &state,
+        &credential,
+        &headers,
+        &request_id,
+        &trace_id,
+        endpoint,
+        &requested,
+        &plan.payload,
+        plan.affinity.clone(),
+    )
+    .await?;
     let mut attempts = 0usize;
     let mut contacted = false;
     let mut last_admission = None;
-    let mut last_target = None;
     'candidates: for candidate in &plan.candidates {
         for _ in 0..candidate.retry.attempts {
             if attempts >= plan.routing.max_attempts {
                 break 'candidates;
             }
-            let (payload, mut extra_headers, tokens) = plan.attempt_payload(candidate)?;
-            let mut attempt = match AttemptGuard::acquire(
+            let (mut payload, mut extra_headers, tokens) = plan.attempt_payload(candidate)?;
+            if streaming
+                && endpoint == "/v1/chat/completions"
+                && matches!(
+                    candidate.target.provider_kind.as_str(),
+                    "openai" | "openai_compatible"
+                )
+            {
+                if payload.get("stream_options").is_none() {
+                    payload["stream_options"] = json!({});
+                }
+                payload["stream_options"]["include_usage"] = json!(true);
+            }
+            let attempt = match AttemptGuard::acquire(
                 state.orchestrator.clone(),
                 candidate,
                 plan.sticky.clone(),
@@ -196,6 +254,16 @@ pub(super) async fn execute_input(
                 Err(error) => return Err(error.into()),
             };
             attempts += 1;
+            let mut attempt = lifecycle
+                .attempt(
+                    candidate,
+                    attempt,
+                    attempts,
+                    tokens,
+                    &payload,
+                    !matches!(input.wire, Wire::Task { .. }),
+                )
+                .await?;
             if attempts > 1 {
                 key_permit
                     .as_ref()
@@ -206,7 +274,6 @@ pub(super) async fn execute_input(
                 tokio::time::sleep(Duration::from_millis(candidate.retry.delay_ms)).await;
             }
             let target = &candidate.target;
-            last_target = Some(target);
             let secret = state
                 .secrets
                 .decrypt(&target.secret_envelope)
@@ -246,16 +313,18 @@ pub(super) async fn execute_input(
                     &secret,
                     &extra_headers,
                     mapped_endpoint,
+                    Some(&mut attempt),
                 )
                 .await
                 {
                     Ok(value) => value,
                     Err(error) => {
                         if let Some(http) = error.downcast_ref::<AnthropicHttpError>() {
+                            attempt.rejection(http.status.as_u16()).await?;
                             let retry = candidate
                                 .retry
                                 .retry_status(http.status.as_u16(), &http.body);
-                            attempt.finish(AttemptOutcome::UpstreamFailure);
+                            attempt.finish(AttemptOutcome::UpstreamFailure).await?;
                             if retry {
                                 continue;
                             }
@@ -266,8 +335,10 @@ pub(super) async fn execute_input(
                                 endpoint,
                             ));
                         }
-                        if error.downcast_ref::<reqwest::Error>().is_some() {
-                            attempt.finish(AttemptOutcome::UpstreamFailure);
+                        if error.downcast_ref::<reqwest::Error>().is_some()
+                            || error.downcast_ref::<std::io::Error>().is_some()
+                        {
+                            attempt.finish(AttemptOutcome::UpstreamFailure).await?;
                             if candidate.retry.transport {
                                 continue;
                             }
@@ -280,31 +351,11 @@ pub(super) async fn execute_input(
                 };
                 let bytes = serde_json::to_vec(&value).map_err(|e| ApiError::Internal(e.into()))?;
                 if candidate.retry.empty_success && empty_success(Some(&value), &bytes) {
-                    attempt.finish(AttemptOutcome::UpstreamFailure);
+                    attempt.finish(AttemptOutcome::UpstreamFailure).await?;
                     continue;
                 }
-                let event = build_event(
-                    &request_id,
-                    &trace_id,
-                    started_at,
-                    started.elapsed().as_millis() as i64,
-                    endpoint,
-                    &credential.id,
-                    &target.provider_name,
-                    &requested,
-                    &target.upstream_name,
-                    200,
-                    None,
-                    &payload,
-                    Some(&value),
-                    captured.clone(),
-                    state.config.capture_payloads,
-                    target.input_price_micros,
-                    target.output_price_micros,
-                );
-                db::add_api_key_spend(&state.db, &credential.id, event.cost_micros).await?;
-                state.observations.record(event);
-                attempt.finish(AttemptOutcome::Success);
+                attempt.response(&value);
+                attempt.finish(AttemptOutcome::Success).await?;
                 if let Some(permit) = &mut key_permit {
                     permit.finish(true);
                 }
@@ -352,10 +403,11 @@ pub(super) async fn execute_input(
                 .client
                 .request(method, &prepared.url)
                 .headers(prepared.headers);
+            attempt.contacted().await?;
             let upstream = match request.body(outbound).send().await {
                 Ok(upstream) => upstream,
                 Err(_) => {
-                    attempt.finish(AttemptOutcome::UpstreamFailure);
+                    attempt.finish(AttemptOutcome::UpstreamFailure).await?;
                     if candidate.retry.transport {
                         continue;
                     }
@@ -363,42 +415,39 @@ pub(super) async fn execute_input(
                 }
             };
             let status = upstream.status();
+            if upstream
+                .headers()
+                .get_all(header::CONTENT_ENCODING)
+                .iter()
+                .any(|value| {
+                    !value
+                        .to_str()
+                        .is_ok_and(|v| v.trim().is_empty() || v.eq_ignore_ascii_case("identity"))
+                })
+            {
+                attempt.finish(AttemptOutcome::UpstreamFailure).await?;
+                return Err(ApiError::Upstream(
+                    "upstream content encoding is unsupported".into(),
+                ));
+            }
             let content_type = upstream
                 .headers()
                 .get(header::CONTENT_TYPE)
                 .cloned()
                 .unwrap_or_else(|| HeaderValue::from_static("application/json"));
             if !status.is_success() {
+                attempt.rejection(status.as_u16()).await?;
                 let bytes = read_body(upstream).await.unwrap_or_default();
                 let retry = candidate
                     .retry
                     .retry_status(status.as_u16(), &String::from_utf8_lossy(&bytes));
-                attempt.finish(AttemptOutcome::UpstreamFailure);
+                attempt.finish(AttemptOutcome::UpstreamFailure).await?;
                 if retry {
                     continue;
                 }
                 if let Some(permit) = &mut key_permit {
                     permit.finish(false);
                 }
-                state.observations.record(build_event(
-                    &request_id,
-                    &trace_id,
-                    started_at,
-                    started.elapsed().as_millis() as i64,
-                    endpoint,
-                    &credential.id,
-                    &target.provider_name,
-                    &requested,
-                    &target.upstream_name,
-                    status.as_u16() as i32,
-                    Some("upstream_http".into()),
-                    &payload,
-                    None,
-                    captured.clone(),
-                    false,
-                    0,
-                    0,
-                ));
                 let mut response = error_response(status, &candidate.retry, Some(bytes), endpoint);
                 response
                     .headers_mut()
@@ -410,7 +459,7 @@ pub(super) async fn execute_input(
                     .to_str()
                     .is_ok_and(|v| v.starts_with("text/event-stream"))
                 {
-                    attempt.finish(AttemptOutcome::UpstreamFailure);
+                    attempt.finish(AttemptOutcome::UpstreamFailure).await?;
                     if candidate.retry.transport {
                         continue;
                     }
@@ -421,7 +470,7 @@ pub(super) async fn execute_input(
                     match sse::next(&mut events, candidate.retry.first_event_timeout_ms).await {
                         Ok(Some(event)) if !sse::failed(&event) => event,
                         _ => {
-                            attempt.finish(AttemptOutcome::UpstreamFailure);
+                            attempt.finish(AttemptOutcome::UpstreamFailure).await?;
                             if candidate.retry.transport {
                                 continue;
                             }
@@ -430,33 +479,18 @@ pub(super) async fn execute_input(
                             ));
                         }
                     };
-                let mut guard = StreamEventGuard::new(
-                    state.observations.clone(),
-                    RequestEvent {
-                        request_id: request_id.clone(),
-                        trace_id: trace_id.clone(),
-                        started_at,
-                        finished_at: 0,
-                        endpoint: endpoint.into(),
-                        api_key_id: Some(credential.id.clone()),
-                        provider: Some(target.provider_name.clone()),
-                        requested_model: Some(requested.clone()),
-                        resolved_model: Some(target.upstream_name.clone()),
-                        status_code: status.as_u16() as i32,
-                        error_kind: None,
-                        latency_ms: 0,
-                        ttft_ms: None,
-                        input_tokens: 0,
-                        output_tokens: 0,
-                        cached_tokens: 0,
-                        cost_micros: 0,
-                        payload_captured: state.config.capture_payloads,
-                        request_json: captured.clone(),
-                        response_json: None,
-                    },
-                    started,
-                );
-                guard.mark_first_byte();
+                attempt.first_byte();
+                if let Some(scope) = &websocket_scope {
+                    let pinned = state
+                        .orchestrator
+                        .websocket_pins
+                        .get_with(scope.clone(), || candidate.provider_id.clone());
+                    if pinned != candidate.provider_id {
+                        return Err(ApiError::Conflict(
+                            "WebSocket channel changed; reconnect required".into(),
+                        ));
+                    }
+                }
                 let mut key = key_permit.take().expect("one downstream response");
                 let runtime = state.orchestrator.clone();
                 let database = state.db.clone();
@@ -469,15 +503,16 @@ pub(super) async fn execute_input(
                 let output = async_stream::stream! {
                     let mut event=first;
                     loop {
+                        if let Ok(value)=serde_json::from_str::<Value>(&event.data) {attempt.stream_event(&value);}
                         let terminal=terminal_state.terminal(&event,endpoint);
                         let failed=sse::failed(&event);
                         if let Some(response)=sse::completed_response(&event)
                             && runtime.sessions.persist(&database,&secrets,&session_credential,&session_request,&response).await.is_err() {
-                            attempt.finish(AttemptOutcome::LocalFailure);key.finish(false);guard.fail("session_storage_error");
+                            let _=attempt.finish(AttemptOutcome::LocalFailure).await;key.finish(false);
                             yield Err(std::io::Error::other("could not persist response session"));return;
                         }
-                        if failed {attempt.finish(AttemptOutcome::UpstreamFailure);key.finish(false);guard.fail("upstream_stream_error");}
-                        if terminal&&!failed {attempt.finish(AttemptOutcome::Success);key.finish(true);guard.complete();}
+                        if failed {if attempt.finish(AttemptOutcome::UpstreamFailure).await.is_err(){yield Err(std::io::Error::other("usage settlement failed"));return;}key.finish(false);}
+                        if terminal&&!failed {if attempt.finish(AttemptOutcome::Success).await.is_err(){yield Err(std::io::Error::other("usage settlement failed"));return;}key.finish(true);}
                         if failed {event=sse::error_event(event,&error_policy,endpoint);}
                         if terminal||failed {
                             // Terminal delivery must not hold upstream permits or a
@@ -491,13 +526,13 @@ pub(super) async fn execute_input(
                         event=match sse::next(&mut events,timeout).await {
                             Ok(Some(event))=>event,
                             Ok(None)=>{
-                                attempt.finish(AttemptOutcome::UpstreamFailure);key.finish(false);guard.fail("incomplete_stream");
+                                let _=attempt.finish(AttemptOutcome::UpstreamFailure).await;key.finish(false);
                                 let error=sse::interrupted_event(&error_policy,endpoint);
                                 drop(events);drop(attempt);drop(key);
                                 yield Ok::<_,std::io::Error>(sse::encode(&error));return;
                             },
                             Err(_)=>{
-                                attempt.finish(AttemptOutcome::UpstreamFailure);key.finish(false);guard.fail("stream_error");
+                                let _=attempt.finish(AttemptOutcome::UpstreamFailure).await;key.finish(false);
                                 let error=sse::interrupted_event(&error_policy,endpoint);
                                 drop(events);drop(attempt);drop(key);
                                 yield Ok::<_,std::io::Error>(sse::encode(&error));return;
@@ -521,7 +556,7 @@ pub(super) async fn execute_input(
             let mut bytes = match read_body(upstream).await {
                 Ok(bytes) => bytes,
                 Err(_) => {
-                    attempt.finish(AttemptOutcome::UpstreamFailure);
+                    attempt.finish(AttemptOutcome::UpstreamFailure).await?;
                     if candidate.retry.transport {
                         continue;
                     }
@@ -543,30 +578,15 @@ pub(super) async fn execute_input(
                 && candidate.retry.empty_success
                 && empty_success(response_json.as_ref(), &bytes)
             {
-                attempt.finish(AttemptOutcome::UpstreamFailure);
+                attempt.finish(AttemptOutcome::UpstreamFailure).await?;
                 continue;
             }
-            let event = build_event(
-                &request_id,
-                &trace_id,
-                started_at,
-                started.elapsed().as_millis() as i64,
-                endpoint,
-                &credential.id,
-                &target.provider_name,
-                &requested,
-                &target.upstream_name,
-                status.as_u16() as i32,
-                None,
-                &payload,
-                response_json.as_ref(),
-                captured.clone(),
-                state.config.capture_payloads,
-                target.input_price_micros,
-                target.output_price_micros,
-            );
-            db::add_api_key_spend(&state.db, &credential.id, event.cost_micros).await?;
-            state.observations.record(event);
+            if let Some(value) = &response_json {
+                attempt.response(value);
+            }
+            if crate::providers::is_media(endpoint) {
+                attempt.media(endpoint, &payload);
+            }
             if matches!(
                 endpoint,
                 "/v1/videos" | "/doubao/v3/contents/generations/tasks"
@@ -596,7 +616,7 @@ pub(super) async fn execute_input(
                     )
                     .await?;
             }
-            attempt.finish(AttemptOutcome::Success);
+            attempt.finish(AttemptOutcome::Success).await?;
             if let Some(permit) = &mut key_permit {
                 permit.finish(true);
             }
@@ -614,28 +634,6 @@ pub(super) async fn execute_input(
             last_admission.unwrap_or("no_available_channel").into(),
         ));
     }
-    state.observations.record(RequestEvent {
-        request_id,
-        trace_id,
-        started_at,
-        finished_at: db::now(),
-        endpoint: endpoint.into(),
-        api_key_id: Some(credential.id),
-        provider: last_target.map(|t| t.provider_name.clone()),
-        requested_model: Some(requested),
-        resolved_model: last_target.map(|t| t.upstream_name.clone()),
-        status_code: 502,
-        error_kind: Some("upstream_unavailable".into()),
-        latency_ms: started.elapsed().as_millis() as i64,
-        ttft_ms: None,
-        input_tokens: 0,
-        output_tokens: 0,
-        cached_tokens: 0,
-        cost_micros: 0,
-        payload_captured: state.config.capture_payloads,
-        request_json: captured,
-        response_json: None,
-    });
     Err(ApiError::Upstream(
         "all eligible upstream attempts failed".into(),
     ))
@@ -655,44 +653,59 @@ fn context_id(headers: &HeaderMap, name: &str, prefix: &str) -> String {
         .unwrap_or_else(|| format!("{prefix}{}", Uuid::new_v4().simple()))
 }
 
-pub(super) fn discovery_response(
+pub(super) async fn discovery_response(
     state: &AppState,
     headers: &HeaderMap,
     key: &crate::models::ApiKeyCredential,
     value: Value,
     endpoint: &str,
-) -> Response {
+) -> Result<Response, ApiError> {
     let request_id = context_id(headers, "x-request-id", "req_");
     let trace_id = context_id(headers, "x-trace-id", "");
-    state.observations.record(RequestEvent {
-        request_id: request_id.clone(),
-        trace_id: trace_id.clone(),
-        started_at: db::now(),
-        finished_at: db::now(),
-        endpoint: endpoint.into(),
-        api_key_id: Some(key.id.clone()),
-        provider: None,
-        requested_model: None,
-        resolved_model: None,
-        status_code: 200,
-        error_kind: None,
-        latency_ms: 0,
-        ttft_ms: None,
-        input_tokens: 0,
-        output_tokens: 0,
-        cached_tokens: 0,
-        cost_micros: 0,
-        payload_captured: false,
-        request_json: None,
-        response_json: None,
-    });
-    response(
+    let lifecycle = crate::operations::lifecycle::Request::begin(
+        state,
+        key,
+        headers,
+        &request_id,
+        &trace_id,
+        endpoint,
+        "",
+        &json!({}),
+        None,
+    )
+    .await?;
+    lifecycle.complete_local(&value).await?;
+    if lifecycle.logs_enabled() {
+        lifecycle.record_event(RequestEvent {
+            request_id: request_id.clone(),
+            trace_id: trace_id.clone(),
+            started_at: db::now(),
+            finished_at: db::now(),
+            endpoint: endpoint.into(),
+            api_key_id: Some(key.id.clone()),
+            provider: None,
+            requested_model: None,
+            resolved_model: None,
+            status_code: 200,
+            error_kind: None,
+            latency_ms: 0,
+            ttft_ms: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_tokens: 0,
+            cost_micros: 0,
+            payload_captured: false,
+            request_json: None,
+            response_json: None,
+        });
+    }
+    Ok(response(
         StatusCode::OK,
         HeaderValue::from_static("application/json"),
         value.to_string(),
         &request_id,
         &trace_id,
-    )
+    ))
 }
 
 fn response(
@@ -747,7 +760,9 @@ fn error_response(
     (status, Json(value)).into_response()
 }
 
-async fn read_body(response: reqwest::Response) -> std::result::Result<Vec<u8>, std::io::Error> {
+pub(super) async fn read_body(
+    response: reqwest::Response,
+) -> std::result::Result<Vec<u8>, std::io::Error> {
     let mut stream = response.bytes_stream();
     let mut output = vec![];
     while let Some(chunk) = stream.next().await {
