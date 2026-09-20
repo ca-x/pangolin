@@ -21,13 +21,20 @@ async fn admin(
     path: &str,
     body: Value,
 ) -> Response {
+    let unsafe_method = method != http::Method::GET
+        && method != http::Method::HEAD
+        && method != http::Method::OPTIONS;
+    let mut request = Request::builder()
+        .method(method)
+        .uri(path)
+        .header("cookie", format!("pangolin_session={cookie}"))
+        .header("content-type", "application/json");
+    if unsafe_method {
+        request = request.header("x-pangolin-csrf", "1");
+    }
     router(f.state.clone())
         .oneshot(
-            Request::builder()
-                .method(method)
-                .uri(path)
-                .header("cookie", format!("pangolin_session={cookie}"))
-                .header("content-type", "application/json")
+            request
                 .body(Body::from(body.to_string()))
                 .unwrap(),
         )
