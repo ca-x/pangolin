@@ -56,7 +56,7 @@ CREATE TABLE IF NOT EXISTS settings (
 CREATE TABLE IF NOT EXISTS providers (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL UNIQUE COLLATE NOCASE,
-    kind TEXT NOT NULL CHECK(kind IN ('openai','openai_compatible','anthropic')),
+    kind TEXT NOT NULL CHECK(kind IN ('openai','openai_compatible','anthropic','gemini','azure','bedrock','vertex','gcp','openrouter','deepseek','moonshot','zhipu','doubao','xai','groq','ollama','nanogpt','jina')),
     base_url TEXT NOT NULL,
     enabled INTEGER NOT NULL DEFAULT 1,
     created_at INTEGER NOT NULL,
@@ -694,6 +694,67 @@ CREATE INDEX idx_response_sessions_expiry ON response_sessions(expires_at);
 CREATE INDEX idx_response_sessions_scope ON response_sessions(project_id,api_key_id,updated_at);
 "#;
 
+const V6_PROTOCOL_TASKS: &str = r#"
+CREATE TABLE protocol_tasks (
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    api_key_id TEXT NOT NULL,
+    endpoint TEXT NOT NULL,
+    upstream_id TEXT NOT NULL,
+    provider_id TEXT NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
+    credential_id TEXT NOT NULL REFERENCES channel_credentials(id) ON DELETE CASCADE,
+    upstream_model TEXT NOT NULL,
+    public_model TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY(api_key_id,endpoint,upstream_id),
+    FOREIGN KEY(api_key_id,project_id) REFERENCES api_keys(id,project_id) ON DELETE CASCADE
+);
+CREATE INDEX idx_protocol_tasks_project ON protocol_tasks(project_id,api_key_id);
+"#;
+
+const V7_CATALOG: &str = r#"
+CREATE TABLE catalog_sources (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    url TEXT NOT NULL,
+    priority INTEGER NOT NULL DEFAULT 100,
+    refresh_interval_secs INTEGER NOT NULL CHECK(refresh_interval_secs BETWEEN 60 AND 2592000),
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0,1)),
+    signature_policy TEXT NOT NULL CHECK(signature_policy IN ('none','optional','required')),
+    public_key TEXT,
+    revision INTEGER NOT NULL DEFAULT 1 CHECK(revision>0),
+    etag TEXT,
+    last_modified TEXT,
+    last_attempt_at INTEGER,
+    last_success_at INTEGER,
+    last_error TEXT,
+    active_snapshot_id TEXT REFERENCES catalog_snapshots(id) ON DELETE SET NULL,
+    previous_snapshot_id TEXT REFERENCES catalog_snapshots(id) ON DELETE SET NULL,
+    CHECK(signature_policy!='required' OR public_key IS NOT NULL)
+);
+CREATE TABLE catalog_snapshots (
+    id TEXT PRIMARY KEY,
+    source_id TEXT NOT NULL REFERENCES catalog_sources(id) ON DELETE CASCADE,
+    version TEXT NOT NULL,
+    document_json TEXT NOT NULL CHECK(json_valid(document_json)),
+    digest TEXT NOT NULL,
+    source_url TEXT NOT NULL,
+    signature_verified INTEGER NOT NULL CHECK(signature_verified IN (0,1)),
+    signing_key TEXT,
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX idx_catalog_snapshots_source ON catalog_snapshots(source_id,created_at);
+CREATE TABLE catalog_overrides (
+    kind TEXT NOT NULL CHECK(kind IN ('provider','model')),
+    entry_id TEXT NOT NULL,
+    entry_json TEXT NOT NULL CHECK(json_valid(entry_json)),
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY(kind,entry_id)
+);
+ALTER TABLE models ADD COLUMN catalog_metadata_json TEXT NOT NULL DEFAULT '{}';
+INSERT INTO permissions(id,slug,level,description,created_at) VALUES('00000000-0000-0000-0000-000000000028','catalog:manage','system','Manage global catalog sources and overrides',unixepoch());
+INSERT INTO role_permissions(role_id,permission_id,created_at) VALUES('00000000-0000-0000-0000-000000000011','00000000-0000-0000-0000-000000000028',unixepoch());
+"#;
+
 #[derive(FromQueryResult)]
 struct Count {
     count: i64,
@@ -801,6 +862,44 @@ pub async fn migrate(db: &DatabaseConnection) -> Result<()> {
             .await?;
         transaction.commit().await?;
     }
+    let tasks_applied = Count::find_by_statement(statement(
+        "SELECT COUNT(*) AS count FROM schema_migrations WHERE version=6",
+    ))
+    .one(db)
+    .await?
+    .is_some_and(|row| row.count > 0);
+    if !tasks_applied {
+        let transaction = db.begin().await?;
+        transaction
+            .execute_unprepared(V6_PROTOCOL_TASKS)
+            .await
+            .context("failed to initialize protocol task ownership")?;
+        transaction
+            .execute(statement(
+                "INSERT INTO schema_migrations(version,applied_at) VALUES(6,unixepoch())",
+            ))
+            .await?;
+        transaction.commit().await?;
+    }
+    let catalog_applied = Count::find_by_statement(statement(
+        "SELECT COUNT(*) AS count FROM schema_migrations WHERE version=7",
+    ))
+    .one(db)
+    .await?
+    .is_some_and(|row| row.count > 0);
+    if !catalog_applied {
+        let transaction = db.begin().await?;
+        transaction
+            .execute_unprepared(V7_CATALOG)
+            .await
+            .context("failed to initialize catalog storage")?;
+        transaction
+            .execute(statement(
+                "INSERT INTO schema_migrations(version,applied_at) VALUES(7,unixepoch())",
+            ))
+            .await?;
+        transaction.commit().await?;
+    }
     Ok(())
 }
 
@@ -838,7 +937,7 @@ mod tests {
 
         assert_eq!(
             scalar(&db, "SELECT MAX(version) AS count FROM schema_migrations").await,
-            5
+            7
         );
         for table in [
             "projects",
@@ -852,6 +951,10 @@ mod tests {
             "oidc_auth_states",
             "api_key_profiles",
             "response_sessions",
+            "protocol_tasks",
+            "catalog_sources",
+            "catalog_snapshots",
+            "catalog_overrides",
             "channel_credentials",
             "channel_settings",
             "model_associations",
@@ -989,7 +1092,7 @@ mod tests {
 
         assert_eq!(
             scalar(&db, "SELECT COUNT(*) AS count FROM schema_migrations").await,
-            4
+            6
         );
         assert_eq!(
             scalar(

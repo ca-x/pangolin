@@ -9,25 +9,81 @@ pub(super) async fn execute(
     body: axum::body::Bytes,
     endpoint: &'static str,
 ) -> Result<Response, ApiError> {
+    let payload = serde_json::from_slice(&body)
+        .map_err(|_| ApiError::BadRequest("request body must be valid JSON".into()))?;
+    execute_input(
+        state,
+        headers,
+        super::protocols::Input::json(payload, endpoint),
+    )
+    .await
+}
+
+pub(super) async fn execute_input(
+    state: AppState,
+    headers: HeaderMap,
+    input: super::protocols::Input,
+) -> Result<Response, ApiError> {
+    use super::protocols::Wire;
+    let endpoint = input.endpoint;
     let started = Instant::now();
     let started_at = db::now();
     let request_id = context_id(&headers, "x-request-id", "req_");
     let trace_id = context_id(&headers, "x-trace-id", "");
     let initial = gateway_key(&state, &headers).await?;
     let initial_profile = orchestration::load_profile(&state.db, &initial).await?;
-    let mut payload: Value = serde_json::from_slice(&body)
-        .map_err(|_| ApiError::BadRequest("request body must be valid JSON".into()))?;
+    let mut payload = input.payload.clone();
+    if !payload.is_object() {
+        return Err(ApiError::BadRequest(
+            "request body must be a JSON object".into(),
+        ));
+    }
+    if endpoint == "/v1/moderations" {
+        if payload.get("model").is_none() || payload["model"] == "" {
+            payload["model"] = json!("omni-moderation-latest");
+        }
+        if payload.get("input").is_none_or(|value| {
+            value.is_null()
+                || value.as_str().is_some_and(str::is_empty)
+                || value.as_array().is_some_and(Vec::is_empty)
+        }) {
+            return Err(ApiError::BadRequest(
+                "moderation input cannot be empty".into(),
+            ));
+        }
+    }
     let requested = payload
         .get("model")
         .and_then(Value::as_str)
         .ok_or_else(|| ApiError::BadRequest("model is required".into()))?
         .to_owned();
+    if payload
+        .get("stream")
+        .is_some_and(|value| !value.is_boolean())
+    {
+        return Err(ApiError::BadRequest("stream must be a boolean".into()));
+    }
     let streaming = payload
         .get("stream")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    if streaming
+        && !matches!(
+            crate::providers::capability(endpoint),
+            "chat" | "completions" | "responses" | "messages" | "gemini"
+        )
+    {
+        return Err(ApiError::BadRequest(
+            "streaming is unsupported for this endpoint".into(),
+        ));
+    }
     if streaming && (initial.budget_micros.is_some() || initial_profile.budget.is_some()) {
         return Err(ApiError::BadRequest("streaming requires reliable budget settlement and is disabled for budget-limited keys/profiles".into()));
+    }
+    if crate::providers::is_media(endpoint)
+        && (initial.budget_micros.is_some() || initial_profile.budget.is_some())
+    {
+        return Err(ApiError::BadRequest("media requires unit-based budget settlement and is disabled for budget-limited keys/profiles".into()));
     }
     let _profile_budget = if initial_profile.budget.is_some() {
         Some(
@@ -65,7 +121,7 @@ pub(super) async fn execute(
             .restore(&state.db, &state.secrets, &credential, &mut payload)
             .await?;
     }
-    let plan = orchestration::prepare(
+    let mut plan = orchestration::prepare(
         &state.db,
         &state.orchestrator,
         &credential,
@@ -75,6 +131,19 @@ pub(super) async fn execute(
         endpoint,
     )
     .await?;
+    if let Wire::Task {
+        provider,
+        credential,
+        upstream_model,
+        ..
+    } = &input.wire
+    {
+        plan.candidates.retain(|candidate| {
+            &candidate.provider_id == provider
+                && &candidate.credential_id == credential
+                && &candidate.target.upstream_name == upstream_model
+        });
+    }
     for decision in &plan.decisions {
         tracing::debug!(request_id,stage=decision.stage,candidate=?decision.candidate,reason=decision.reason,"routing decision");
     }
@@ -156,7 +225,7 @@ pub(super) async fn execute(
             }
             extra_headers.insert("x-request-id", HeaderValue::from_str(&request_id).unwrap());
             extra_headers.insert("x-trace-id", HeaderValue::from_str(&trace_id).unwrap());
-            for name in ["x-thread-id", "x-session-id"] {
+            for name in ["x-thread-id", "x-session-id", "idempotency-key"] {
                 if let Some(value) = headers.get(name)
                     && value.as_bytes().len() <= 256
                 {
@@ -194,6 +263,7 @@ pub(super) async fn execute(
                                 http.status,
                                 &candidate.retry,
                                 Some(http.body.as_bytes().to_vec()),
+                                endpoint,
                             ));
                         }
                         if error.downcast_ref::<reqwest::Error>().is_some() {
@@ -246,24 +316,43 @@ pub(super) async fn execute(
                     &trace_id,
                 ));
             }
-            let url = upstream_url(&target.base_url, &candidate.endpoint);
-            let mut request = state
-                .client
-                .post(url)
-                .headers(extra_headers)
-                .header(header::CONTENT_TYPE, "application/json");
-            request = if target.provider_kind == "anthropic" {
-                request.header("x-api-key", secret.as_str()).header(
-                    "anthropic-version",
-                    headers
-                        .get("anthropic-version")
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or("2023-06-01"),
-                )
+            let mut prepared = crate::providers::prepare_routed(
+                target,
+                crate::providers::Route {
+                    protocol: endpoint,
+                    path: &candidate.endpoint,
+                    native_version: match &input.wire {
+                        Wire::Gemini { version } => Some(version.as_str()),
+                        _ => None,
+                    },
+                },
+                &payload,
+                &secret,
+                extra_headers,
+                &headers,
+            )
+            .await?;
+            if streaming && !prepared.response.identity() {
+                return Err(ApiError::BadRequest("cross-protocol streaming is unsupported for this provider; use its native endpoint".into()));
+            }
+            let method = if let Wire::Task { id, delete, .. } = &input.wire {
+                prepared.url.push('/');
+                prepared.url.push_str(&crate::providers::segment(id));
+                crate::providers::request_method(*delete)
             } else {
-                request.bearer_auth(secret.as_str())
+                http::Method::POST
             };
-            let upstream = match request.body(body_from_json(&payload)?).send().await {
+            let (outbound, content_type) = input.body(&prepared.payload)?;
+            prepared.headers.insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_str(&content_type)
+                    .map_err(|_| ApiError::BadRequest("invalid content type".into()))?,
+            );
+            let request = state
+                .client
+                .request(method, &prepared.url)
+                .headers(prepared.headers);
+            let upstream = match request.body(outbound).send().await {
                 Ok(upstream) => upstream,
                 Err(_) => {
                     attempt.finish(AttemptOutcome::UpstreamFailure);
@@ -310,7 +399,7 @@ pub(super) async fn execute(
                     0,
                     0,
                 ));
-                let mut response = error_response(status, &candidate.retry, Some(bytes));
+                let mut response = error_response(status, &candidate.retry, Some(bytes), endpoint);
                 response
                     .headers_mut()
                     .insert("x-request-id", HeaderValue::from_str(&request_id).unwrap());
@@ -428,7 +517,7 @@ pub(super) async fn execute(
                     .insert("x-trace-id", HeaderValue::from_str(&trace_id).unwrap());
                 return Ok(response);
             }
-            let bytes = match read_body(upstream).await {
+            let mut bytes = match read_body(upstream).await {
                 Ok(bytes) => bytes,
                 Err(_) => {
                     attempt.finish(AttemptOutcome::UpstreamFailure);
@@ -438,8 +527,21 @@ pub(super) async fn execute(
                     return Err(ApiError::Upstream("upstream body failed".into()));
                 }
             };
-            let response_json = serde_json::from_slice::<Value>(&bytes).ok();
-            if candidate.retry.empty_success && empty_success(response_json.as_ref(), &bytes) {
+            let mut response_json = serde_json::from_slice::<Value>(&bytes).ok();
+            if !prepared.response.identity() {
+                let value =
+                    prepared
+                        .response
+                        .apply(response_json.take().ok_or_else(|| {
+                            ApiError::Upstream("provider response is not JSON".into())
+                        })?)?;
+                bytes = serde_json::to_vec(&value).map_err(|e| ApiError::Internal(e.into()))?;
+                response_json = Some(value);
+            }
+            if status != StatusCode::NO_CONTENT
+                && candidate.retry.empty_success
+                && empty_success(response_json.as_ref(), &bytes)
+            {
                 attempt.finish(AttemptOutcome::UpstreamFailure);
                 continue;
             }
@@ -464,6 +566,20 @@ pub(super) async fn execute(
             );
             db::add_api_key_spend(&state.db, &credential.id, event.cost_micros).await?;
             state.observations.record(event);
+            if matches!(
+                endpoint,
+                "/v1/videos" | "/doubao/v3/contents/generations/tasks"
+            ) {
+                super::protocols::persist(
+                    &state,
+                    &credential,
+                    &input,
+                    candidate,
+                    &requested,
+                    response_json.as_ref(),
+                )
+                .await?;
+            }
             if endpoint == "/v1/responses"
                 && let Some(value) = &response_json
             {
@@ -538,6 +654,46 @@ fn context_id(headers: &HeaderMap, name: &str, prefix: &str) -> String {
         .unwrap_or_else(|| format!("{prefix}{}", Uuid::new_v4().simple()))
 }
 
+pub(super) fn discovery_response(
+    state: &AppState,
+    headers: &HeaderMap,
+    key: &crate::models::ApiKeyCredential,
+    value: Value,
+    endpoint: &str,
+) -> Response {
+    let request_id = context_id(headers, "x-request-id", "req_");
+    let trace_id = context_id(headers, "x-trace-id", "");
+    state.observations.record(RequestEvent {
+        request_id: request_id.clone(),
+        trace_id: trace_id.clone(),
+        started_at: db::now(),
+        finished_at: db::now(),
+        endpoint: endpoint.into(),
+        api_key_id: Some(key.id.clone()),
+        provider: None,
+        requested_model: None,
+        resolved_model: None,
+        status_code: 200,
+        error_kind: None,
+        latency_ms: 0,
+        ttft_ms: None,
+        input_tokens: 0,
+        output_tokens: 0,
+        cached_tokens: 0,
+        cost_micros: 0,
+        payload_captured: false,
+        request_json: None,
+        response_json: None,
+    });
+    response(
+        StatusCode::OK,
+        HeaderValue::from_static("application/json"),
+        value.to_string(),
+        &request_id,
+        &trace_id,
+    )
+}
+
 fn response(
     status: StatusCode,
     content_type: HeaderValue,
@@ -563,6 +719,7 @@ fn error_response(
     status: StatusCode,
     policy: &orchestration::policy::Retry,
     bytes: Option<Vec<u8>>,
+    endpoint: &str,
 ) -> Response {
     if matches!(policy.error_mode, ErrorMode::PassThrough)
         && let Some(bytes) = bytes
@@ -577,11 +734,14 @@ fn error_response(
     } else {
         "upstream request failed"
     };
-    (
-        status,
-        Json(json!({"error":{"type":"upstream_error","message":message}})),
-    )
-        .into_response()
+    let value = if endpoint == "/v1/messages" {
+        json!({"type":"error","error":{"type":"api_error","message":message}})
+    } else if endpoint.starts_with("/v1beta/models:") {
+        json!({"error":{"code":status.as_u16(),"status":"UNAVAILABLE","message":message}})
+    } else {
+        json!({"error":{"type":"upstream_error","message":message}})
+    };
+    (status, Json(value)).into_response()
 }
 
 async fn read_body(response: reqwest::Response) -> std::result::Result<Vec<u8>, std::io::Error> {

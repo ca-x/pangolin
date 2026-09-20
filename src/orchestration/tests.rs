@@ -111,6 +111,7 @@ pub(super) fn candidate(id: &str, weight: u32) -> Candidate {
         model_rules: json!({"version":1}),
         pass_user_agent: false,
         endpoint: "/v1/chat/completions".into(),
+        protocol_endpoint: "/v1/chat/completions".into(),
     }
 }
 

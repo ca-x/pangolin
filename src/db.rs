@@ -178,16 +178,52 @@ pub async fn create_provider(
     input: &ProviderInput,
     secret_envelope: String,
 ) -> Result<Provider> {
-    let kind = input.kind.trim();
-    if !matches!(kind, "openai" | "openai_compatible" | "anthropic") {
-        bail!("unsupported provider kind");
-    }
+    let catalog = crate::catalog::repository::effective(db).await?;
+    let preset = catalog
+        .providers
+        .iter()
+        .find(|provider| provider.id == input.kind.trim());
+    let kind = if crate::providers::KINDS.contains(&input.kind.trim()) {
+        input.kind.trim()
+    } else {
+        preset
+            .and_then(|provider| provider.adapter_kind.as_deref())
+            .filter(|kind| crate::providers::KINDS.contains(kind))
+            .ok_or_else(|| anyhow::anyhow!("provider preset has no implemented adapter"))?
+    };
+    let base_url = if input.base_url.trim().is_empty() {
+        preset
+            .and_then(|provider| provider.default_base_url.as_deref())
+            .or_else(|| crate::providers::default_base(kind))
+            .ok_or_else(|| anyhow::anyhow!("base URL is required for this provider"))?
+    } else {
+        input.base_url.trim()
+    };
     let id = Uuid::new_v4().to_string();
     let timestamp = now();
+    let mut catalog_paths = serde_json::Map::new();
+    if let Some(preset) = preset {
+        for endpoint in &preset.default_endpoints {
+            if matches!(
+                endpoint.transport,
+                crate::catalog::types::Transport::Websocket
+            ) {
+                bail!("upstream WebSocket presets are not implemented");
+            }
+            if let Some(canonical) = crate::providers::ENDPOINTS
+                .iter()
+                .find(|path| crate::providers::capability(path) == endpoint.protocol)
+                && !endpoint.path.contains('{')
+                && endpoint.path != *canonical
+            {
+                catalog_paths.insert((*canonical).into(), serde_json::json!(endpoint.path));
+            }
+        }
+    }
     let transaction = db.begin().await?;
     transaction.execute(stmt(
-        "INSERT INTO providers(id,name,kind,base_url,enabled,created_at,updated_at,project_id) VALUES(?,?,?,?,1,?,?,?)",
-        vec![id.clone().into(), input.name.trim().to_owned().into(), kind.into(), input.base_url.trim_end_matches('/').to_owned().into(), timestamp.into(), timestamp.into(), DEFAULT_PROJECT_ID.into()],
+        "INSERT INTO providers(id,name,kind,base_url,enabled,created_at,updated_at,project_id,settings_json) VALUES(?,?,?,?,1,?,?,?,?)",
+        vec![id.clone().into(), input.name.trim().to_owned().into(), kind.into(), base_url.trim_end_matches('/').to_owned().into(), timestamp.into(), timestamp.into(), DEFAULT_PROJECT_ID.into(),serde_json::json!({"version":1,"catalog_preset_id":preset.map(|p|&p.id),"catalog_version":catalog.version}).to_string().into()],
     )).await?;
     transaction
         .execute(stmt(
@@ -203,8 +239,8 @@ pub async fn create_provider(
         .await?;
     transaction
         .execute(stmt(
-            "INSERT INTO channel_settings(provider_id,updated_at) VALUES(?,?)",
-            vec![id.clone().into(), timestamp.into()],
+            "INSERT INTO channel_settings(provider_id,updated_at,endpoint_mappings_json) VALUES(?,?,?)",
+            vec![id.clone().into(), timestamp.into(),serde_json::json!({"version":1,"paths":catalog_paths}).to_string().into()],
         ))
         .await?;
     transaction.commit().await?;
@@ -234,14 +270,44 @@ pub async fn list_models(db: &DatabaseConnection) -> Result<Vec<Model>> {
 
 pub async fn create_model(db: &DatabaseConnection, input: &ModelInput) -> Result<Model> {
     let id = Uuid::new_v4().to_string();
-    let capabilities = serde_json::to_string(input.capabilities.as_deref().unwrap_or(&[
-        "chat".to_owned(),
-        "responses".to_owned(),
-        "messages".to_owned(),
-    ]))?;
+    let catalog = crate::catalog::repository::effective(db).await?;
+    let defaults = catalog.models.iter().find(|model| {
+        model.upstream_id == input.upstream_name
+            || model.id == input.upstream_name
+            || model.aliases.contains(&input.upstream_name)
+    });
+    let default_capabilities = defaults
+        .map(|model| model.gateway_capabilities())
+        .unwrap_or_else(|| {
+            vec![
+                "chat".to_owned(),
+                "responses".to_owned(),
+                "messages".to_owned(),
+            ]
+        });
+    let capabilities = serde_json::to_string(
+        input
+            .capabilities
+            .as_deref()
+            .unwrap_or(&default_capabilities),
+    )?;
+    let price = |value: Option<f64>| {
+        value
+            .filter(|value| {
+                value.is_finite() && *value >= 0.0 && *value <= (i64::MAX as f64 / 1_000_000.0)
+            })
+            .map(|value| (value * 1_000_000.0).round() as i64)
+            .unwrap_or(0)
+    };
+    let default_prices = defaults.filter(|model| {
+        model.cost_defaults.currency.as_deref() == Some("USD")
+            && model.cost_defaults.unit.as_deref() == Some("per_million_tokens")
+    });
+    let metadata =
+        serde_json::json!({"catalog_version":catalog.version,"card":defaults}).to_string();
     db.execute(stmt(
-        "INSERT INTO models(id,provider_id,public_name,upstream_name,capabilities,input_price_micros,output_price_micros,priority,enabled,created_at) VALUES(?,?,?,?,?,?,?,?,1,?)",
-        vec![id.clone().into(), input.provider_id.clone().into(), input.public_name.trim().to_owned().into(), input.upstream_name.trim().to_owned().into(), capabilities.into(), input.input_price_micros.unwrap_or(0).into(), input.output_price_micros.unwrap_or(0).into(), input.priority.unwrap_or(100).into(), now().into()],
+        "INSERT INTO models(id,provider_id,public_name,upstream_name,capabilities,input_price_micros,output_price_micros,priority,enabled,created_at,catalog_metadata_json) VALUES(?,?,?,?,?,?,?,?,1,?,?)",
+        vec![id.clone().into(), input.provider_id.clone().into(), input.public_name.trim().to_owned().into(), input.upstream_name.trim().to_owned().into(), capabilities.into(), input.input_price_micros.unwrap_or_else(||price(default_prices.and_then(|model|model.cost_defaults.input))).into(), input.output_price_micros.unwrap_or_else(||price(default_prices.and_then(|model|model.cost_defaults.output))).into(), input.priority.unwrap_or(100).into(), now().into(),metadata.into()],
     )).await?;
     Ok(Model::find_by_statement(stmt(
         "SELECT m.*,p.name AS provider_name FROM models m JOIN providers p ON p.id=m.provider_id WHERE m.id=?",

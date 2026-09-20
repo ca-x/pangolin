@@ -89,7 +89,32 @@ pub async fn inject(
                 .ok_or(Error::Invalid("messages must be an array"))?,
         );
         body["messages"] = Value::Array(prefix);
-    } else {
+    } else if endpoint.starts_with("/v1beta/models:") {
+        let mut contents = body
+            .get("contents")
+            .and_then(Value::as_array)
+            .cloned()
+            .ok_or(Error::Invalid("contents must be an array"))?;
+        let mut instructions = body
+            .get("systemInstruction")
+            .and_then(|v| v.get("parts"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let mut before = vec![];
+        for prompt in prefix {
+            if prompt["role"] == "system" || prompt["role"] == "developer" {
+                instructions.push(json!({"text":prompt["content"]}));
+            } else {
+                before.push(json!({"role":if prompt["role"]=="assistant"{"model"}else{"user"},"parts":[{"text":prompt["content"]}]}));
+            }
+        }
+        before.append(&mut contents);
+        body["contents"] = Value::Array(before);
+        if !instructions.is_empty() {
+            body["systemInstruction"] = json!({"parts":instructions});
+        }
+    } else if endpoint == "/v1/chat/completions" {
         prefix.extend(
             body.get("messages")
                 .and_then(Value::as_array)
@@ -97,6 +122,10 @@ pub async fn inject(
                 .ok_or(Error::Invalid("messages must be an array"))?,
         );
         body["messages"] = Value::Array(prefix);
+    } else {
+        return Err(Error::Invalid(
+            "prompt injection is unsupported for this endpoint; scope prompts to a conversational endpoint",
+        ));
     }
     Ok(())
 }
@@ -112,10 +141,23 @@ pub fn apply(
             continue;
         }
         let mut hit = false;
-        for field in ["messages", "input"] {
+        for field in ["messages", "input", "contents"] {
             if let Some(value) = body.get_mut(field) {
                 if let Value::Array(messages) = value {
                     for message in messages {
+                        if message.is_string() {
+                            protect_content(rule, "user", message, &mut hit)?;
+                            continue;
+                        }
+                        if message.get("text").is_some()
+                            || matches!(
+                                message.get("type").and_then(Value::as_str),
+                                Some("text" | "input_text")
+                            )
+                        {
+                            protect_content(rule, "user", message, &mut hit)?;
+                            continue;
+                        }
                         let is_tool_output = matches!(
                             message.get("type").and_then(Value::as_str),
                             Some("function_call_output" | "custom_tool_call_output")
@@ -132,6 +174,9 @@ pub fn apply(
                         if let Some(content) = message.get_mut("content") {
                             protect_content(rule, &role, content, &mut hit)?;
                         }
+                        if let Some(parts) = message.get_mut("parts") {
+                            protect_content(rule, &role, parts, &mut hit)?;
+                        }
                         if is_tool_output && let Some(output) = message.get_mut("output") {
                             protect_content(rule, "tool", output, &mut hit)?;
                         }
@@ -141,9 +186,14 @@ pub fn apply(
                 }
             }
         }
-        for field in ["system", "instructions"] {
+        for field in ["system", "instructions", "systemInstruction"] {
             if let Some(content) = body.get_mut(field) {
                 protect_content(rule, "system", content, &mut hit)?;
+            }
+        }
+        for field in ["prompt", "query", "documents", "content"] {
+            if let Some(content) = body.get_mut(field) {
+                protect_content(rule, "user", content, &mut hit)?;
             }
         }
         if hit {
@@ -195,10 +245,44 @@ fn protect_content(rule: &Rule, role: &str, content: &mut Value, hit: &mut bool)
             if let Some(nested) = part.get_mut("content") {
                 protect_content(rule, role, nested, hit)?;
             }
+            if let Some(parts) = part.get_mut("parts") {
+                protect_content(rule, role, parts, hit)?;
+            }
+            if let Some(response) = part
+                .get_mut("functionResponse")
+                .and_then(|v| v.get_mut("response"))
+            {
+                protect_tool_json(rule, response, hit)?;
+            }
+            if let Some(response) = part
+                .get_mut("function_response")
+                .and_then(|value| value.get_mut("response"))
+            {
+                protect_tool_json(rule, response, hit)?;
+            }
         }
         _ => (),
     }
     Ok(())
+}
+
+fn protect_tool_json(rule: &Rule, value: &mut Value, hit: &mut bool) -> Result<()> {
+    match value {
+        Value::String(_) => protect_content(rule, "tool", value, hit),
+        Value::Array(items) => {
+            for item in items {
+                protect_tool_json(rule, item, hit)?;
+            }
+            Ok(())
+        }
+        Value::Object(object) => {
+            for value in object.values_mut() {
+                protect_tool_json(rule, value, hit)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 fn tool_name(tool: &Value) -> Option<&str> {
@@ -220,6 +304,38 @@ pub fn tools(body: &mut Value, allowed: Option<&[String]>) -> Result<()> {
     }
     let permitted =
         |tool: &Value| tool_name(tool).is_some_and(|name| allowed.iter().any(|a| a == name));
+    if body.get("contents").is_some() {
+        if let Some(names) = body
+            .pointer("/toolConfig/functionCallingConfig/allowedFunctionNames")
+            .and_then(Value::as_array)
+            && names.iter().any(|name| {
+                name.as_str()
+                    .is_none_or(|name| !allowed.iter().any(|a| a == name))
+            })
+        {
+            return Err(Error::Forbidden);
+        }
+        if let Some(tools) = body.get_mut("tools") {
+            for tool in tools
+                .as_array_mut()
+                .ok_or(Error::Invalid("tools must be an array"))?
+            {
+                if tool.as_object().is_none_or(|object| {
+                    object.len() != 1 || !object.contains_key("functionDeclarations")
+                }) {
+                    return Err(Error::Invalid(
+                        "native Gemini built-in tools are unsupported under an allowed-tools policy",
+                    ));
+                }
+                let declarations = tool
+                    .get_mut("functionDeclarations")
+                    .and_then(Value::as_array_mut)
+                    .ok_or(Error::Invalid("functionDeclarations must be an array"))?;
+                declarations.retain(permitted);
+            }
+        }
+        return Ok(());
+    }
     if let Some(choice) = body.get("tool_choice") {
         if tool_name(choice).is_some() && !permitted(choice) {
             return Err(Error::Forbidden);

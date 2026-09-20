@@ -37,6 +37,7 @@ pub struct Model {
     pub priority: i32,
     pub enabled: bool,
     pub created_at: i64,
+    pub catalog_metadata_json: String,
 }
 
 #[derive(Debug, Clone, Serialize, FromQueryResult)]
@@ -97,7 +98,9 @@ pub struct LoginRequest {
 pub struct ProviderInput {
     pub name: String,
     pub kind: String,
+    #[serde(default)]
     pub base_url: String,
+    #[serde(default)]
     pub api_key: String,
 }
 

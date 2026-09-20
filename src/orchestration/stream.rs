@@ -2,7 +2,7 @@
 //! downstream commitment; terminal detection is protocol-aware.
 use super::policy::{ErrorMode, Retry};
 use axum::body::Bytes;
-use eventsource_stream::{Event, Eventsource};
+use eventsource_stream::Event;
 use futures_util::{Stream, StreamExt};
 use serde_json::{Value, json};
 use std::{
@@ -30,10 +30,22 @@ pub fn events(response: reqwest::Response) -> Events {
         }
         Ok(chunk)
     });
-    Box::pin(bytes.eventsource().map(move |event| {
-        buffered.store(0, Ordering::Relaxed);
-        event.map_err(|_| std::io::Error::other("invalid upstream SSE event"))
-    }))
+    Box::pin(
+        crate::providers::framing::frames(bytes).filter_map(move |event| {
+            std::future::ready(match event {
+                Ok(frame) => frame.data.map(|data| {
+                    buffered.store(0, Ordering::Relaxed);
+                    Ok(Event {
+                        event: frame.event.unwrap_or_else(|| "message".into()),
+                        data,
+                        id: frame.id.unwrap_or_default(),
+                        retry: frame.retry.map(Duration::from_millis),
+                    })
+                }),
+                Err(_) => Some(Err(std::io::Error::other("invalid upstream SSE event"))),
+            })
+        }),
+    )
 }
 
 pub async fn next(
@@ -175,13 +187,25 @@ pub fn terminal(event: &Event, endpoint: &str) -> bool {
         return true;
     }
     match endpoint {
-        "/v1/chat/completions" => event.data.trim() == "[DONE]",
+        "/v1/chat/completions" | "/v1/completions" => event.data.trim() == "[DONE]",
         "/v1/messages" => {
             event.event == "message_stop"
                 || serde_json::from_str::<Value>(&event.data)
                     .is_ok_and(|v| v["type"] == "message_stop")
         }
         "/v1/responses" => completed_response(event).is_some(),
+        "/v1beta/models:streamGenerateContent" => serde_json::from_str::<Value>(&event.data)
+            .ok()
+            .and_then(|value| value.get("candidates").and_then(Value::as_array).cloned())
+            .is_some_and(|candidates| {
+                !candidates.is_empty()
+                    && candidates.iter().all(|candidate| {
+                        candidate
+                            .get("finishReason")
+                            .and_then(Value::as_str)
+                            .is_some()
+                    })
+            }),
         _ => false,
     }
 }

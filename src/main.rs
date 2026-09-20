@@ -1,6 +1,7 @@
 mod access;
 mod access_api;
 mod api;
+mod catalog;
 mod config;
 mod crypto;
 mod db;
@@ -8,6 +9,7 @@ mod models;
 mod observability;
 mod oidc;
 mod orchestration;
+mod providers;
 mod web;
 
 use std::{collections::HashMap, fs, sync::Arc};
@@ -50,12 +52,7 @@ async fn main() -> Result<()> {
         config: Arc::new(config.clone()),
         secrets,
         observations: observations.clone(),
-        client: reqwest::Client::builder()
-            .user_agent(concat!("pangolin/", env!("CARGO_PKG_VERSION")))
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .timeout(config.upstream_timeout)
-            .build()?,
+        client: providers::http_client(config.upstream_timeout)?,
         oidc_client: reqwest::Client::builder()
             .user_agent(concat!("pangolin/", env!("CARGO_PKG_VERSION")))
             .redirect(reqwest::redirect::Policy::none())

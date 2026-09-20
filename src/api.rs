@@ -14,7 +14,9 @@ use serde_json::{Map, Value, json};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use uuid::Uuid;
 
+mod catalog_api;
 mod gateway;
+mod protocols;
 
 use crate::{
     config::Config,
@@ -128,6 +130,8 @@ impl From<crate::orchestration::Error> for ApiError {
 
 pub fn router(state: AppState) -> Router {
     Router::new()
+        .merge(protocols::router())
+        .merge(catalog_api::router())
         .merge(crate::access_api::router())
         .route("/api/health/live", get(live))
         .route("/api/health/ready", get(ready))
@@ -287,8 +291,10 @@ async fn create_provider(
     Json(input): Json<ProviderInput>,
 ) -> Result<impl IntoResponse, ApiError> {
     let user = require_user_permission(&state, &headers, "project:manage").await?;
-    validate_http_url(&input.base_url)?;
-    if input.name.trim().is_empty() || input.api_key.trim().is_empty() {
+    if !input.base_url.trim().is_empty() {
+        validate_http_url(&input.base_url)?;
+    }
+    if input.name.trim().is_empty() || (input.api_key.trim().is_empty() && input.kind != "ollama") {
         return Err(ApiError::BadRequest("name and API key are required".into()));
     }
     let envelope = state
@@ -481,10 +487,16 @@ async fn metrics(State(state): State<AppState>) -> Result<Response, ApiError> {
 async fn gateway_models(
     State(state): State<AppState>,
     headers: HeaderMap,
-) -> Result<impl IntoResponse, ApiError> {
+) -> Result<Response, ApiError> {
     let credential = gateway_key(&state, &headers).await?;
     let models = crate::orchestration::visible_models(&state.db, &credential, &headers).await?;
-    Ok(Json(json!({ "object": "list", "data": models })))
+    Ok(gateway::discovery_response(
+        &state,
+        &headers,
+        &credential,
+        json!({"object":"list","data":models}),
+        "/v1/models",
+    ))
 }
 
 async fn gateway_chat(
@@ -508,7 +520,10 @@ async fn gateway_messages(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
-    gateway_request(state, headers, body, "/v1/messages").await
+    protocols::protocol_error(
+        gateway_request(state, headers, body, "/v1/messages").await,
+        false,
+    )
 }
 
 async fn gateway_request(
@@ -600,6 +615,23 @@ async fn call_anthropic_chat(
     headers: &HeaderMap,
     endpoint: &str,
 ) -> anyhow::Result<Value> {
+    crate::providers::ensure_fields(
+        payload,
+        &[
+            "model",
+            "messages",
+            "max_tokens",
+            "max_completion_tokens",
+            "max_output_tokens",
+            "temperature",
+            "top_p",
+            "stop",
+            "tools",
+            "tool_choice",
+            "stream",
+            "n",
+        ],
+    )?;
     let object = payload
         .as_object()
         .ok_or_else(|| anyhow::anyhow!("chat request must be an object"))?;
@@ -610,10 +642,19 @@ async fn call_anthropic_chat(
     let mut system = Vec::<String>::new();
     let mut messages = Vec::new();
     for message in source_messages {
+        crate::providers::ensure_fields(
+            message,
+            &["role", "content", "tool_calls", "tool_call_id"],
+        )?;
         let role = message
             .get("role")
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow::anyhow!("every message requires a role"))?;
+        if (role != "assistant" && message.get("tool_calls").is_some())
+            || (role != "tool" && message.get("tool_call_id").is_some())
+        {
+            anyhow::bail!("tool fields do not match the message role");
+        }
         match role {
             "system" => {
                 let content = message
@@ -649,6 +690,7 @@ async fn call_anthropic_chat(
                     }
                     Some(Value::Array(parts)) => {
                         for part in parts {
+                            crate::providers::ensure_fields(part, &["type", "text"])?;
                             if part.get("type").and_then(Value::as_str) != Some("text") {
                                 anyhow::bail!(
                                     "Anthropic bridge currently supports text content parts only"
@@ -664,9 +706,14 @@ async fn call_anthropic_chat(
                     && let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array)
                 {
                     for call in tool_calls {
+                        crate::providers::ensure_fields(call, &["id", "type", "function"])?;
+                        if call["type"] != "function" {
+                            anyhow::bail!("only function tool calls are supported");
+                        }
                         let function = call
                             .get("function")
                             .ok_or_else(|| anyhow::anyhow!("tool call requires function"))?;
+                        crate::providers::ensure_fields(function, &["name", "arguments"])?;
                         let arguments = function
                             .get("arguments")
                             .and_then(Value::as_str)
@@ -716,9 +763,14 @@ async fn call_anthropic_chat(
     if let Some(tools) = object.get("tools").and_then(Value::as_array) {
         let mut converted = Vec::with_capacity(tools.len());
         for tool in tools {
+            crate::providers::ensure_fields(tool, &["type", "function"])?;
+            if tool["type"] != "function" {
+                anyhow::bail!("only function tools are supported");
+            }
             let function = tool
                 .get("function")
                 .ok_or_else(|| anyhow::anyhow!("tool requires function"))?;
+            crate::providers::ensure_fields(function, &["name", "description", "parameters"])?;
             converted.push(json!({
                 "name": function.get("name").and_then(Value::as_str).ok_or_else(|| anyhow::anyhow!("tool requires function name"))?,
                 "description": function.get("description").cloned().unwrap_or(Value::Null),
@@ -728,6 +780,13 @@ async fn call_anthropic_chat(
         request.insert("tools".into(), Value::Array(converted));
     }
     if let Some(choice) = object.get("tool_choice") {
+        if choice.is_object() {
+            crate::providers::ensure_fields(choice, &["type", "function"])?;
+            crate::providers::ensure_fields(&choice["function"], &["name"])?;
+            if choice["type"] != "function" || !choice["function"]["name"].is_string() {
+                anyhow::bail!("unsupported tool_choice");
+            }
+        }
         let disable_tools = choice.as_str() == Some("none");
         let converted = match choice {
             Value::String(value) if value == "auto" => Some(json!({"type":"auto"})),
@@ -745,6 +804,16 @@ async fn call_anthropic_chat(
         } else if let Some(converted) = converted {
             request.insert("tool_choice".into(), converted);
         }
+    }
+    let mut checked_payload = payload.clone();
+    for name in ["max_completion_tokens", "max_output_tokens", "n"] {
+        checked_payload.as_object_mut().unwrap().remove(name);
+    }
+    checked_payload["max_tokens"] = json!(crate::orchestration::output_limit(payload)?);
+    if let Some(value) =
+        crate::providers::anthropic_text_request(&target.upstream_name, &checked_payload)
+    {
+        request = value.as_object().expect("LiteLLM emits an object").clone();
     }
     let upstream = client
         .post(upstream_url(&target.base_url, endpoint))
@@ -768,6 +837,24 @@ async fn call_anthropic_chat(
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    if content.iter().any(|block| {
+        !matches!(
+            block.get("type").and_then(Value::as_str),
+            Some("text" | "tool_use")
+        )
+    }) {
+        anyhow::bail!("unsupported Anthropic response content block");
+    }
+    for block in &content {
+        crate::providers::ensure_fields(
+            block,
+            if block["type"] == "text" {
+                &["type", "text"]
+            } else {
+                &["type", "id", "name", "input"]
+            },
+        )?;
+    }
     let text = content
         .iter()
         .filter_map(|block| {
@@ -820,7 +907,8 @@ async fn call_anthropic_chat(
         "usage": {
             "prompt_tokens": input_tokens,
             "completion_tokens": output_tokens,
-            "total_tokens": input_tokens + output_tokens
+            "total_tokens": input_tokens + output_tokens,
+            "prompt_tokens_details":{"cached_tokens":body.pointer("/usage/cache_read_input_tokens").and_then(Value::as_i64).unwrap_or(0),"cache_creation_tokens":body.pointer("/usage/cache_creation_input_tokens").and_then(Value::as_i64).unwrap_or(0)}
         }
     }))
 }
@@ -885,12 +973,14 @@ fn build_event(
 }
 
 fn usage(response: Option<&Value>) -> (i64, i64, i64) {
-    let usage = response.and_then(|value| value.get("usage"));
+    let usage =
+        response.and_then(|value| value.get("usage").or_else(|| value.get("usageMetadata")));
     let input = usage
         .and_then(|value| {
             value
                 .get("prompt_tokens")
                 .or_else(|| value.get("input_tokens"))
+                .or_else(|| value.get("promptTokenCount"))
         })
         .and_then(Value::as_i64)
         .unwrap_or(0);
@@ -899,6 +989,7 @@ fn usage(response: Option<&Value>) -> (i64, i64, i64) {
             value
                 .get("completion_tokens")
                 .or_else(|| value.get("output_tokens"))
+                .or_else(|| value.get("candidatesTokenCount"))
         })
         .and_then(Value::as_i64)
         .unwrap_or(0);
@@ -907,6 +998,7 @@ fn usage(response: Option<&Value>) -> (i64, i64, i64) {
             value
                 .pointer("/prompt_tokens_details/cached_tokens")
                 .or_else(|| value.get("cache_read_input_tokens"))
+                .or_else(|| value.get("cachedContentTokenCount"))
         })
         .and_then(Value::as_i64)
         .unwrap_or(0);
@@ -935,10 +1027,6 @@ fn redact_json(mut value: Value) -> Value {
         _ => {}
     }
     value
-}
-
-fn body_from_json(value: &Value) -> Result<Vec<u8>, ApiError> {
-    serde_json::to_vec(value).map_err(|error| ApiError::Internal(error.into()))
 }
 
 fn upstream_url(base: &str, endpoint: &str) -> String {
@@ -1253,8 +1341,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(models_response.status(), StatusCode::OK);
+        assert!(models_response.headers().contains_key("x-trace-id"));
         observations.flush().await;
-        assert_eq!(observations.summary().await.unwrap().requests, 1);
+        assert_eq!(observations.summary().await.unwrap().requests, 2);
         server.abort();
     }
 

@@ -49,6 +49,7 @@ pub struct Candidate {
     pub model_rules: Value,
     pub pass_user_agent: bool,
     pub endpoint: String,
+    pub protocol_endpoint: String,
 }
 
 impl Candidate {
@@ -105,6 +106,15 @@ pub async fn visible_models(
     key: &ApiKeyCredential,
     headers: &HeaderMap,
 ) -> Result<Vec<Value>> {
+    visible_models_for(db, key, headers, crate::providers::ENDPOINTS).await
+}
+
+pub async fn visible_models_for(
+    db: &DatabaseConnection,
+    key: &ApiKeyCredential,
+    headers: &HeaderMap,
+    endpoints: &[&str],
+) -> Result<Vec<Value>> {
     use sea_orm::ConnectionTrait;
     let profile = load_profile(db, key).await?;
     let rows=db.query_all(repository::statement("SELECT DISTINCT m.public_name,m.created_at FROM models m JOIN providers p ON p.id=m.provider_id WHERE p.project_id=? AND p.enabled=1 AND m.enabled=1 ORDER BY m.public_name",vec![key.project_id.clone().into()])).await?;
@@ -127,7 +137,7 @@ pub async fn visible_models(
             Err(Error::Forbidden) => continue,
             Err(error) => return Err(error),
         };
-        for endpoint in ["/v1/chat/completions", "/v1/responses", "/v1/messages"] {
+        for &endpoint in endpoints {
             if profile
                 .routing
                 .allowed_endpoints
@@ -364,10 +374,80 @@ impl Plan {
 
     pub fn attempt_payload(&self, candidate: &Candidate) -> Result<(Value, HeaderMap, u32)> {
         let (mut payload, headers) = self.candidate_request(candidate)?;
-        if self.routing.limits.tpm.is_some() || candidate.limits.tpm.is_some() {
-            validate_token_reservation(&mut payload)?;
+        if crate::providers::capability(&candidate.protocol_endpoint) == "gemini"
+            && payload
+                .get("generationConfig")
+                .is_some_and(|value| !value.is_object())
+        {
+            return Err(Error::Invalid("generationConfig must be an object"));
         }
-        let tokens = estimate_tokens(&payload)?;
+        if self.routing.limits.tpm.is_some() || candidate.limits.tpm.is_some() {
+            if crate::providers::is_media(&candidate.protocol_endpoint) {
+                return Err(Error::Invalid(
+                    "TPM admission for media requires a provider token estimator",
+                ));
+            }
+            let mut checked = payload.clone();
+            validate_token_reservation(&mut checked)?;
+            match crate::providers::capability(&candidate.protocol_endpoint) {
+                "chat" | "messages" | "completions" | "responses" => payload = checked,
+                "gemini"
+                    if payload
+                        .pointer("/generationConfig/maxOutputTokens")
+                        .is_none() =>
+                {
+                    payload["generationConfig"]["maxOutputTokens"] = serde_json::json!(4096);
+                }
+                _ => {}
+            }
+        }
+        let mut tokens = if let Some(input) = crate::providers::tokens::input_tokens(
+            &candidate.target.provider_kind,
+            &candidate.target.upstream_name,
+            &payload,
+        ) {
+            input
+                .checked_add(
+                    output_limit(&payload)?
+                        .checked_mul(completion_count(&payload)?)
+                        .ok_or(Error::Invalid("request token reservation is too large"))?,
+                )
+                .ok_or(Error::Invalid("request token reservation is too large"))?
+        } else {
+            estimate_tokens(&payload)?
+        };
+        if crate::providers::capability(&candidate.protocol_endpoint) == "gemini" {
+            let output = payload
+                .pointer("/generationConfig/maxOutputTokens")
+                .map(|value| {
+                    value
+                        .as_u64()
+                        .and_then(|n| u32::try_from(n).ok())
+                        .filter(|n| *n > 0)
+                        .ok_or(Error::Invalid(
+                            "maxOutputTokens must be a positive 32-bit integer",
+                        ))
+                })
+                .transpose()?
+                .unwrap_or(4096);
+            let count = payload
+                .pointer("/generationConfig/candidateCount")
+                .map(|value| {
+                    value
+                        .as_u64()
+                        .and_then(|n| u32::try_from(n).ok())
+                        .filter(|n| *n > 0)
+                        .ok_or(Error::Invalid(
+                            "candidateCount must be a positive 32-bit integer",
+                        ))
+                })
+                .transpose()?
+                .unwrap_or(1);
+            tokens = tokens
+                .checked_sub(4096)
+                .and_then(|n| n.checked_add(output.checked_mul(count)?))
+                .ok_or(Error::Invalid("request token reservation is too large"))?;
+        }
         Ok((payload, headers, tokens))
     }
 }
@@ -376,18 +456,31 @@ fn validate_token_reservation(payload: &mut Value) -> Result<()> {
     fn non_text(value: &Value) -> bool {
         match value {
             Value::Object(map) => {
-                map.get("type").and_then(Value::as_str).is_some_and(|kind| {
-                    matches!(
-                        kind,
-                        "image_url"
-                            | "input_image"
-                            | "input_audio"
-                            | "audio"
-                            | "image"
-                            | "file"
-                            | "input_file"
-                    )
-                }) || map.values().any(non_text)
+                map.contains_key("inlineData")
+                    || map.contains_key("fileData")
+                    || map.contains_key("inline_data")
+                    || map.contains_key("file_data")
+                    || map.contains_key("image")
+                    || map.contains_key("image_url")
+                    || map.contains_key("audio")
+                    || map.contains_key("video")
+                    || map.contains_key("cachedContent")
+                    || map.contains_key("cached_content")
+                    || map.get("type").and_then(Value::as_str).is_some_and(|kind| {
+                        matches!(
+                            kind,
+                            "image_url"
+                                | "input_image"
+                                | "input_audio"
+                                | "audio"
+                                | "image"
+                                | "file"
+                                | "input_file"
+                                | "video_url"
+                                | "input_video"
+                        )
+                    })
+                    || map.values().any(non_text)
             }
             Value::Array(items) => items.iter().any(non_text),
             _ => false,

@@ -302,6 +302,7 @@ pub async fn candidates(
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
             endpoint: path,
+            protocol_endpoint: endpoint.into(),
         });
     }
     result.sort_by(|a, b| {
@@ -349,21 +350,5 @@ fn resolve_model(original: &str, rules: &Value) -> Result<String> {
 }
 
 fn supports(kind: &str, capabilities: &[String], endpoint: &str, stream: bool) -> bool {
-    let capability = match endpoint {
-        "/v1/chat/completions" => "chat",
-        "/v1/messages" => "messages",
-        "/v1/responses" | "/v1/responses/compact" => "responses",
-        "/v1/embeddings" => "embeddings",
-        "/v1/rerank" => "rerank",
-        _ => endpoint,
-    };
-    let configured = capabilities.iter().any(|v| v == capability);
-    match endpoint {
-        "/v1/messages" => {
-            kind == "anthropic" && (configured || capabilities.iter().any(|v| v == "chat"))
-        }
-        "/v1/responses" | "/v1/responses/compact" => kind != "anthropic" && configured,
-        "/v1/chat/completions" => configured && !(kind == "anthropic" && stream),
-        _ => configured,
-    }
+    crate::providers::supports(kind, capabilities, endpoint, stream)
 }
