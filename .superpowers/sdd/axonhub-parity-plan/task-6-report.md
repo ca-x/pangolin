@@ -197,3 +197,11 @@ Commit base: `db2fcf7`.
   - request detail rendered without an alert or 404 and retained `documentWidth=375`, `overflow=false`.
 
 No full suite, full browser matrix, release build or actionlint run was repeated.
+
+### Fix round 2 follow-up
+
+- Preserved `editing.id` inside the routing association normalizer before mapping unrestricted model/provider sentinels to null. Edit now targets the existing association upsert identity instead of creating a duplicate UUID.
+- `pnpm --dir web exec vitest run src/pages/ModelsPage.test.tsx`
+  - passed: edit mutation contains original `id: "a1"` and retains null model/provider references.
+- `pnpm --dir web lint`
+  - passed.
