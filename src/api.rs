@@ -9,11 +9,12 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{delete, get, post},
 };
-use futures_util::StreamExt as _;
 use sea_orm::DatabaseConnection;
 use serde_json::{Map, Value, json};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use uuid::Uuid;
+
+mod gateway;
 
 use crate::{
     config::Config,
@@ -32,6 +33,7 @@ pub struct AppState {
     pub client: reqwest::Client,
     pub oidc_client: reqwest::Client,
     pub budget_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    pub orchestrator: Arc<crate::orchestration::Runtime>,
 }
 
 impl AppState {
@@ -62,6 +64,8 @@ pub enum ApiError {
     Conflict(String),
     #[error("{0}")]
     Upstream(String),
+    #[error("{0}")]
+    RateLimited(String),
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
 }
@@ -81,6 +85,9 @@ impl IntoResponse for ApiError {
             Self::NotFound => (StatusCode::NOT_FOUND, "not_found_error", self.to_string()),
             Self::Conflict(message) => (StatusCode::CONFLICT, "conflict_error", message),
             Self::Upstream(message) => (StatusCode::BAD_GATEWAY, "upstream_error", message),
+            Self::RateLimited(message) => {
+                (StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", message)
+            }
             Self::Internal(error) => {
                 tracing::error!(%error, "internal API error");
                 (
@@ -101,6 +108,21 @@ impl IntoResponse for ApiError {
 impl From<sea_orm::DbErr> for ApiError {
     fn from(value: sea_orm::DbErr) -> Self {
         Self::Internal(value.into())
+    }
+}
+
+impl From<crate::orchestration::Error> for ApiError {
+    fn from(error: crate::orchestration::Error) -> Self {
+        use crate::orchestration::Error;
+        match error {
+            Error::Forbidden => Self::Forbidden,
+            Error::Invalid(message) => Self::BadRequest(message.into()),
+            Error::Admission(reason) => Self::RateLimited(reason.into()),
+            Error::Configuration => {
+                Self::Internal(anyhow::anyhow!("invalid orchestration configuration"))
+            }
+            Error::Database(error) => Self::from(error),
+        }
     }
 }
 
@@ -452,6 +474,7 @@ async fn metrics(State(state): State<AppState>) -> Result<Response, ApiError> {
         i32::from(state.observations.is_available()),
         state.observations.dropped_events(),
     );
+    let body = format!("{body}{}", state.orchestrator.metrics());
     Ok(([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], body).into_response())
 }
 
@@ -459,11 +482,8 @@ async fn gateway_models(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError> {
-    gateway_key(&state, &headers).await?;
-    let mut seen = std::collections::BTreeSet::new();
-    let models = db::list_models(&state.db).await?.into_iter().filter(|model| model.enabled && seen.insert(model.public_name.clone())).map(|model| json!({
-        "id": model.public_name, "object": "model", "created": model.created_at, "owned_by": "pangolin"
-    })).collect::<Vec<_>>();
+    let credential = gateway_key(&state, &headers).await?;
+    let models = crate::orchestration::visible_models(&state.db, &credential, &headers).await?;
     Ok(Json(json!({ "object": "list", "data": models })))
 }
 
@@ -497,258 +517,7 @@ async fn gateway_request(
     body: axum::body::Bytes,
     endpoint: &'static str,
 ) -> Result<Response, ApiError> {
-    let started = Instant::now();
-    let started_at = db::now();
-    let request_id = format!("req_{}", Uuid::new_v4().simple());
-    let trace_id = Uuid::new_v4().simple().to_string();
-    let initial_credential = gateway_key(&state, &headers).await?;
-    let mut payload: Value = serde_json::from_slice(&body)
-        .map_err(|_| ApiError::BadRequest("request body must be valid JSON".into()))?;
-    let requested_model = payload
-        .get("model")
-        .and_then(Value::as_str)
-        .ok_or_else(|| ApiError::BadRequest("model is required".into()))?
-        .to_owned();
-    let stream = payload
-        .get("stream")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    if stream && initial_credential.budget_micros.is_some() {
-        return Err(ApiError::BadRequest(
-            "streaming is disabled for budget-limited API keys because provider-neutral usage settlement is not reliable".into(),
-        ));
-    }
-    let _budget_guard = if initial_credential.budget_micros.is_some() {
-        Some(state.lock_budget_key(&initial_credential.id).await)
-    } else {
-        None
-    };
-    let credential = if _budget_guard.is_some() {
-        gateway_key(&state, &headers).await?
-    } else {
-        initial_credential
-    };
-    let targets = db::resolve_targets(&state.db, &requested_model, endpoint).await?;
-    if targets.is_empty() {
-        return Err(ApiError::BadRequest(format!(
-            "no enabled route for model `{requested_model}`"
-        )));
-    }
-
-    let captured_request = state
-        .config
-        .capture_payloads
-        .then(|| redact_json(payload.clone()).to_string());
-    let mut last_error = None;
-    let mut last_provider = None;
-    let mut last_resolved_model = None;
-    for target in targets {
-        last_provider = Some(target.provider_name.clone());
-        last_resolved_model = Some(target.upstream_name.clone());
-        payload["model"] = Value::String(target.upstream_name.clone());
-        let secret = state
-            .secrets
-            .decrypt(&target.secret_envelope)
-            .map_err(ApiError::Internal)?;
-
-        if endpoint == "/v1/chat/completions" && target.provider_kind == "anthropic" && !stream {
-            match call_anthropic_chat(&state.client, &target, &payload, &secret).await {
-                Ok(value) => {
-                    let response_bytes = serde_json::to_vec(&value)
-                        .map_err(|error| ApiError::Internal(error.into()))?;
-                    let event = build_event(
-                        &request_id,
-                        &trace_id,
-                        started_at,
-                        started.elapsed().as_millis() as i64,
-                        endpoint,
-                        &credential.id,
-                        &target.provider_name,
-                        &requested_model,
-                        &target.upstream_name,
-                        200,
-                        None,
-                        &payload,
-                        Some(&value),
-                        captured_request.clone(),
-                        state.config.capture_payloads,
-                        target.input_price_micros,
-                        target.output_price_micros,
-                    );
-                    db::add_api_key_spend(&state.db, &credential.id, event.cost_micros).await?;
-                    state.observations.record(event);
-                    return Ok((
-                        StatusCode::OK,
-                        [
-                            ("content-type", "application/json"),
-                            ("x-request-id", request_id.as_str()),
-                        ],
-                        response_bytes,
-                    )
-                        .into_response());
-                }
-                Err(error) => {
-                    last_error = Some(error.to_string());
-                    continue;
-                }
-            }
-        } else if endpoint == "/v1/chat/completions" && target.provider_kind == "anthropic" {
-            return Err(ApiError::BadRequest(
-                "streaming OpenAI-to-Anthropic translation is not available in v0.1; use /v1/messages or disable stream".into(),
-            ));
-        }
-
-        let url = upstream_url(&target.base_url, endpoint);
-        let mut request = state
-            .client
-            .post(url)
-            .header(header::CONTENT_TYPE, "application/json");
-        request = if target.provider_kind == "anthropic" {
-            request.header("x-api-key", secret.as_str()).header(
-                "anthropic-version",
-                headers
-                    .get("anthropic-version")
-                    .and_then(|value| value.to_str().ok())
-                    .unwrap_or("2023-06-01"),
-            )
-        } else {
-            request.bearer_auth(secret.as_str())
-        };
-        let upstream = match request.body(body_from_json(&payload)?).send().await {
-            Ok(response) => response,
-            Err(error) => {
-                last_error = Some(error.to_string());
-                continue;
-            }
-        };
-        let status = upstream.status();
-        if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
-            last_error = Some(format!("{} returned {status}", target.provider_name));
-            continue;
-        }
-        let content_type = upstream
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .cloned()
-            .unwrap_or_else(|| HeaderValue::from_static("application/json"));
-        if stream {
-            let status_code = status.as_u16() as i32;
-            let mut upstream_stream = upstream.bytes_stream();
-            let mut guard = StreamEventGuard::new(
-                state.observations.clone(),
-                RequestEvent {
-                    request_id: request_id.clone(),
-                    trace_id,
-                    started_at,
-                    finished_at: 0,
-                    endpoint: endpoint.into(),
-                    api_key_id: Some(credential.id),
-                    provider: Some(target.provider_name),
-                    requested_model: Some(requested_model),
-                    resolved_model: Some(target.upstream_name),
-                    status_code,
-                    error_kind: None,
-                    latency_ms: 0,
-                    ttft_ms: None,
-                    input_tokens: 0,
-                    output_tokens: 0,
-                    cached_tokens: 0,
-                    cost_micros: 0,
-                    payload_captured: state.config.capture_payloads,
-                    request_json: captured_request,
-                    response_json: None,
-                },
-                started,
-            );
-            let stream = async_stream::stream! {
-                while let Some(chunk) = upstream_stream.next().await {
-                    match chunk {
-                        Ok(bytes) => {
-                            guard.mark_first_byte();
-                            yield Ok::<_, std::io::Error>(bytes);
-                        }
-                        Err(error) => {
-                            guard.fail("stream_error");
-                            yield Err(std::io::Error::other(error));
-                            return;
-                        }
-                    }
-                }
-                guard.complete();
-            };
-            let mut response = Response::new(Body::from_stream(stream));
-            *response.status_mut() = status;
-            response
-                .headers_mut()
-                .insert(header::CONTENT_TYPE, content_type);
-            response.headers_mut().insert(
-                "x-request-id",
-                HeaderValue::from_str(&request_id).expect("request id is an HTTP header value"),
-            );
-            return Ok(response);
-        }
-        let response_bytes = upstream
-            .bytes()
-            .await
-            .map_err(|error| ApiError::Upstream(error.to_string()))?;
-        let response_json = serde_json::from_slice::<Value>(&response_bytes).ok();
-        let event = build_event(
-            &request_id,
-            &trace_id,
-            started_at,
-            started.elapsed().as_millis() as i64,
-            endpoint,
-            &credential.id,
-            &target.provider_name,
-            &requested_model,
-            &target.upstream_name,
-            status.as_u16() as i32,
-            (status.as_u16() >= 400).then(|| "upstream_http".into()),
-            &payload,
-            response_json.as_ref(),
-            captured_request.clone(),
-            state.config.capture_payloads,
-            target.input_price_micros,
-            target.output_price_micros,
-        );
-        db::add_api_key_spend(&state.db, &credential.id, event.cost_micros).await?;
-        state.observations.record(event);
-        let mut response = Response::new(Body::from(response_bytes));
-        *response.status_mut() = status;
-        response
-            .headers_mut()
-            .insert(header::CONTENT_TYPE, content_type);
-        response.headers_mut().insert(
-            "x-request-id",
-            HeaderValue::from_str(&request_id).expect("request id is an HTTP header value"),
-        );
-        return Ok(response);
-    }
-    state.observations.record(RequestEvent {
-        request_id,
-        trace_id,
-        started_at,
-        finished_at: db::now(),
-        endpoint: endpoint.into(),
-        api_key_id: Some(credential.id),
-        provider: last_provider,
-        requested_model: Some(requested_model),
-        resolved_model: last_resolved_model,
-        status_code: StatusCode::BAD_GATEWAY.as_u16() as i32,
-        error_kind: Some("upstream_unavailable".into()),
-        latency_ms: started.elapsed().as_millis() as i64,
-        ttft_ms: None,
-        input_tokens: 0,
-        output_tokens: 0,
-        cached_tokens: 0,
-        cost_micros: 0,
-        payload_captured: state.config.capture_payloads,
-        request_json: captured_request,
-        response_json: None,
-    });
-    Err(ApiError::Upstream(
-        last_error.unwrap_or_else(|| "all upstream targets failed".into()),
-    ))
+    gateway::execute(state, headers, body, endpoint).await
 }
 
 struct StreamEventGuard {
@@ -828,6 +597,8 @@ async fn call_anthropic_chat(
     target: &crate::models::RouteTarget,
     payload: &Value,
     secret: &str,
+    headers: &HeaderMap,
+    endpoint: &str,
 ) -> anyhow::Result<Value> {
     let object = payload
         .as_object()
@@ -979,7 +750,8 @@ async fn call_anthropic_chat(
         }
     }
     let upstream = client
-        .post(upstream_url(&target.base_url, "/v1/messages"))
+        .post(upstream_url(&target.base_url, endpoint))
+        .headers(headers.clone())
         .header("x-api-key", secret)
         .header("anthropic-version", "2023-06-01")
         .json(&request)
@@ -988,7 +760,11 @@ async fn call_anthropic_chat(
     let status = upstream.status();
     let body: Value = upstream.json().await?;
     if !status.is_success() {
-        anyhow::bail!("Anthropic returned {status}: {body}");
+        return Err(AnthropicHttpError {
+            status,
+            body: body.to_string(),
+        }
+        .into());
     }
     let content = body
         .get("content")
@@ -1050,6 +826,13 @@ async fn call_anthropic_chat(
             "total_tokens": input_tokens + output_tokens
         }
     }))
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("Anthropic request failed with HTTP {status}")]
+struct AnthropicHttpError {
+    status: StatusCode,
+    body: String,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1323,6 +1106,7 @@ mod tests {
                 .build()
                 .unwrap(),
             budget_locks: Arc::new(Mutex::new(HashMap::new())),
+            orchestrator: Arc::new(crate::orchestration::Runtime::default()),
         });
         let response = app
             .oneshot(
@@ -1442,6 +1226,7 @@ mod tests {
                 .build()
                 .unwrap(),
             budget_locks: Arc::new(Mutex::new(HashMap::new())),
+            orchestrator: Arc::new(crate::orchestration::Runtime::default()),
         });
         let response = app
             .clone()
@@ -1499,7 +1284,6 @@ mod tests {
         let target = crate::models::RouteTarget {
             public_name: "assistant".into(),
             upstream_name: "claude-test".into(),
-            capabilities: "[\"chat\"]".into(),
             provider_name: "Anthropic".into(),
             provider_kind: "anthropic".into(),
             base_url: format!("http://{address}/v1"),
@@ -1522,6 +1306,8 @@ mod tests {
                 "tools": [{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}]
             }),
             "test-key",
+            &HeaderMap::new(),
+            "/v1/messages",
         )
         .await
         .unwrap();

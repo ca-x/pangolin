@@ -911,6 +911,7 @@ mod tests {
                 .build()
                 .unwrap(),
             budget_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            orchestrator: Arc::new(crate::orchestration::Runtime::default()),
         };
         let database = state.db.clone();
         (

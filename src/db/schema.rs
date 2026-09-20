@@ -676,6 +676,24 @@ const V4_OIDC_BROWSER_BINDING: &str = r#"
 ALTER TABLE oidc_auth_states ADD COLUMN browser_binding_hash TEXT NOT NULL DEFAULT '';
 "#;
 
+const V5_RESPONSE_SESSIONS: &str = r#"
+CREATE UNIQUE INDEX idx_api_keys_id_project ON api_keys(id,project_id);
+CREATE TABLE response_sessions (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    api_key_id TEXT NOT NULL,
+    response_id TEXT NOT NULL,
+    state_envelope TEXT NOT NULL,
+    version INTEGER NOT NULL DEFAULT 1 CHECK(version=1),
+    updated_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    UNIQUE(api_key_id,response_id),
+    FOREIGN KEY(api_key_id,project_id) REFERENCES api_keys(id,project_id) ON DELETE CASCADE
+);
+CREATE INDEX idx_response_sessions_expiry ON response_sessions(expires_at);
+CREATE INDEX idx_response_sessions_scope ON response_sessions(project_id,api_key_id,updated_at);
+"#;
+
 #[derive(FromQueryResult)]
 struct Count {
     count: i64,
@@ -764,6 +782,25 @@ pub async fn migrate(db: &DatabaseConnection) -> Result<()> {
             .await?;
         transaction.commit().await?;
     }
+    let sessions_applied = Count::find_by_statement(statement(
+        "SELECT COUNT(*) AS count FROM schema_migrations WHERE version=5",
+    ))
+    .one(db)
+    .await?
+    .is_some_and(|row| row.count > 0);
+    if !sessions_applied {
+        let transaction = db.begin().await?;
+        transaction
+            .execute_unprepared(V5_RESPONSE_SESSIONS)
+            .await
+            .context("failed to initialize Responses session storage")?;
+        transaction
+            .execute(statement(
+                "INSERT INTO schema_migrations(version,applied_at) VALUES(5,unixepoch())",
+            ))
+            .await?;
+        transaction.commit().await?;
+    }
     Ok(())
 }
 
@@ -801,7 +838,7 @@ mod tests {
 
         assert_eq!(
             scalar(&db, "SELECT MAX(version) AS count FROM schema_migrations").await,
-            4
+            5
         );
         for table in [
             "projects",
@@ -814,6 +851,7 @@ mod tests {
             "oidc_identities",
             "oidc_auth_states",
             "api_key_profiles",
+            "response_sessions",
             "channel_credentials",
             "channel_settings",
             "model_associations",
@@ -883,6 +921,7 @@ mod tests {
             "idx_project_memberships_user",
             "idx_oidc_identities_user",
             "idx_api_keys_project",
+            "idx_response_sessions_expiry",
             "idx_user_role_bindings_global_unique",
             "idx_channel_credentials_provider",
             "idx_model_associations_project",
@@ -950,7 +989,7 @@ mod tests {
 
         assert_eq!(
             scalar(&db, "SELECT COUNT(*) AS count FROM schema_migrations").await,
-            3
+            4
         );
         assert_eq!(
             scalar(

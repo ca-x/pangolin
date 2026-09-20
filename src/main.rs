@@ -7,6 +7,7 @@ mod db;
 mod models;
 mod observability;
 mod oidc;
+mod orchestration;
 mod web;
 
 use std::{collections::HashMap, fs, sync::Arc};
@@ -51,6 +52,7 @@ async fn main() -> Result<()> {
         observations: observations.clone(),
         client: reqwest::Client::builder()
             .user_agent(concat!("pangolin/", env!("CARGO_PKG_VERSION")))
+            .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(std::time::Duration::from_secs(10))
             .timeout(config.upstream_timeout)
             .build()?,
@@ -61,6 +63,7 @@ async fn main() -> Result<()> {
             .timeout(config.upstream_timeout)
             .build()?,
         budget_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        orchestrator: Arc::new(orchestration::Runtime::default()),
     };
     let app = Router::new()
         .merge(api::router(state))

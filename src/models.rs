@@ -71,7 +71,6 @@ pub struct ApiKeyCredential {
 pub struct RouteTarget {
     pub public_name: String,
     pub upstream_name: String,
-    pub capabilities: String,
     pub provider_name: String,
     pub provider_kind: String,
     pub base_url: String,

@@ -257,38 +257,6 @@ pub async fn delete_model(db: &DatabaseConnection, id: &str) -> Result<bool> {
         > 0)
 }
 
-pub async fn resolve_targets(
-    db: &DatabaseConnection,
-    public_name: &str,
-    endpoint: &str,
-) -> Result<Vec<RouteTarget>> {
-    let targets = RouteTarget::find_by_statement(stmt(
-        "SELECT m.public_name,m.upstream_name,m.capabilities,p.name AS provider_name,p.kind AS provider_kind,p.base_url,c.secret_envelope,m.input_price_micros,m.output_price_micros FROM models m JOIN providers p ON p.id=m.provider_id JOIN channel_credentials c ON c.id=(SELECT cc.id FROM channel_credentials cc WHERE cc.provider_id=p.id AND cc.enabled=1 ORDER BY cc.priority,cc.id LIMIT 1) WHERE m.public_name=? AND m.enabled=1 AND p.enabled=1 ORDER BY m.priority,p.name",
-        vec![public_name.into()],
-    )).all(db).await?;
-    Ok(targets
-        .into_iter()
-        .filter(|target| {
-            let capabilities =
-                serde_json::from_str::<Vec<String>>(&target.capabilities).unwrap_or_default();
-            match endpoint {
-                "/v1/chat/completions" => capabilities.iter().any(|value| value == "chat"),
-                "/v1/responses" => {
-                    target.provider_kind != "anthropic"
-                        && capabilities.iter().any(|value| value == "responses")
-                }
-                "/v1/messages" => {
-                    target.provider_kind == "anthropic"
-                        && capabilities
-                            .iter()
-                            .any(|value| value == "messages" || value == "chat")
-                }
-                _ => false,
-            }
-        })
-        .collect())
-}
-
 pub async fn list_api_keys(db: &DatabaseConnection) -> Result<Vec<ApiKey>> {
     Ok(ApiKey::find_by_statement(stmt("SELECT id,name,key_prefix,scopes,budget_micros,spent_micros,enabled,last_used_at,created_at FROM api_keys WHERE project_id=? ORDER BY created_at DESC", vec![DEFAULT_PROJECT_ID.into()])).all(db).await?)
 }
