@@ -52,8 +52,12 @@ pub enum ApiError {
     BadRequest(String),
     #[error("authentication required")]
     Unauthorized,
+    #[error("permission denied")]
+    Forbidden,
     #[error("resource not found")]
     NotFound,
+    #[error("{0}")]
+    Conflict(String),
     #[error("{0}")]
     Upstream(String),
     #[error(transparent)]
@@ -71,7 +75,9 @@ impl IntoResponse for ApiError {
                 "authentication_error",
                 self.to_string(),
             ),
+            Self::Forbidden => (StatusCode::FORBIDDEN, "permission_error", self.to_string()),
             Self::NotFound => (StatusCode::NOT_FOUND, "not_found_error", self.to_string()),
+            Self::Conflict(message) => (StatusCode::CONFLICT, "conflict_error", message),
             Self::Upstream(message) => (StatusCode::BAD_GATEWAY, "upstream_error", message),
             Self::Internal(error) => {
                 tracing::error!(%error, "internal API error");
@@ -98,6 +104,7 @@ impl From<sea_orm::DbErr> for ApiError {
 
 pub fn router(state: AppState) -> Router {
     Router::new()
+        .merge(crate::access_api::router())
         .route("/api/health/live", get(live))
         .route("/api/health/ready", get(ready))
         .route("/api/v1/bootstrap", get(bootstrap))
@@ -191,7 +198,7 @@ async fn login(
     session_response(&state, &user).await
 }
 
-async fn session_response(state: &AppState, user: &User) -> Result<Response, ApiError> {
+pub(crate) async fn session_response(state: &AppState, user: &User) -> Result<Response, ApiError> {
     let token = db::create_session(&state.db, &user.id).await?;
     let mut cookie =
         format!("pangolin_session={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=2592000");
@@ -222,7 +229,7 @@ async fn list_providers(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError> {
-    require_user(&state, &headers).await?;
+    require_user_permission(&state, &headers, "project:read").await?;
     Ok(Json(db::list_providers(&state.db).await?))
 }
 
@@ -231,7 +238,7 @@ async fn create_provider(
     headers: HeaderMap,
     Json(input): Json<ProviderInput>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user = require_user(&state, &headers).await?;
+    let user = require_user_permission(&state, &headers, "project:manage").await?;
     validate_http_url(&input.base_url)?;
     if input.name.trim().is_empty() || input.api_key.trim().is_empty() {
         return Err(ApiError::BadRequest("name and API key are required".into()));
@@ -260,7 +267,7 @@ async fn delete_provider(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    let user = require_user(&state, &headers).await?;
+    let user = require_user_permission(&state, &headers, "project:manage").await?;
     if db::delete_provider(&state.db, &id).await? {
         db::record_audit_event(&state.db, &user.id, "delete", "provider", &id, json!({})).await?;
         Ok(StatusCode::NO_CONTENT)
@@ -273,7 +280,7 @@ async fn list_models(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError> {
-    require_user(&state, &headers).await?;
+    require_user_permission(&state, &headers, "project:read").await?;
     Ok(Json(db::list_models(&state.db).await?))
 }
 
@@ -282,7 +289,7 @@ async fn create_model(
     headers: HeaderMap,
     Json(input): Json<ModelInput>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user = require_user(&state, &headers).await?;
+    let user = require_user_permission(&state, &headers, "project:manage").await?;
     if input.public_name.trim().is_empty() || input.upstream_name.trim().is_empty() {
         return Err(ApiError::BadRequest("model names are required".into()));
     }
@@ -306,7 +313,7 @@ async fn delete_model(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    let user = require_user(&state, &headers).await?;
+    let user = require_user_permission(&state, &headers, "project:manage").await?;
     if db::delete_model(&state.db, &id).await? {
         db::record_audit_event(&state.db, &user.id, "delete", "model", &id, json!({})).await?;
         Ok(StatusCode::NO_CONTENT)
@@ -319,7 +326,7 @@ async fn list_api_keys(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError> {
-    require_user(&state, &headers).await?;
+    require_user_permission(&state, &headers, "project:read").await?;
     Ok(Json(db::list_api_keys(&state.db).await?))
 }
 
@@ -328,7 +335,7 @@ async fn create_api_key(
     headers: HeaderMap,
     Json(input): Json<ApiKeyInput>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user = require_user(&state, &headers).await?;
+    let user = require_user_permission(&state, &headers, "api_key:manage").await?;
     if input.name.trim().is_empty() {
         return Err(ApiError::BadRequest("name is required".into()));
     }
@@ -355,7 +362,7 @@ async fn delete_api_key(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    let user = require_user(&state, &headers).await?;
+    let user = require_user_permission(&state, &headers, "api_key:manage").await?;
     if db::delete_api_key(&state.db, &id).await? {
         db::record_audit_event(&state.db, &user.id, "delete", "api_key", &id, json!({})).await?;
         Ok(StatusCode::NO_CONTENT)
@@ -368,7 +375,7 @@ async fn observation_summary(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError> {
-    require_user(&state, &headers).await?;
+    require_user_permission(&state, &headers, "project:read").await?;
     Ok(Json(
         state
             .observations
@@ -383,7 +390,7 @@ async fn observation_list(
     headers: HeaderMap,
     Query(filter): Query<RequestFilter>,
 ) -> Result<impl IntoResponse, ApiError> {
-    require_user(&state, &headers).await?;
+    require_user_permission(&state, &headers, "project:read").await?;
     Ok(Json(
         state
             .observations
@@ -398,7 +405,7 @@ async fn observation_detail(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
-    require_user(&state, &headers).await?;
+    require_user_permission(&state, &headers, "project:read").await?;
     state
         .observations
         .get(id)
@@ -1155,6 +1162,30 @@ async fn require_user(state: &AppState, headers: &HeaderMap) -> Result<User, Api
         .ok_or(ApiError::Unauthorized)
 }
 
+async fn require_user_permission(
+    state: &AppState,
+    headers: &HeaderMap,
+    permission: &str,
+) -> Result<User, ApiError> {
+    let user = require_user(state, headers).await?;
+    crate::access::authorize(
+        &state.db,
+        &crate::access::Principal::session(user.id.clone()),
+        Some(db::DEFAULT_PROJECT_ID),
+        permission,
+    )
+    .await
+    .map_err(|error| match error {
+        crate::access::AccessError::Forbidden => ApiError::Forbidden,
+        crate::access::AccessError::Unauthorized => ApiError::Unauthorized,
+        crate::access::AccessError::NotFound => ApiError::NotFound,
+        crate::access::AccessError::Invalid(message) => ApiError::BadRequest(message),
+        crate::access::AccessError::Conflict(message) => ApiError::Conflict(message),
+        crate::access::AccessError::Internal(error) => ApiError::Internal(error),
+    })?;
+    Ok(user)
+}
+
 async fn optional_user(state: &AppState, headers: &HeaderMap) -> Result<Option<User>, ApiError> {
     let Some(token) = session_token(headers) else {
         return Ok(None);
@@ -1189,7 +1220,11 @@ async fn gateway_key(
     let credential = db::authenticate_api_key(&state.db, token)
         .await?
         .ok_or(ApiError::Unauthorized)?;
-    if !credential.scopes.contains("gateway") {
+    let scopes = serde_json::from_str::<Vec<String>>(&credential.scopes).unwrap_or_default();
+    if !scopes
+        .iter()
+        .any(|scope| matches!(scope.as_str(), "gateway" | "gateway:use" | "*"))
+    {
         return Err(ApiError::Unauthorized);
     }
     Ok(credential)
@@ -1218,6 +1253,69 @@ mod tests {
         let redacted = redact_json(json!({"password":"secret","nested":{"api_key":"sk-test"}}));
         assert_eq!(redacted["password"], "[REDACTED]");
         assert_eq!(redacted["nested"]["api_key"], "[REDACTED]");
+    }
+
+    #[tokio::test]
+    async fn local_password_login_remains_compatible() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = db::connect("sqlite::memory:").await.unwrap();
+        db::create_initial_admin(
+            &database,
+            &SetupRequest {
+                email: "admin@example.com".into(),
+                password: "a secure password".into(),
+                instance_name: None,
+                language: None,
+            },
+        )
+        .await
+        .unwrap();
+        let secrets = SecretBox::load(directory.path(), None).unwrap();
+        let observations =
+            ObservationStore::open(directory.path().join("login-events.duckdb"), 30).unwrap();
+        let app = router(AppState {
+            db: database,
+            config: Arc::new(Config {
+                bind: "127.0.0.1:0".parse().unwrap(),
+                data_dir: directory.path().into(),
+                database_url: "sqlite::memory:".into(),
+                observation_path: directory.path().join("login-events.duckdb"),
+                observation_retention_days: 30,
+                public_url: None,
+                session_secure: false,
+                capture_payloads: false,
+                upstream_timeout: std::time::Duration::from_secs(30),
+                admin_email: None,
+                admin_password: None,
+                master_key: None,
+            }),
+            secrets,
+            observations,
+            client: reqwest::Client::new(),
+            budget_locks: Arc::new(Mutex::new(HashMap::new())),
+        });
+        let response = app
+            .oneshot(
+                Request::post("/api/v1/auth/login")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({"email":"ADMIN@example.com","password":"a secure password"})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(cookie.starts_with("pangolin_session=ps_"));
+        assert!(cookie.contains("HttpOnly"));
+        assert!(cookie.contains("SameSite=Strict"));
     }
 
     #[tokio::test]

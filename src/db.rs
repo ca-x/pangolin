@@ -69,8 +69,8 @@ pub async fn create_initial_admin(db: &DatabaseConnection, request: &SetupReques
         created_at: now(),
     };
     transaction.execute(stmt(
-        "INSERT INTO users(id,email,password_hash,role,language,theme,created_at) VALUES(?,?,?,?,?,?,?)",
-        vec![user.id.clone().into(), user.email.clone().into(), user.password_hash.clone().into(), user.role.clone().into(), user.language.clone().into(), user.theme.clone().into(), user.created_at.into()],
+        "INSERT INTO users(id,email,password_hash,role,language,theme,created_at,display_name,enabled,updated_at) VALUES(?,?,?,?,?,?,?,?,1,?)",
+        vec![user.id.clone().into(), user.email.clone().into(), user.password_hash.clone().into(), user.role.clone().into(), user.language.clone().into(), user.theme.clone().into(), user.created_at.into(), user.email.clone().into(), user.created_at.into()],
     )).await?;
     transaction
         .execute(stmt(
@@ -98,7 +98,7 @@ pub async fn create_initial_admin(db: &DatabaseConnection, request: &SetupReques
                 user.id.clone().into(),
                 user.id.clone().into(),
                 SYSTEM_OWNER_ROLE_ID.into(),
-                DEFAULT_PROJECT_ID.into(),
+                sea_orm::Value::String(None),
                 user.created_at.into(),
             ],
         ))
@@ -121,7 +121,7 @@ pub async fn create_initial_admin(db: &DatabaseConnection, request: &SetupReques
 
 pub async fn find_user_by_email(db: &DatabaseConnection, email: &str) -> Result<Option<User>> {
     Ok(User::find_by_statement(stmt(
-        "SELECT * FROM users WHERE email = ? COLLATE NOCASE",
+        "SELECT id,email,password_hash,role,language,theme,created_at FROM users WHERE email = ? COLLATE NOCASE AND enabled=1",
         vec![email.trim().into()],
     ))
     .one(db)
@@ -131,7 +131,7 @@ pub async fn find_user_by_email(db: &DatabaseConnection, email: &str) -> Result<
 pub async fn find_user_by_session(db: &DatabaseConnection, token: &str) -> Result<Option<User>> {
     let hash = crypto::token_hash(token);
     Ok(User::find_by_statement(stmt(
-        "SELECT u.* FROM users u JOIN sessions s ON s.user_id=u.id WHERE s.token_hash=? AND s.expires_at>?",
+        "SELECT u.id,u.email,u.password_hash,u.role,u.language,u.theme,u.created_at FROM users u JOIN sessions s ON s.user_id=u.id WHERE s.token_hash=? AND s.expires_at>? AND u.enabled=1",
         vec![hash.into(), now().into()],
     )).one(db).await?)
 }
@@ -287,7 +287,7 @@ pub async fn resolve_targets(
 }
 
 pub async fn list_api_keys(db: &DatabaseConnection) -> Result<Vec<ApiKey>> {
-    Ok(ApiKey::find_by_statement(stmt("SELECT id,name,key_prefix,scopes,budget_micros,spent_micros,enabled,last_used_at,created_at FROM api_keys ORDER BY created_at DESC", vec![])).all(db).await?)
+    Ok(ApiKey::find_by_statement(stmt("SELECT id,name,key_prefix,scopes,budget_micros,spent_micros,enabled,last_used_at,created_at FROM api_keys WHERE project_id=? ORDER BY created_at DESC", vec![DEFAULT_PROJECT_ID.into()])).all(db).await?)
 }
 
 pub async fn create_api_key(
@@ -309,7 +309,10 @@ pub async fn create_api_key(
 
 pub async fn delete_api_key(db: &DatabaseConnection, id: &str) -> Result<bool> {
     Ok(db
-        .execute(stmt("DELETE FROM api_keys WHERE id=?", vec![id.into()]))
+        .execute(stmt(
+            "DELETE FROM api_keys WHERE id=? AND project_id=?",
+            vec![id.into(), DEFAULT_PROJECT_ID.into()],
+        ))
         .await?
         .rows_affected()
         > 0)
@@ -330,13 +333,18 @@ pub async fn authenticate_api_key(
         return Ok(None);
     }
     let credential = ApiKeyCredential::find_by_statement(stmt(
-        "SELECT id,key_hash,scopes,budget_micros,spent_micros,enabled FROM api_keys WHERE key_prefix=?",
+        "SELECT id,project_id,user_id,key_hash,scopes,budget_micros,spent_micros,enabled,expires_at FROM api_keys WHERE key_prefix=?",
         vec![prefix.into()],
     )).one(db).await?;
     let Some(credential) = credential else {
         return Ok(None);
     };
-    if !credential.enabled || !crypto::verify_password(token, &credential.key_hash) {
+    if !credential.enabled
+        || credential
+            .expires_at
+            .is_some_and(|expires| expires <= now())
+        || !crypto::verify_password(token, &credential.key_hash)
+    {
         return Ok(None);
     }
     if credential

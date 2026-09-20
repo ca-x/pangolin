@@ -1,9 +1,12 @@
+mod access;
+mod access_api;
 mod api;
 mod config;
 mod crypto;
 mod db;
 mod models;
 mod observability;
+mod oidc;
 mod web;
 
 use std::{collections::HashMap, fs, sync::Arc};

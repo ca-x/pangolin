@@ -55,11 +55,14 @@ pub struct ApiKey {
 #[derive(Debug, Clone, FromQueryResult)]
 pub struct ApiKeyCredential {
     pub id: String,
+    pub project_id: String,
+    pub user_id: Option<String>,
     pub key_hash: String,
     pub scopes: String,
     pub budget_micros: Option<i64>,
     pub spent_micros: i64,
     pub enabled: bool,
+    pub expires_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, FromQueryResult)]

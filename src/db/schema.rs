@@ -643,6 +643,35 @@ INSERT INTO role_permissions(role_id,permission_id,created_at) VALUES
 
 "#;
 
+const V3_ACCESS_SCHEMA: &str = r#"
+ALTER TABLE users ADD COLUMN display_name TEXT NOT NULL DEFAULT '';
+ALTER TABLE users ADD COLUMN avatar_url TEXT;
+ALTER TABLE users ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0,1));
+ALTER TABLE users ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0;
+UPDATE users SET display_name=email, updated_at=created_at WHERE updated_at=0;
+
+CREATE TABLE oidc_auth_states (
+    state_hash TEXT PRIMARY KEY,
+    provider_id TEXT NOT NULL REFERENCES oidc_providers(id) ON DELETE CASCADE,
+    code_verifier_envelope TEXT NOT NULL,
+    redirect_uri TEXT NOT NULL,
+    expires_at INTEGER NOT NULL,
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX idx_oidc_auth_states_expiry ON oidc_auth_states(expires_at);
+
+INSERT INTO permissions(id,slug,level,description,created_at) VALUES
+('00000000-0000-0000-0000-000000000024','user:manage','system','Manage users',unixepoch()),
+('00000000-0000-0000-0000-000000000025','role:manage','project','Manage roles and assignments',unixepoch()),
+('00000000-0000-0000-0000-000000000026','oidc:manage','system','Manage OIDC providers',unixepoch()),
+('00000000-0000-0000-0000-000000000027','api_key:manage','project','Manage API keys',unixepoch());
+INSERT INTO role_permissions(role_id,permission_id,created_at) VALUES
+('00000000-0000-0000-0000-000000000011','00000000-0000-0000-0000-000000000024',unixepoch()),
+('00000000-0000-0000-0000-000000000011','00000000-0000-0000-0000-000000000025',unixepoch()),
+('00000000-0000-0000-0000-000000000011','00000000-0000-0000-0000-000000000026',unixepoch()),
+('00000000-0000-0000-0000-000000000011','00000000-0000-0000-0000-000000000027',unixepoch());
+"#;
+
 #[derive(FromQueryResult)]
 struct Count {
     count: i64,
@@ -663,37 +692,55 @@ pub async fn migrate(db: &DatabaseConnection) -> Result<()> {
     .one(db)
     .await?
     .is_some_and(|row| row.count > 0);
-    if applied {
-        return Ok(());
+    if !applied {
+        let experimental_v1 = Count::find_by_statement(statement(
+            "SELECT COUNT(*) AS count FROM schema_migrations WHERE version=1",
+        ))
+        .one(db)
+        .await?
+        .is_some_and(|row| row.count > 0);
+        let transaction = db.begin().await?;
+        if experimental_v1 {
+            transaction
+                .execute_unprepared(EXPERIMENTAL_V1_RESET)
+                .await
+                .context("failed to reset the unreleased experimental v1 schema")?;
+        }
+        transaction
+            .execute_unprepared(BASE_SCHEMA)
+            .await
+            .context("failed to initialize SQLite base schema")?;
+        transaction
+            .execute_unprepared(V2_SCHEMA)
+            .await
+            .context("failed to initialize SQLite v2 parity schema")?;
+        transaction
+            .execute(statement(
+                "INSERT INTO schema_migrations(version,applied_at) VALUES(2,unixepoch())",
+            ))
+            .await?;
+        transaction.commit().await?;
     }
 
-    let experimental_v1 = Count::find_by_statement(statement(
-        "SELECT COUNT(*) AS count FROM schema_migrations WHERE version=1",
+    let access_applied = Count::find_by_statement(statement(
+        "SELECT COUNT(*) AS count FROM schema_migrations WHERE version=3",
     ))
     .one(db)
     .await?
     .is_some_and(|row| row.count > 0);
-    let transaction = db.begin().await?;
-    if experimental_v1 {
+    if !access_applied {
+        let transaction = db.begin().await?;
         transaction
-            .execute_unprepared(EXPERIMENTAL_V1_RESET)
+            .execute_unprepared(V3_ACCESS_SCHEMA)
             .await
-            .context("failed to reset the unreleased experimental v1 schema")?;
+            .context("failed to initialize SQLite access-control schema")?;
+        transaction
+            .execute(statement(
+                "INSERT INTO schema_migrations(version,applied_at) VALUES(3,unixepoch())",
+            ))
+            .await?;
+        transaction.commit().await?;
     }
-    transaction
-        .execute_unprepared(BASE_SCHEMA)
-        .await
-        .context("failed to initialize SQLite base schema")?;
-    transaction
-        .execute_unprepared(V2_SCHEMA)
-        .await
-        .context("failed to initialize SQLite v2 parity schema")?;
-    transaction
-        .execute(statement(
-            "INSERT INTO schema_migrations(version,applied_at) VALUES(2,unixepoch())",
-        ))
-        .await?;
-    transaction.commit().await?;
     Ok(())
 }
 
@@ -731,7 +778,7 @@ mod tests {
 
         assert_eq!(
             scalar(&db, "SELECT MAX(version) AS count FROM schema_migrations").await,
-            2
+            3
         );
         for table in [
             "projects",
@@ -742,6 +789,7 @@ mod tests {
             "user_role_bindings",
             "oidc_providers",
             "oidc_identities",
+            "oidc_auth_states",
             "api_key_profiles",
             "channel_credentials",
             "channel_settings",
@@ -879,7 +927,7 @@ mod tests {
 
         assert_eq!(
             scalar(&db, "SELECT COUNT(*) AS count FROM schema_migrations").await,
-            1
+            2
         );
         assert_eq!(
             scalar(
