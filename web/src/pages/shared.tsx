@@ -1,3 +1,4 @@
+import * as Tooltip from '@radix-ui/react-tooltip'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { createColumnHelper, flexRender, getCoreRowModel, getFilteredRowModel, useReactTable } from '@tanstack/react-table'
 import { AlertTriangle, Copy, Inbox, Plus, Search, Trash2 } from 'lucide-react'
@@ -5,7 +6,7 @@ import { useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 import { api, type Document, type Paged } from '../api'
-import { EmptyState, Field, Modal, SelectField, SkeletonRows } from '../components'
+import { EmptyState, EnabledPill, Field, Modal, SelectField, SkeletonRows, Tip } from '../components'
 import { projectOperationPath, useProject } from '../project'
 
 export function PageHeader({ title, description, action }: { title: string; description?: string; action?: ReactNode }) {
@@ -104,7 +105,7 @@ export function ResourcePage({ resource, title, description, empty, columns, fie
   const columnHelper = createColumnHelper<Document>()
   const tableColumns = useMemo(() => [
     ...columns.map((column) => columnHelper.accessor((row) => row[column.key], { id: column.key, header: column.label, cell: (info) => <span className={column.mono ? 'mono-cell' : ''}>{column.render ? column.render(info.getValue(), info.row.original) : displayValue(info.getValue())}</span> })),
-    ...((!immutable && !appendOnly && fields.length) || rowActions ? [columnHelper.display({ id: 'actions', header: () => <span className="sr-only">{t('actions')}</span>, cell: ({ row }) => <div className="row-actions">{!immutable && !appendOnly && !editDisabled && fields.length > 0 && <button className="button button-quiet" onClick={(event) => { lastTrigger.current=event.currentTarget;setEditing(row.original);setOpen(true) }}>{t('edit')}</button>}<button className="icon-button" aria-label={`${t('copyId')} ${displayValue(row.original.name || row.original.id)}`} onClick={()=>void navigator.clipboard?.writeText(String(row.original.id))}><Copy size={15}/></button>{!immutable && !appendOnly && canDelete && <button className="icon-button danger" aria-label={`${t('delete')} ${displayValue(row.original.name || row.original.id)}`} onClick={() => confirm(t('deleteConfirm')) && remove.mutate(row.original.id)}><Trash2 size={16}/></button>}{rowActions?.(row.original)}</div> })] : []),
+    ...((!immutable && !appendOnly && fields.length) || rowActions ? [columnHelper.display({ id: 'actions', header: () => <span className="sr-only">{t('actions')}</span>, cell: ({ row }) => <div className="row-actions">{!immutable && !appendOnly && !editDisabled && fields.length > 0 && <button className="button button-quiet" onClick={(event) => { lastTrigger.current=event.currentTarget;setEditing(row.original);setOpen(true) }}>{t('edit')}</button>}<Tip label={t('copyId')}><button className="icon-button" aria-label={`${t('copyId')} ${displayValue(row.original.name || row.original.id)}`} onClick={()=>void navigator.clipboard?.writeText(String(row.original.id))}><Copy size={15}/></button></Tip>{!immutable && !appendOnly && canDelete && <Tip label={t('delete')}><button className="icon-button danger" aria-label={`${t('delete')} ${displayValue(row.original.name || row.original.id)}`} onClick={() => confirm(t('deleteConfirm')) && remove.mutate(row.original.id)}><Trash2 size={16}/></button></Tip>}{rowActions?.(row.original)}</div> })] : []),
   ], [appendOnly, canDelete, columns, editDisabled, fields.length, immutable, rowActions, t])
   const table = useReactTable({ data: rows, columns: tableColumns, getCoreRowModel: getCoreRowModel(), getFilteredRowModel: getFilteredRowModel() })
   const submit = (event: FormEvent<HTMLFormElement>) => {
@@ -115,7 +116,7 @@ export function ResourcePage({ resource, title, description, empty, columns, fie
     } catch { toast.error(t('invalidJson')) }
   }
   const beginCreate = (trigger: HTMLButtonElement) => { lastTrigger.current=trigger;setEditing(null);setOpen(true) }
-  return <>
+  return <Tooltip.Provider delayDuration={400} skipDelayDuration={300}>
     <PageHeader title={title} description={description} action={!immutable && fields.length ? <button className="button button-primary" onClick={(event)=>beginCreate(event.currentTarget)}><Plus size={17}/>{createLabel || t('add')}</button> : undefined} />
     {(total > 0 || filter) && <label className="search-control"><Search size={17} aria-hidden="true"/><span className="sr-only">{t('search')}</span><input value={filter} onChange={(event) => {setFilter(event.target.value);setOffset(0)}} placeholder={t('search')} /></label>}
     {query.isError ? <QueryError retry={() => void query.refetch()} /> : query.isLoading ? <SkeletonRows /> : rows.length === 0 ? <EmptyState icon={<Inbox />} title={title} copy={filter ? t('noSearchResults') : empty} action={!filter && !immutable && fields.length ? <button className="button" onClick={(event)=>beginCreate(event.currentTarget)}>{createLabel || t('add')}</button> : undefined} /> : <><div className="table-wrap desktop-resource-table" role="region" aria-label={title} tabIndex={0}><table><thead>{table.getHeaderGroups().map((group) => <tr key={group.id}>{group.headers.map((header) => <th key={header.id}>{flexRender(header.column.columnDef.header, header.getContext())}</th>)}</tr>)}</thead><tbody>{table.getRowModel().rows.map((row) => <tr key={row.id}>{row.getVisibleCells().map((cell) => <td key={cell.id}>{flexRender(cell.column.columnDef.cell, cell.getContext())}</td>)}</tr>)}</tbody></table></div><MobileResources rows={rows} columns={columns} rowActions={rowActions} onEdit={!immutable&&!appendOnly&&!editDisabled&&fields.length? (row,trigger)=>{lastTrigger.current=trigger;setEditing(row);setOpen(true)}:undefined} onDelete={!immutable&&!appendOnly&&canDelete?(row)=>confirm(t('deleteConfirm'))&&remove.mutate(row.id):undefined}/></>}
@@ -123,13 +124,13 @@ export function ResourcePage({ resource, title, description, empty, columns, fie
     <Modal open={open} onOpenChange={(value) => { setOpen(value); if (!value) {setEditing(null);requestAnimationFrame(()=>lastTrigger.current?.focus())} }} title={editing ? `${t('edit')} ${title}` : createLabel || `${t('add')} ${title}`}>
       <form className="form-stack" onSubmit={submit}>{fields.map((field) => <ResourceField key={field.key} field={field} value={editing?.[field.sourceKey || field.key] ?? field.defaultValue}/>) }<div className="form-actions"><button type="button" className="button" onClick={() => setOpen(false)}>{t('cancel')}</button><button className="button button-primary" disabled={save.isPending}>{save.isPending ? t('loading') : t('save')}</button></div></form>
     </Modal>
-  </>
+  </Tooltip.Provider>
 }
 
 function MobileResources({rows,columns,onEdit,onDelete,rowActions}:{rows:Document[];columns:Array<{key:string;label:string;mono?:boolean;render?:(value:unknown,row:Document)=>ReactNode}>;onEdit?: (row:Document,trigger:HTMLButtonElement)=>void;onDelete?: (row:Document)=>void;rowActions?:(row:Document)=>ReactNode}) {
   const {t}=useTranslation()
   const primary=(row:Document)=>String(row.name||row.public_name||row.email||row.pattern||row.suffix||row.id)
-  const state=(row:Document)=>row.enabled!=null?(Number(row.enabled)?t('enabled'):t('disabled')):displayValue(row.status)
+  const state=(row:Document)=>row.enabled!=null?<EnabledPill enabled={row.enabled}/>:displayValue(row.status)
   const visible=columns.filter(column=>column.key!=='id').slice(0,3)
   return <div className="mobile-resource-list">{rows.map(row=><article key={row.id}><header><div><strong>{primary(row)}</strong><button className="copy-id" onClick={()=>void navigator.clipboard?.writeText(String(row.id))}>{t('copyId')}</button></div><span>{state(row)}</span></header><dl>{visible.filter(column=>String(row[column.key]??'')!==primary(row)).map(column=><div key={column.key}><dt>{column.label}</dt><dd className={column.mono?'mono-cell':''}>{column.render?column.render(row[column.key],row):displayValue(row[column.key])}</dd></div>)}</dl>{(onEdit||onDelete||rowActions)&&<footer>{onEdit&&<button className="button button-quiet" onClick={(event)=>onEdit(row,event.currentTarget)}>{t('edit')}</button>}{onDelete&&<button className="button button-quiet danger" onClick={()=>onDelete(row)}>{t('delete')}</button>}{rowActions?.(row)}</footer>}</article>)}</div>
 }

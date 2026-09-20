@@ -1,6 +1,7 @@
 import * as Dialog from '@radix-ui/react-dialog'
 import * as Select from '@radix-ui/react-select'
-import { Check, ChevronDown, X } from 'lucide-react'
+import * as Tooltip from '@radix-ui/react-tooltip'
+import { AlertTriangle, Check, ChevronDown, X } from 'lucide-react'
 import { useEffect, useState, type ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
 
@@ -28,9 +29,36 @@ export function SelectField({ value, onValueChange, label, options, name }: { va
   return <Field label={label}><Select.Root name={name} value={internal} onValueChange={(next)=>{setInternal(next);onValueChange(next)}}><Select.Trigger className="select-trigger"><Select.Value /><Select.Icon><ChevronDown size={16} /></Select.Icon></Select.Trigger><Select.Portal><Select.Content className="select-content" position="popper" sideOffset={6}><Select.Viewport>{options.map((option) => <Select.Item className="select-item" key={option.value} value={option.value}><Select.ItemText>{option.label}</Select.ItemText><Select.ItemIndicator><Check size={15} /></Select.ItemIndicator></Select.Item>)}</Select.Viewport></Select.Content></Select.Portal></Select.Root></Field>
 }
 
+export function Tip({ label, children }: { label: string; children: ReactNode }) {
+  return <Tooltip.Root>
+    <Tooltip.Trigger asChild>{children}</Tooltip.Trigger>
+    <Tooltip.Portal>
+      <Tooltip.Content className="tooltip-content" sideOffset={6}>
+        {label}
+        <Tooltip.Arrow className="tooltip-arrow" width={10} height={5} />
+      </Tooltip.Content>
+    </Tooltip.Portal>
+  </Tooltip.Root>
+}
+
 export function Status({ code }: { code: number }) {
   const healthy = code < 400
-  return <span className={`status ${healthy ? 'status-good' : 'status-bad'}`}><span aria-hidden="true">{healthy ? '✓' : '!'}</span>{code}</span>
+  return <span className={`status ${healthy ? 'status-good' : 'status-bad'}`}><span aria-hidden="true">{healthy ? <Check size={11} strokeWidth={3.2} /> : <AlertTriangle size={11} strokeWidth={2.8} />}</span>{code}</span>
+}
+
+export function EnabledPill({ enabled, tone }: { enabled: unknown; tone?: 'accent' | 'warning' }) {
+  const { t } = useTranslation()
+  const on = Boolean(Number(enabled))
+  return <span className={`pill ${on ? (tone ? `pill-${tone}` : 'pill-good') : 'pill-muted'}`}><span className="pill-dot" aria-hidden="true" />{on ? t('enabled') : t('disabled')}</span>
+}
+
+export function CapabilityTags({ value, max = 3 }: { value: unknown; max?: number }) {
+  const list = Array.isArray(value)
+    ? value.map(String).filter(Boolean)
+    : typeof value === 'string' && value.trim() ? value.split(',').map((item) => item.trim()).filter(Boolean) : []
+  if (!list.length) return <>—</>
+  const shown = list.slice(0, max)
+  return <span className="tag-row">{shown.map((item) => <span className="tag" key={item}>{item}</span>)}{list.length > shown.length && <span className="tag tag-more">+{list.length - shown.length}</span>}</span>
 }
 
 export function EmptyState({ icon, title, copy, action }: { icon: ReactNode; title: string; copy: string; action?: ReactNode }) {

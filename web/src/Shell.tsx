@@ -1,4 +1,4 @@
-import { Activity, Boxes, FlaskConical, Gauge, KeyRound, Menu, MessageSquareText, Settings, Unplug, X } from 'lucide-react'
+import { Activity, Boxes, FlaskConical, Gauge, KeyRound, LogOut, Menu, MessageSquareText, Settings, Unplug, X } from 'lucide-react'
 import { useEffect, useRef, useState, type KeyboardEvent } from 'react'
 import { useTranslation } from 'react-i18next'
 import { NavLink, Outlet, useNavigate } from 'react-router'
@@ -51,9 +51,9 @@ function ShellContent({ user,branding }: { user: User; branding: Branding }) {
       <div className="sidebar-top"><Brand name={branding.branding_name}/><button ref={closeButton} className="icon-button sidebar-close" onClick={() => setMobileOpen(false)} aria-label={t('close')}><X size={18} /></button></div>
       {projects.length > 1 && <label className="project-switcher"><span>{t('project')}</span><select value={project.id} onChange={(event) => setProjectId(event.target.value)}>{projects.filter((item)=>item.enabled).map((item)=><option key={item.id} value={item.id}>{item.name}</option>)}</select></label>}
       <nav aria-label={t('primaryNavigation')}>{groups.map((group)=><section className="nav-group" key={group.label}><h2>{group.label}</h2>{group.links.map(({ to, label, icon: Icon, end }) => <NavLink onClick={() => setMobileOpen(false)} className={({ isActive }) => isActive ? 'nav-link nav-link-active' : 'nav-link'} key={to} to={to} end={end}><Icon size={18} strokeWidth={1.8} /><span>{label}</span></NavLink>)}</section>)}</nav>
-      <div className="account-block"><span>{user.email}</span><button className="signout" onClick={signOut}>{t('signOut')}</button></div>
+      <div className="account-block"><div className="account-identity"><span className="account-avatar" aria-hidden="true">{user.email.slice(0, 2)}</span><span title={user.email}>{user.email}</span></div><button className="signout" onClick={signOut}><LogOut size={16} aria-hidden="true" />{t('signOut')}</button></div>
     </aside>
-    <main id="main-content" className="content" tabIndex={-1} inert={mobileOpen || undefined} aria-hidden={mobileOpen || undefined}>{!branding.onboarding_complete&&<aside className="onboarding-banner"><div><strong>{t('onboardingTitle')}</strong><span>{t('onboardingHint')}</span></div><NavLink className="button" to="/channels">{t('configureChannel')}</NavLink></aside>}<Outlet /></main>
+    <main id="main-content" className="content" tabIndex={-1} inert={mobileOpen || undefined} aria-hidden={mobileOpen || undefined}>{!branding.onboarding_complete&&<aside className="onboarding-banner"><div><strong>{t('onboardingTitle')}</strong><span>{t('onboardingHint')}</span></div><NavLink className="button button-quiet" to="/channels">{t('configureChannel')}</NavLink></aside>}<Outlet /></main>
   </div>
 }
 
