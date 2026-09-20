@@ -196,11 +196,12 @@ pub(super) async fn execute(
                                 Some(http.body.as_bytes().to_vec()),
                             ));
                         }
-                        if error.downcast_ref::<reqwest::Error>().is_some()
-                            && candidate.retry.transport
-                        {
+                        if error.downcast_ref::<reqwest::Error>().is_some() {
                             attempt.finish(AttemptOutcome::UpstreamFailure);
-                            continue;
+                            if candidate.retry.transport {
+                                continue;
+                            }
+                            return Err(ApiError::Upstream("upstream transport failed".into()));
                         }
                         return Err(ApiError::BadRequest(
                             "unsupported Anthropic request or response shape".into(),

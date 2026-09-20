@@ -486,3 +486,153 @@ async fn review_nonretryable_http_errors_fail_counters_sticky_and_half_open_prob
         }
     }
 }
+
+#[tokio::test]
+async fn review_anthropic_transport_failure_settles_half_open_when_retry_is_disabled() {
+    let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = closed.local_addr().unwrap();
+    drop(closed);
+    let f = fixture(Router::new()).await;
+    sql(
+        &f,
+        "UPDATE providers SET kind='anthropic',base_url=?,settings_json=? WHERE id=?",
+        vec![
+            format!("http://{address}").into(),
+            json!({"version":1,"circuit":{"enabled":true,"failures":1,"window_ms":1000,"recovery_ms":10}})
+                .to_string()
+                .into(),
+            f.providers[0].clone().into(),
+        ],
+    )
+    .await;
+    sql(
+        &f,
+        "UPDATE providers SET enabled=0 WHERE id=?",
+        vec![f.providers[1].clone().into()],
+    )
+    .await;
+    sql(
+        &f,
+        "UPDATE channel_settings SET retry_statuses_json=? WHERE provider_id=?",
+        vec![
+            json!({"version":1,"transport":false}).to_string().into(),
+            f.providers[0].clone().into(),
+        ],
+    )
+    .await;
+    let key = db::authenticate_api_key(&f.state.db, &f.token, None)
+        .await
+        .unwrap()
+        .unwrap();
+    let headers = HeaderMap::new();
+    let plan = orchestration::prepare(
+        &f.state.db,
+        &f.state.orchestrator,
+        &key,
+        orchestration::load_profile(&f.state.db, &key)
+            .await
+            .unwrap(),
+        chat(),
+        &headers,
+        "/v1/chat/completions",
+    )
+    .await
+    .unwrap();
+    let candidate = plan.candidates[0].clone();
+    f.state
+        .orchestrator
+        .enter_circuit(&candidate.circuit_id(), &candidate.circuit)
+        .unwrap()
+        .finish(false);
+    tokio::time::sleep(Duration::from_millis(15)).await;
+    assert_eq!(
+        request(&f, "/v1/chat/completions", chat()).await.status(),
+        StatusCode::BAD_GATEWAY
+    );
+    assert!(
+        f.state
+            .orchestrator
+            .metrics()
+            .contains("pangolin_orchestration_failed_total{resource=\"channel\"} 1")
+    );
+    assert!(
+        f.state
+            .orchestrator
+            .metrics()
+            .contains("pangolin_orchestration_failed_total{resource=\"key\"} 1")
+    );
+    assert!(
+        !f.state
+            .orchestrator
+            .circuit_available(&candidate.circuit_id(), &candidate.circuit)
+    );
+}
+
+#[tokio::test]
+async fn review_anthropic_multi_choice_candidates_are_skipped_without_blocking_openai() {
+    let seen = Arc::new(Mutex::new(vec![]));
+    let captured = seen.clone();
+    let f = fixture(Router::new().route(
+        "/v1/chat/completions",
+        post(move |Json(body): Json<Value>| {
+            let captured = captured.clone();
+            async move {
+                captured.lock().await.push(body);
+                Json(json!({"choices":[{"message":{"content":"ok"}}]}))
+            }
+        }),
+    ))
+    .await;
+    sql(
+        &f,
+        "UPDATE providers SET kind='anthropic' WHERE id=?",
+        vec![f.providers[1].clone().into()],
+    )
+    .await;
+    let mut body = chat();
+    body["n"] = json!(2);
+    let key = db::authenticate_api_key(&f.state.db, &f.token, None)
+        .await
+        .unwrap()
+        .unwrap();
+    let plan = orchestration::prepare(
+        &f.state.db,
+        &f.state.orchestrator,
+        &key,
+        orchestration::load_profile(&f.state.db, &key)
+            .await
+            .unwrap(),
+        body.clone(),
+        &HeaderMap::new(),
+        "/v1/chat/completions",
+    )
+    .await
+    .unwrap();
+    assert_eq!(plan.candidates.len(), 1);
+    assert_eq!(plan.candidates[0].target.provider_kind, "openai");
+    assert!(
+        plan.decisions
+            .iter()
+            .any(|decision| decision.reason == "unsupported_completion_count")
+    );
+    assert_eq!(
+        request(&f, "/v1/chat/completions", body).await.status(),
+        StatusCode::OK
+    );
+    let seen = seen.lock().await;
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0]["model"], "a-model");
+    assert_eq!(seen[0]["n"], 2);
+    drop(seen);
+
+    sql(&f, "UPDATE providers SET kind='anthropic'", vec![]).await;
+    let mut body = chat();
+    body["n"] = json!(2);
+    let response = request(&f, "/v1/chat/completions", body).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error = to_bytes(response.into_body(), 4096).await.unwrap();
+    assert!(
+        String::from_utf8_lossy(&error)
+            .contains("Anthropic requests support exactly one completion")
+    );
+}

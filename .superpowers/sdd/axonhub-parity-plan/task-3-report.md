@@ -87,6 +87,46 @@ Pangolin-specific wrappers own policy ordering, SQLite joins, scoping, RAII term
 - `cargo clippy --locked --all-targets -- -D warnings` — passed.
 - `cargo test --locked` — 57 passed, 0 failed.
 - `git diff --check` — passed.
+
+## Fix round 2 — Anthropic outcome and capability closure
+
+Two remaining Important findings were closed.
+
+- Anthropic bridge `reqwest::Error` failures now always settle the active
+  `AttemptGuard` as `UpstreamFailure` before the retry policy is consulted.
+  With transport retry disabled the request ends as a 502, but the channel/key
+  counters and a half-open circuit are still settled as a provider failure.
+- Candidate preflight now separates candidate request compatibility from TPM
+  accounting. An Anthropic Chat candidate whose final transformed/overridden
+  request has `n != 1` is removed with an
+  `unsupported_completion_count` capability decision; compatible OpenAI
+  candidates remain routable. If that leaves no candidate, preparation returns
+  the explicit Anthropic completion-count request error. Full TPM/media
+  validation stays in attempt admission, preserving the prior policy boundary.
+
+Red/green evidence:
+
+- Red: the bridge only called `attempt.finish(UpstreamFailure)` when
+  `retry.transport` was true; setting it false returned a local bad-request
+  path and left a half-open probe/circuit outcome unresolved. Also, preflight
+  invoked full `attempt_payload` for each candidate, turning a lower-priority
+  Anthropic `n=2` incompatibility into a global error.
+- Green: `review_anthropic_transport_failure_settles_half_open_when_retry_is_disabled`
+  uses a closed local socket, confirms a 502, failed channel/key counters and
+  a reopened circuit. `review_anthropic_multi_choice_candidates_are_skipped_without_blocking_openai`
+  confirms the capability decision, one OpenAI `n=2` upstream call and the
+  explicit all-Anthropic 400. The existing TPM/media policy test remains green.
+
+Fresh verification after the fix:
+
+- `pnpm --dir web lint` — passed.
+- `pnpm --dir web test` — 1 passed, 0 failed.
+- `pnpm --dir web build` — passed.
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --locked --all-targets -- -D warnings` — passed.
+- `cargo test --locked` — 73 passed, 0 failed.
+- `cargo build --release --locked` — passed.
+- `git diff --check` — passed.
 - `cargo build --release --locked` — passed; release build completed in 1m 49s.
 
 ## Explicit boundaries for later tasks

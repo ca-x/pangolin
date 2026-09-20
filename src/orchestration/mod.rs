@@ -32,6 +32,8 @@ pub enum Error {
 }
 pub type Result<T> = std::result::Result<T, Error>;
 
+const ANTHROPIC_COMPLETION_COUNT_ERROR: &str = "Anthropic requests support exactly one completion";
+
 #[derive(Clone)]
 pub struct Candidate {
     pub target: RouteTarget,
@@ -266,7 +268,7 @@ pub async fn prepare(
     // ceiling is a conservative text reservation. Non-text inputs require an explicit
     // provider token estimate before they can use TPM-limited policies.
     let estimated_tokens = estimate_tokens(&payload)?;
-    Ok(Plan {
+    let mut plan = Plan {
         candidates,
         payload,
         session_request,
@@ -276,7 +278,28 @@ pub async fn prepare(
         estimated_tokens,
         protection,
         context,
-    })
+    };
+    let mut incompatible_completion_count = false;
+    let mut compatible = Vec::with_capacity(plan.candidates.len());
+    for candidate in std::mem::take(&mut plan.candidates) {
+        match plan.candidate_request(&candidate) {
+            Ok(_) => compatible.push(candidate),
+            Err(Error::Invalid(ANTHROPIC_COMPLETION_COUNT_ERROR)) => {
+                incompatible_completion_count = true;
+                plan.decisions.push(Decision {
+                    stage: "capability",
+                    candidate: Some(candidate.id()),
+                    reason: "unsupported_completion_count",
+                });
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    plan.candidates = compatible;
+    if plan.candidates.is_empty() && incompatible_completion_count {
+        return Err(Error::Invalid(ANTHROPIC_COMPLETION_COUNT_ERROR));
+    }
+    Ok(plan)
 }
 
 /// Shared by admission and protocol adapters; never infer a different output
@@ -324,7 +347,7 @@ fn estimate_tokens(payload: &Value) -> Result<u32> {
 }
 
 impl Plan {
-    pub fn attempt_payload(&self, candidate: &Candidate) -> Result<(Value, HeaderMap, u32)> {
+    fn candidate_request(&self, candidate: &Candidate) -> Result<(Value, HeaderMap)> {
         let mut payload = self.payload.clone();
         payload["model"] = Value::String(candidate.target.upstream_name.clone());
         protection::transform(&mut payload, &candidate.model_rules)?;
@@ -334,10 +357,13 @@ impl Plan {
         protection::apply(&self.protection, &mut payload, &self.context, &mut vec![])?;
         protection::tools(&mut payload, self.routing.allowed_tools.as_deref())?;
         if candidate.target.provider_kind == "anthropic" && completion_count(&payload)? != 1 {
-            return Err(Error::Invalid(
-                "Anthropic requests support exactly one completion",
-            ));
+            return Err(Error::Invalid(ANTHROPIC_COMPLETION_COUNT_ERROR));
         }
+        Ok((payload, headers))
+    }
+
+    pub fn attempt_payload(&self, candidate: &Candidate) -> Result<(Value, HeaderMap, u32)> {
+        let (mut payload, headers) = self.candidate_request(candidate)?;
         if self.routing.limits.tpm.is_some() || candidate.limits.tpm.is_some() {
             validate_token_reservation(&mut payload)?;
         }
