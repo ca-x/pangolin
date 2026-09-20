@@ -42,3 +42,27 @@ pub async fn serve(uri: Uri) -> Response {
             .into_response(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::to_bytes;
+
+    #[tokio::test]
+    async fn embedded_spa_serves_direct_admin_and_auth_routes() {
+        for route in [
+            "/login",
+            "/setup",
+            "/channels",
+            "/operations/traces/example",
+        ] {
+            let response = serve(route.parse().unwrap()).await;
+            assert_eq!(response.status(), StatusCode::OK, "{route}");
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-cache");
+            let body = to_bytes(response.into_body(), 2 * 1024 * 1024)
+                .await
+                .unwrap();
+            assert!(String::from_utf8_lossy(&body).contains("id=\"root\""));
+        }
+    }
+}

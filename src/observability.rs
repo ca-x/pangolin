@@ -2,7 +2,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
 };
@@ -14,6 +14,7 @@ use tokio::sync::{mpsc, oneshot};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestEvent {
+    pub project_id: String,
     pub request_id: String,
     pub trace_id: String,
     pub started_at: i64,
@@ -73,15 +74,58 @@ pub struct RequestListItem {
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct RequestFilter {
+    #[serde(skip)]
+    pub project_id: Option<String>,
     pub status_code: Option<i32>,
     pub provider: Option<String>,
     pub model: Option<String>,
     pub limit: Option<usize>,
+    pub offset: Option<usize>,
 }
 
 enum Command {
-    Record(Box<RequestEvent>),
+    Record(Box<RequestEvent>, u64),
     Flush(oneshot::Sender<()>),
+    Reset(u64, oneshot::Sender<bool>),
+    Retain(Vec<Retention>, oneshot::Sender<bool>),
+}
+
+#[derive(Clone)]
+pub struct Retention {
+    pub project_id: Option<String>,
+    pub days: i64,
+    pub payloads_only: bool,
+}
+impl Retention {
+    fn cutoff(&self) -> i64 {
+        time::OffsetDateTime::now_utc()
+            .unix_timestamp()
+            .saturating_sub(self.days.saturating_mul(86400))
+    }
+    fn matches(&self, event: &RequestEvent) -> bool {
+        event.started_at < self.cutoff()
+            && self
+                .project_id
+                .as_ref()
+                .is_none_or(|project| project == &event.project_id || event.project_id.is_empty())
+    }
+}
+
+fn retain(connection: &Connection, rules: &[Retention]) -> Result<()> {
+    for rule in rules {
+        let mutation = if rule.payloads_only {
+            "UPDATE request_events SET payload_captured=false,request_json=NULL,response_json=NULL"
+        } else {
+            "DELETE FROM request_events"
+        };
+        connection.execute(
+            &format!(
+                "{mutation} WHERE started_at<? AND (? IS NULL OR project_id=? OR project_id='')"
+            ),
+            params![rule.cutoff(), rule.project_id, rule.project_id],
+        )?;
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -90,6 +134,8 @@ pub struct ObservationStore {
     sender: Option<mpsc::Sender<Command>>,
     failure: Option<Arc<str>>,
     dropped: Arc<AtomicU64>,
+    generation: Arc<AtomicU64>,
+    poisoned: Arc<AtomicBool>,
 }
 
 impl ObservationStore {
@@ -100,6 +146,9 @@ impl ObservationStore {
         let writer_path = path.clone();
         let dropped = Arc::new(AtomicU64::new(0));
         let writer_dropped = Arc::clone(&dropped);
+        let generation = Arc::new(AtomicU64::new(0));
+        let poisoned = Arc::new(AtomicBool::new(false));
+        let writer_poisoned = poisoned.clone();
         thread::Builder::new().name("pangolin-observation-writer".into()).spawn(move || {
             let connection = match Connection::open(&writer_path) {
                 Ok(connection) => connection,
@@ -108,30 +157,48 @@ impl ObservationStore {
                     return;
                 }
             };
-            while let Some(command) = receiver.blocking_recv() {
+            let mut pending=None;let mut epoch=0;
+            let mut retention=vec![Retention {project_id:None,days:retention_days.min(i64::MAX as u64) as i64,payloads_only:false}];
+            while let Some(command) = pending.take().or_else(||receiver.blocking_recv()) {
                 match command {
-                    Command::Record(event) => {
+                    Command::Record(event,version) => {
+                        if version!=epoch {writer_dropped.fetch_add(1,Ordering::Relaxed);continue}
                         let mut batch = vec![event];
-                        let mut flush_after = None;
                         while batch.len() < 64 {
                             match receiver.try_recv() {
-                                Ok(Command::Record(event)) => batch.push(event),
-                                Ok(Command::Flush(done)) => { flush_after = Some(done); break; }
+                                Ok(Command::Record(event,version)) if version==epoch => batch.push(event),
+                                Ok(Command::Record(_, _))=>{writer_dropped.fetch_add(1,Ordering::Relaxed);},
+                                Ok(control) => { pending=Some(control);break; }
                                 Err(_) => break,
                             }
                         }
+                        batch.retain_mut(|event| {
+                            for rule in &retention {
+                                if rule.matches(event) {
+                                    if !rule.payloads_only {return false;}
+                                    event.payload_captured=false;event.request_json=None;event.response_json=None;
+                                }
+                            }
+                            true
+                        });
                         if let Err(error) = insert_batch(&connection, &batch) {
                             writer_dropped.fetch_add(batch.len() as u64, Ordering::Relaxed);
                             tracing::warn!(%error, count = batch.len(), "observation event batch was dropped");
-                        }
-                        if let Some(done) = flush_after {
-                            let _ = connection.execute_batch("CHECKPOINT");
-                            let _ = done.send(());
                         }
                     }
                     Command::Flush(done) => {
                         let _ = connection.execute_batch("CHECKPOINT");
                         let _ = done.send(());
+                    }
+                    Command::Reset(version,done)=>{
+                        epoch=version;let cleared=connection.execute_batch("DELETE FROM request_events; CHECKPOINT;").is_ok();
+                        writer_poisoned.store(!cleared,Ordering::Release);let _=done.send(cleared);
+                    }
+                    Command::Retain(rules,done)=>{
+                        retention=rules;
+                        let applied=retain(&connection,&retention).is_ok();
+                        if !applied {writer_poisoned.store(true,Ordering::Release);}
+                        let _=done.send(applied);
                     }
                 }
             }
@@ -141,6 +208,8 @@ impl ObservationStore {
             sender: Some(sender),
             failure: None,
             dropped,
+            generation,
+            poisoned,
         })
     }
 
@@ -150,26 +219,68 @@ impl ObservationStore {
             sender: None,
             failure: Some(Arc::from(error.to_string())),
             dropped: Arc::new(AtomicU64::new(0)),
+            generation: Arc::new(AtomicU64::new(0)),
+            poisoned: Arc::new(AtomicBool::new(true)),
         }
     }
 
     pub fn is_available(&self) -> bool {
-        self.failure.is_none()
+        self.failure.is_none() && !self.poisoned.load(Ordering::Acquire)
     }
 
     pub fn dropped_events(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
     }
 
+    #[cfg(test)]
     pub fn record(&self, event: RequestEvent) {
+        self.record_at(event, self.generation());
+    }
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+    pub fn record_at(&self, event: RequestEvent, generation: u64) {
+        if generation != self.generation() || self.poisoned.load(Ordering::Acquire) {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         let Some(sender) = &self.sender else {
             self.dropped.fetch_add(1, Ordering::Relaxed);
             return;
         };
-        if sender.try_send(Command::Record(Box::new(event))).is_err() {
+        if sender
+            .try_send(Command::Record(Box::new(event), generation))
+            .is_err()
+        {
             self.dropped.fetch_add(1, Ordering::Relaxed);
             tracing::warn!("observation queue is full; event dropped");
         }
+    }
+    pub async fn clear_for_restore(&self) -> bool {
+        self.poisoned.store(true, Ordering::Release);
+        let epoch = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        let (done, result) = oneshot::channel();
+        if let Some(sender) = &self.sender
+            && sender.send(Command::Reset(epoch, done)).await.is_ok()
+        {
+            return result.await.unwrap_or(false);
+        }
+        false
+    }
+
+    pub async fn apply_retention(&self, rules: Vec<Retention>) -> bool {
+        let (done, result) = oneshot::channel();
+        if let Some(sender) = &self.sender
+            && sender.send(Command::Retain(rules, done)).await.is_ok()
+        {
+            let applied = result.await.unwrap_or(false);
+            if !applied {
+                self.poisoned.store(true, Ordering::Release);
+            }
+            return applied;
+        }
+        self.poisoned.store(true, Ordering::Release);
+        false
     }
 
     pub async fn flush(&self) {
@@ -187,10 +298,21 @@ impl ObservationStore {
         tokio::task::spawn_blocking(move || query_summary(&path)).await?
     }
 
+    pub async fn summary_for(&self, project_id: String) -> Result<Summary> {
+        self.ensure_available()?;
+        let path = Arc::clone(&self.path);
+        tokio::task::spawn_blocking(move || query_summary_for(&path, Some(&project_id))).await?
+    }
+
     pub async fn list(&self, filter: RequestFilter) -> Result<Vec<RequestListItem>> {
         self.ensure_available()?;
         let path = Arc::clone(&self.path);
         tokio::task::spawn_blocking(move || query_list(&path, &filter)).await?
+    }
+    pub async fn count(&self, filter: RequestFilter) -> Result<i64> {
+        self.ensure_available()?;
+        let path = Arc::clone(&self.path);
+        tokio::task::spawn_blocking(move || query_count(&path, &filter)).await?
     }
 
     pub async fn get(&self, request_id: String) -> Result<Option<RequestEvent>> {
@@ -199,7 +321,21 @@ impl ObservationStore {
         tokio::task::spawn_blocking(move || query_one(&path, &request_id)).await?
     }
 
+    pub async fn get_for(
+        &self,
+        project_id: String,
+        request_id: String,
+    ) -> Result<Option<RequestEvent>> {
+        Ok(self
+            .get(request_id)
+            .await?
+            .filter(|event| event.project_id == project_id))
+    }
+
     fn ensure_available(&self) -> Result<()> {
+        if self.poisoned.load(Ordering::Acquire) {
+            anyhow::bail!("observation projection is unavailable")
+        }
         if let Some(error) = &self.failure {
             anyhow::bail!("observation store unavailable: {error}");
         }
@@ -237,6 +373,7 @@ fn initialize(path: &Path, retention_days: u64) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_request_events_started ON request_events(started_at);
         CREATE INDEX IF NOT EXISTS idx_request_events_model ON request_events(requested_model);
         INSERT INTO observation_schema SELECT 1, epoch(current_timestamp)::BIGINT WHERE NOT EXISTS (SELECT 1 FROM observation_schema WHERE version=1);
+        ALTER TABLE request_events ADD COLUMN IF NOT EXISTS project_id VARCHAR DEFAULT '';
         "#,
     ).context("failed to migrate DuckDB observation schema")?;
     let retention_seconds = retention_days.min((i64::MAX / 86_400) as u64) as i64 * 86_400;
@@ -261,7 +398,7 @@ fn insert_batch(connection: &Connection, events: &[Box<RequestEvent>]) -> Result
 
 fn insert(connection: &Connection, event: &RequestEvent) -> Result<()> {
     connection.execute(
-        "INSERT OR REPLACE INTO request_events VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT OR REPLACE INTO request_events VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         params![
             event.request_id,
             event.trace_id,
@@ -282,18 +419,23 @@ fn insert(connection: &Connection, event: &RequestEvent) -> Result<()> {
             event.cost_micros,
             event.payload_captured,
             event.request_json,
-            event.response_json
+            event.response_json,
+            event.project_id
         ],
     )?;
     Ok(())
 }
 
 fn query_summary(path: &Path) -> Result<Summary> {
+    query_summary_for(path, None)
+}
+
+fn query_summary_for(path: &Path, project_id: Option<&str>) -> Result<Summary> {
     let connection = Connection::open(path)?;
     let since = time::OffsetDateTime::now_utc().unix_timestamp() - 24 * 3600;
     let mut summary = connection.query_row(
-        "SELECT count(*),count(*) FILTER (WHERE status_code >= 400),coalesce(quantile_cont(latency_ms,0.95),0),coalesce(sum(input_tokens),0),coalesce(sum(output_tokens),0),coalesce(sum(cost_micros),0) FROM request_events WHERE started_at >= ?",
-        [since],
+        "SELECT count(*),count(*) FILTER (WHERE status_code >= 400),coalesce(quantile_cont(latency_ms,0.95),0),coalesce(sum(input_tokens),0),coalesce(sum(output_tokens),0),coalesce(sum(cost_micros),0) FROM request_events WHERE started_at >= ? AND (? IS NULL OR project_id=?)",
+        params![since, project_id, project_id],
         |row| Ok(Summary {
             requests: row.get(0)?, errors: row.get(1)?, error_rate: 0.0,
             p95_latency_ms: row.get(2)?, input_tokens: row.get(3)?, output_tokens: row.get(4)?, cost_micros: row.get(5)?, series: vec![],
@@ -305,9 +447,9 @@ fn query_summary(path: &Path) -> Result<Summary> {
         summary.errors as f64 / summary.requests as f64
     };
     let mut statement = connection.prepare(
-        "SELECT floor(started_at/3600)*3600 AS bucket,count(*),count(*) FILTER (WHERE status_code >= 400),avg(latency_ms) FROM request_events WHERE started_at >= ? GROUP BY bucket ORDER BY bucket",
+        "SELECT floor(started_at/3600)*3600 AS bucket,count(*),count(*) FILTER (WHERE status_code >= 400),avg(latency_ms) FROM request_events WHERE started_at >= ? AND (? IS NULL OR project_id=?) GROUP BY bucket ORDER BY bucket",
     )?;
-    let points = statement.query_map([since], |row| {
+    let points = statement.query_map(params![since, project_id, project_id], |row| {
         Ok(SummaryPoint {
             bucket: row.get(0)?,
             requests: row.get(1)?,
@@ -323,10 +465,12 @@ fn query_list(path: &Path, filter: &RequestFilter) -> Result<Vec<RequestListItem
     let connection = Connection::open(path)?;
     let limit = filter.limit.unwrap_or(100).clamp(1, 500) as i64;
     let mut statement = connection.prepare(
-        "SELECT request_id,started_at,endpoint,provider,requested_model,resolved_model,status_code,latency_ms,input_tokens,output_tokens,cost_micros FROM request_events WHERE (? IS NULL OR status_code=?) AND (? IS NULL OR provider=?) AND (? IS NULL OR requested_model=? OR resolved_model=?) ORDER BY started_at DESC LIMIT ?",
+        "SELECT request_id,started_at,endpoint,provider,requested_model,resolved_model,status_code,latency_ms,input_tokens,output_tokens,cost_micros FROM request_events WHERE (? IS NULL OR project_id=?) AND (? IS NULL OR status_code=?) AND (? IS NULL OR provider=?) AND (? IS NULL OR requested_model=? OR resolved_model=?) ORDER BY started_at DESC LIMIT ? OFFSET ?",
     )?;
     let rows = statement.query_map(
         params![
+            filter.project_id,
+            filter.project_id,
             filter.status_code,
             filter.status_code,
             filter.provider,
@@ -335,6 +479,7 @@ fn query_list(path: &Path, filter: &RequestFilter) -> Result<Vec<RequestListItem
             filter.model,
             filter.model,
             limit,
+            filter.offset.unwrap_or(0).min(100_000) as i64,
         ],
         |row| {
             Ok(RequestListItem {
@@ -355,6 +500,15 @@ fn query_list(path: &Path, filter: &RequestFilter) -> Result<Vec<RequestListItem
     Ok(rows.collect::<duckdb::Result<Vec<_>>>()?)
 }
 
+fn query_count(path: &Path, filter: &RequestFilter) -> Result<i64> {
+    let connection = Connection::open(path)?;
+    Ok(connection.query_row(
+        "SELECT count(*) FROM request_events WHERE (? IS NULL OR project_id=?) AND (? IS NULL OR status_code=?) AND (? IS NULL OR provider=?) AND (? IS NULL OR requested_model=? OR resolved_model=?)",
+        params![filter.project_id,filter.project_id,filter.status_code,filter.status_code,filter.provider,filter.provider,filter.model,filter.model,filter.model],
+        |row| row.get(0),
+    )?)
+}
+
 fn query_one(path: &Path, request_id: &str) -> Result<Option<RequestEvent>> {
     let connection = Connection::open(path)?;
     let mut statement = connection.prepare("SELECT * FROM request_events WHERE request_id=?")?;
@@ -363,6 +517,7 @@ fn query_one(path: &Path, request_id: &str) -> Result<Option<RequestEvent>> {
         return Ok(None);
     };
     Ok(Some(RequestEvent {
+        project_id: row.get(20)?,
         request_id: row.get(0)?,
         trace_id: row.get(1)?,
         started_at: row.get(2)?,
@@ -396,6 +551,7 @@ mod tests {
         let store =
             ObservationStore::open(directory.path().join("observations.duckdb"), 30).unwrap();
         store.record(RequestEvent {
+            project_id: "test-project".into(),
             request_id: "req-1".into(),
             trace_id: "trace-1".into(),
             started_at: time::OffsetDateTime::now_utc().unix_timestamp(),
@@ -425,12 +581,25 @@ mod tests {
             store.get("req-1".into()).await.unwrap().unwrap().latency_ms,
             42
         );
+        let old = store.get("req-1".into()).await.unwrap().unwrap();
+        let epoch = store.generation();
+        assert!(store.clear_for_restore().await);
+        store.record_at(old.clone(), epoch);
+        store.record(RequestEvent {
+            request_id: "req-new".into(),
+            ..old
+        });
+        store.flush().await;
+        assert!(store.get("req-1".into()).await.unwrap().is_none());
+        assert_eq!(store.summary().await.unwrap().requests, 1);
+        assert_eq!(store.dropped_events(), 1);
     }
 
     #[tokio::test]
     async fn degraded_store_drops_without_blocking_gateway_work() {
         let store = ObservationStore::degraded("/unavailable", "permission denied");
         store.record(RequestEvent {
+            project_id: "test-project".into(),
             request_id: "req-degraded".into(),
             trace_id: "trace-degraded".into(),
             started_at: 0,

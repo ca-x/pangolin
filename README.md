@@ -10,16 +10,32 @@ Pangolin（中文正式名称“鲮鲤”）是一款单二进制 AI API 聚合�
 
 ## 功能
 
-- OpenAI 兼容的 `/v1/chat/completions`、`/v1/responses`、`/v1/models`
-- Anthropic 兼容的 `/v1/messages`，以及基础非流式 OpenAI → Anthropic 转换
-- 多供应商同名模型的优先级故障转移
-- 加密上游密钥、Argon2id 管理员密码和虚拟 API Key
-- SeaORM + SQLite 控制主库，DuckDB 独立请求观测库
-- 请求量、错误率、P95 延迟、Token 和微美元成本
+- OpenAI、Anthropic、Gemini、Jina 及兼容供应商的聊天、Responses、Embedding、图像、音频、视频、重排与异步任务入口
+- 精确/正则/标签/条件模型路由，支持故障转移、轮询、权重、最少并发、延迟优先、粘性路由与熔断
+- 项目、用户、角色、邀请、OIDC、API Key Profile、IP/额度/预算/日志策略
+- 同一渠道配置多个加密凭据，支持优先级、轮换、批量启停、探测、配额和自动禁用
+- 内置供应商/模型目录、品牌图标、能力与价格元数据；支持导入、导出、签名订阅、刷新与回滚
+- Thread → Trace → Request → Execution → Usage/Cost 全链路观测与可解释路由预览
+- SeaORM + SQLite 权威主库，DuckDB 独立派生分析库；项目与整实例加密备份/恢复
+- 站点与 API Key 级请求日志策略，默认不保存敏感正文；可选精确会话回放与压缩
 - Web 初始化向导或环境变量无人值守初始化
 - 中英文、system/light/dark、bronze/slate/jade 主题
 - 内嵌 React 控制台，单二进制与非 root Docker 镜像
 - GitHub Actions 原生构建 Linux/macOS/Windows 二进制和 amd64/arm64 镜像
+
+## 界面预览
+
+### PC
+
+| 概览 | 渠道 | 模型路由与解释 |
+| --- | --- | --- |
+| ![Pangolin desktop overview](docs/screenshots/overview-desktop-light-en.png) | ![Pangolin desktop channels](docs/screenshots/channels-desktop-light-en.png) | ![鲮鲤桌面端模型路由](docs/screenshots/routing-desktop-dark-zh.png) |
+
+### 移动端
+
+| 概览 | 渠道多凭据 | 追踪详情 |
+| --- | --- | --- |
+| ![鲮鲤移动端概览](docs/screenshots/overview-mobile-dark-zh.png) | ![鲮鲤移动端多凭据管理](docs/screenshots/credentials-mobile-dark-zh.png) | ![鲮鲤移动端追踪详情](docs/screenshots/trace-mobile-dark-zh.png) |
 
 ## 快速开始
 
@@ -87,18 +103,20 @@ pnpm --dir web dev
 
 ## API 兼容边界
 
-v0.1 优先保证 OpenAI 兼容上游的透明传输。OpenAI → Anthropic 的非流式文本与基础工具调用由独立适配层转换；跨协议流式转换暂不提供，使用 Anthropic SDK 时应调用 `/v1/messages`。不会在已经向客户端发送流字节后重试请求。
+协议与供应商适配通过统一编排器执行，跨协议不支持的字段会明确报错，不会静默丢弃。Pangolin 不会在已经向客户端发送流字节后重试请求。没有真实凭据的供应商集成仅标记为契约测试通过，不宣称已经通过真实云服务验证。
 
 ## 参考与致谢
 
 本项目在设计和实现时明确研究了以下开源项目：
 
-- [BerriAI/litellm 的 litellm-rust](https://github.com/BerriAI/litellm/tree/main/litellm-rust)（MIT）：参考多供应商协议转换与类型边界。评估 commit `8c4c394ecc82c4d6acb5eb371d8781e487894a17`。由于其 crate 尚未独立发布、Git 依赖会解析整个大型工作区，v0.1 未把它作为默认构建依赖；Pangolin 的适配层保留了未来替换边界。
-- [traceloop/hub](https://github.com/traceloop/hub)（Apache-2.0）：参考 Rust 网关的 provider registry、pipeline、Prometheus 和 OpenTelemetry 组织方式。
-- [looplj/axonhub](https://github.com/looplj/axonhub)：参考渠道/模型/API Key、健康路由、请求追踪和成本控制的产品能力。本项目为独立实现，不复制其源代码。
-- [ca-x/raindrop](https://github.com/ca-x/raindrop)：参考嵌入式 React 资源、原生多平台二进制、非 root Docker 与固定 SHA 的 GitHub Actions 发布链路。
+- [looplj/axonhub](https://github.com/looplj/axonhub)（按其仓库 LICENSE 的适用范围，主要为 Apache-2.0；评估 commit `cb29b65d9adfb06f89bb1b467418e0816988f36c`）：参考企业访问控制、渠道/模型路由、可观测性、成本与备份的公开产品能力和测试不变量。
+- [BerriAI/litellm 的 litellm-rust](https://github.com/BerriAI/litellm/tree/main/litellm-rust)（MIT；评估 commit `8c4c394ecc82c4d6acb5eb371d8781e487894a17`）：直接复用兼容的 types、core、llms、framing、auth、HTTP、token counter 与 cache crates，并通过 Pangolin 适配边界承接编排和缺失协议。
+- [traceloop/hub](https://github.com/traceloop/hub)（Apache-2.0；评估 commit `e1be468f87de077ce066fbdebc858e913dc889a1`）：参考 Rust 网关的 provider registry、pipeline、Prometheus 和 OpenTelemetry 组织方式。
+- [ca-x/raindrop](https://github.com/ca-x/raindrop)（MIT；评估 commit `73948bd650d2aa6b117b4ad63af6aff8b24e2938`）：参考嵌入式 React、原生多平台二进制、不可变备份目标快照、fencing、保留策略和 GitHub Actions 发布链路。
+- [QuantumNous/new-api](https://github.com/QuantumNous/new-api)（AGPL-3.0；评估 commit `972aed1972820389ea0b603ca58f03f846fbf790`）：仅研究渠道/模型预设、分组倍率、令牌管理、亲和规则与运维交互；没有复制其 AGPL 源代码或资源。
+- [farion1231/cc-switch](https://github.com/farion1231/cc-switch/tree/main/src-tauri/src/proxy)（MIT；评估 commit `06082e189d65e6d6dbadc35dacdac1ce6c79d89a`）：参考 Rust 代理流水线、故障切换、用量、媒体和会话处理设计。
 
-这些项目的商标、版权和许可证归各自权利人所有。
+Pangolin 是独立实现，与上述项目及其维护者不存在隶属或官方关联；第三方商标、版权和许可证归各自权利人所有。
 
 ## License
 

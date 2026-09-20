@@ -1,0 +1,68 @@
+[
+  {
+    "route": "/v1/completions", "upstream": "/v1/completions",
+    "source": "internal/server/routes.go; llm/transformer/openai/completion_inbound_cost_test.go",
+    "request": {"model":"public","prompt":"Say hello","max_tokens":12,"echo":true},
+    "response": {"id":"cmpl-contract","object":"text_completion","choices":[{"index":0,"text":"Say hello Hello!","finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":2,"total_tokens":4}}
+  },
+  {
+    "route": "/v1/responses/compact", "upstream": "/v1/responses/compact",
+    "source": "internal/server/routes.go; internal/server/orchestrator/responses_session_test.go",
+    "request": {"model":"public","input":[{"role":"user","content":"Keep this context"}],"instructions":"Be brief"},
+    "response": {"id":"cmp-contract","object":"response.compaction","output":[{"type":"compaction","encrypted_content":"opaque-context"}]}
+  },
+  {
+    "route": "/v1/embeddings", "upstream": "/v1/embeddings",
+    "source": "llm/transformer/openai/embedding_test.go; internal/server/biz/trace_embedding_test.go",
+    "request": {"model":"public","input":["one","two"],"encoding_format":"float","dimensions":2},
+    "response": {"object":"list","data":[{"object":"embedding","index":0,"embedding":[0.1,0.2]},{"object":"embedding","index":1,"embedding":[0.3,0.4]}],"usage":{"prompt_tokens":2,"total_tokens":2}}
+  },
+  {
+    "route": "/v1/moderations", "upstream": "/v1/moderations",
+    "source": "llm/transformer/openai/moderation_test.go",
+    "request": {"model":"public","input":["one","two"]},
+    "response": {"id":"mod-contract","model":"a-model","results":[{"flagged":false,"categories":{"violence":false},"category_scores":{"violence":0.01}}]}
+  },
+  {
+    "route": "/v1/alpha/search", "upstream": "/v1/alpha/search",
+    "source": "llm/transformer/openai/alpha_search_test.go",
+    "request": {"id":"session-contract","model":"public","commands":{"search_query":[{"q":"golang"}]}},
+    "response": {"results":[{"title":"Go","url":"https://go.dev"}]}
+  },
+  {
+    "route": "/v1/images/generations", "upstream": "/v1/images/generations",
+    "source": "llm/transformer/openai/image_inbound_test.go; image_outbound_test.go",
+    "request": {"model":"public","prompt":"A boat at sea","n":1,"size":"1024x1024","response_format":"b64_json"},
+    "response": {"created":1750000000,"data":[{"b64_json":"cG5nLWZpeHR1cmU=","revised_prompt":"A boat at sea"}]}
+  },
+  {
+    "route": "/v1/videos", "upstream": "/v1/videos",
+    "source": "llm/transformer/openai/video_inbound_test.go; video_outbound_test.go",
+    "request": {"model":"public","prompt":"Waves","seconds":"4","size":"1280x720"},
+    "response": {"id":"task-contract","object":"video","status":"queued","progress":0,"seconds":"4","size":"1280x720"}
+  },
+  {
+    "route": "/v1/rerank", "upstream": "/v1/rerank",
+    "source": "internal/server/routes.go",
+    "request": {"model":"public","query":"search","documents":["first","second"],"top_n":1,"return_documents":true},
+    "response": {"results":[{"index":1,"relevance_score":0.9,"document":{"text":"second"}}],"usage":{"total_tokens":3}}
+  },
+  {
+    "route": "/jina/v1/embeddings", "upstream": "/v1/embeddings",
+    "source": "llm/transformer/jina/embedding_test.go",
+    "request": {"model":"public","input":[{"text":"hello"}],"task":"retrieval.query","normalized":true},
+    "response": {"object":"list","data":[{"index":0,"embedding":[0.1,0.2]}],"usage":{"total_tokens":1}}
+  },
+  {
+    "route": "/jina/v1/rerank", "upstream": "/v1/rerank",
+    "source": "internal/server/routes.go",
+    "request": {"model":"public","query":"search","documents":["first","second"],"top_n":1},
+    "response": {"results":[{"index":1,"relevance_score":0.9}],"usage":{"total_tokens":3}}
+  },
+  {
+    "route": "/doubao/v3/contents/generations/tasks", "upstream": "/api/v3/contents/generations/tasks",
+    "source": "llm/transformer/doubao/outbound_test.go",
+    "request": {"model":"public","content":[{"type":"text","text":"Ocean waves"}],"ratio":"16:9","duration":5},
+    "response": {"id":"doubao-contract","status":"queued"}
+  }
+]

@@ -1,9 +1,16 @@
+mod access;
+mod access_api;
 mod api;
+mod catalog;
 mod config;
 mod crypto;
 mod db;
 mod models;
 mod observability;
+mod oidc;
+mod operations;
+mod orchestration;
+mod providers;
 mod web;
 
 use std::{collections::HashMap, fs, sync::Arc};
@@ -46,28 +53,44 @@ async fn main() -> Result<()> {
         config: Arc::new(config.clone()),
         secrets,
         observations: observations.clone(),
-        client: reqwest::Client::builder()
+        client: providers::http_client(config.upstream_timeout)?,
+        oidc_client: reqwest::Client::builder()
             .user_agent(concat!("pangolin/", env!("CARGO_PKG_VERSION")))
+            .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(std::time::Duration::from_secs(10))
             .timeout(config.upstream_timeout)
             .build()?,
         budget_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        maintenance: Arc::new(tokio::sync::RwLock::new(())),
+        orchestrator: Arc::new(orchestration::Runtime::default()),
     };
+    operations::instance_backup::reset_projection(&state).await?;
+    operations::runtime::recover(&state).await?;
+    let operations = operations::runtime::start(state.clone());
     let app = Router::new()
         .merge(api::router(state))
         .fallback(web::serve)
         .layer(CompressionLayer::new())
         .layer(CatchPanicLayer::new())
-        .layer(TraceLayer::new_for_http());
+        .layer(TraceLayer::new_for_http().make_span_with(http_span));
     let listener = tokio::net::TcpListener::bind(config.bind)
         .await
         .with_context(|| format!("failed to bind {}", config.bind))?;
     tracing::info!(address = %config.bind, product = "Pangolin / 鲮鲤", "server listening");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
+    operations.abort();
+    let _ = operations.await;
     observations.flush().await;
     Ok(())
+}
+
+fn http_span<B>(request: &http::Request<B>) -> tracing::Span {
+    tracing::debug_span!("http.request",method=%request.method(),path=%request.uri().path())
 }
 
 async fn bootstrap_from_environment(

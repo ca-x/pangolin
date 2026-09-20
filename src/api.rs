@@ -1,18 +1,24 @@
-use std::{collections::HashMap, sync::Arc, time::Instant};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
 use axum::{
     Json, Router,
     body::Body,
-    extract::{Path, Query, State},
+    extract::{ConnectInfo, Path, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
 };
-use futures_util::StreamExt as _;
-use sea_orm::DatabaseConnection;
+use sea_orm::{ConnectionTrait, DatabaseConnection};
 use serde_json::{Map, Value, json};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use uuid::Uuid;
+
+mod catalog_api;
+pub(crate) mod errors;
+pub(crate) mod gateway;
+mod operations_api;
+mod protocols;
 
 use crate::{
     config::Config,
@@ -29,7 +35,10 @@ pub struct AppState {
     pub secrets: SecretBox,
     pub observations: ObservationStore,
     pub client: reqwest::Client,
+    pub oidc_client: reqwest::Client,
     pub budget_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    pub maintenance: Arc<tokio::sync::RwLock<()>>,
+    pub orchestrator: Arc<crate::orchestration::Runtime>,
 }
 
 impl AppState {
@@ -52,17 +61,31 @@ pub enum ApiError {
     BadRequest(String),
     #[error("authentication required")]
     Unauthorized,
+    #[error("permission denied")]
+    Forbidden,
     #[error("resource not found")]
     NotFound,
     #[error("{0}")]
+    Conflict(String),
+    #[error("{0}")]
     Upstream(String),
+    #[error("{0}")]
+    RateLimited(String),
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
 }
 
-impl IntoResponse for ApiError {
-    fn into_response(self) -> Response {
-        let (status, kind, message) = match self {
+impl ApiError {
+    pub(crate) fn public_message(&self) -> String {
+        match self {
+            Self::Internal(_) => "An internal error occurred".into(),
+            _ => self.to_string(),
+        }
+    }
+    /// The only boundary that converts local failures into client-visible data.
+    /// Internal causes may contain database rows, credentials or stored payloads.
+    pub(crate) fn public_parts(self) -> (StatusCode, &'static str, String) {
+        match self {
             Self::BadRequest(message) => {
                 (StatusCode::BAD_REQUEST, "invalid_request_error", message)
             }
@@ -71,17 +94,28 @@ impl IntoResponse for ApiError {
                 "authentication_error",
                 self.to_string(),
             ),
+            Self::Forbidden => (StatusCode::FORBIDDEN, "permission_error", self.to_string()),
             Self::NotFound => (StatusCode::NOT_FOUND, "not_found_error", self.to_string()),
+            Self::Conflict(message) => (StatusCode::CONFLICT, "conflict_error", message),
             Self::Upstream(message) => (StatusCode::BAD_GATEWAY, "upstream_error", message),
-            Self::Internal(error) => {
-                tracing::error!(%error, "internal API error");
+            Self::RateLimited(message) => {
+                (StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", message)
+            }
+            Self::Internal(_) => {
+                tracing::error!("internal API error");
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "internal_error",
                     "An internal error occurred".into(),
                 )
             }
-        };
+        }
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let (status, kind, message) = self.public_parts();
         (
             status,
             Json(json!({ "error": { "type": kind, "message": message } })),
@@ -96,8 +130,27 @@ impl From<sea_orm::DbErr> for ApiError {
     }
 }
 
+impl From<crate::orchestration::Error> for ApiError {
+    fn from(error: crate::orchestration::Error) -> Self {
+        use crate::orchestration::Error;
+        match error {
+            Error::Forbidden => Self::Forbidden,
+            Error::Invalid(message) => Self::BadRequest(message.into()),
+            Error::Admission(reason) => Self::RateLimited(reason.into()),
+            Error::Configuration => {
+                Self::Internal(anyhow::anyhow!("invalid orchestration configuration"))
+            }
+            Error::Database(error) => Self::from(error),
+        }
+    }
+}
+
 pub fn router(state: AppState) -> Router {
     Router::new()
+        .merge(protocols::router())
+        .merge(catalog_api::router())
+        .merge(operations_api::router(state.clone()))
+        .merge(crate::access_api::router())
         .route("/api/health/live", get(live))
         .route("/api/health/ready", get(ready))
         .route("/api/v1/bootstrap", get(bootstrap))
@@ -133,7 +186,92 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/chat/completions", post(gateway_chat))
         .route("/v1/responses", post(gateway_responses))
         .route("/v1/messages", post(gateway_messages))
+        .layer(middleware::from_fn(browser_csrf))
+        .layer(middleware::from_fn(errors::native_errors))
+        .layer(middleware::from_fn(capture_trusted_client_ip))
+        .layer(middleware::from_fn_with_state(state.clone(), maintenance))
         .with_state(state)
+}
+
+async fn browser_csrf(request: axum::extract::Request, next: Next) -> Response {
+    let unsafe_method = !matches!(
+        *request.method(),
+        axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS
+    );
+    let browser_session = request
+        .headers()
+        .get(header::COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|cookies| {
+            cookies
+                .split(';')
+                .any(|cookie| cookie.trim().starts_with("pangolin_session="))
+        });
+    if request.uri().path().starts_with("/api/admin/v1/")
+        && unsafe_method
+        && browser_session
+        && (request
+            .headers()
+            .get("x-pangolin-csrf")
+            .and_then(|value| value.to_str().ok())
+            != Some("1")
+            || request
+                .headers()
+                .get("sec-fetch-site")
+                .is_some_and(|value| value == "cross-site"))
+    {
+        return ApiError::Forbidden.into_response();
+    }
+    next.run(request).await
+}
+async fn maintenance(
+    State(state): State<AppState>,
+    request: axum::extract::Request,
+    next: Next,
+) -> Response {
+    let path = request.uri().path();
+    if path.starts_with("/api/") && !path.starts_with("/api/admin/v1/instance/restore") {
+        let guard = state.maintenance.clone().read_owned().await;
+        hold_maintenance(next.run(request).await, guard)
+    } else {
+        next.run(request).await
+    }
+}
+pub(crate) fn hold_maintenance(
+    response: Response,
+    guard: tokio::sync::OwnedRwLockReadGuard<()>,
+) -> Response {
+    use futures_util::StreamExt;
+    let (parts, body) = response.into_parts();
+    let output = async_stream::stream! {let _guard=guard;let mut stream=body.into_data_stream();while let Some(chunk)=stream.next().await{yield chunk;}};
+    Response::from_parts(parts, Body::from_stream(output))
+}
+
+pub(crate) const TRUSTED_CLIENT_IP_HEADER: &str = "x-pangolin-trusted-client-ip";
+
+async fn capture_trusted_client_ip(mut request: axum::extract::Request, next: Next) -> Response {
+    request.headers_mut().remove(TRUSTED_CLIENT_IP_HEADER);
+    request.headers_mut().remove("x-pangolin-websocket-session");
+    request
+        .headers_mut()
+        .remove("x-pangolin-websocket-generation");
+    if let Some(ConnectInfo(address)) = request.extensions().get::<ConnectInfo<SocketAddr>>()
+        && let Ok(value) = HeaderValue::from_str(&address.ip().to_string())
+    {
+        request
+            .headers_mut()
+            .insert(TRUSTED_CLIENT_IP_HEADER, value);
+    }
+    next.run(request).await
+}
+
+pub(crate) fn trusted_client_ip(headers: &HeaderMap) -> Option<std::net::IpAddr> {
+    headers
+        .get(TRUSTED_CLIENT_IP_HEADER)?
+        .to_str()
+        .ok()?
+        .parse()
+        .ok()
 }
 
 async fn live() -> impl IntoResponse {
@@ -157,6 +295,27 @@ async fn bootstrap(
 ) -> Result<impl IntoResponse, ApiError> {
     let initialized = db::is_initialized(&state.db).await?;
     let user = optional_user(&state, &headers).await?;
+    let system = state
+        .db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DbBackend::Sqlite,
+            "SELECT value FROM settings WHERE key='system'",
+        ))
+        .await?
+        .map(|row| row.try_get::<String>("", "value"))
+        .transpose()?
+        .and_then(|value| serde_json::from_str::<Value>(&value).ok());
+    let legacy_name = state
+        .db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DbBackend::Sqlite,
+            "SELECT value FROM settings WHERE key='instance_name'",
+        ))
+        .await?
+        .map(|row| row.try_get::<String>("", "value"))
+        .transpose()?
+        .unwrap_or_else(|| "Pangolin".into());
+    let system=system.unwrap_or_else(||json!({"instance_name":legacy_name,"branding_name":legacy_name,"favicon_url":"/logo.webp","onboarding_complete":false}));
     Ok(Json(json!({
         "initialized": initialized,
         "authenticated": user.is_some(),
@@ -165,6 +324,7 @@ async fn bootstrap(
         "public_url": state.config.public_url,
         "capture_payloads": state.config.capture_payloads,
         "observability_available": state.observations.is_available(),
+        "branding": system,
     })))
 }
 
@@ -191,7 +351,7 @@ async fn login(
     session_response(&state, &user).await
 }
 
-async fn session_response(state: &AppState, user: &User) -> Result<Response, ApiError> {
+pub(crate) async fn session_response(state: &AppState, user: &User) -> Result<Response, ApiError> {
     let token = db::create_session(&state.db, &user.id).await?;
     let mut cookie =
         format!("pangolin_session={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=2592000");
@@ -222,7 +382,7 @@ async fn list_providers(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError> {
-    require_user(&state, &headers).await?;
+    require_user_permission(&state, &headers, "project:read").await?;
     Ok(Json(db::list_providers(&state.db).await?))
 }
 
@@ -231,9 +391,11 @@ async fn create_provider(
     headers: HeaderMap,
     Json(input): Json<ProviderInput>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user = require_user(&state, &headers).await?;
-    validate_http_url(&input.base_url)?;
-    if input.name.trim().is_empty() || input.api_key.trim().is_empty() {
+    let user = require_user_permission(&state, &headers, "project:manage").await?;
+    if !input.base_url.trim().is_empty() {
+        validate_http_url(&input.base_url)?;
+    }
+    if input.name.trim().is_empty() || (input.api_key.trim().is_empty() && input.kind != "ollama") {
         return Err(ApiError::BadRequest("name and API key are required".into()));
     }
     let envelope = state
@@ -260,7 +422,7 @@ async fn delete_provider(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    let user = require_user(&state, &headers).await?;
+    let user = require_user_permission(&state, &headers, "project:manage").await?;
     if db::delete_provider(&state.db, &id).await? {
         db::record_audit_event(&state.db, &user.id, "delete", "provider", &id, json!({})).await?;
         Ok(StatusCode::NO_CONTENT)
@@ -273,7 +435,7 @@ async fn list_models(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError> {
-    require_user(&state, &headers).await?;
+    require_user_permission(&state, &headers, "project:read").await?;
     Ok(Json(db::list_models(&state.db).await?))
 }
 
@@ -282,7 +444,7 @@ async fn create_model(
     headers: HeaderMap,
     Json(input): Json<ModelInput>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user = require_user(&state, &headers).await?;
+    let user = require_user_permission(&state, &headers, "project:manage").await?;
     if input.public_name.trim().is_empty() || input.upstream_name.trim().is_empty() {
         return Err(ApiError::BadRequest("model names are required".into()));
     }
@@ -306,7 +468,7 @@ async fn delete_model(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    let user = require_user(&state, &headers).await?;
+    let user = require_user_permission(&state, &headers, "project:manage").await?;
     if db::delete_model(&state.db, &id).await? {
         db::record_audit_event(&state.db, &user.id, "delete", "model", &id, json!({})).await?;
         Ok(StatusCode::NO_CONTENT)
@@ -319,7 +481,7 @@ async fn list_api_keys(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError> {
-    require_user(&state, &headers).await?;
+    require_user_permission(&state, &headers, "project:read").await?;
     Ok(Json(db::list_api_keys(&state.db).await?))
 }
 
@@ -328,10 +490,11 @@ async fn create_api_key(
     headers: HeaderMap,
     Json(input): Json<ApiKeyInput>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user = require_user(&state, &headers).await?;
+    let user = require_user_permission(&state, &headers, "api_key:manage").await?;
     if input.name.trim().is_empty() {
         return Err(ApiError::BadRequest("name is required".into()));
     }
+    let imported = input.token_mode == crate::models::ApiKeyTokenMode::ImportExisting;
     let (key, token) = db::create_api_key(&state.db, &input)
         .await
         .map_err(bad_request)?;
@@ -341,12 +504,16 @@ async fn create_api_key(
         "create",
         "api_key",
         &key.id,
-        json!({"name":key.name,"prefix":key.key_prefix}),
+        json!({"name":key.name,"fingerprint":key.key_prefix,"token_mode":if imported {"import_existing"} else {"generated"}}),
     )
     .await?;
     Ok((
         StatusCode::CREATED,
-        Json(json!({ "key": key, "token": token })),
+        Json(if imported {
+            json!({ "key": key, "mode": "import_existing" })
+        } else {
+            json!({ "key": key, "mode": "generated", "token": token })
+        }),
     ))
 }
 
@@ -355,7 +522,7 @@ async fn delete_api_key(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    let user = require_user(&state, &headers).await?;
+    let user = require_user_permission(&state, &headers, "api_key:manage").await?;
     if db::delete_api_key(&state.db, &id).await? {
         db::record_audit_event(&state.db, &user.id, "delete", "api_key", &id, json!({})).await?;
         Ok(StatusCode::NO_CONTENT)
@@ -368,7 +535,7 @@ async fn observation_summary(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError> {
-    require_user(&state, &headers).await?;
+    operations_api::actor(&state, &headers, None, false).await?;
     Ok(Json(
         state
             .observations
@@ -383,7 +550,7 @@ async fn observation_list(
     headers: HeaderMap,
     Query(filter): Query<RequestFilter>,
 ) -> Result<impl IntoResponse, ApiError> {
-    require_user(&state, &headers).await?;
+    operations_api::actor(&state, &headers, None, false).await?;
     Ok(Json(
         state
             .observations
@@ -398,7 +565,7 @@ async fn observation_detail(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
-    require_user(&state, &headers).await?;
+    operations_api::actor(&state, &headers, None, false).await?;
     state
         .observations
         .get(id)
@@ -419,19 +586,25 @@ async fn metrics(State(state): State<AppState>) -> Result<Response, ApiError> {
         i32::from(state.observations.is_available()),
         state.observations.dropped_events(),
     );
+    let body = format!("{body}{}", state.orchestrator.metrics());
     Ok(([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], body).into_response())
 }
 
 async fn gateway_models(
     State(state): State<AppState>,
     headers: HeaderMap,
-) -> Result<impl IntoResponse, ApiError> {
-    gateway_key(&state, &headers).await?;
-    let mut seen = std::collections::BTreeSet::new();
-    let models = db::list_models(&state.db).await?.into_iter().filter(|model| model.enabled && seen.insert(model.public_name.clone())).map(|model| json!({
-        "id": model.public_name, "object": "model", "created": model.created_at, "owned_by": "pangolin"
-    })).collect::<Vec<_>>();
-    Ok(Json(json!({ "object": "list", "data": models })))
+) -> Result<Response, ApiError> {
+    let _maintenance = state.maintenance.clone().read_owned().await;
+    let credential = gateway_key(&state, &headers).await?;
+    let models = crate::orchestration::visible_models(&state.db, &credential, &headers).await?;
+    gateway::discovery_response(
+        &state,
+        &headers,
+        &credential,
+        json!({"object":"list","data":models}),
+        "/v1/models",
+    )
+    .await
 }
 
 async fn gateway_chat(
@@ -455,7 +628,10 @@ async fn gateway_messages(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
-    gateway_request(state, headers, body, "/v1/messages").await
+    protocols::protocol_error(
+        gateway_request(state, headers, body, "/v1/messages").await,
+        false,
+    )
 }
 
 async fn gateway_request(
@@ -464,319 +640,7 @@ async fn gateway_request(
     body: axum::body::Bytes,
     endpoint: &'static str,
 ) -> Result<Response, ApiError> {
-    let started = Instant::now();
-    let started_at = db::now();
-    let request_id = format!("req_{}", Uuid::new_v4().simple());
-    let trace_id = Uuid::new_v4().simple().to_string();
-    let initial_credential = gateway_key(&state, &headers).await?;
-    let mut payload: Value = serde_json::from_slice(&body)
-        .map_err(|_| ApiError::BadRequest("request body must be valid JSON".into()))?;
-    let requested_model = payload
-        .get("model")
-        .and_then(Value::as_str)
-        .ok_or_else(|| ApiError::BadRequest("model is required".into()))?
-        .to_owned();
-    let stream = payload
-        .get("stream")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    if stream && initial_credential.budget_micros.is_some() {
-        return Err(ApiError::BadRequest(
-            "streaming is disabled for budget-limited API keys because provider-neutral usage settlement is not reliable".into(),
-        ));
-    }
-    let _budget_guard = if initial_credential.budget_micros.is_some() {
-        Some(state.lock_budget_key(&initial_credential.id).await)
-    } else {
-        None
-    };
-    let credential = if _budget_guard.is_some() {
-        gateway_key(&state, &headers).await?
-    } else {
-        initial_credential
-    };
-    let targets = db::resolve_targets(&state.db, &requested_model, endpoint).await?;
-    if targets.is_empty() {
-        return Err(ApiError::BadRequest(format!(
-            "no enabled route for model `{requested_model}`"
-        )));
-    }
-
-    let captured_request = state
-        .config
-        .capture_payloads
-        .then(|| redact_json(payload.clone()).to_string());
-    let mut last_error = None;
-    let mut last_provider = None;
-    let mut last_resolved_model = None;
-    for target in targets {
-        last_provider = Some(target.provider_name.clone());
-        last_resolved_model = Some(target.upstream_name.clone());
-        payload["model"] = Value::String(target.upstream_name.clone());
-        let secret = state
-            .secrets
-            .decrypt(&target.secret_envelope)
-            .map_err(ApiError::Internal)?;
-
-        if endpoint == "/v1/chat/completions" && target.provider_kind == "anthropic" && !stream {
-            match call_anthropic_chat(&state.client, &target, &payload, &secret).await {
-                Ok(value) => {
-                    let response_bytes = serde_json::to_vec(&value)
-                        .map_err(|error| ApiError::Internal(error.into()))?;
-                    let event = build_event(
-                        &request_id,
-                        &trace_id,
-                        started_at,
-                        started.elapsed().as_millis() as i64,
-                        endpoint,
-                        &credential.id,
-                        &target.provider_name,
-                        &requested_model,
-                        &target.upstream_name,
-                        200,
-                        None,
-                        &payload,
-                        Some(&value),
-                        captured_request.clone(),
-                        state.config.capture_payloads,
-                        target.input_price_micros,
-                        target.output_price_micros,
-                    );
-                    db::add_api_key_spend(&state.db, &credential.id, event.cost_micros).await?;
-                    state.observations.record(event);
-                    return Ok((
-                        StatusCode::OK,
-                        [
-                            ("content-type", "application/json"),
-                            ("x-request-id", request_id.as_str()),
-                        ],
-                        response_bytes,
-                    )
-                        .into_response());
-                }
-                Err(error) => {
-                    last_error = Some(error.to_string());
-                    continue;
-                }
-            }
-        } else if endpoint == "/v1/chat/completions" && target.provider_kind == "anthropic" {
-            return Err(ApiError::BadRequest(
-                "streaming OpenAI-to-Anthropic translation is not available in v0.1; use /v1/messages or disable stream".into(),
-            ));
-        }
-
-        let url = upstream_url(&target.base_url, endpoint);
-        let mut request = state
-            .client
-            .post(url)
-            .header(header::CONTENT_TYPE, "application/json");
-        request = if target.provider_kind == "anthropic" {
-            request.header("x-api-key", secret.as_str()).header(
-                "anthropic-version",
-                headers
-                    .get("anthropic-version")
-                    .and_then(|value| value.to_str().ok())
-                    .unwrap_or("2023-06-01"),
-            )
-        } else {
-            request.bearer_auth(secret.as_str())
-        };
-        let upstream = match request.body(body_from_json(&payload)?).send().await {
-            Ok(response) => response,
-            Err(error) => {
-                last_error = Some(error.to_string());
-                continue;
-            }
-        };
-        let status = upstream.status();
-        if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
-            last_error = Some(format!("{} returned {status}", target.provider_name));
-            continue;
-        }
-        let content_type = upstream
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .cloned()
-            .unwrap_or_else(|| HeaderValue::from_static("application/json"));
-        if stream {
-            let status_code = status.as_u16() as i32;
-            let mut upstream_stream = upstream.bytes_stream();
-            let mut guard = StreamEventGuard::new(
-                state.observations.clone(),
-                RequestEvent {
-                    request_id: request_id.clone(),
-                    trace_id,
-                    started_at,
-                    finished_at: 0,
-                    endpoint: endpoint.into(),
-                    api_key_id: Some(credential.id),
-                    provider: Some(target.provider_name),
-                    requested_model: Some(requested_model),
-                    resolved_model: Some(target.upstream_name),
-                    status_code,
-                    error_kind: None,
-                    latency_ms: 0,
-                    ttft_ms: None,
-                    input_tokens: 0,
-                    output_tokens: 0,
-                    cached_tokens: 0,
-                    cost_micros: 0,
-                    payload_captured: state.config.capture_payloads,
-                    request_json: captured_request,
-                    response_json: None,
-                },
-                started,
-            );
-            let stream = async_stream::stream! {
-                while let Some(chunk) = upstream_stream.next().await {
-                    match chunk {
-                        Ok(bytes) => {
-                            guard.mark_first_byte();
-                            yield Ok::<_, std::io::Error>(bytes);
-                        }
-                        Err(error) => {
-                            guard.fail("stream_error");
-                            yield Err(std::io::Error::other(error));
-                            return;
-                        }
-                    }
-                }
-                guard.complete();
-            };
-            let mut response = Response::new(Body::from_stream(stream));
-            *response.status_mut() = status;
-            response
-                .headers_mut()
-                .insert(header::CONTENT_TYPE, content_type);
-            response.headers_mut().insert(
-                "x-request-id",
-                HeaderValue::from_str(&request_id).expect("request id is an HTTP header value"),
-            );
-            return Ok(response);
-        }
-        let response_bytes = upstream
-            .bytes()
-            .await
-            .map_err(|error| ApiError::Upstream(error.to_string()))?;
-        let response_json = serde_json::from_slice::<Value>(&response_bytes).ok();
-        let event = build_event(
-            &request_id,
-            &trace_id,
-            started_at,
-            started.elapsed().as_millis() as i64,
-            endpoint,
-            &credential.id,
-            &target.provider_name,
-            &requested_model,
-            &target.upstream_name,
-            status.as_u16() as i32,
-            (status.as_u16() >= 400).then(|| "upstream_http".into()),
-            &payload,
-            response_json.as_ref(),
-            captured_request.clone(),
-            state.config.capture_payloads,
-            target.input_price_micros,
-            target.output_price_micros,
-        );
-        db::add_api_key_spend(&state.db, &credential.id, event.cost_micros).await?;
-        state.observations.record(event);
-        let mut response = Response::new(Body::from(response_bytes));
-        *response.status_mut() = status;
-        response
-            .headers_mut()
-            .insert(header::CONTENT_TYPE, content_type);
-        response.headers_mut().insert(
-            "x-request-id",
-            HeaderValue::from_str(&request_id).expect("request id is an HTTP header value"),
-        );
-        return Ok(response);
-    }
-    state.observations.record(RequestEvent {
-        request_id,
-        trace_id,
-        started_at,
-        finished_at: db::now(),
-        endpoint: endpoint.into(),
-        api_key_id: Some(credential.id),
-        provider: last_provider,
-        requested_model: Some(requested_model),
-        resolved_model: last_resolved_model,
-        status_code: StatusCode::BAD_GATEWAY.as_u16() as i32,
-        error_kind: Some("upstream_unavailable".into()),
-        latency_ms: started.elapsed().as_millis() as i64,
-        ttft_ms: None,
-        input_tokens: 0,
-        output_tokens: 0,
-        cached_tokens: 0,
-        cost_micros: 0,
-        payload_captured: state.config.capture_payloads,
-        request_json: captured_request,
-        response_json: None,
-    });
-    Err(ApiError::Upstream(
-        last_error.unwrap_or_else(|| "all upstream targets failed".into()),
-    ))
-}
-
-struct StreamEventGuard {
-    store: ObservationStore,
-    event: Option<RequestEvent>,
-    started: Instant,
-}
-
-impl StreamEventGuard {
-    fn new(store: ObservationStore, event: RequestEvent, started: Instant) -> Self {
-        Self {
-            store,
-            event: Some(event),
-            started,
-        }
-    }
-
-    fn mark_first_byte(&mut self) {
-        if let Some(event) = &mut self.event
-            && event.ttft_ms.is_none()
-        {
-            event.ttft_ms = Some(self.started.elapsed().as_millis() as i64);
-        }
-    }
-
-    fn complete(&mut self) {
-        if let Some(event) = &mut self.event {
-            if event.status_code >= 400 {
-                event.error_kind = Some("upstream_http".into());
-            } else {
-                event.error_kind = Some("usage_unavailable".into());
-            }
-        }
-        self.publish();
-    }
-
-    fn fail(&mut self, kind: &str) {
-        if let Some(event) = &mut self.event {
-            event.status_code = StatusCode::BAD_GATEWAY.as_u16() as i32;
-            event.error_kind = Some(kind.into());
-        }
-        self.publish();
-    }
-
-    fn publish(&mut self) {
-        if let Some(mut event) = self.event.take() {
-            event.finished_at = db::now();
-            event.latency_ms = self.started.elapsed().as_millis() as i64;
-            self.store.record(event);
-        }
-    }
-}
-
-impl Drop for StreamEventGuard {
-    fn drop(&mut self) {
-        if let Some(event) = &mut self.event {
-            event.status_code = 499;
-            event.error_kind = Some("client_cancelled".into());
-        }
-        self.publish();
-    }
+    gateway::execute(state, headers, body, endpoint).await
 }
 
 fn push_anthropic_message(messages: &mut Vec<Value>, role: &str, mut blocks: Vec<Value>) {
@@ -795,7 +659,27 @@ async fn call_anthropic_chat(
     target: &crate::models::RouteTarget,
     payload: &Value,
     secret: &str,
+    headers: &HeaderMap,
+    endpoint: &str,
+    mut accounting: Option<&mut crate::operations::lifecycle::Attempt>,
 ) -> anyhow::Result<Value> {
+    crate::providers::ensure_fields(
+        payload,
+        &[
+            "model",
+            "messages",
+            "max_tokens",
+            "max_completion_tokens",
+            "max_output_tokens",
+            "temperature",
+            "top_p",
+            "stop",
+            "tools",
+            "tool_choice",
+            "stream",
+            "n",
+        ],
+    )?;
     let object = payload
         .as_object()
         .ok_or_else(|| anyhow::anyhow!("chat request must be an object"))?;
@@ -806,10 +690,19 @@ async fn call_anthropic_chat(
     let mut system = Vec::<String>::new();
     let mut messages = Vec::new();
     for message in source_messages {
+        crate::providers::ensure_fields(
+            message,
+            &["role", "content", "tool_calls", "tool_call_id"],
+        )?;
         let role = message
             .get("role")
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow::anyhow!("every message requires a role"))?;
+        if (role != "assistant" && message.get("tool_calls").is_some())
+            || (role != "tool" && message.get("tool_call_id").is_some())
+        {
+            anyhow::bail!("tool fields do not match the message role");
+        }
         match role {
             "system" => {
                 let content = message
@@ -845,6 +738,7 @@ async fn call_anthropic_chat(
                     }
                     Some(Value::Array(parts)) => {
                         for part in parts {
+                            crate::providers::ensure_fields(part, &["type", "text"])?;
                             if part.get("type").and_then(Value::as_str) != Some("text") {
                                 anyhow::bail!(
                                     "Anthropic bridge currently supports text content parts only"
@@ -860,9 +754,14 @@ async fn call_anthropic_chat(
                     && let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array)
                 {
                     for call in tool_calls {
+                        crate::providers::ensure_fields(call, &["id", "type", "function"])?;
+                        if call["type"] != "function" {
+                            anyhow::bail!("only function tool calls are supported");
+                        }
                         let function = call
                             .get("function")
                             .ok_or_else(|| anyhow::anyhow!("tool call requires function"))?;
+                        crate::providers::ensure_fields(function, &["name", "arguments"])?;
                         let arguments = function
                             .get("arguments")
                             .and_then(Value::as_str)
@@ -891,10 +790,7 @@ async fn call_anthropic_chat(
     request.insert("messages".into(), Value::Array(messages));
     request.insert(
         "max_tokens".into(),
-        object
-            .get("max_tokens")
-            .cloned()
-            .unwrap_or(Value::from(4096)),
+        Value::from(crate::orchestration::output_limit(payload)?),
     );
     if !system.is_empty() {
         request.insert("system".into(), Value::String(system.join("\n\n")));
@@ -915,9 +811,14 @@ async fn call_anthropic_chat(
     if let Some(tools) = object.get("tools").and_then(Value::as_array) {
         let mut converted = Vec::with_capacity(tools.len());
         for tool in tools {
+            crate::providers::ensure_fields(tool, &["type", "function"])?;
+            if tool["type"] != "function" {
+                anyhow::bail!("only function tools are supported");
+            }
             let function = tool
                 .get("function")
                 .ok_or_else(|| anyhow::anyhow!("tool requires function"))?;
+            crate::providers::ensure_fields(function, &["name", "description", "parameters"])?;
             converted.push(json!({
                 "name": function.get("name").and_then(Value::as_str).ok_or_else(|| anyhow::anyhow!("tool requires function name"))?,
                 "description": function.get("description").cloned().unwrap_or(Value::Null),
@@ -927,6 +828,13 @@ async fn call_anthropic_chat(
         request.insert("tools".into(), Value::Array(converted));
     }
     if let Some(choice) = object.get("tool_choice") {
+        if choice.is_object() {
+            crate::providers::ensure_fields(choice, &["type", "function"])?;
+            crate::providers::ensure_fields(&choice["function"], &["name"])?;
+            if choice["type"] != "function" || !choice["function"]["name"].is_string() {
+                anyhow::bail!("unsupported tool_choice");
+            }
+        }
         let disable_tools = choice.as_str() == Some("none");
         let converted = match choice {
             Value::String(value) if value == "auto" => Some(json!({"type":"auto"})),
@@ -945,23 +853,68 @@ async fn call_anthropic_chat(
             request.insert("tool_choice".into(), converted);
         }
     }
-    let upstream = client
-        .post(upstream_url(&target.base_url, "/v1/messages"))
+    let mut checked_payload = payload.clone();
+    for name in ["max_completion_tokens", "max_output_tokens", "n"] {
+        checked_payload.as_object_mut().unwrap().remove(name);
+    }
+    checked_payload["max_tokens"] = json!(crate::orchestration::output_limit(payload)?);
+    if let Some(value) =
+        crate::providers::anthropic_text_request(&target.upstream_name, &checked_payload)
+    {
+        request = value.as_object().expect("LiteLLM emits an object").clone();
+    }
+    let request = client
+        .post(upstream_url(&target.base_url, endpoint))
+        .headers(headers.clone())
         .header("x-api-key", secret)
         .header("anthropic-version", "2023-06-01")
         .json(&request)
-        .send()
-        .await?;
+        .build()?;
+    if let Some(accounting) = accounting.as_deref_mut() {
+        accounting.contacted().await?;
+    }
+    let upstream = client.execute(request).await?;
     let status = upstream.status();
-    let body: Value = upstream.json().await?;
+    let bytes = gateway::read_body(upstream).await?;
+    let body: Value = serde_json::from_slice(&bytes)
+        .map_err(|_| std::io::Error::other("upstream JSON response is invalid"))?;
+    if status.is_success()
+        && let Some(accounting) = accounting
+    {
+        accounting
+            .usage
+            .merge(crate::operations::pricing::Usage::parse_for(&body, true));
+    }
     if !status.is_success() {
-        anyhow::bail!("Anthropic returned {status}: {body}");
+        return Err(AnthropicHttpError {
+            status,
+            body: body.to_string(),
+        }
+        .into());
     }
     let content = body
         .get("content")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    if content.iter().any(|block| {
+        !matches!(
+            block.get("type").and_then(Value::as_str),
+            Some("text" | "tool_use")
+        )
+    }) {
+        anyhow::bail!("unsupported Anthropic response content block");
+    }
+    for block in &content {
+        crate::providers::ensure_fields(
+            block,
+            if block["type"] == "text" {
+                &["type", "text"]
+            } else {
+                &["type", "id", "name", "input"]
+            },
+        )?;
+    }
     let text = content
         .iter()
         .filter_map(|block| {
@@ -989,14 +942,9 @@ async fn call_anthropic_chat(
     if !tool_calls.is_empty() {
         message["tool_calls"] = Value::Array(tool_calls);
     }
-    let input_tokens = body
-        .pointer("/usage/input_tokens")
-        .and_then(Value::as_i64)
-        .unwrap_or(0);
-    let output_tokens = body
-        .pointer("/usage/output_tokens")
-        .and_then(Value::as_i64)
-        .unwrap_or(0);
+    let canonical_usage = crate::operations::pricing::Usage::parse_for(&body, true);
+    let input_tokens = canonical_usage.input;
+    let output_tokens = canonical_usage.output;
     Ok(json!({
         "id": body.get("id").cloned().unwrap_or_else(|| Value::String(format!("chatcmpl_{}", Uuid::new_v4().simple()))),
         "object": "chat.completion",
@@ -1014,92 +962,20 @@ async fn call_anthropic_chat(
         "usage": {
             "prompt_tokens": input_tokens,
             "completion_tokens": output_tokens,
-            "total_tokens": input_tokens + output_tokens
+            "total_tokens": input_tokens + output_tokens,
+            "prompt_tokens_details":{"cached_tokens":body.pointer("/usage/cache_read_input_tokens").and_then(Value::as_i64).unwrap_or(0),"cache_creation_tokens":body.pointer("/usage/cache_creation_input_tokens").and_then(Value::as_i64).unwrap_or(0)}
         }
     }))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn build_event(
-    request_id: &str,
-    trace_id: &str,
-    started_at: i64,
-    latency_ms: i64,
-    endpoint: &str,
-    api_key_id: &str,
-    provider: &str,
-    requested_model: &str,
-    resolved_model: &str,
-    status_code: i32,
-    error_kind: Option<String>,
-    request: &Value,
-    response: Option<&Value>,
-    captured_request: Option<String>,
-    capture: bool,
-    input_price: i64,
-    output_price: i64,
-) -> RequestEvent {
-    let (input_tokens, output_tokens, cached_tokens) = usage(response);
-    let cost_micros = input_tokens
-        .saturating_mul(input_price)
-        .saturating_add(output_tokens.saturating_mul(output_price))
-        / 1_000_000;
-    RequestEvent {
-        request_id: request_id.into(),
-        trace_id: trace_id.into(),
-        started_at,
-        finished_at: db::now(),
-        endpoint: endpoint.into(),
-        api_key_id: Some(api_key_id.into()),
-        provider: Some(provider.into()),
-        requested_model: Some(requested_model.into()),
-        resolved_model: Some(resolved_model.into()),
-        status_code,
-        error_kind,
-        latency_ms,
-        ttft_ms: None,
-        input_tokens,
-        output_tokens,
-        cached_tokens,
-        cost_micros,
-        payload_captured: capture,
-        request_json: captured_request
-            .or_else(|| capture.then(|| redact_json(request.clone()).to_string())),
-        response_json: capture
-            .then(|| response.map(|value| redact_json(value.clone()).to_string()))
-            .flatten(),
-    }
+#[derive(Debug, thiserror::Error)]
+#[error("Anthropic request failed with HTTP {status}")]
+struct AnthropicHttpError {
+    status: StatusCode,
+    body: String,
 }
 
-fn usage(response: Option<&Value>) -> (i64, i64, i64) {
-    let usage = response.and_then(|value| value.get("usage"));
-    let input = usage
-        .and_then(|value| {
-            value
-                .get("prompt_tokens")
-                .or_else(|| value.get("input_tokens"))
-        })
-        .and_then(Value::as_i64)
-        .unwrap_or(0);
-    let output = usage
-        .and_then(|value| {
-            value
-                .get("completion_tokens")
-                .or_else(|| value.get("output_tokens"))
-        })
-        .and_then(Value::as_i64)
-        .unwrap_or(0);
-    let cached = usage
-        .and_then(|value| {
-            value
-                .pointer("/prompt_tokens_details/cached_tokens")
-                .or_else(|| value.get("cache_read_input_tokens"))
-        })
-        .and_then(Value::as_i64)
-        .unwrap_or(0);
-    (input, output, cached)
-}
-
+#[cfg(test)]
 fn redact_json(mut value: Value) -> Value {
     match &mut value {
         Value::Object(object) => {
@@ -1122,10 +998,6 @@ fn redact_json(mut value: Value) -> Value {
         _ => {}
     }
     value
-}
-
-fn body_from_json(value: &Value) -> Result<Vec<u8>, ApiError> {
-    serde_json::to_vec(value).map_err(|error| ApiError::Internal(error.into()))
 }
 
 fn upstream_url(base: &str, endpoint: &str) -> String {
@@ -1153,6 +1025,30 @@ async fn require_user(state: &AppState, headers: &HeaderMap) -> Result<User, Api
     optional_user(state, headers)
         .await?
         .ok_or(ApiError::Unauthorized)
+}
+
+async fn require_user_permission(
+    state: &AppState,
+    headers: &HeaderMap,
+    permission: &str,
+) -> Result<User, ApiError> {
+    let user = require_user(state, headers).await?;
+    crate::access::authorize(
+        &state.db,
+        &crate::access::Principal::session(user.id.clone()),
+        Some(db::DEFAULT_PROJECT_ID),
+        permission,
+    )
+    .await
+    .map_err(|error| match error {
+        crate::access::AccessError::Forbidden => ApiError::Forbidden,
+        crate::access::AccessError::Unauthorized => ApiError::Unauthorized,
+        crate::access::AccessError::NotFound => ApiError::NotFound,
+        crate::access::AccessError::Invalid(message) => ApiError::BadRequest(message),
+        crate::access::AccessError::Conflict(message) => ApiError::Conflict(message),
+        crate::access::AccessError::Internal(error) => ApiError::Internal(error),
+    })?;
+    Ok(user)
 }
 
 async fn optional_user(state: &AppState, headers: &HeaderMap) -> Result<Option<User>, ApiError> {
@@ -1186,10 +1082,14 @@ async fn gateway_key(
                 .and_then(|value| value.to_str().ok())
         })
         .ok_or(ApiError::Unauthorized)?;
-    let credential = db::authenticate_api_key(&state.db, token)
+    let credential = db::authenticate_api_key(&state.db, token, trusted_client_ip(headers))
         .await?
         .ok_or(ApiError::Unauthorized)?;
-    if !credential.scopes.contains("gateway") {
+    let scopes = serde_json::from_str::<Vec<String>>(&credential.scopes).unwrap_or_default();
+    if !scopes
+        .iter()
+        .any(|scope| matches!(scope.as_str(), "gateway" | "gateway:use" | "*"))
+    {
         return Err(ApiError::Unauthorized);
     }
     Ok(credential)
@@ -1218,6 +1118,75 @@ mod tests {
         let redacted = redact_json(json!({"password":"secret","nested":{"api_key":"sk-test"}}));
         assert_eq!(redacted["password"], "[REDACTED]");
         assert_eq!(redacted["nested"]["api_key"], "[REDACTED]");
+    }
+
+    #[tokio::test]
+    async fn local_password_login_remains_compatible() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = db::connect("sqlite::memory:").await.unwrap();
+        db::create_initial_admin(
+            &database,
+            &SetupRequest {
+                email: "admin@example.com".into(),
+                password: "a secure password".into(),
+                instance_name: None,
+                language: None,
+            },
+        )
+        .await
+        .unwrap();
+        let secrets = SecretBox::load(directory.path(), None).unwrap();
+        let observations =
+            ObservationStore::open(directory.path().join("login-events.duckdb"), 30).unwrap();
+        let app = router(AppState {
+            db: database,
+            config: Arc::new(Config {
+                bind: "127.0.0.1:0".parse().unwrap(),
+                data_dir: directory.path().into(),
+                database_url: "sqlite::memory:".into(),
+                observation_path: directory.path().join("login-events.duckdb"),
+                observation_retention_days: 30,
+                public_url: None,
+                session_secure: false,
+                capture_payloads: false,
+                upstream_timeout: std::time::Duration::from_secs(30),
+                admin_email: None,
+                admin_password: None,
+                master_key: None,
+            }),
+            secrets,
+            observations,
+            client: reqwest::Client::new(),
+            oidc_client: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap(),
+            budget_locks: Arc::new(Mutex::new(HashMap::new())),
+            maintenance: Arc::new(tokio::sync::RwLock::new(())),
+            orchestrator: Arc::new(crate::orchestration::Runtime::default()),
+        });
+        let response = app
+            .oneshot(
+                Request::post("/api/v1/auth/login")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({"email":"ADMIN@example.com","password":"a secure password"})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(cookie.starts_with("pangolin_session=ps_"));
+        assert!(cookie.contains("HttpOnly"));
+        assert!(cookie.contains("SameSite=Strict"));
     }
 
     #[tokio::test]
@@ -1284,6 +1253,7 @@ mod tests {
             &ApiKeyInput {
                 name: "test".into(),
                 budget_micros: None,
+                ..Default::default()
             },
         )
         .await
@@ -1309,7 +1279,13 @@ mod tests {
             secrets,
             observations: observations.clone(),
             client: reqwest::Client::new(),
+            oidc_client: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap(),
             budget_locks: Arc::new(Mutex::new(HashMap::new())),
+            maintenance: Arc::new(tokio::sync::RwLock::new(())),
+            orchestrator: Arc::new(crate::orchestration::Runtime::default()),
         });
         let response = app
             .clone()
@@ -1339,8 +1315,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(models_response.status(), StatusCode::OK);
+        assert!(models_response.headers().contains_key("x-trace-id"));
         observations.flush().await;
-        assert_eq!(observations.summary().await.unwrap().requests, 1);
+        assert_eq!(observations.summary().await.unwrap().requests, 2);
         server.abort();
     }
 
@@ -1367,7 +1344,6 @@ mod tests {
         let target = crate::models::RouteTarget {
             public_name: "assistant".into(),
             upstream_name: "claude-test".into(),
-            capabilities: "[\"chat\"]".into(),
             provider_name: "Anthropic".into(),
             provider_kind: "anthropic".into(),
             base_url: format!("http://{address}/v1"),
@@ -1390,6 +1366,9 @@ mod tests {
                 "tools": [{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}]
             }),
             "test-key",
+            &HeaderMap::new(),
+            "/v1/messages",
+            None,
         )
         .await
         .unwrap();
