@@ -19,8 +19,10 @@ function webBuild() {
       return ''
     }
   }
-  const revision = git(['rev-parse', '--short=12', 'HEAD']) || 'unknown'
-  const dirty = git(['status', '--porcelain', '--untracked-files=no']) !== ''
+  // Container builds have no `.git`, so the image build injects the revision.
+  const injected = (process.env.PANGOLIN_WEB_COMMIT ?? '').trim()
+  const revision = injected || git(['rev-parse', '--short=12', 'HEAD']) || 'unknown'
+  const dirty = !injected && git(['status', '--porcelain', '--untracked-files=no']) !== ''
   return {
     version,
     commit: dirty ? `${revision}-dirty` : revision,
