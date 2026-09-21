@@ -175,7 +175,7 @@ function CatalogModelsMobile() {
         <Title order={1}>{t('catalog')}</Title>
         <Text size="md" c="dimmed">{t('catalogDescription')}</Text>
       </Stack>
-      {(total > 0 || filter) && <TextInput leftSection={<Search size={17} />} placeholder={t('search')} aria-label={t('search')} value={filter} onChange={(event) => { setFilter(event.currentTarget.value); setOffset(0) }} className="search-control" style={{ marginTop: 12 }} />}
+      {(total > 0 || filter) && <TextInput leftSection={<Search size={17} />} placeholder={t('search')} aria-label={t('search')} value={filter} onChange={(event) => { setFilter(event.currentTarget.value); setOffset(0) }} w={{ base: '100%', sm: 360 }} style={{ marginTop: 12 }} />}
       {query.isError ? <QueryError retry={() => void query.refetch()} /> : query.isLoading ? <SkeletonRows /> : rows.length === 0 ? <EmptyState icon={<Inbox />} title={t('catalog')} copy={filter ? t('noSearchResults') : t('catalogEmpty')} /> : (
         <>
           <Text size="md" c="dimmed" style={{ marginBottom: 16 }}>{t('catalogResultCount', { count: total })}</Text>
