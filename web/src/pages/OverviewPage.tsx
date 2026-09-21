@@ -31,7 +31,7 @@ export default function OverviewPage() {
   const tokens = value ? (value.input_tokens || 0) + (value.output_tokens || 0) : 0
   const failed = value && value.error_rate != null ? Math.round(value.requests * value.error_rate) : null
   return <><PageHeader title={t('overview')} description={t('last24h')} />
-    <SimpleGrid cols={{ base: 1, xs: 2, md: 4 }} mb="lg" aria-label={t('last24h')}>
+    <SimpleGrid cols={{ base: 1, xs: 2, md: 4 }} mb="lg" role="group" aria-label={t('last24h')}>
       <Stat icon={<Activity />} label={t('totalRequests')} value={value ? formatNumber(value.requests) : '—'} sub={value && tokens > 0 ? `${formatNumber(tokens)} ${t('tokens')}` : undefined} />
       <Stat icon={<ShieldCheck />} label={t('errorRate')} value={value && value.requests > 0 && value.error_rate != null ? <>{(value.error_rate * 100).toFixed(1)}<Text component="span" fz=".62em" fw={500} c="dimmed">%</Text></> : '—'} sub={failed != null && value!.requests > 0 ? t('failedRequests', { count: failed }) : undefined} tone={value?.error_rate != null && value.error_rate > .05 ? 'danger' : undefined} />
       <Stat icon={<Clock3 />} label={t('p95Latency')} value={value && value.requests > 0 && value.p95_latency_ms != null ? <>{Math.round(value.p95_latency_ms)}<Text component="span" fz=".62em" fw={500} c="dimmed"> ms</Text></> : '—'} />

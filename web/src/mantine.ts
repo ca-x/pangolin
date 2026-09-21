@@ -132,7 +132,26 @@ export function buildTheme(skinId: string, paletteId: string, mode: Mode): Manti
     focusRing: skin.id === 'accessible' ? 'always' : 'auto',
     cursorType: 'pointer',
     components: {
-      Button: { defaultProps: { radius: 'md', className: controlClass } },
+      Button: {
+        defaultProps: {
+          radius: 'md',
+          className: ['pm-button', controlClass].filter(Boolean).join(' '),
+        },
+        // Mantine resolves the filled label from `theme.white` and writes it as an
+        // inline custom property, so no stylesheet rule can reach it. Theme vars
+        // are merged after the component's own resolver, which makes this the one
+        // channel that wins. Measured before it: #fff on the bronze accent was
+        // 2.61:1, below WCAG AA.
+        //
+        // Only the filled variant may be touched: every other variant draws its
+        // text from `--button-color` too, and forcing the accent contrast on them
+        // put dark ink on a dark surface (measured 1.05:1). Mantine calls this
+        // with the resolved props, so the variant is known here.
+        vars: (_theme: unknown, props: { variant?: string }) =>
+          (props.variant ?? 'filled') === 'filled'
+            ? { root: { '--button-color': 'var(--accent-contrast)' } }
+            : {},
+      },
       ActionIcon: { defaultProps: { radius: 'md', className: controlClass } },
       TextInput: { defaultProps: { radius: 'md', className: controlClass } },
       NumberInput: { defaultProps: { radius: 'md', className: controlClass } },

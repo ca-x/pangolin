@@ -55,6 +55,8 @@ export default function AccessPage() {
 
 type ScopedKey = { id: string; name: string; key_prefix: string; budget_micros: number | null; enabled: boolean; key_type: string; profile_id: string | null; expires_at: number | null; allowed_ips_json: string; denied_ips_json: string }
 
+const keysPath = (projectId: string) => `/api/admin/v1/projects/${projectId}/api-keys`
+
 function KeysPanel() {
   const { t } = useTranslation()
   const { project } = useProject()
@@ -67,7 +69,7 @@ function KeysPanel() {
   // Profiles belong to a project, so drop the selection when the project changes.
   useEffect(() => { setProfile('__none__'); setEditProfile('__none__') }, [project.id])
   const [editProfile, setEditProfile] = useState('__none__')
-  const path = `/api/admin/v1/projects/${project.id}/api-keys`
+  const path = keysPath(project.id)
   const query = useQuery({ queryKey: ['keys', project.id], queryFn: () => api<ScopedKey[]>(path) })
   const profiles = useQuery({ queryKey: ['profile-options', project.id], queryFn: () => api<{ data: Array<{ id: string; name: string }> }>(`/api/admin/v1/projects/${project.id}/operations/key-profiles?limit=500`) })
   const profileOptions = [{ value: '__none__', label: t('noProfile') }, ...(profiles.data?.data || []).map((profile) => ({ value: profile.id, label: profile.name }))]
@@ -78,8 +80,10 @@ function KeysPanel() {
   const submitEdit = (event: FormEvent<HTMLFormElement>) => { event.preventDefault(); if (!editing) return; const data = new FormData(event.currentTarget); update.mutate({ id: editing.id, body: { name: data.get('name'), profile_id: data.get('profile_id') === '__none__' ? null : data.get('profile_id') || null, budget_micros: data.get('budget_micros') ? Number(data.get('budget_micros')) : null, expires_at: data.get('expires_at') ? Number(data.get('expires_at')) : null, allowed_ips: String(data.get('allowed_ips') || '').split(',').map((v) => v.trim()).filter(Boolean), denied_ips: String(data.get('denied_ips') || '').split(',').map((v) => v.trim()).filter(Boolean) } }); setEditing(null); setEditProfile('__none__') }
   return (
     <>
-      <PageHeader title={t('keys')} description={t('keysDescription')} action={<Button leftSection={<Plus size={17} />} onClick={() => setOpen(true)}>{t('addKey')}</Button>} />
-      {query.isError ? <QueryError retry={() => void query.refetch()} /> : query.isLoading ? <SkeletonRows /> : !query.data?.length ? <EmptyState icon={<KeyRound />} title={t('keys')} copy={t('keyEmpty')} action={<Button variant="default" onClick={() => setOpen(true)}>{t('addKey')}</Button>} /> : (
+      {/* One solid primary per page: with no keys the empty state below owns the
+          call to action, so the header only carries a button once a key exists. */}
+      <PageHeader title={t('keys')} description={t('keysDescription')} action={query.data?.length ? <Button leftSection={<Plus size={17} />} onClick={() => setOpen(true)}>{t('addKey')}</Button> : undefined} />
+      {query.isError ? <QueryError retry={() => void query.refetch()} /> : query.isLoading ? <SkeletonRows /> : !query.data?.length ? <EmptyState icon={<KeyRound />} title={t('keys')} copy={t('keyEmpty')} action={<Button onClick={() => setOpen(true)}>{t('addKey')}</Button>} /> : (
         <TableScrollContainer minWidth={700}>
           <Table stickyHeader highlightOnHover>
             <Table.Thead>
@@ -179,8 +183,14 @@ function KeyLoggingForm() {
   const { t } = useTranslation()
   const { project } = useProject()
   const [level, setLevel] = useState('inherit')
+  // Same query key as the key table above, so this observes the cached list
+  // instead of issuing a second request.
+  const keys = useQuery({ queryKey: ['keys', project.id], queryFn: () => api<ScopedKey[]>(keysPath(project.id)) })
   const save = useMutation({ mutationFn: (body: unknown) => api(`/api/admin/v1/projects/${project.id}/operations/key-logging`, { method: 'POST', body: JSON.stringify(body) }), onSuccess: () => toast.success(t('saved')), onError: (error: Error) => toast.error(error.message) })
   const submit = (event: FormEvent<HTMLFormElement>) => { event.preventDefault(); save.mutate({ api_key_id: new FormData(event.currentTarget).get('api_key_id'), level }) }
+  // Per-key logging has nothing to configure while the project has no keys, and
+  // an errored key list already surfaces its own retry above.
+  if (!keys.data?.length) return null
   return (
     <Accordion mt="md" variant="contained">
       <Accordion.Item value="key-logging">

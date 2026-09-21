@@ -1,11 +1,12 @@
-import { ActionIcon, Button, Checkbox, Collapse, Group, NumberInput, Paper, Select, Stack, Table, TableScrollContainer, Tabs, Text, Textarea, TextInput, Title, UnstyledButton } from '@mantine/core'
+import { ActionIcon, Button, Checkbox, Collapse, Group, NumberInput, Pagination, Paper, Select, Stack, Table, TableScrollContainer, Tabs, Text, Textarea, TextInput, Title, UnstyledButton } from '@mantine/core'
+import { useMediaQuery } from '@mantine/hooks'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Download, Plus, RefreshCw, RotateCcw, Trash2, Upload } from 'lucide-react'
+import { Copy, Download, Inbox, Plus, RefreshCw, RotateCcw, Search, Trash2, Upload } from 'lucide-react'
 import { useEffect, useState, type FormEvent } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 import { api, type Document, type Paged } from '../api'
-import { CapabilityTags, EnabledPill, Modal, SelectField, SkeletonRows } from '../components'
+import { CapabilityTags, EmptyState, EnabledPill, Modal, SelectField, SkeletonRows } from '../components'
 import { useProject } from '../project'
 import { PageHeader, QueryError, ResourcePage, displayValue, formatDate } from './shared'
 
@@ -23,7 +24,7 @@ export default function ModelsPage() {
       <Tabs.Panel value="models"><ModelsPanel /></Tabs.Panel>
       <Tabs.Panel value="routing"><RoutingEditor /><RoutingPreview /></Tabs.Panel>
       <Tabs.Panel value="prices"><PricesPanel /></Tabs.Panel>
-      <Tabs.Panel value="catalog"><CatalogMaintenance /><CatalogOverrideEditor /><ResourcePage resource="catalog-models" endpoint="/api/admin/v1/catalog/models" title={t('catalog')} description={t('catalogDescription')} empty={t('catalogEmpty')} immutable columns={[{ key: 'id', label: t('modelId'), mono: true }, { key: 'name', label: t('name'), mono: true }, { key: 'type', label: t('type') }, { key: 'capabilities', label: t('capabilities'), render: (value) => <CapabilityTags value={value} /> }, { key: 'provider_id', label: t('provider') }]} /></Tabs.Panel>
+      <Tabs.Panel value="catalog"><CatalogPanel /></Tabs.Panel>
       <Tabs.Panel value="subscriptions"><CatalogSubscriptions /></Tabs.Panel>
     </Tabs>
   )
@@ -110,6 +111,113 @@ function RoutingPreview() {
   )
 }
 
+/**
+ * Matches the width where `styles.css` hides `.desktop-resource-table`, so the
+ * catalog list swaps at the same point as every other resource page.
+ */
+const MOBILE_VIEWPORT = '(max-width: 900px)'
+/** Outer gap between the catalog tab's groups. Everything inside a group stays
+ *  on a ≤16px ladder, so grouping never rests on adjacent borders (audit P2-7). */
+const CATALOG_GROUP_GAP = 24
+/** Mobile page size. Desktop keeps the shared 25-row default. */
+const CATALOG_MOBILE_PAGE_SIZE = 10
+
+/** Capability names as text: at 375px every pill truncated (audit P2-5). */
+function capabilityNames(value: unknown): string[] {
+  if (Array.isArray(value)) return value.map(String).filter(Boolean)
+  if (value && typeof value === 'object') return Object.entries(value as Record<string, unknown>).filter(([, enabled]) => enabled === true).map(([name]) => name)
+  return typeof value === 'string' && value.trim() ? value.split(',').map((item) => item.trim()).filter(Boolean) : []
+}
+
+/**
+ * The catalog tab stacks three independent groups — import/export, local
+ * overrides and the model list — so it owns the 24px outer gap between them.
+ * Below the shared table breakpoint the list is a compact 10-row mobile list
+ * instead of `ResourcePage`'s 25-row cards (audit P2-6).
+ */
+function CatalogPanel() {
+  const { t } = useTranslation()
+  const mobile = useMediaQuery(MOBILE_VIEWPORT, undefined, { getInitialValueInEffect: false })
+  return (
+    <Stack gap={CATALOG_GROUP_GAP}>
+      <CatalogMaintenance />
+      <CatalogOverrideEditor />
+      {mobile
+        ? <CatalogModelsMobile />
+        : <ResourcePage resource="catalog-models" endpoint="/api/admin/v1/catalog/models" title={t('catalog')} description={t('catalogDescription')} empty={t('catalogEmpty')} immutable columns={[{ key: 'id', label: t('modelId'), mono: true }, { key: 'name', label: t('name'), mono: true }, { key: 'type', label: t('type') }, { key: 'capabilities', label: t('capabilities'), render: (value) => <CapabilityTags value={value} /> }, { key: 'provider_id', label: t('provider') }]} />}
+    </Stack>
+  )
+}
+
+/**
+ * Mobile catalog list. Title/description/search/result count sit on an
+ * 8/12/16px ladder (the shared `h1` rule adds 6px under the title, so the
+ * rendered title-to-description gap is 14px), each card is a two-line summary,
+ * and the result count is repeated above the list so the page size is knowable
+ * without scrolling.
+ */
+function CatalogModelsMobile() {
+  const { t } = useTranslation()
+  const { project } = useProject()
+  const [offset, setOffset] = useState(0)
+  const [filter, setFilter] = useState('')
+  const [pageSize, setPageSize] = useState(CATALOG_MOBILE_PAGE_SIZE)
+  const path = `/api/admin/v1/catalog/models?offset=${offset}&limit=${pageSize}${filter.trim() ? `&q=${encodeURIComponent(filter.trim())}` : ''}`
+  const query = useQuery({ queryKey: ['resource', project.id, 'catalog-models', path], queryFn: () => api<Paged<Document>>(path) })
+  const rows = query.data?.data || []
+  const total = query.data?.total ?? rows.length
+  const totalPages = Math.max(1, Math.ceil(total / pageSize))
+  const currentPage = Math.floor(offset / pageSize) + 1
+  const changePageSize = (value: string | null) => { if (value) { setPageSize(Number(value)); setOffset(0) } }
+  return (
+    <div>
+      <Stack gap={8}>
+        <Title order={1}>{t('catalog')}</Title>
+        <Text size="md" c="dimmed">{t('catalogDescription')}</Text>
+      </Stack>
+      {(total > 0 || filter) && <TextInput leftSection={<Search size={17} />} placeholder={t('search')} aria-label={t('search')} value={filter} onChange={(event) => { setFilter(event.currentTarget.value); setOffset(0) }} className="search-control" style={{ marginTop: 12 }} />}
+      {query.isError ? <QueryError retry={() => void query.refetch()} /> : query.isLoading ? <SkeletonRows /> : rows.length === 0 ? <EmptyState icon={<Inbox />} title={t('catalog')} copy={filter ? t('noSearchResults') : t('catalogEmpty')} /> : (
+        <>
+          <Text size="md" c="dimmed" style={{ marginBottom: 16 }}>{t('catalogResultCount', { count: total })}</Text>
+          <Stack gap={8}>{rows.map((row) => <CatalogModelCard key={row.id} row={row} />)}</Stack>
+        </>
+      )}
+      {total > pageSize && (
+        <Group justify="flex-end" gap="sm" mt={16} className="pagination">
+          <Pagination total={totalPages} value={currentPage} onChange={(page) => setOffset((page - 1) * pageSize)} getControlProps={(control) => {
+            if (control === 'previous') return { 'aria-label': t('previous') }
+            if (control === 'next') return { 'aria-label': t('next') }
+            return {}
+          }} />
+          <Text size="sm" c="dimmed">{offset + 1}–{Math.min(offset + pageSize, total)} / {total}</Text>
+          <Select aria-label={t('pageSize')} data={['10', '25', '50']} value={String(pageSize)} onChange={changePageSize} size="sm" style={{ width: 80 }} />
+        </Group>
+      )}
+    </div>
+  )
+}
+
+/** One catalog model as a two-line summary: name, then type and key capabilities. */
+function CatalogModelCard({ row }: { row: Document }) {
+  const { t } = useTranslation()
+  const name = displayValue(row.name)
+  const names = capabilityNames(row.capabilities)
+  const shown = names.slice(0, 2)
+  const extra = names.length - shown.length
+  const summary = [displayValue(row.type), ...shown, ...(extra > 0 ? [t('moreCapabilities', { count: extra })] : [])].join(' · ')
+  return (
+    <Paper p="md" withBorder>
+      <Group justify="space-between" align="flex-start" gap="xs" wrap="nowrap">
+        <Stack gap={4} style={{ flex: 1, minWidth: 0 }}>
+          <Text fw={600} size="md" style={{ overflowWrap: 'anywhere' }}>{name}</Text>
+          <Text size="md" c="dimmed" style={{ overflowWrap: 'anywhere' }}>{summary}</Text>
+        </Stack>
+        <ActionIcon variant="subtle" color="gray" aria-label={`${t('copyId')} ${name}`} onClick={() => void navigator.clipboard?.writeText(String(row.id))}><Copy size={16} /></ActionIcon>
+      </Group>
+    </Paper>
+  )
+}
+
 function CatalogMaintenance() {
   const { t } = useTranslation()
   const client = useQueryClient()
@@ -151,7 +259,7 @@ function CatalogOverrideEditor() {
   const mutate = useMutation({ mutationFn: ({ id, document, remove }: { id: string; document?: unknown; remove?: boolean }) => api(`/api/admin/v1/catalog/overrides/${kind}/${encodeURIComponent(id)}`, { method: remove ? 'DELETE' : 'PUT', body: remove ? undefined : JSON.stringify(document) }), onSuccess: () => toast.success(t('saved')), onError: (error: Error) => toast.error(error.message) })
   const submit = (event: FormEvent<HTMLFormElement>) => { event.preventDefault(); const data = new FormData(event.currentTarget); try { const id = String(data.get('id')); const document = JSON.parse(String(data.get('document'))); mutate.mutate({ id, document: { ...document, id } }) } catch { toast.error(t('invalidJson')) } }
   return (
-    <Paper p="md" withBorder mt="lg">
+    <Paper p="md" withBorder>
       <UnstyledButton onClick={() => setOpen(!open)} w="100%" aria-expanded={open}>
         <Group justify="space-between">
           <Text fw={600}>{t('localOverrides')}</Text>

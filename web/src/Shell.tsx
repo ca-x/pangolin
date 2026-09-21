@@ -13,6 +13,8 @@ export default function Shell({ user, branding }: { user: User; branding: Brandi
 
 function ShellContent({ user, branding }: { user: User; branding: Branding }) {
   const { t } = useTranslation()
+  const route = useLocation()
+  const isOverview = route.pathname === '/'
   const { project, projects, permissions, setProjectId } = useProject()
   const navigate = useNavigate()
   const [mobileOpen, { toggle: toggleMobile, close: closeMobile }] = useDisclosure(false)
@@ -52,25 +54,17 @@ function ShellContent({ user, branding }: { user: User; branding: Branding }) {
       <AppShell.Header hiddenFrom="md" px="sm">
         <Group justify="space-between" h="100%">
           <Brand compact name={branding.branding_name} />
-          <Burger opened={mobileOpen} onClick={toggleMobile} aria-label={t('menu')} size="sm" />
+          <Burger opened={mobileOpen} onClick={toggleMobile} aria-label={t('menu')} aria-expanded={mobileOpen} size="sm" />
         </Group>
       </AppShell.Header>
 
       {/* Sidebar (desktop: floating panel; mobile: Drawer via AppShell) */}
-      <AppShell.Navbar
-        p="md"
-        style={{
-          margin: 'var(--mantine-spacing-xs)',
-          marginInlineEnd: 0,
-          borderRadius: 'var(--mantine-radius-xl)',
-          border: '1px solid var(--mantine-color-default-border)',
-          boxShadow: 'var(--mantine-shadow-md)',
-        }}
-      >
-        {/* Desktop brand + mobile drawer close */}
-        <Group justify="space-between" mb="md" mt={2} mx={6}>
+      <AppShell.Navbar p="md" className="pm-shell-navbar" data-open={mobileOpen ? 'true' : 'false'}>
+        {/* Desktop brand. On mobile the drawer opens below the header, which
+            already carries the brand and the toggle, so repeating them here
+            would show two brand rows and two close buttons. */}
+        <Group justify="space-between" mb="md" mt={2} mx={6} visibleFrom="md">
           <Brand name={branding.branding_name} />
-          <Burger opened={mobileOpen} onClick={toggleMobile} hiddenFrom="md" size="sm" aria-label={t('close')} />
         </Group>
 
         {/* Project switcher */}
@@ -124,13 +118,23 @@ function ShellContent({ user, branding }: { user: User; branding: Branding }) {
 
       {/* Main content */}
       <AppShell.Main id="main-content">
+        {/* Onboarding competes with the page's own primary action on every
+            screen, so it only takes the full width on the overview. Elsewhere it
+            drops its title and demotes its action to a text button, which keeps
+            one solid primary per resource page. */}
         {!branding.onboarding_complete && (
-          <Alert variant="light" color="pangolin" mb="lg" title={t('onboardingTitle')} radius="md">
-            <Group justify="space-between" align="center" gap="md">
+          <Alert variant="light" color="pangolin" mb="lg" radius="md" className="pm-onboarding" title={isOverview ? t('onboardingTitle') : undefined}>
+            <Group justify="space-between" align="center" gap="md" wrap="nowrap">
               <Text size="sm">{t('onboardingHint')}</Text>
-              <Button component="a" href="/channels" variant="light" size="sm">
-                {t('configureChannel')}
-              </Button>
+              {isOverview ? (
+                <Button component={RouterLink} to="/channels" variant="light" size="sm">
+                  {t('configureChannel')}
+                </Button>
+              ) : (
+                <Button component={RouterLink} to="/channels" variant="subtle" size="compact-sm">
+                  {t('configureChannel')}
+                </Button>
+              )}
             </Group>
           </Alert>
         )}

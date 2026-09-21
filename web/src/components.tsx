@@ -89,10 +89,13 @@ export function CapabilityTags({ value, max = 3 }: { value: unknown; max?: numbe
       : typeof value === 'string' && value.trim() ? value.split(',').map((item) => item.trim()).filter(Boolean) : []
   if (!list.length) return <>—</>
   const shown = list.slice(0, max)
+  // Mantine's smallest badge is 9px, upper-cased and ellipsised, which turned
+  // every capability into a clipped pill. These are reference values, so they
+  // read as text: 12.5px, sentence case, never truncated mid-word.
   return (
-    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-      {shown.map((item) => <Badge key={item} variant="default" size="xs">{item}</Badge>)}
-      {list.length > shown.length && <Badge variant="transparent" size="xs" c="dimmed">+{list.length - shown.length}</Badge>}
+    <span className="pm-capabilities">
+      {shown.map((item) => <span key={item} className="pm-capability">{item}</span>)}
+      {list.length > shown.length && <span className="pm-capability pm-capability-more">+{list.length - shown.length}</span>}
     </span>
   )
 }

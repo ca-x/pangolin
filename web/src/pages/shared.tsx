@@ -1,7 +1,7 @@
-import { ActionIcon, Alert, Button, Checkbox, Group, Modal, NumberInput, Pagination, Paper, PasswordInput, Select, Stack, Table, TableScrollContainer, Text, Textarea, TextInput, Title, Tooltip } from '@mantine/core'
+import { ActionIcon, Alert, Button, Collapse, Group, Modal, NumberInput, Pagination, Paper, PasswordInput, Select, Stack, Switch, Table, TableScrollContainer, Text, Textarea, TextInput, Title, Tooltip } from '@mantine/core'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { createColumnHelper, flexRender, getCoreRowModel, getFilteredRowModel, useReactTable } from '@tanstack/react-table'
-import { AlertTriangle, Copy, Inbox, Plus, Search, Trash2 } from 'lucide-react'
+import { AlertTriangle, ChevronRight, Copy, Inbox, Plus, Search, Trash2 } from 'lucide-react'
 import { useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
@@ -124,15 +124,15 @@ export function ResourcePage({ resource, title, description, empty, columns, fie
   const beginCreate = (trigger: HTMLButtonElement) => { lastTrigger.current = trigger; setEditing(null); setOpen(true) }
   const handleClose = () => { setOpen(false); setEditing(null); requestAnimationFrame(() => lastTrigger.current?.focus()) }
   return <>
-    <PageHeader title={title} description={description} action={!immutable && fields.length ? <Button leftSection={<Plus size={17} />} onClick={(event) => beginCreate(event.currentTarget)}>{createLabel || t('add')}</Button> : undefined} />
+    <PageHeader title={title} description={description} action={!immutable && fields.length && (total > 0 || filter) ? <Button leftSection={<Plus size={17} />} onClick={(event) => beginCreate(event.currentTarget)}>{createLabel || t('add')}</Button> : undefined} />
     {(total > 0 || filter) && <TextInput leftSection={<Search size={17} />} placeholder={t('search')} value={filter} onChange={(event) => { setFilter(event.target.value); setOffset(0) }} aria-label={t('search')} mb="md" className="search-control" />}
-    {query.isError ? <QueryError retry={() => void query.refetch()} /> : query.isLoading ? <SkeletonRows /> : rows.length === 0 ? <EmptyState icon={<Inbox />} title={title} copy={filter ? t('noSearchResults') : empty} action={!filter && !immutable && fields.length ? <Button variant="default" onClick={(event) => beginCreate(event.currentTarget)}>{createLabel || t('add')}</Button> : undefined} /> : <><TableScrollContainer minWidth={700} className="desktop-resource-table" style={{ maxHeight: 'min(74vh, 900px)' }} role="region" aria-label={title} tabIndex={0}><Table stickyHeader highlightOnHover><Table.Thead>{table.getHeaderGroups().map((group) => <Table.Tr key={group.id}>{group.headers.map((header) => <Table.Th key={header.id}>{flexRender(header.column.columnDef.header, header.getContext())}</Table.Th>)}</Table.Tr>)}</Table.Thead><Table.Tbody>{table.getRowModel().rows.map((row) => <Table.Tr key={row.id}>{row.getVisibleCells().map((cell) => <Table.Td key={cell.id}>{flexRender(cell.column.columnDef.cell, cell.getContext())}</Table.Td>)}</Table.Tr>)}</Table.Tbody></Table></TableScrollContainer><MobileResources rows={rows} columns={columns} rowActions={rowActions} onEdit={!immutable && !appendOnly && fields.length ? (row, trigger) => { lastTrigger.current = trigger; setEditing(row); setOpen(true) } : undefined} editDisabled={editDisabled} onDelete={!immutable && !appendOnly ? (row) => confirm(t('deleteConfirm')) && remove.mutate(row.id) : undefined} canDelete={canDelete} /></>}
+    {query.isError ? <QueryError retry={() => void query.refetch()} /> : query.isLoading ? <SkeletonRows /> : rows.length === 0 ? <EmptyState icon={<Inbox />} title={title} copy={filter ? t('noSearchResults') : empty} action={!filter && !immutable && fields.length ? <Button onClick={(event) => beginCreate(event.currentTarget)}>{createLabel || t('add')}</Button> : undefined} /> : <><TableScrollContainer minWidth={700} className="desktop-resource-table" style={{ maxHeight: 'min(74vh, 900px)' }} role="region" aria-label={title} tabIndex={0}><Table stickyHeader highlightOnHover><Table.Thead>{table.getHeaderGroups().map((group) => <Table.Tr key={group.id}>{group.headers.map((header) => <Table.Th key={header.id}>{flexRender(header.column.columnDef.header, header.getContext())}</Table.Th>)}</Table.Tr>)}</Table.Thead><Table.Tbody>{table.getRowModel().rows.map((row) => <Table.Tr key={row.id}>{row.getVisibleCells().map((cell) => <Table.Td key={cell.id}>{flexRender(cell.column.columnDef.cell, cell.getContext())}</Table.Td>)}</Table.Tr>)}</Table.Tbody></Table></TableScrollContainer><MobileResources rows={rows} columns={columns} rowActions={rowActions} onEdit={!immutable && !appendOnly && fields.length ? (row, trigger) => { lastTrigger.current = trigger; setEditing(row); setOpen(true) } : undefined} editDisabled={editDisabled} onDelete={!immutable && !appendOnly ? (row) => confirm(t('deleteConfirm')) && remove.mutate(row.id) : undefined} canDelete={canDelete} /></>}
     {total > limit && <Group justify="flex-end" gap="sm" mt="md" className="pagination"><Pagination total={totalPages} value={currentPage} onChange={(page) => setOffset((page - 1) * limit)} getControlProps={(control) => {
       if (control === 'previous') return { 'aria-label': t('previous') }
       if (control === 'next') return { 'aria-label': t('next') }
       return {}
     }} /><Text size="sm" c="dimmed">{offset + 1}–{Math.min(offset + limit, total)} / {total}</Text><Select aria-label={t('pageSize')} data={['10', '25', '50']} value={String(limit)} onChange={(value) => { value && setLimit(Number(value)); setOffset(0) }} size="sm" style={{ width: 80 }} /></Group>}
-    <Modal opened={open} onClose={handleClose} title={editing ? `${t('edit')} ${title}` : createLabel || `${t('add')} ${title}`}>
+    <Modal opened={open} onClose={handleClose} title={editing ? `${t('edit')} ${title}` : createLabel || `${t('add')} ${title}`} closeButtonProps={{ 'aria-label': t('close') }}>
       <form onSubmit={submit}><Stack gap="md">{fields.map((field) => <ResourceField key={field.key} field={field} value={editing?.[field.sourceKey || field.key] ?? field.defaultValue} />)}<Group justify="flex-end" gap="xs" pt="xs"><Button variant="default" type="button" onClick={handleClose}>{t('cancel')}</Button><Button type="submit" loading={save.isPending}>{t('save')}</Button></Group></Stack></form>
     </Modal>
   </>
@@ -147,6 +147,7 @@ function MobileResources({ rows, columns, onEdit, onDelete, rowActions, editDisa
 }
 
 function ResourceField({ field, value }: { field: FormField; value: unknown }) {
+  const [advanced, setAdvanced] = useState(false)
   if (field.kind === 'select' && field.options) {
     return <Select
       name={field.key}
@@ -158,7 +159,7 @@ function ResourceField({ field, value }: { field: FormField; value: unknown }) {
     />
   }
   if (field.kind === 'checkbox') {
-    return <Checkbox
+    return <Switch
       name={field.key}
       label={field.label}
       description={field.hint}
@@ -185,16 +186,42 @@ function ResourceField({ field, value }: { field: FormField; value: unknown }) {
       required={field.required}
     />
   }
-  if (field.kind === 'textarea' || field.kind === 'json') {
-    const initial = field.kind === 'json' && typeof value === 'object' ? JSON.stringify(value, null, 2) : String(value ?? '')
+  if (field.kind === 'textarea') {
     return <Textarea
       name={field.key}
       label={field.label}
       description={field.hint}
-      defaultValue={initial}
+      defaultValue={String(value ?? '')}
       required={field.required}
-      rows={field.kind === 'json' ? 7 : 4}
+      rows={4}
     />
+  }
+  if (field.kind === 'json') {
+    const initial = typeof value === 'object' && value !== null ? JSON.stringify(value, null, 2) : String(value ?? '')
+    return <Stack gap="xs">
+      <Button
+        variant="subtle"
+        size="compact-sm"
+        justify="flex-start"
+        leftSection={<ChevronRight size={15} style={{ transform: advanced ? 'rotate(90deg)' : undefined, transition: 'transform 150ms' }} />}
+        onClick={() => setAdvanced((open) => !open)}
+        aria-expanded={advanced}
+      >
+        {field.label}
+      </Button>
+      <Collapse expanded={advanced} keepMounted>
+        <div inert={!advanced}>
+          <Textarea
+            name={field.key}
+            aria-label={field.label}
+            description={field.hint}
+            defaultValue={initial}
+            required={field.required}
+            rows={7}
+          />
+        </div>
+      </Collapse>
+    </Stack>
   }
   return <TextInput
     name={field.key}

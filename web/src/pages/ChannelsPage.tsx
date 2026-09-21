@@ -50,6 +50,15 @@ function useChannelOptions() {
   return { query, options: (query.data?.data || []).map((row) => ({ value: String(row.id), label: String(row.name) })) }
 }
 
+/** Row count for a resource-backed tab. The key reuses the
+ *  `['resource', projectId, resource]` prefix that ResourcePage invalidates
+ *  after every create and delete, so the count cannot go stale. */
+function useResourceTotal(resource: 'channels' | 'credentials') {
+  const { project } = useProject()
+  const query = useQuery({ queryKey: ['resource', project.id, resource], queryFn: () => api<Paged<Document>>(`${projectOperationPath(project.id, resource)}?limit=1`) })
+  return query.data?.total ?? query.data?.data?.length ?? 0
+}
+
 function CredentialsPanel() {
   const { t } = useTranslation()
   const { options } = useChannelOptions()
@@ -73,8 +82,12 @@ function BulkToggle({ resource = 'channels' }: { resource?: 'channels' | 'creden
   const { t } = useTranslation()
   const { project } = useProject()
   const client = useQueryClient()
+  const total = useResourceTotal(resource)
   const mutate = useMutation({ mutationFn: (body: unknown) => api(projectOperationPath(project.id, 'bulk-toggle'), { method: 'POST', body: JSON.stringify(body) }), onSuccess: () => { toast.success(t('saved')); void client.invalidateQueries({ queryKey: ['resource', project.id, resource] }) }, onError: (error: Error) => toast.error(error.message) })
   const submit = (event: FormEvent<HTMLFormElement>) => { event.preventDefault(); const data = new FormData(event.currentTarget); mutate.mutate({ resource, ids: String(data.get('ids')).split(',').map((id) => id.trim()).filter(Boolean), enabled: data.get('enabled') === 'true' }) }
+  // With no rows to act on the bulk form is dead weight next to the empty
+  // state's single call to action, so it only appears once a row exists.
+  if (!total) return null
   return (
     <Paper withBorder p="md" mt="md">
       <Title order={3} mb="md">{t('bulkActions')}</Title>
@@ -82,7 +95,9 @@ function BulkToggle({ resource = 'channels' }: { resource?: 'channels' | 'creden
         <Group gap="md" align="end" wrap="wrap">
           <TextInput name="ids" label={t('resourceIds')} placeholder="id-1, id-2" required style={{ minWidth: 260 }} />
           <Select name="enabled" label={t('action')} defaultValue="true" data={[{ value: 'true', label: t('enable') }, { value: 'false', label: t('disable') }]} />
-          <Button type="submit">{t('apply')}</Button>
+          {/* The page's primary action is creating a resource, so the bulk
+              panel submits through a secondary button. */}
+          <Button type="submit" variant="default">{t('apply')}</Button>
         </Group>
       </form>
     </Paper>

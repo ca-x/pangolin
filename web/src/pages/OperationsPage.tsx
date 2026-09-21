@@ -50,19 +50,28 @@ function RequestList() {
   const totalPages = Math.max(1, Math.ceil(total / limit))
   const currentPage = Math.floor(offset / limit) + 1
   const statusError = filters.status.trim() && !/^\d{3}$/.test(filters.status.trim()) ? t('statusCodeHint') : undefined
+  // Filters and live refresh cannot do anything before the first request lands,
+  // so an empty list keeps a single explanation instead of dead controls. A
+  // filter that matches nothing is a different state: the controls stay, so the
+  // user can see and undo what narrowed the result.
+  const filtered = Boolean(filters.status.trim() || filters.provider.trim() || filters.model.trim())
+  const showFilters = filtered || total > 0
+  // Never hide the control that undoes a pause, even once the list drains.
+  const showPause = paused || total > 0
+  const clearFilters = () => update({ status: '', provider: '', model: '' })
   return <>
     <PageHeader title={t('requests')} description={`${t('requestsDescription')} · ${query.dataUpdatedAt ? new Date(query.dataUpdatedAt).toLocaleTimeString() : '—'}`} />
-    <Card p="sm" mb="md">
-      <Group justify="space-between" align="flex-end" gap="md" wrap="wrap">
-        <SimpleGrid cols={{ base: 1, sm: 3 }} style={{ flex: '1 1 480px' }}>
+    {(showFilters || showPause) && <Card p="sm" mb="md">
+      <Group justify={showFilters ? 'space-between' : 'flex-end'} align="flex-end" gap="md" wrap="wrap">
+        {showFilters && <SimpleGrid cols={{ base: 1, sm: 3 }} style={{ flex: '1 1 480px' }}>
           <TextInput label={t('statusCode')} description={statusError} value={filters.status} onChange={e => update({ ...filters, status: e.target.value })} inputMode="numeric" maxLength={3} placeholder="200" />
           <TextInput label={t('provider')} value={filters.provider} onChange={e => update({ ...filters, provider: e.target.value })} />
           <TextInput label={t('model')} value={filters.model} onChange={e => update({ ...filters, model: e.target.value })} />
-        </SimpleGrid>
-        <Button onClick={() => setPaused(value => !value)} leftSection={paused ? <Play size={16} /> : <Pause size={16} />}>{paused ? t('resume') : t('pause')}</Button>
+        </SimpleGrid>}
+        {showPause && <Button onClick={() => setPaused(value => !value)} leftSection={paused ? <Play size={16} /> : <Pause size={16} />}>{paused ? t('resume') : t('pause')}</Button>}
       </Group>
-    </Card>
-    {query.isError ? <QueryError retry={() => void query.refetch()} /> : query.isLoading ? <SkeletonRows /> : !rows.length ? <EmptyState icon={<Activity />} title={t('requests')} copy={t('noRequests24h')} /> : <>
+    </Card>}
+    {query.isError ? <QueryError retry={() => void query.refetch()} /> : query.isLoading ? <SkeletonRows /> : !rows.length ? <EmptyState icon={<Activity />} title={t('requests')} copy={filtered ? t('noSearchResults') : t('noRequests24h')} action={filtered ? <Button variant="default" onClick={clearFilters}>{t('clearFilters')}</Button> : undefined} /> : <>
       <TableScrollContainer minWidth={700} style={{ maxHeight: 'min(74vh, 900px)' }}>
         <Table stickyHeader highlightOnHover>
           <Table.Thead><Table.Tr><Table.Th>{t('status')}</Table.Th><Table.Th>{t('model')}</Table.Th><Table.Th>{t('provider')}</Table.Th><Table.Th>{t('endpoint')}</Table.Th><Table.Th>{t('latency')}</Table.Th><Table.Th>{t('cost')}</Table.Th><Table.Th>{t('startedAt')}</Table.Th></Table.Tr></Table.Thead>

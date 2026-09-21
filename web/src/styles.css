@@ -101,6 +101,41 @@ body { margin: 0; min-width: 320px; min-height: 100vh; background: var(--canvas)
 button, input, select, textarea { font: inherit; }
 button, [role='button'], a { -webkit-tap-highlight-color: transparent; }
 button { cursor: pointer; }
+
+/* Capability values are reference text, not badges: they must stay legible and
+   never be clipped, since a truncated capability name reads as a different one. */
+.pm-capabilities { display: inline-flex; align-items: center; flex-wrap: wrap; font-size: 12.5px; color: var(--muted); }
+.pm-capability { white-space: nowrap; }
+.pm-capability:not(:last-child)::after { content: '·'; margin: 0 8px; color: var(--faint); }
+
+/* The sidebar floats inset from the viewport on desktop. On mobile it is an
+   off-canvas drawer: any margin, border or shadow left behind by the closed
+   state shows up as a sliver of chrome at the left edge, and an off-canvas panel
+   must not stay reachable, so it is hidden outright once the slide-out ends. */
+@media (min-width: 62em) {
+  .pm-shell-navbar {
+    margin: var(--mantine-spacing-xs);
+    margin-inline-end: 0;
+    border: 1px solid var(--mantine-color-default-border);
+    border-radius: var(--mantine-radius-xl);
+    box-shadow: var(--mantine-shadow-md);
+  }
+}
+
+@media (max-width: 61.99em) {
+  .pm-shell-navbar {
+    margin: 0;
+    border: 0;
+    border-radius: 0 var(--mantine-radius-xl) var(--mantine-radius-xl) 0;
+    box-shadow: var(--mantine-shadow-md);
+    transition: visibility 0s linear 0s;
+  }
+
+  .pm-shell-navbar[data-open='false'] {
+    visibility: hidden;
+    transition: visibility 0s linear 240ms;
+  }
+}
 a { color: inherit; }
 code, pre { font-family: 'Geist Mono Variable', 'SFMono-Regular', Consolas, monospace; font-feature-settings: 'zero' 1; } /* deslop-ignore 33 34 — mono belongs to code */
 
