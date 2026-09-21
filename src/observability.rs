@@ -128,14 +128,34 @@ fn retain(connection: &Connection, rules: &[Retention]) -> Result<()> {
     Ok(())
 }
 
+/// Projection writes can be lost for different reasons; keeping them apart makes the loss
+/// diagnosable instead of collapsing every cause into one opaque counter.
+#[derive(Default)]
+struct DropCounters {
+    queue_full: AtomicU64,
+    writer_down: AtomicU64,
+    stale_generation: AtomicU64,
+    batch_failed: AtomicU64,
+}
+
+impl DropCounters {
+    fn total(&self) -> u64 {
+        self.queue_full.load(Ordering::Relaxed)
+            + self.writer_down.load(Ordering::Relaxed)
+            + self.stale_generation.load(Ordering::Relaxed)
+            + self.batch_failed.load(Ordering::Relaxed)
+    }
+}
+
 #[derive(Clone)]
 pub struct ObservationStore {
     path: Arc<PathBuf>,
     sender: Option<mpsc::Sender<Command>>,
     failure: Option<Arc<str>>,
-    dropped: Arc<AtomicU64>,
+    dropped: Arc<DropCounters>,
     generation: Arc<AtomicU64>,
     poisoned: Arc<AtomicBool>,
+    writer_down: Arc<AtomicBool>,
 }
 
 impl ObservationStore {
@@ -144,30 +164,36 @@ impl ObservationStore {
         initialize(&path, retention_days)?;
         let (sender, mut receiver) = mpsc::channel::<Command>(4096);
         let writer_path = path.clone();
-        let dropped = Arc::new(AtomicU64::new(0));
+        let dropped = Arc::new(DropCounters::default());
         let writer_dropped = Arc::clone(&dropped);
         let generation = Arc::new(AtomicU64::new(0));
         let poisoned = Arc::new(AtomicBool::new(false));
         let writer_poisoned = poisoned.clone();
+        let writer_down = Arc::new(AtomicBool::new(false));
+        let writer_down_flag = Arc::clone(&writer_down);
         thread::Builder::new().name("pangolin-observation-writer".into()).spawn(move || {
             let connection = match Connection::open(&writer_path) {
                 Ok(connection) => connection,
                 Err(error) => {
+                    // The projection is dead for the life of the process; report it instead of
+                    // pretending the store is healthy while every event is dropped.
                     tracing::error!(%error, "observation writer failed to open");
+                    writer_down_flag.store(true, Ordering::Release);
+                    writer_poisoned.store(true, Ordering::Release);
                     return;
                 }
             };
-            let mut pending=None;let mut epoch=0;
+            let mut pending=None;let mut epoch=0;let mut consecutive_failures=0;
             let mut retention=vec![Retention {project_id:None,days:retention_days.min(i64::MAX as u64) as i64,payloads_only:false}];
             while let Some(command) = pending.take().or_else(||receiver.blocking_recv()) {
                 match command {
                     Command::Record(event,version) => {
-                        if version!=epoch {writer_dropped.fetch_add(1,Ordering::Relaxed);continue}
+                        if version!=epoch {writer_dropped.stale_generation.fetch_add(1,Ordering::Relaxed);continue}
                         let mut batch = vec![event];
                         while batch.len() < 64 {
                             match receiver.try_recv() {
                                 Ok(Command::Record(event,version)) if version==epoch => batch.push(event),
-                                Ok(Command::Record(_, _))=>{writer_dropped.fetch_add(1,Ordering::Relaxed);},
+                                Ok(Command::Record(_, _))=>{writer_dropped.stale_generation.fetch_add(1,Ordering::Relaxed);},
                                 Ok(control) => { pending=Some(control);break; }
                                 Err(_) => break,
                             }
@@ -181,9 +207,19 @@ impl ObservationStore {
                             }
                             true
                         });
-                        if let Err(error) = insert_batch(&connection, &batch) {
-                            writer_dropped.fetch_add(batch.len() as u64, Ordering::Relaxed);
-                            tracing::warn!(%error, count = batch.len(), "observation event batch was dropped");
+                        match insert_batch(&connection, &batch) {
+                            Ok(()) => { consecutive_failures = 0; }
+                            Err(error) => {
+                                consecutive_failures += 1;
+                                writer_dropped.batch_failed.fetch_add(batch.len() as u64, Ordering::Relaxed);
+                                tracing::warn!(%error, count = batch.len(), consecutive_failures, "observation event batch was dropped");
+                                if consecutive_failures >= 3 {
+                                    // Fail closed: an operator must see that analytics stopped
+                                    // rather than read an empty-but-plausible dashboard.
+                                    tracing::error!(%error, "observation writer is failing repeatedly; analytics are degraded");
+                                    writer_poisoned.store(true, Ordering::Release);
+                                }
+                            }
                         }
                     }
                     Command::Flush(done) => {
@@ -210,6 +246,7 @@ impl ObservationStore {
             dropped,
             generation,
             poisoned,
+            writer_down,
         })
     }
 
@@ -218,18 +255,47 @@ impl ObservationStore {
             path: Arc::new(path.as_ref().to_path_buf()),
             sender: None,
             failure: Some(Arc::from(error.to_string())),
-            dropped: Arc::new(AtomicU64::new(0)),
+            dropped: Arc::new(DropCounters::default()),
             generation: Arc::new(AtomicU64::new(0)),
             poisoned: Arc::new(AtomicBool::new(true)),
+            writer_down: Arc::new(AtomicBool::new(true)),
         }
     }
 
     pub fn is_available(&self) -> bool {
-        self.failure.is_none() && !self.poisoned.load(Ordering::Acquire)
+        self.failure.is_none()
+            && !self.poisoned.load(Ordering::Acquire)
+            && !self.writer_down.load(Ordering::Acquire)
+            && self
+                .sender
+                .as_ref()
+                .is_some_and(|sender| !sender.is_closed())
     }
 
     pub fn dropped_events(&self) -> u64 {
-        self.dropped.load(Ordering::Relaxed)
+        self.dropped.total()
+    }
+
+    /// Drops by cause: queue pressure, a dead writer, stale generations, failed batches.
+    pub fn dropped_breakdown(&self) -> [(&'static str, u64); 4] {
+        [
+            (
+                "queue_full",
+                self.dropped.queue_full.load(Ordering::Relaxed),
+            ),
+            (
+                "writer_down",
+                self.dropped.writer_down.load(Ordering::Relaxed),
+            ),
+            (
+                "stale_generation",
+                self.dropped.stale_generation.load(Ordering::Relaxed),
+            ),
+            (
+                "batch_failed",
+                self.dropped.batch_failed.load(Ordering::Relaxed),
+            ),
+        ]
     }
 
     #[cfg(test)]
@@ -241,19 +307,27 @@ impl ObservationStore {
     }
     pub fn record_at(&self, event: RequestEvent, generation: u64) {
         if generation != self.generation() || self.poisoned.load(Ordering::Acquire) {
-            self.dropped.fetch_add(1, Ordering::Relaxed);
+            self.dropped
+                .stale_generation
+                .fetch_add(1, Ordering::Relaxed);
             return;
         }
         let Some(sender) = &self.sender else {
-            self.dropped.fetch_add(1, Ordering::Relaxed);
+            self.dropped.writer_down.fetch_add(1, Ordering::Relaxed);
             return;
         };
-        if sender
-            .try_send(Command::Record(Box::new(event), generation))
-            .is_err()
-        {
-            self.dropped.fetch_add(1, Ordering::Relaxed);
-            tracing::warn!("observation queue is full; event dropped");
+        match sender.try_send(Command::Record(Box::new(event), generation)) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.dropped.queue_full.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!("observation queue is full; event dropped");
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                // The writer thread is gone: every later event would be lost silently.
+                self.dropped.writer_down.fetch_add(1, Ordering::Relaxed);
+                self.writer_down.store(true, Ordering::Release);
+                tracing::error!("observation writer is gone; analytics are degraded");
+            }
         }
     }
     pub async fn clear_for_restore(&self) -> bool {

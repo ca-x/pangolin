@@ -17,7 +17,8 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
   useEffect(() => { if (project) { setSelected(project.id); localStorage.setItem('pangolin-project', project.id) } }, [project?.id])
   const value = useMemo(() => project ? { project, projects, permissions:new Set(permissions.data||[]), setProjectId: setSelected } : null, [permissions.data, project, projects])
   if (query.isLoading) return <SkeletonRows count={3}/>
-  if (query.isError || !value) return <div className="query-error" role="alert">{t('noAccessibleProject')}</div>
+  if (query.isError) return <div className="query-error" role="alert"><div><strong>{t('networkError')}</strong><p>{t('retryHint')}</p></div><button className="button" onClick={() => void query.refetch()}>{t('retry')}</button></div>
+  if (!value) return <div className="query-error" role="alert">{t('noAccessibleProject')}</div>
   return <ProjectContext.Provider value={value}>{children}</ProjectContext.Provider>
 }
 

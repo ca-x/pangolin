@@ -624,6 +624,15 @@ pub async fn gc(state: &AppState) -> Result<(), ApiError> {
     ))
     .await?;
     let policies=tx.query_all(sql("SELECT project_id,resource_type,retention_days,retain_payloads FROM data_retention_policies",vec![])).await?;
+    let mut policies_for_facts: Vec<(Option<String>, i64)> = vec![];
+    for row in policies.iter() {
+        let resource: String = row.try_get("", "resource_type")?;
+        if resource == "requests" {
+            let project: Option<String> = row.try_get("", "project_id")?;
+            let days: i64 = row.try_get("", "retention_days")?;
+            policies_for_facts.push((project, now - days.saturating_mul(86400)));
+        }
+    }
     for row in policies {
         let project: Option<String> = row.try_get("", "project_id")?;
         let resource: String = row.try_get("", "resource_type")?;
@@ -672,6 +681,30 @@ pub async fn gc(state: &AppState) -> Result<(), ApiError> {
         ))
         .await?;
     }
+    // The requests policy must reach the authoritative ledger too, otherwise "delete after N
+    // days" is a promise the instance does not keep. Children (execution_facts -> usage_logs ->
+    // usage_cost_items) cascade, and running rows are never touched so in-flight work keeps its
+    // reservation. Lifetime counters (api_keys.spent_micros) stay authoritative.
+    for row in policies_for_facts {
+        let project: Option<String> = row.0;
+        let before: i64 = row.1;
+        let (scope, args) = if let Some(project) = project {
+            (" AND project_id=?", vec![before.into(), project.into()])
+        } else {
+            ("", vec![before.into()])
+        };
+        tx.execute(sql(
+            format!("DELETE FROM request_facts WHERE started_at<? AND status!='running'{scope}"),
+            args,
+        ))
+        .await?;
+    }
+    // Settlement fingerprints only matter while their execution is retained.
+    tx.execute(sql(
+        "DELETE FROM provider_response_settlements WHERE execution_id NOT IN (SELECT id FROM execution_facts)",
+        vec![],
+    ))
+    .await?;
     tx.execute(sql("DELETE FROM traces WHERE finished_at IS NOT NULL AND NOT EXISTS(SELECT 1 FROM requests WHERE trace_id=traces.id)",vec![])).await?;
     tx.execute(sql(
         "DELETE FROM threads WHERE NOT EXISTS(SELECT 1 FROM traces WHERE thread_id=threads.id)",

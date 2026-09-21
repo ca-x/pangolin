@@ -134,7 +134,9 @@ async fn provider_presets_install_endpoint_mapping_and_keep_tpm_policy() {
     let seen = Arc::new(Mutex::new(vec![]));
     let copy = seen.clone();
     let f=fixture(Router::new().route("/chat/completions",post(move|Json(body):Json<Value>|{let seen=copy.clone();async move{seen.lock().await.push(body);Json(json!({"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":1,"completion_tokens":1}}))}}))).await;
-    let base = db::list_providers(&f.state.db).await.unwrap()[0]
+    let base = db::list_providers(&f.state.db, db::DEFAULT_PROJECT_ID)
+        .await
+        .unwrap()[0]
         .base_url
         .clone();
     let provider = db::create_provider(
@@ -162,6 +164,7 @@ async fn provider_presets_install_endpoint_mapping_and_keep_tpm_policy() {
             output_price_micros: Some(0),
             priority: None,
         },
+        db::DEFAULT_PROJECT_ID,
     )
     .await
     .unwrap();
@@ -210,6 +213,7 @@ async fn model_catalog_defaults_preserve_explicit_admin_prices_and_capabilities(
             output_price_micros: Some(0),
             priority: None,
         },
+        db::DEFAULT_PROJECT_ID,
     )
     .await
     .unwrap();
@@ -232,6 +236,7 @@ async fn model_catalog_defaults_preserve_explicit_admin_prices_and_capabilities(
             output_price_micros: Some(0),
             priority: None,
         },
+        db::DEFAULT_PROJECT_ID,
     )
     .await
     .unwrap();

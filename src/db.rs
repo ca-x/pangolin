@@ -16,7 +16,13 @@ mod schema;
 pub use schema::{DEFAULT_PROJECT_ID, SYSTEM_OWNER_ROLE_ID};
 
 pub async fn connect(url: &str) -> Result<DatabaseConnection> {
-    let db = Database::connect(url)
+    // The budget reservation in `operations::lifecycle` is built on SQLite's writer lock: the
+    // first write in the transaction acquires it before shared budgets are re-read, which is only
+    // sound while every budget-relevant writer shares one connection. Pin that contract here so a
+    // later pool tweak cannot silently turn admission into a lost-update race.
+    let mut options = sea_orm::ConnectOptions::new(url.to_owned());
+    options.max_connections(1);
+    let db = Database::connect(options)
         .await
         .context("failed to connect to SQLite")?;
     db.execute_unprepared(
@@ -164,10 +170,10 @@ pub async fn delete_session(db: &DatabaseConnection, token: &str) -> Result<()> 
     Ok(())
 }
 
-pub async fn list_providers(db: &DatabaseConnection) -> Result<Vec<Provider>> {
+pub async fn list_providers(db: &DatabaseConnection, project_id: &str) -> Result<Vec<Provider>> {
     Ok(Provider::find_by_statement(stmt(
-        "SELECT id,name,kind,base_url,enabled,created_at,updated_at FROM providers ORDER BY name",
-        vec![],
+        "SELECT id,name,kind,base_url,enabled,created_at,updated_at FROM providers WHERE project_id=? ORDER BY name",
+        vec![project_id.into()],
     ))
     .all(db)
     .await?)
@@ -253,23 +259,40 @@ pub async fn create_provider(
     .expect("inserted provider exists"))
 }
 
-pub async fn delete_provider(db: &DatabaseConnection, id: &str) -> Result<bool> {
+pub async fn delete_provider(db: &DatabaseConnection, id: &str, project_id: &str) -> Result<bool> {
     Ok(db
-        .execute(stmt("DELETE FROM providers WHERE id=?", vec![id.into()]))
+        .execute(stmt(
+            "DELETE FROM providers WHERE id=? AND project_id=?",
+            vec![id.into(), project_id.into()],
+        ))
         .await?
         .rows_affected()
         > 0)
 }
 
-pub async fn list_models(db: &DatabaseConnection) -> Result<Vec<Model>> {
+pub async fn list_models(db: &DatabaseConnection, project_id: &str) -> Result<Vec<Model>> {
     Ok(Model::find_by_statement(stmt(
-        "SELECT m.*, p.name AS provider_name FROM models m JOIN providers p ON p.id=m.provider_id ORDER BY m.public_name,m.priority,p.name",
-        vec![],
+        "SELECT m.*, p.name AS provider_name FROM models m JOIN providers p ON p.id=m.provider_id WHERE p.project_id=? ORDER BY m.public_name,m.priority,p.name",
+        vec![project_id.into()],
     )).all(db).await?)
 }
 
-pub async fn create_model(db: &DatabaseConnection, input: &ModelInput) -> Result<Model> {
+pub async fn create_model(
+    db: &DatabaseConnection,
+    input: &ModelInput,
+    project_id: &str,
+) -> Result<Model> {
     let id = Uuid::new_v4().to_string();
+    let owned = Provider::find_by_statement(stmt(
+        "SELECT id,name,kind,base_url,enabled,created_at,updated_at FROM providers WHERE id=? AND project_id=?",
+        vec![input.provider_id.clone().into(), project_id.into()],
+    ))
+    .one(db)
+    .await?
+    .is_some();
+    if !owned {
+        return Err(anyhow::anyhow!("provider is not in this project"));
+    }
     let catalog = crate::catalog::repository::effective(db).await?;
     let defaults = catalog.models.iter().find(|model| {
         model.upstream_id == input.upstream_name
@@ -315,9 +338,12 @@ pub async fn create_model(db: &DatabaseConnection, input: &ModelInput) -> Result
     )).one(db).await?.expect("inserted model exists"))
 }
 
-pub async fn delete_model(db: &DatabaseConnection, id: &str) -> Result<bool> {
+pub async fn delete_model(db: &DatabaseConnection, id: &str, project_id: &str) -> Result<bool> {
     Ok(db
-        .execute(stmt("DELETE FROM models WHERE id=?", vec![id.into()]))
+        .execute(stmt(
+            "DELETE FROM models WHERE id=? AND provider_id IN (SELECT id FROM providers WHERE project_id=?)",
+            vec![id.into(), project_id.into()],
+        ))
         .await?
         .rows_affected()
         > 0)
@@ -454,11 +480,63 @@ pub async fn record_audit_event(
     resource_id: &str,
     details: serde_json::Value,
 ) -> Result<()> {
+    record_audit_event_in(
+        db,
+        actor_user_id,
+        action,
+        resource_type,
+        resource_id,
+        details,
+    )
+    .await
+}
+
+/// Same audit row, but on any connection — including an open transaction, so a control-plane
+/// mutation and its audit entry commit or roll back together.
+pub async fn record_audit_event_in<C: ConnectionTrait>(
+    db: &C,
+    actor_user_id: &str,
+    action: &str,
+    resource_type: &str,
+    resource_id: &str,
+    details: serde_json::Value,
+) -> Result<()> {
+    record_audit_event_for(
+        db,
+        Some(actor_user_id),
+        action,
+        resource_type,
+        resource_id,
+        details,
+    )
+    .await
+}
+
+/// Security events such as a rejected login have no authenticated actor; they are recorded with a
+/// NULL actor rather than dropped, so brute-force attempts still leave a trail.
+pub async fn record_anonymous_audit_event(
+    db: &DatabaseConnection,
+    action: &str,
+    resource_type: &str,
+    resource_id: &str,
+    details: serde_json::Value,
+) -> Result<()> {
+    record_audit_event_for(db, None, action, resource_type, resource_id, details).await
+}
+
+async fn record_audit_event_for<C: ConnectionTrait>(
+    db: &C,
+    actor_user_id: Option<&str>,
+    action: &str,
+    resource_type: &str,
+    resource_id: &str,
+    details: serde_json::Value,
+) -> Result<()> {
     db.execute(stmt(
         "INSERT INTO audit_events(id,actor_user_id,action,resource_type,resource_id,details,created_at) VALUES(?,?,?,?,?,?,?)",
         vec![
             Uuid::new_v4().to_string().into(),
-            actor_user_id.into(),
+            actor_user_id.map(str::to_owned).into(),
             action.into(),
             resource_type.into(),
             resource_id.into(),

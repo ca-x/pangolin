@@ -19,7 +19,7 @@ function ShellContent({ user,branding }: { user: User; branding: Branding }) {
   const closeButton = useRef<HTMLButtonElement>(null)
   const menuWasOpened = useRef(false)
   const can = (permission: string) => permissions.has('*') || permissions.has(permission)
-  const canAccess = ['api_key:manage','role:manage','user:manage','oidc:manage'].some(can)
+  const canAccess = ['project:manage','api_key:manage','role:manage','user:manage','oidc:manage'].some(can)
   const groups = [
     { label: t('workspace'), links: [{ to: '/', label: t('overview'), icon: Gauge, end: true },...(can('project:manage')?[{ to: '/channels', label: t('channels'), icon: Unplug },{ to: '/models', label: t('models'), icon: Boxes },{ to: '/prompts', label: t('prompts'), icon: MessageSquareText }]:[]),{ to: '/playground', label: t('playground'), icon: FlaskConical }] },
     { label: t('observe'), links: [{ to: '/operations', label: t('operations'), icon: Activity }] },

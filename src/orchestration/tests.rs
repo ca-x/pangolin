@@ -183,6 +183,7 @@ async fn add_model(
             output_price_micros: None,
             priority: None,
         },
+        db::DEFAULT_PROJECT_ID,
     )
     .await
     .unwrap();
@@ -223,6 +224,7 @@ async fn database_candidates_exact_regex_tag_conditions_dedup_and_project_isolat
             output_price_micros: None,
             priority: None,
         },
+        db::DEFAULT_PROJECT_ID,
     )
     .await
     .unwrap();

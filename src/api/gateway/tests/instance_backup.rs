@@ -66,6 +66,7 @@ async fn fill(f: &mut Fixture, owner: &access::Principal) {
             output_price_micros: Some(2000000),
             priority: None,
         },
+        db::DEFAULT_PROJECT_ID,
     )
     .await
     .unwrap();

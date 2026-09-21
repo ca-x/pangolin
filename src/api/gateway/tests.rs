@@ -1,9 +1,12 @@
 use super::*;
 
+mod auth_audit;
 mod catalog;
 mod instance_backup;
+mod isolation;
 mod operations;
 mod protocols;
+mod retention;
 mod review;
 mod task4_review;
 mod task5_review;
@@ -71,6 +74,7 @@ async fn fixture(mock: Router) -> Fixture {
                 output_price_micros: None,
                 priority: Some(index as i32),
             },
+            db::DEFAULT_PROJECT_ID,
         )
         .await
         .unwrap();

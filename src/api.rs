@@ -335,6 +335,17 @@ async fn setup(
     let user = db::create_initial_admin(&state.db, &request)
         .await
         .map_err(bad_request)?;
+    // Authentication events are the backbone of an audit trail: record the first administrator
+    // even though no actor existed before this request.
+    db::record_audit_event(
+        &state.db,
+        &user.id,
+        "setup",
+        "user",
+        &user.id,
+        json!({"email": user.email}),
+    )
+    .await?;
     session_response(&state, &user).await
 }
 
@@ -342,13 +353,40 @@ async fn login(
     State(state): State<AppState>,
     Json(request): Json<LoginRequest>,
 ) -> Result<Response, ApiError> {
-    let user = db::find_user_by_email(&state.db, &request.email)
-        .await?
-        .ok_or(ApiError::Unauthorized)?;
+    let Some(user) = db::find_user_by_email(&state.db, &request.email).await? else {
+        record_login_failure(&state, &request.email).await;
+        return Err(ApiError::Unauthorized);
+    };
     if !crypto::verify_password(&request.password, &user.password_hash) {
+        record_login_failure(&state, &request.email).await;
         return Err(ApiError::Unauthorized);
     }
+    db::record_audit_event(
+        &state.db,
+        &user.id,
+        "login",
+        "user",
+        &user.id,
+        json!({"email": user.email}),
+    )
+    .await?;
     session_response(&state, &user).await
+}
+
+/// A failed login has no authenticated actor; record it anonymously and never let the audit
+/// write change the response the client sees.
+async fn record_login_failure(state: &AppState, email: &str) {
+    if let Err(error) = db::record_anonymous_audit_event(
+        &state.db,
+        "login_failed",
+        "user",
+        "",
+        json!({"email": email}),
+    )
+    .await
+    {
+        tracing::warn!(%error, "failed to record a rejected login");
+    }
 }
 
 pub(crate) async fn session_response(state: &AppState, user: &User) -> Result<Response, ApiError> {
@@ -383,7 +421,9 @@ async fn list_providers(
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError> {
     require_user_permission(&state, &headers, "project:read").await?;
-    Ok(Json(db::list_providers(&state.db).await?))
+    Ok(Json(
+        db::list_providers(&state.db, db::DEFAULT_PROJECT_ID).await?,
+    ))
 }
 
 async fn create_provider(
@@ -423,7 +463,7 @@ async fn delete_provider(
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     let user = require_user_permission(&state, &headers, "project:manage").await?;
-    if db::delete_provider(&state.db, &id).await? {
+    if db::delete_provider(&state.db, &id, db::DEFAULT_PROJECT_ID).await? {
         db::record_audit_event(&state.db, &user.id, "delete", "provider", &id, json!({})).await?;
         Ok(StatusCode::NO_CONTENT)
     } else {
@@ -436,7 +476,9 @@ async fn list_models(
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError> {
     require_user_permission(&state, &headers, "project:read").await?;
-    Ok(Json(db::list_models(&state.db).await?))
+    Ok(Json(
+        db::list_models(&state.db, db::DEFAULT_PROJECT_ID).await?,
+    ))
 }
 
 async fn create_model(
@@ -448,7 +490,7 @@ async fn create_model(
     if input.public_name.trim().is_empty() || input.upstream_name.trim().is_empty() {
         return Err(ApiError::BadRequest("model names are required".into()));
     }
-    let model = db::create_model(&state.db, &input)
+    let model = db::create_model(&state.db, &input, db::DEFAULT_PROJECT_ID)
         .await
         .map_err(bad_request)?;
     db::record_audit_event(
@@ -469,7 +511,7 @@ async fn delete_model(
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     let user = require_user_permission(&state, &headers, "project:manage").await?;
-    if db::delete_model(&state.db, &id).await? {
+    if db::delete_model(&state.db, &id, db::DEFAULT_PROJECT_ID).await? {
         db::record_audit_event(&state.db, &user.id, "delete", "model", &id, json!({})).await?;
         Ok(StatusCode::NO_CONTENT)
     } else {
@@ -577,14 +619,19 @@ async fn observation_detail(
 
 async fn metrics(State(state): State<AppState>) -> Result<Response, ApiError> {
     let summary = state.observations.summary().await.unwrap_or_default();
+    let drops = state.observations.dropped_breakdown();
     let body = format!(
-        "# HELP pangolin_requests_total Requests observed in the last 24 hours\n# TYPE pangolin_requests_total gauge\npangolin_requests_total {}\n# HELP pangolin_errors_total Errors observed in the last 24 hours\n# TYPE pangolin_errors_total gauge\npangolin_errors_total {}\n# HELP pangolin_tokens_total Tokens observed in the last 24 hours\n# TYPE pangolin_tokens_total gauge\npangolin_tokens_total{{direction=\"input\"}} {}\npangolin_tokens_total{{direction=\"output\"}} {}\n# HELP pangolin_observability_available Whether the observation store is available\n# TYPE pangolin_observability_available gauge\npangolin_observability_available {}\n# HELP pangolin_observation_events_dropped_total Observation events dropped since process start\n# TYPE pangolin_observation_events_dropped_total counter\npangolin_observation_events_dropped_total {}\n",
+        "# HELP pangolin_requests_total Requests observed in the last 24 hours\n# TYPE pangolin_requests_total gauge\npangolin_requests_total {}\n# HELP pangolin_errors_total Errors observed in the last 24 hours\n# TYPE pangolin_errors_total gauge\npangolin_errors_total {}\n# HELP pangolin_tokens_total Tokens observed in the last 24 hours\n# TYPE pangolin_tokens_total gauge\npangolin_tokens_total{{direction=\"input\"}} {}\npangolin_tokens_total{{direction=\"output\"}} {}\n# HELP pangolin_observability_available Whether the observation store is available\n# TYPE pangolin_observability_available gauge\npangolin_observability_available {}\n# HELP pangolin_observation_events_dropped_total Observation events dropped since process start\n# TYPE pangolin_observation_events_dropped_total counter\npangolin_observation_events_dropped_total {}\n# HELP pangolin_observation_drops_by_reason Events dropped by cause\n# TYPE pangolin_observation_drops_by_reason counter\npangolin_observation_drops_by_reason{{reason=\"queue_full\"}} {}\npangolin_observation_drops_by_reason{{reason=\"writer_down\"}} {}\npangolin_observation_drops_by_reason{{reason=\"stale_generation\"}} {}\npangolin_observation_drops_by_reason{{reason=\"batch_failed\"}} {}\n",
         summary.requests,
         summary.errors,
         summary.input_tokens,
         summary.output_tokens,
         i32::from(state.observations.is_available()),
         state.observations.dropped_events(),
+        drops[0].1,
+        drops[1].1,
+        drops[2].1,
+        drops[3].1,
     );
     let body = format!("{body}{}", state.orchestrator.metrics());
     Ok(([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], body).into_response())
@@ -1245,6 +1292,7 @@ mod tests {
                 output_price_micros: Some(2_000_000),
                 priority: None,
             },
+            db::DEFAULT_PROJECT_ID,
         )
         .await
         .unwrap();

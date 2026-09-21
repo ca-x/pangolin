@@ -55,7 +55,9 @@ export function EnabledPill({ enabled, tone }: { enabled: unknown; tone?: 'accen
 export function CapabilityTags({ value, max = 3 }: { value: unknown; max?: number }) {
   const list = Array.isArray(value)
     ? value.map(String).filter(Boolean)
-    : typeof value === 'string' && value.trim() ? value.split(',').map((item) => item.trim()).filter(Boolean) : []
+    : value && typeof value === 'object'
+      ? Object.entries(value as Record<string, unknown>).filter(([, enabled]) => enabled === true).map(([name]) => name)
+      : typeof value === 'string' && value.trim() ? value.split(',').map((item) => item.trim()).filter(Boolean) : []
   if (!list.length) return <>—</>
   const shown = list.slice(0, max)
   return <span className="tag-row">{shown.map((item) => <span className="tag" key={item}>{item}</span>)}{list.length > shown.length && <span className="tag tag-more">+{list.length - shown.length}</span>}</span>

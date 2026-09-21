@@ -8,7 +8,7 @@ import { ProjectProvider } from '../project'
 import AccessPage from './AccessPage'
 
 describe('API key administration', () => {
-  beforeEach(() => { void i18n.changeLanguage('en'); vi.stubGlobal('fetch', vi.fn((input:RequestInfo|URL) => { const path=String(input); const data=path.endsWith('/projects')||path.includes('/projects?')?[{id:'project-a',name:'Project A',slug:'project-a',owner_user_id:'owner',is_default:true,enabled:true}]:path.includes('/permissions')?['project:read','api_key:manage']:[]; return Promise.resolve(new Response(JSON.stringify(data), { status: 200, headers: { 'Content-Type': 'application/json' } })) })) })
+  beforeEach(() => { void i18n.changeLanguage('en'); vi.stubGlobal('fetch', vi.fn((input:RequestInfo|URL) => { const path=String(input); const data=path.endsWith('/projects')||path.includes('/projects?')?[{id:'project-a',name:'Project A',slug:'project-a',owner_user_id:'owner',is_default:true,enabled:true}]:path.includes('/permissions')?['project:read','project:manage','api_key:manage','role:manage']:[]; return Promise.resolve(new Response(JSON.stringify(data), { status: 200, headers: { 'Content-Type': 'application/json' } })) })) })
   it('explains generated and one-time imported token modes', async () => {
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
     render(<QueryClientProvider client={client}><MemoryRouter><ProjectProvider><AccessPage/></ProjectProvider></MemoryRouter></QueryClientProvider>)
@@ -28,5 +28,20 @@ describe('API key administration', () => {
     const name=screen.getByLabelText('Name');await userEvent.clear(name);await userEvent.type(name,'Renamed project')
     await userEvent.click(screen.getByRole('button',{name:'Save'}))
     await vi.waitFor(()=>expect(vi.mocked(fetch).mock.calls.some(([path,init])=>String(path).endsWith('/projects/project-a')&&init?.method==='PATCH'&&new Headers(init.headers).get('X-Pangolin-CSRF')==='1')).toBe(true))
+  })
+  it('only shows access tabs the principal is authorized to use', async () => {
+    vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
+      const path = String(input)
+      const data = path.endsWith('/projects') || path.includes('/projects?')
+        ? [{ id: 'project-a', name: 'Project A', slug: 'project-a', owner_user_id: 'owner', is_default: true, enabled: true }]
+        : path.includes('/permissions') ? ['project:read', 'api_key:manage'] : []
+      return Promise.resolve(new Response(JSON.stringify(data), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+    }))
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    render(<QueryClientProvider client={client}><MemoryRouter><ProjectProvider><AccessPage/></ProjectProvider></MemoryRouter></QueryClientProvider>)
+    expect(await screen.findByRole('tab', { name: 'API keys' })).toBeInTheDocument()
+    for (const hidden of ['Users', 'Roles', 'OIDC', 'Invitations']) {
+      expect(screen.queryByRole('tab', { name: hidden })).not.toBeInTheDocument()
+    }
   })
 })

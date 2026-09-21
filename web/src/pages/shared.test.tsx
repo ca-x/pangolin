@@ -17,4 +17,19 @@ describe('resource management contracts',()=>{
     await userEvent.click(edit);await userEvent.keyboard('{Escape}');await vi.waitFor(()=>expect(edit).toHaveFocus())
     await userEvent.click(screen.getByRole('button',{name:'Next'}));await vi.waitFor(()=>expect(fetchMock.mock.calls.some(([path])=>String(path).includes('offset=25')&&String(path).includes('limit=25'))).toBe(true))
   })
+  it('applies per-row rules to edit and delete affordances', async () => {
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const path = String(input)
+      if (path.endsWith('/projects')) return json([{ id: 'p1', name: 'Project', slug: 'project', owner_user_id: 'u1', is_default: true, enabled: true }])
+      if (path.includes('/permissions')) return json(['*'])
+      return json({ data: [{ id: 'sys', name: 'Owner', is_system: 1 }, { id: 'custom', name: 'Analyst', is_system: 0 }], total: 2, offset: 0, limit: 25 })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    render(<QueryClientProvider client={client}><MemoryRouter><ProjectProvider><ResourcePage resource="roles" title="Roles" description="Roles" empty="None" columns={[{ key: 'name', label: 'Name' }]} fields={[{ key: 'name', label: 'Name', required: true }]} canDelete={(row) => !row.is_system} editDisabled={(row) => Boolean(row.is_system)} /></ProjectProvider></MemoryRouter></QueryClientProvider>)
+    await screen.findAllByText('Analyst')
+    // one row is a system role: it must offer neither edit nor delete, in the table and on mobile
+    expect(screen.getAllByRole('button', { name: 'Edit' })).toHaveLength(2)
+    expect(screen.getAllByRole('button', { name: /^Delete/ })).toHaveLength(2)
+  })
 })
