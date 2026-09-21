@@ -39,9 +39,9 @@ Pangolin（中文正式名称“鲮鲤”）是一款单二进制 AI API 聚合�
 | --- | --- | --- |
 | ![鲮鲤桌面端模型路由](docs/screenshots/routing-desktop-dark-zh.png) | ![鲮鲤桌面端请求记录](docs/screenshots/requests-desktop-light-en.png) | ![鲮鲤请求详情](docs/screenshots/request-detail-desktop-light-en.png) |
 
-| 追踪详情 | 访问控制 | 系统设置 |
-| --- | --- | --- |
-| ![鲮鲤追踪详情](docs/screenshots/trace-desktop-dark-en.png) | ![鲮鲤访问控制](docs/screenshots/access-desktop-light-zh.png) | ![鲮鲤系统设置](docs/screenshots/system-desktop-dark-zh.png) |
+| 追踪详情 | 访问控制 | 系统设置 | 关于 |
+| --- | --- | --- | --- |
+| ![鲮鲤追踪详情](docs/screenshots/trace-desktop-dark-en.png) | ![鲮鲤访问控制](docs/screenshots/access-desktop-light-zh.png) | ![鲮鲤系统设置](docs/screenshots/system-desktop-dark-zh.png) | ![鲮鲤构建信息](docs/screenshots/about-desktop-dark-zh.png) |
 
 ### 主题
 

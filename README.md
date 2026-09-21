@@ -39,9 +39,9 @@ Pangolin (Chinese name 鲮鲤) is a single-binary AI API aggregation gateway. It
 | --- | --- | --- |
 | ![Pangolin model routing](docs/screenshots/routing-desktop-dark-zh.png) | ![Pangolin request list](docs/screenshots/requests-desktop-light-en.png) | ![Pangolin request detail](docs/screenshots/request-detail-desktop-light-en.png) |
 
-| Trace detail | Access control | System settings |
-| --- | --- | --- |
-| ![Pangolin trace detail](docs/screenshots/trace-desktop-dark-en.png) | ![Pangolin access control](docs/screenshots/access-desktop-light-zh.png) | ![Pangolin system settings](docs/screenshots/system-desktop-dark-zh.png) |
+| Trace detail | Access control | System settings | About |
+| --- | --- | --- | --- |
+| ![Pangolin trace detail](docs/screenshots/trace-desktop-dark-en.png) | ![Pangolin access control](docs/screenshots/access-desktop-light-zh.png) | ![Pangolin system settings](docs/screenshots/system-desktop-dark-zh.png) | ![Pangolin build identity](docs/screenshots/about-desktop-dark-zh.png) |
 
 ### Themes
 
