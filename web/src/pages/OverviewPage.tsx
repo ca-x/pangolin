@@ -84,8 +84,10 @@ function TrendChart({ series }: { series: SeriesPoint[] }) {
           {gridlines.map((ratio) => <line key={ratio} className="chart-grid-line" x1="0" x2={width} y1={ratio * height} y2={ratio * height} vectorEffect="non-scaling-stroke"/>)}
           <path className="chart-area" d={area} vectorEffect="non-scaling-stroke"/>
           <path className="chart-line" d={line} vectorEffect="non-scaling-stroke"/>
+          {/* deslop-ignore-next-line 24 — chart marks, not icons */}
           {points.length <= 14 && points.map((point) => <circle key={point.bucket} className="chart-dot" cx={point.x} cy={point.y} r="3" vectorEffect="non-scaling-stroke"/>)}
           {focus && <line className="chart-crosshair" x1={focus.x} x2={focus.x} y1="0" y2={height} vectorEffect="non-scaling-stroke"/>}
+          {/* deslop-ignore-next-line 24 — chart marks, not icons */}
           {focus && <circle className="chart-dot-active" cx={focus.x} cy={focus.y} r="4.5" vectorEffect="non-scaling-stroke"/>}
         </svg>
         {focus && <div className="chart-tooltip" style={{ left: `${(focus.x / width) * 100}%`, top: `${(focus.y / height) * 100}%` }}><span>{formatShortDate(focus.bucket)}</span><div><strong>{formatNumber(focus.requests)}</strong><span>{t('requests')}</span></div></div>}

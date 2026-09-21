@@ -12,12 +12,12 @@ Rejected: glassmorphism card stacks, atmospheric gradients, decorative 01/02/03 
 
 ## Typography
 
-- UI: `Geist Sans`, with `Inter`, `Segoe UI` and system sans fallbacks.
+- UI: `Geist Sans`, bundled locally through `@fontsource-variable` (a self-hosted binary never fetches fonts from a CDN), with system sans fallbacks.
 - Code, ids, numeric telemetry: `Geist Mono`, `SFMono-Regular`, `Cascadia Code` and monospace fallbacks, `font-feature-settings: 'zero' 1`.
-- Metric values (stat cards, trace outcomes, cost) use the mono family with `font-variant-numeric: tabular-nums` so digits align column to column.
+- The mono family is reserved for code, machine identifiers and table cells holding ids — places where `0/O` and `1/l` must be told apart. Metric values (stat cards, trace outcomes, chart tooltips) use the UI family with `font-variant-numeric: tabular-nums`, which aligns digits column to column without turning the console into a terminal.
 - Headings use the same family as body copy with tighter tracking and stronger weight: `h1` is `clamp(1.55rem, 2.2vw, 1.95rem)` at weight 640 with `-0.028em`; `h2` is 1rem at weight 620 with `-0.014em`. Tracking tightens as size grows; body copy stays near zero.
 - Body text is at least 14px in dense tables and 16px in forms/long copy; line height is 1.5 (1.55 in code blocks).
-- Micro labels (nav groups, table headers, stat captions, definition terms) are 10.5–11.5px, weight 560–660, uppercase, `0.07–0.085em` tracking, in `--faint`.
+- Micro labels (nav groups, stat captions, definition terms, trace captions) are 11.5–12.5px, weight 540–600, sentence case, in `--faint` or `--muted`. Uppercase with `0.075em` tracking is reserved for table column headers, the one place the treatment earns its keep: it separates the header band from row content at a glance, and it never repeats a heading that already sits above it.
 
 ## Core tokens
 
@@ -76,13 +76,13 @@ Surfaces are strictly layered — `canvas < surface-muted < surface < elevated`.
 - Control height: 40px desktop (`--control-height`), expanded to 44px on coarse pointers so touch keeps the minimum hit area. Icon buttons are 40px square (44px on touch); in-table row actions are 36px.
 - Radius ladder: 9px controls, 10px nav items and icon chips, 12–14px panels and tables, 16px dialogs, 18px auth cards and the sidebar shell. Pills (status, switches) are fully rounded. Avoid mixing radii inside one surface.
 - Elevation is reserved for things that float: `--shadow-chrome` (sidebar, sticky chrome), `--shadow-overlay` (dialogs, drawers, popovers, toasts). Cards and tables use hairline borders, not shadows.
-- Desktop shell: 244px floating navigation panel inset 12px from the viewport edge, fluid content capped at 1560px. Mobile shell uses a translucent top bar and a modal drawer.
+- Desktop shell: 244px floating navigation panel inset 12px from the viewport edge, fluid content capped at 1560px. The panel is a solid `surface` — nothing scrolls behind it, so a blur there would be decoration, not material. Mobile shell uses a translucent top bar (content does scroll beneath it) and a modal drawer.
 
 ## Components
 
 - Buttons provide a `scale(0.97)` active state over 160ms on every pointer type, never move vertically on hover, and carry a 1px contact shadow. Primary buttons fill with `--accent` and use `--accent-contrast` text so dark-mode contrast holds.
 - Inputs always keep visible labels, helper/error text space and a 3px soft focus ring at 18% accent-mix. Radix selects and native selects share that ring. Booleans render as iOS-style switches — the native checkbox keeps its semantics and FormData name while CSS paints a 34×20px track with a 180ms thumb slide.
-- Navigation items are 40px tall with a 10px radius; the active item is a filled accent pill with `--accent-contrast` text and an inset highlight. Group labels are 10.5px uppercase.
+- Navigation items are 40px tall with a 10px radius; the active item is a filled accent pill with `--accent-contrast` text and an inset highlight. Group labels are 11.5px sentence case in `--faint`.
 - Tables use a sticky header inside the scroll region (`max-height: min(74vh, 900px)`), a `surface-muted` header band with blur, hairline row separators, 54px rows, and a `surface-muted` row hover. Machine fields use the mono family. Every row action has a text label or accessible name plus a tooltip.
 - Status combines text, icon/shape and color in a pill (`--success-soft`/`--danger-soft` background, colored icon chip). No unlabeled glowing dot.
 - Charts are hand-built SVG: dashed horizontal gridlines only, a 26%→0 accent area fill, a 2px accent line, axis labels in `--faint`, and a hover crosshair with an elevated tooltip. Data never animates; the data table fallback stays under every chart.
