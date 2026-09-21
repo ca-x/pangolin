@@ -196,6 +196,19 @@ function ResourceField({ field, value }: { field: FormField; value: unknown }) {
       rows={4}
     />
   }
+  if (field.kind === 'json' && field.required) {
+    // Collapsing a required editor would leave the browser blocking the submit
+    // with no focusable control to report it, so it stays open.
+    const initial = typeof value === 'object' && value !== null ? JSON.stringify(value, null, 2) : String(value ?? '')
+    return <Textarea
+      name={field.key}
+      label={field.label}
+      description={field.hint}
+      defaultValue={initial}
+      required
+      rows={7}
+    />
+  }
   if (field.kind === 'json') {
     const initial = typeof value === 'object' && value !== null ? JSON.stringify(value, null, 2) : String(value ?? '')
     return <Stack gap="xs">
@@ -216,7 +229,6 @@ function ResourceField({ field, value }: { field: FormField; value: unknown }) {
             aria-label={field.label}
             description={field.hint}
             defaultValue={initial}
-            required={field.required}
             rows={7}
           />
         </div>

@@ -56,7 +56,10 @@ function useChannelOptions() {
 function useResourceTotal(resource: 'channels' | 'credentials') {
   const { project } = useProject()
   const query = useQuery({ queryKey: ['resource', project.id, resource], queryFn: () => api<Paged<Document>>(`${projectOperationPath(project.id, resource)}?limit=1`) })
-  return query.data?.total ?? query.data?.data?.length ?? 0
+  // `null` means the count is unknown (still loading, or the request failed), and
+  // an unknown count must not be treated as empty: that would drop the bulk
+  // controls from a populated page whenever this auxiliary request failed.
+  return query.data ? (query.data.total ?? query.data.data?.length ?? 0) : null
 }
 
 function CredentialsPanel() {
@@ -86,8 +89,10 @@ function BulkToggle({ resource = 'channels' }: { resource?: 'channels' | 'creden
   const mutate = useMutation({ mutationFn: (body: unknown) => api(projectOperationPath(project.id, 'bulk-toggle'), { method: 'POST', body: JSON.stringify(body) }), onSuccess: () => { toast.success(t('saved')); void client.invalidateQueries({ queryKey: ['resource', project.id, resource] }) }, onError: (error: Error) => toast.error(error.message) })
   const submit = (event: FormEvent<HTMLFormElement>) => { event.preventDefault(); const data = new FormData(event.currentTarget); mutate.mutate({ resource, ids: String(data.get('ids')).split(',').map((id) => id.trim()).filter(Boolean), enabled: data.get('enabled') === 'true' }) }
   // With no rows to act on the bulk form is dead weight next to the empty
-  // state's single call to action, so it only appears once a row exists.
-  if (!total) return null
+  // state's single call to action, so it only appears once a row exists. An
+  // unknown count (`null`) keeps it: the failure belongs to the count query, and
+  // silently dropping a working control is worse than showing it unnecessarily.
+  if (total === 0) return null
   return (
     <Paper withBorder p="md" mt="md">
       <Title order={3} mb="md">{t('bulkActions')}</Title>

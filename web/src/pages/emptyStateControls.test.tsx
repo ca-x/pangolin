@@ -8,6 +8,7 @@ import { ProjectProvider } from '../project'
 import AccessPage from './AccessPage'
 import ChannelsPage from './ChannelsPage'
 import OperationsPage from './OperationsPage'
+import { ResourcePage } from './shared'
 
 const json = (value: unknown) => Promise.resolve(new Response(JSON.stringify(value), { status: 200, headers: { 'Content-Type': 'application/json' } }))
 const project = { id: 'p1', name: 'Project', slug: 'project', owner_user_id: 'u1', is_default: true, enabled: true }
@@ -69,6 +70,38 @@ describe('empty states drop controls that cannot do anything', () => {
     await i18n.changeLanguage('zh-CN')
     expect(await screen.findByRole('button', { name: '清除筛选条件' })).toBeInTheDocument()
     await i18n.changeLanguage('en')
+  })
+
+  it('keeps the bulk form when the count request fails', async () => {
+    // The count is an auxiliary request. A failure there must not read as "no
+    // rows" and silently remove a control the page can still use.
+    vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
+      const path = String(input)
+      if (path.includes('limit=1')) return Promise.reject(new Error('count unavailable'))
+      return base(path) ?? json({ data: [{ id: 'c1', name: 'Primary', kind: 'openai', base_url: 'https://api.openai.com', enabled: true }], total: 1, offset: 0, limit: 25 })
+    }))
+    renderPage(<ChannelsPage />)
+    expect(await screen.findByText('Bulk enable or disable')).toBeInTheDocument()
+  })
+
+  it('keeps a required JSON editor open, so an invalid one can be reported', async () => {
+    // A collapsed editor keeps `required` on a control the browser cannot focus,
+    // which blocks Save with no actionable error.
+    vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => base(String(input)) ?? json({ data: [], total: 0, offset: 0, limit: 25 })))
+    renderPage(
+      <ResourcePage
+        resource="models"
+        title="Models"
+        description="d"
+        empty="none"
+        createLabel="Add model"
+        columns={[{ key: 'name', label: 'Name' }]}
+        fields={[{ key: 'name', label: 'Name', required: true }, { key: 'components', label: 'Components', kind: 'json', required: true }]}
+      />,
+    )
+    await userEvent.click(await screen.findByRole('button', { name: 'Add model' }))
+    const editor = await screen.findByLabelText(/^Components/)
+    expect(editor.closest('[inert]')).toBeNull()
   })
 
   it('hides per-key request logging until a key exists', async () => {
