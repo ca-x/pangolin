@@ -896,6 +896,100 @@ async fn circuit_is_model_scoped_and_half_open_probe_is_exclusive() {
     assert!(runtime.circuit_available("channel:model-a", &policy));
 }
 
+// -- Multi-credential candidate selection (Issue 1) --
+
+#[tokio::test]
+async fn multiple_enabled_credentials_produce_separate_candidates() {
+    let f = database_fixture().await;
+    let (provider, _) = add_model(&f, "a", "public", "actual").await;
+    // Second credential at a different priority.
+    sql(
+        &f,
+        "INSERT INTO channel_credentials(id,provider_id,secret_envelope,priority,created_at,updated_at) VALUES('cred-two',?,?,50,0,0)",
+        vec![provider.clone().into(), f.secrets.encrypt("second-key").unwrap().into()],
+    )
+    .await;
+    let result = plan(&f, json!({"model":"public"})).await.unwrap();
+    // Both enabled credentials should produce candidates.
+    assert_eq!(
+        result.candidates.len(),
+        2,
+        "both enabled credentials must yield separate candidates"
+    );
+    let ids: Vec<_> = result
+        .candidates
+        .iter()
+        .map(|c| c.credential_id.clone())
+        .collect();
+    assert!(ids.contains(&provider));
+    assert!(ids.contains(&"cred-two".to_string()));
+    // Each candidate must have a unique id (credential_id embedded).
+    assert_ne!(result.candidates[0].id(), result.candidates[1].id());
+}
+
+#[tokio::test]
+async fn disabled_credential_is_excluded_from_candidates() {
+    let f = database_fixture().await;
+    let (provider, _) = add_model(&f, "a", "public", "actual").await;
+    // Insert a second credential and disable it.
+    sql(
+        &f,
+        "INSERT INTO channel_credentials(id,provider_id,secret_envelope,priority,enabled,created_at,updated_at) VALUES('disabled-cred',?,?,25,0,0,0)",
+        vec![provider.clone().into(), f.secrets.encrypt("disabled-key").unwrap().into()],
+    )
+    .await;
+    let result = plan(&f, json!({"model":"public"})).await.unwrap();
+    // Only the enabled (primary) credential should appear.
+    assert_eq!(result.candidates.len(), 1);
+    assert_eq!(result.candidates[0].credential_id, provider);
+}
+
+#[tokio::test]
+async fn round_robin_rotates_across_credentials() {
+    let f = database_fixture().await;
+    let (provider, _) = add_model(&f, "a", "public", "actual").await;
+    sql(
+        &f,
+        "INSERT INTO channel_credentials(id,provider_id,secret_envelope,priority,created_at,updated_at) VALUES('cred-b',?,?,100,0,0)",
+        vec![provider.clone().into(), f.secrets.encrypt("b-key").unwrap().into()],
+    )
+    .await;
+    // Set project-level routing strategy to round_robin.
+    sql(
+        &f,
+        "UPDATE projects SET settings_json=? WHERE id=?",
+        vec![
+            json!({"version":1,"routing":{"version":1,"strategy":"round_robin"}})
+                .to_string()
+                .into(),
+            db::DEFAULT_PROJECT_ID.into(),
+        ],
+    )
+    .await;
+    let runtime = Runtime::default();
+    // Collect first candidate across many plans; both credentials should appear.
+    let mut seen = std::collections::BTreeSet::new();
+    for _ in 0..20 {
+        let plan = prepare(
+            &f.db,
+            &runtime,
+            &f.key,
+            load_profile(&f.db, &f.key).await.unwrap(),
+            json!({"model":"public"}),
+            &HeaderMap::new(),
+            "/v1/chat/completions",
+        )
+        .await
+        .unwrap();
+        assert!(!plan.candidates.is_empty());
+        seen.insert(plan.candidates[0].credential_id.clone());
+    }
+    assert!(
+        seen.len() >= 2,
+        "round-robin across two credentials should surface both; saw {seen:?}"
+    );
+}
+
 #[test]
 fn response_sessions_preserve_order_normalize_status_and_deny_cross_key_reads() {
     let sessions = session::Sessions::default();

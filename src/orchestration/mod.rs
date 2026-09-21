@@ -57,8 +57,9 @@ pub struct Candidate {
 impl Candidate {
     pub fn id(&self) -> String {
         format!(
-            "{}:{}:{}",
+            "{}:{}:{}:{}",
             self.provider_id,
+            self.credential_id,
             self.target.upstream_name.len(),
             self.target.upstream_name
         )
