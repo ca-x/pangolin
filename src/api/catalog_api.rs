@@ -64,6 +64,7 @@ fn audit_ctx<'a>(user: &'a User, action: &'a str) -> repo::CatalogAudit<'a> {
         actor_user_id: &user.id,
         action,
         resource_id: None,
+        details: json!({}),
     }
 }
 
@@ -77,6 +78,7 @@ fn audit_ctx_for<'a>(
         actor_user_id: &user.id,
         action,
         resource_id: Some(resource_id),
+        details: json!({}),
     }
 }
 
@@ -323,41 +325,31 @@ async fn delete_source(
     repo::delete_source(&state.db, &id, Some(audit_ctx(&user, "delete_source"))).await?;
     Ok(StatusCode::NO_CONTENT)
 }
-/// Refresh fetches catalog data over the network, so the audit cannot share a SQLite
-/// transaction with the fetch — it is intentionally recorded after the refresh completes.
+/// Refresh fetches catalog data over the network, so the fetch stays outside any SQLite
+/// transaction. The audit row is written by the transaction that commits the resulting
+/// state change instead, so a refresh can never be committed unaudited.
 async fn refresh(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<catalog::refresh::Outcome>, ApiError> {
     let user = manager(&state, &headers).await?;
-    let result = catalog::refresh::refresh(&state.db, &id).await?;
-    db::record_audit_event(
+    let outcome = catalog::refresh::refresh(
         &state.db,
-        &user.id,
-        "refresh_source",
-        "catalog",
         &id,
-        json!({}),
+        Some(audit_ctx_for(&user, "refresh_source", &id)),
     )
     .await?;
-    Ok(Json(result))
+    Ok(Json(outcome))
 }
-/// Refresh-due runs multiple network fetches; same constraint as refresh above.
+/// Refresh-due runs multiple network fetches; each source keeps the constraint above, so
+/// every per-source mutation is audited in its own transaction. The batch invocation is
+/// recorded first, so a failed audit can no longer follow committed refreshes.
 async fn refresh_due(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<Value>>, ApiError> {
     let user = manager(&state, &headers).await?;
-    let mut results = vec![];
-    for source in repo::due_sources(&state.db, db::now()).await? {
-        match catalog::refresh::refresh(&state.db, &source.id).await {
-            Ok(outcome) => results.push(json!(outcome)),
-            Err(error) => results.push(
-                json!({"source_id":source.id,"status":"failed","error":error.public_message()}),
-            ),
-        }
-    }
     db::record_audit_event(
         &state.db,
         &user.id,
@@ -367,6 +359,16 @@ async fn refresh_due(
         json!({}),
     )
     .await?;
+    let mut results = vec![];
+    for source in repo::due_sources(&state.db, db::now()).await? {
+        let audit = audit_ctx_for(&user, "refresh_source", &source.id);
+        match catalog::refresh::refresh(&state.db, &source.id, Some(audit)).await {
+            Ok(outcome) => results.push(json!(outcome)),
+            Err(error) => results.push(
+                json!({"source_id":source.id,"status":"failed","error":error.public_message()}),
+            ),
+        }
+    }
     Ok(Json(results))
 }
 async fn snapshots(

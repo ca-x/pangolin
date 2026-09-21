@@ -45,6 +45,21 @@ async fn json_body(response: Response) -> Value {
     )
     .unwrap()
 }
+async fn audit_count(f: &Fixture, action: &str) -> i64 {
+    sea_orm::ConnectionTrait::query_one(
+        &f.state.db,
+        Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT COUNT(*) AS count FROM audit_events WHERE action=?",
+            vec![action.into()],
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .try_get::<i64>("", "count")
+    .unwrap()
+}
 
 #[tokio::test]
 async fn catalog_api_is_offline_filterable_versioned_and_authorized() {
@@ -243,6 +258,65 @@ async fn model_catalog_defaults_preserve_explicit_admin_prices_and_capabilities(
     assert_eq!(explicit.capabilities, "[\"rerank\"]");
     assert_eq!(explicit.input_price_micros, 0);
 }
+#[tokio::test]
+async fn refresh_state_changes_commit_only_together_with_their_audit_row() {
+    // A refresh mutates the source row (snapshot activation, validators, attempt and
+    // error bookkeeping). If that bookkeeping cannot be audited, it must not commit:
+    // an unattributable catalog change is worse than a failed refresh. The fetch is
+    // network work and stays outside the transaction; only the mutation is wrapped.
+    let f = fixture(Router::new()).await;
+    let cookie = session(&f).await;
+    let created = admin(
+        &f,
+        &cookie,
+        http::Method::POST,
+        "/api/admin/v1/catalog/sources",
+        json!({"name":"unreachable","url":"https://catalog.invalid/pangolin.json","priority":10,"refresh_interval_secs":3600,"enabled":true,"signature_policy":"optional","public_key":null}),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let id = json_body(created).await["id"].as_str().unwrap().to_string();
+    // Make every refresh audit insert fail, as a broken audit table would.
+    sql(
+        &f,
+        "CREATE TRIGGER fail_refresh_audit BEFORE INSERT ON audit_events WHEN NEW.action='refresh_source' BEGIN SELECT RAISE(ABORT,'audit unavailable'); END",
+        vec![],
+    )
+    .await;
+    let manual = admin(
+        &f,
+        &cookie,
+        http::Method::POST,
+        &format!("/api/admin/v1/catalog/sources/{id}/refresh"),
+        Value::Null,
+    )
+    .await;
+    assert!(!manual.status().is_success());
+    let due = admin(
+        &f,
+        &cookie,
+        http::Method::POST,
+        "/api/admin/v1/catalog/sources/refresh-due",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(due.status(), StatusCode::OK);
+    let due_results = json_body(due).await;
+    let source = crate::catalog::repository::source(&f.state.db, &id)
+        .await
+        .unwrap();
+    assert_eq!(source.revision, 1);
+    assert_eq!(source.last_attempt_at, None);
+    assert_eq!(source.last_error, None);
+    assert_eq!(source.active_snapshot_id, None);
+    assert_eq!(audit_count(&f, "refresh_source").await, 0);
+    // The source is still due, because the first attempt left no trace at all.
+    assert_eq!(due_results.as_array().unwrap().len(), 1);
+    assert_eq!(due_results[0]["status"], "failed");
+    // The public error names the failure without leaking the internal cause.
+    assert_eq!(due_results[0]["error"], "An internal error occurred");
+}
+
 #[tokio::test]
 async fn override_audits_identify_the_kind_as_well_as_the_entry() {
     // Overrides are keyed by (kind, entry_id), so a provider and a model may

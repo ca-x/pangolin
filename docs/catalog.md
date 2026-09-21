@@ -64,6 +64,8 @@ ETag and Last-Modified are stored with the active snapshot and sent as condition
 
 Validated snapshots activate transactionally with a revision check, so a late refresh cannot overwrite a newer source edit or activation. Aggregate merge validation occurs inside the same transaction. SQLite stores active/previous snapshots, last attempt/success/error, HTTP validators and signature verification metadata. Up to five recent snapshots plus any separately pinned active/previous versions are retained. Rollback is source-scoped and revision-checked. Local overrides use separate rows and remain higher priority than subscriptions.
 
+The HTTPS fetch stays outside every SQLite transaction. Each refresh outcome that changes state — activation, 304 bookkeeping and failure bookkeeping — writes its audit row inside the transaction that commits it, so a committed refresh always has an audit entry naming the actor, the source and the outcome. Refresh-due records the batch invocation before it starts, then audits each source mutation the same way.
+
 `catalog::repository::due_sources` and `catalog::refresh::refresh` are the Task 5 scheduler integration points. Automatic scheduler ticks are not installed in Task 4. The manual service/API is complete and refreshes do not require rebuilding the binary.
 
 Logo keys use `lobehub:Name`, `simple-icons:slug`, or `initials:id`, with a nonempty initials fallback, optional brand color and monochrome preference. No upstream logo assets are copied. Task 6 bundles icon libraries offline and resolves the keys during onboarding/provider selection.

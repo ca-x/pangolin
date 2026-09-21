@@ -33,10 +33,10 @@ async fn task4_document_extensions_merge_atomically_and_roundtrip_separately_fro
     higher.extensions =
         serde_json::from_value(json!({"collision":{"higher":true},"higher_only":"preserve"}))
             .unwrap();
-    repository::activate(&db, &low, &encoded(&lower), None, None, false)
+    repository::activate(&db, &low, &encoded(&lower), None, None, false, None)
         .await
         .unwrap();
-    repository::activate(&db, &high, &encoded(&higher), None, None, false)
+    repository::activate(&db, &high, &encoded(&higher), None, None, false, None)
         .await
         .unwrap();
     let merged = repository::effective(&db).await.unwrap();
@@ -60,7 +60,7 @@ async fn task4_document_extensions_merge_atomically_and_roundtrip_separately_fro
     higher
         .extensions
         .insert("collision".into(), json!("new subscription value"));
-    repository::activate(&db, &current, &encoded(&higher), None, None, false)
+    repository::activate(&db, &current, &encoded(&higher), None, None, false, None)
         .await
         .unwrap();
     let exported = repository::effective(&db).await.unwrap();
@@ -124,6 +124,171 @@ fn download(body: Vec<u8>) -> Download {
         last_modified: Some("Sun, 20 Sep 2026 00:00:00 GMT".into()),
         signature: None,
     }
+}
+
+fn refresh_audit<'a>(actor_user_id: &'a str, source_id: &'a str) -> repository::CatalogAudit<'a> {
+    repository::CatalogAudit {
+        actor_user_id,
+        action: "refresh_source",
+        resource_id: Some(source_id),
+        details: json!({}),
+    }
+}
+
+/// Every catalog audit row written by a refresh, oldest first.
+async fn refresh_audits(db: &sea_orm::DatabaseConnection) -> Vec<serde_json::Value> {
+    sea_orm::ConnectionTrait::query_all(
+        db,
+        sea_orm::Statement::from_sql_and_values(
+            sea_orm::DbBackend::Sqlite,
+            "SELECT actor_user_id,action,resource_id,details FROM audit_events WHERE resource_type='catalog' AND action='refresh_source' ORDER BY rowid",
+            vec![],
+        ),
+    )
+    .await
+    .unwrap()
+    .iter()
+    .map(|row| {
+        json!({
+            "actor_user_id": row.try_get::<Option<String>>("", "actor_user_id").unwrap(),
+            "action": row.try_get::<String>("", "action").unwrap(),
+            "resource_id": row.try_get::<Option<String>>("", "resource_id").unwrap(),
+            "details": serde_json::from_str::<serde_json::Value>(&row.try_get::<String>("", "details").unwrap()).unwrap(),
+        })
+    })
+    .collect()
+}
+
+async fn catalog_actor(db: &sea_orm::DatabaseConnection) -> crate::models::User {
+    db::create_initial_admin(
+        db,
+        &crate::models::SetupRequest {
+            email: "catalog-refresh@example.com".into(),
+            password: "catalog-refresh-password".into(),
+            instance_name: None,
+            language: None,
+        },
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn refresh_outcomes_record_their_actor_resource_and_status_with_the_state_change() {
+    let db = db::connect("sqlite::memory:").await.unwrap();
+    let actor = catalog_actor(&db).await;
+    let source = repository::create_source(&db, source_input(1), None)
+        .await
+        .unwrap();
+    let mut not_modified = download(vec![]);
+    not_modified.status = 304;
+    let transport = Mock::new(vec![
+        download(encoded(&document("v1", "First"))),
+        not_modified,
+        download(b"{\"schema_version\":999}".to_vec()),
+    ]);
+    let activated = refresh::refresh_with(
+        &db,
+        &source.id,
+        &transport,
+        Some(refresh_audit(&actor.id, &source.id)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(activated.status, "activated");
+    let not_modified = refresh::refresh_with(
+        &db,
+        &source.id,
+        &transport,
+        Some(refresh_audit(&actor.id, &source.id)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(not_modified.status, "not_modified");
+    assert!(
+        refresh::refresh_with(
+            &db,
+            &source.id,
+            &transport,
+            Some(refresh_audit(&actor.id, &source.id)),
+        )
+        .await
+        .is_err()
+    );
+    // A failed attempt still advances the attempt/error bookkeeping, so it is a mutation
+    // and is attributed to the same actor and source as the two successes.
+    assert_eq!(
+        refresh_audits(&db).await,
+        vec![
+            json!({"actor_user_id":actor.id,"action":"refresh_source","resource_id":source.id,"details":{"status":"activated"}}),
+            json!({"actor_user_id":actor.id,"action":"refresh_source","resource_id":source.id,"details":{"status":"not_modified"}}),
+            json!({"actor_user_id":actor.id,"action":"refresh_source","resource_id":source.id,"details":{"status":"failed"}}),
+        ]
+    );
+    assert!(
+        repository::source(&db, &source.id)
+            .await
+            .unwrap()
+            .last_error
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn refresh_bookkeeping_rolls_back_when_its_audit_row_cannot_be_written() {
+    let db = db::connect("sqlite::memory:").await.unwrap();
+    let actor = catalog_actor(&db).await;
+    let source = repository::create_source(&db, source_input(1), None)
+        .await
+        .unwrap();
+    let mut not_modified = download(vec![]);
+    not_modified.status = 304;
+    let transport = Mock::new(vec![
+        download(encoded(&document("v1", "First"))),
+        download(encoded(&document("v2", "Second"))),
+        not_modified,
+        download(b"{\"schema_version\":999}".to_vec()),
+    ]);
+    refresh::refresh_with(
+        &db,
+        &source.id,
+        &transport,
+        Some(refresh_audit(&actor.id, &source.id)),
+    )
+    .await
+    .unwrap();
+    // A catalog change that cannot be audited must not be committed: the state change and
+    // its audit row share one transaction, so an unwritable audit table rolls back the
+    // activation, the 304 bookkeeping and the failure bookkeeping alike.
+    sea_orm::ConnectionTrait::execute_unprepared(&db, "CREATE TRIGGER fail_refresh_audit BEFORE INSERT ON audit_events WHEN NEW.action='refresh_source' BEGIN SELECT RAISE(ABORT,'audit unavailable'); END").await.unwrap();
+    let before = repository::source(&db, &source.id).await.unwrap();
+    assert!(before.active_snapshot_id.is_some());
+    // The mock serves, in order, an activation, a 304 and a schema-invalid document. None
+    // of the three may leave bookkeeping behind when its audit row cannot be written.
+    for outcome in ["activation", "not_modified", "failure"] {
+        assert!(
+            refresh::refresh_with(
+                &db,
+                &source.id,
+                &transport,
+                Some(refresh_audit(&actor.id, &source.id)),
+            )
+            .await
+            .is_err(),
+            "{outcome} must not commit without its audit row"
+        );
+        let after = repository::source(&db, &source.id).await.unwrap();
+        assert_eq!(after.revision, before.revision);
+        assert_eq!(after.active_snapshot_id, before.active_snapshot_id);
+        assert_eq!(after.last_attempt_at, before.last_attempt_at);
+        assert_eq!(after.last_success_at, before.last_success_at);
+        assert_eq!(after.last_error, before.last_error);
+        assert_eq!(
+            repository::snapshots(&db, &source.id).await.unwrap().len(),
+            1
+        );
+    }
+    assert_eq!(refresh_audits(&db).await.len(), 1);
 }
 
 #[test]
@@ -205,6 +370,7 @@ async fn merge_priority_local_override_and_import_export_are_lossless() {
         None,
         None,
         false,
+        None,
     )
     .await
     .unwrap();
@@ -215,6 +381,7 @@ async fn merge_priority_local_override_and_import_export_are_lossless() {
         None,
         None,
         false,
+        None,
     )
     .await
     .unwrap();
@@ -245,6 +412,7 @@ async fn merge_priority_local_override_and_import_export_are_lossless() {
         None,
         None,
         false,
+        None,
     )
     .await
     .unwrap();
@@ -298,11 +466,11 @@ async fn conditional_refresh_and_failed_staging_preserve_last_known_good() {
         download(b"{\"schema_version\":999}".to_vec()),
         download(vec![b'x'; types::MAX_BYTES + 1]),
     ]);
-    let first = refresh::refresh_with(&db, &source.id, &transport)
+    let first = refresh::refresh_with(&db, &source.id, &transport, None)
         .await
         .unwrap();
     assert_eq!(
-        refresh::refresh_with(&db, &source.id, &transport)
+        refresh::refresh_with(&db, &source.id, &transport, None)
             .await
             .unwrap()
             .status,
@@ -315,7 +483,7 @@ async fn conditional_refresh_and_failed_staging_preserve_last_known_good() {
     assert!(transport.requests.lock().unwrap()[1].1.is_some());
     for _ in 0..2 {
         assert!(
-            refresh::refresh_with(&db, &source.id, &transport)
+            refresh::refresh_with(&db, &source.id, &transport, None)
                 .await
                 .is_err()
         );
@@ -361,12 +529,12 @@ async fn pinned_ed25519_signatures_rollback_and_revision_fencing() {
         bad,
         download(encoded(&document("unsigned", "Unsigned"))),
     ]);
-    let first = refresh::refresh_with(&db, &source.id, &transport)
+    let first = refresh::refresh_with(&db, &source.id, &transport, None)
         .await
         .unwrap();
     for _ in 0..2 {
         assert!(
-            refresh::refresh_with(&db, &source.id, &transport)
+            refresh::refresh_with(&db, &source.id, &transport, None)
                 .await
                 .is_err()
         );
@@ -390,7 +558,8 @@ async fn pinned_ed25519_signatures_rollback_and_revision_fencing() {
             &encoded(&document("stale", "Stale")),
             None,
             None,
-            true
+            true,
+            None
         )
         .await
         .is_err()
@@ -403,6 +572,7 @@ async fn pinned_ed25519_signatures_rollback_and_revision_fencing() {
         None,
         None,
         true,
+        None,
     )
     .await
     .unwrap();

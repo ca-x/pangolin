@@ -317,14 +317,33 @@ pub struct Outcome {
     pub snapshot_id: Option<String>,
 }
 
-pub async fn refresh(db: &DatabaseConnection, id: &str) -> Result<Outcome, ApiError> {
-    refresh_with(db, id, &HttpsTransport).await
+pub async fn refresh(
+    db: &DatabaseConnection,
+    id: &str,
+    audit: Option<repository::CatalogAudit<'_>>,
+) -> Result<Outcome, ApiError> {
+    refresh_with(db, id, &HttpsTransport, audit).await
+}
+
+/// The audit row of a refresh must state which outcome it recorded; otherwise a failed
+/// attempt and an activation are indistinguishable in the trail.
+fn outcome_audit<'a>(
+    audit: Option<&'a repository::CatalogAudit<'a>>,
+    status: &str,
+) -> Option<repository::CatalogAudit<'a>> {
+    audit.map(|audit| repository::CatalogAudit {
+        actor_user_id: audit.actor_user_id,
+        action: audit.action,
+        resource_id: audit.resource_id,
+        details: serde_json::json!({"status": status}),
+    })
 }
 
 pub async fn refresh_with<T: Transport>(
     db: &DatabaseConnection,
     id: &str,
     transport: &T,
+    audit: Option<repository::CatalogAudit<'_>>,
 ) -> Result<Outcome, ApiError> {
     let source = repository::source(db, id).await?;
     if !source.enabled {
@@ -335,7 +354,8 @@ pub async fn refresh_with<T: Transport>(
             .await
             .map_err(|_| ApiError::Upstream("catalog refresh timed out".into()))??;
         if download.status == 304 {
-            repository::not_modified(db, &source).await?;
+            repository::not_modified(db, &source, outcome_audit(audit.as_ref(), "not_modified"))
+                .await?;
             return Ok(Outcome {
                 source_id: source.id.clone(),
                 status: "not_modified",
@@ -359,6 +379,7 @@ pub async fn refresh_with<T: Transport>(
             download.etag,
             download.last_modified,
             verified,
+            outcome_audit(audit.as_ref(), "activated"),
         )
         .await?;
         Ok(Outcome {
@@ -369,7 +390,16 @@ pub async fn refresh_with<T: Transport>(
     }
     .await;
     if let Err(error) = &result {
-        repository::failed(db, &source, &error.public_message()).await?;
+        // The failure bookkeeping is a mutation too, so it carries its own audit row. If
+        // that row cannot be written the attempt is rolled back and its error wins: the
+        // caller must not believe the source recorded a refresh it never recorded.
+        repository::failed(
+            db,
+            &source,
+            &error.public_message(),
+            outcome_audit(audit.as_ref(), "failed"),
+        )
+        .await?;
     }
     result
 }

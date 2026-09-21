@@ -20,10 +20,35 @@ pub struct CatalogAudit<'a> {
     /// the batch label; single-entry operations pass the entry id so the audit
     /// trail can tell entries apart.
     pub resource_id: Option<&'a str>,
+    /// Operation-specific audit detail. A refresh records its outcome here so an
+    /// attempt that failed is distinguishable from one that changed the catalog.
+    pub details: Value,
 }
 
 fn sql(query: &str, values: Vec<sea_orm::Value>) -> Statement {
     Statement::from_sql_and_values(DbBackend::Sqlite, query, values)
+}
+
+/// Write the audit row of a catalog mutation on the caller's transaction, so the state
+/// change and its audit entry commit or roll back together.
+async fn record_audit<C: ConnectionTrait>(
+    connection: &C,
+    audit: &Option<CatalogAudit<'_>>,
+    fallback_resource_id: &str,
+) -> Result<(), ApiError> {
+    let Some(audit) = audit else {
+        return Ok(());
+    };
+    db::record_audit_event_in(
+        connection,
+        audit.actor_user_id,
+        audit.action,
+        "catalog",
+        audit.resource_id.unwrap_or(fallback_resource_id),
+        audit.details.clone(),
+    )
+    .await?;
+    Ok(())
 }
 
 #[derive(Clone, Debug, Serialize, FromQueryResult)]
@@ -119,17 +144,7 @@ pub async fn create_source(
     }
     let id = Uuid::new_v4().to_string();
     tx.execute(sql("INSERT INTO catalog_sources(id,name,url,priority,refresh_interval_secs,enabled,signature_policy,public_key,revision) VALUES(?,?,?,?,?,?,?,?,1)",vec![id.clone().into(),input.name.into(),input.url.into(),input.priority.into(),input.refresh_interval_secs.into(),input.enabled.into(),input.signature_policy.into(),input.public_key.into()])).await?;
-    if let Some(audit) = &audit {
-        db::record_audit_event_in(
-            &tx,
-            audit.actor_user_id,
-            audit.action,
-            "catalog",
-            &id,
-            json!({}),
-        )
-        .await?;
-    }
+    record_audit(&tx, &audit, &id).await?;
     tx.commit().await?;
     source(db, &id).await
 }
@@ -150,17 +165,7 @@ pub async fn update_source(
         ));
     }
     assemble(&tx).await?;
-    if let Some(audit) = &audit {
-        db::record_audit_event_in(
-            &tx,
-            audit.actor_user_id,
-            audit.action,
-            "catalog",
-            id,
-            json!({}),
-        )
-        .await?;
-    }
+    record_audit(&tx, &audit, id).await?;
     tx.commit().await?;
     source(db, id).await
 }
@@ -183,21 +188,13 @@ pub async fn delete_source(
         return Err(ApiError::NotFound);
     }
     assemble(&tx).await?;
-    if let Some(audit) = &audit {
-        db::record_audit_event_in(
-            &tx,
-            audit.actor_user_id,
-            audit.action,
-            "catalog",
-            id,
-            json!({}),
-        )
-        .await?;
-    }
+    record_audit(&tx, &audit, id).await?;
     tx.commit().await?;
     Ok(())
 }
 
+/// Activate a freshly fetched document. The fetch has already happened outside this
+/// transaction; the snapshot, the source bookkeeping and the audit row commit together.
 pub async fn activate(
     db: &DatabaseConnection,
     current: &Source,
@@ -205,6 +202,7 @@ pub async fn activate(
     etag: Option<String>,
     last_modified: Option<String>,
     signature_verified: bool,
+    audit: Option<CatalogAudit<'_>>,
 ) -> Result<String, ApiError> {
     let document = Catalog::parse(body)?;
     let serialized = serde_json::to_string(&document).map_err(|e| ApiError::Internal(e.into()))?;
@@ -222,11 +220,18 @@ pub async fn activate(
     // Keep a bounded history plus the current/previous snapshots. Activation and
     // history retention share the same transaction and revision fence.
     tx.execute(sql("DELETE FROM catalog_snapshots WHERE source_id=? AND id NOT IN (SELECT id FROM catalog_snapshots WHERE source_id=? ORDER BY created_at DESC,rowid DESC LIMIT 5) AND id NOT IN (SELECT active_snapshot_id FROM catalog_sources WHERE id=? UNION SELECT previous_snapshot_id FROM catalog_sources WHERE id=?)",vec![current.id.clone().into(),current.id.clone().into(),current.id.clone().into(),current.id.clone().into()])).await?;
+    record_audit(&tx, &audit, &current.id).await?;
     tx.commit().await?;
     Ok(id)
 }
 
-pub async fn not_modified(db: &DatabaseConnection, current: &Source) -> Result<(), ApiError> {
+/// A 304 still advances the attempt/success bookkeeping, so it is a mutation and shares
+/// its transaction with the audit row.
+pub async fn not_modified(
+    db: &DatabaseConnection,
+    current: &Source,
+    audit: Option<CatalogAudit<'_>>,
+) -> Result<(), ApiError> {
     if current.active_snapshot_id.is_none()
         || (current.etag.is_none() && current.last_modified.is_none())
     {
@@ -234,21 +239,29 @@ pub async fn not_modified(db: &DatabaseConnection, current: &Source) -> Result<(
             "source returned 304 without an active conditional snapshot",
         ));
     }
-    let result=db.execute(sql("UPDATE catalog_sources SET last_attempt_at=?,last_success_at=?,last_error=NULL,revision=revision+1 WHERE id=? AND revision=? AND enabled=1",vec![db::now().into(),db::now().into(),current.id.clone().into(),current.revision.into()])).await?;
+    let tx = db.begin().await?;
+    let result=tx.execute(sql("UPDATE catalog_sources SET last_attempt_at=?,last_success_at=?,last_error=NULL,revision=revision+1 WHERE id=? AND revision=? AND enabled=1",vec![db::now().into(),db::now().into(),current.id.clone().into(),current.revision.into()])).await?;
     if result.rows_affected() != 1 {
         return Err(ApiError::Conflict(
             "catalog source changed during refresh".into(),
         ));
     }
+    record_audit(&tx, &audit, &current.id).await?;
+    tx.commit().await?;
     Ok(())
 }
 
+/// Record a failed refresh attempt. This is a mutation (last attempt/error), so it shares
+/// its transaction with the audit row: a failure that cannot be audited leaves no trace
+/// and the source stays due.
 pub async fn failed(
     db: &DatabaseConnection,
     current: &Source,
     message: &str,
+    audit: Option<CatalogAudit<'_>>,
 ) -> Result<(), ApiError> {
-    db.execute(sql(
+    let tx = db.begin().await?;
+    tx.execute(sql(
         "UPDATE catalog_sources SET last_attempt_at=?,last_error=? WHERE id=? AND revision=?",
         vec![
             db::now().into(),
@@ -258,6 +271,8 @@ pub async fn failed(
         ],
     ))
     .await?;
+    record_audit(&tx, &audit, &current.id).await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -290,17 +305,7 @@ pub async fn rollback(
         ));
     }
     assemble(&tx).await?;
-    if let Some(audit) = &audit {
-        db::record_audit_event_in(
-            &tx,
-            audit.actor_user_id,
-            audit.action,
-            "catalog",
-            id,
-            json!({}),
-        )
-        .await?;
-    }
+    record_audit(&tx, &audit, id).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -340,17 +345,7 @@ pub async fn import(
         }
     }
     assemble(&tx).await?;
-    if let Some(audit) = &audit {
-        db::record_audit_event_in(
-            &tx,
-            audit.actor_user_id,
-            audit.action,
-            "catalog",
-            audit.resource_id.unwrap_or("local-overrides"),
-            json!({}),
-        )
-        .await?;
-    }
+    record_audit(&tx, &audit, "local-overrides").await?;
     tx.commit().await?;
     Ok(counts)
 }
@@ -377,19 +372,9 @@ pub async fn remove_override(
         return Err(ApiError::NotFound);
     }
     assemble(&tx).await?;
-    if let Some(audit) = &audit {
-        // Overrides are keyed by (kind, entry_id), so the caller passes a
-        // composite identity to tell a provider and a model apart.
-        db::record_audit_event_in(
-            &tx,
-            audit.actor_user_id,
-            audit.action,
-            "catalog",
-            audit.resource_id.unwrap_or(id),
-            json!({}),
-        )
-        .await?;
-    }
+    // Overrides are keyed by (kind, entry_id), so the caller passes a
+    // composite identity to tell a provider and a model apart.
+    record_audit(&tx, &audit, id).await?;
     tx.commit().await?;
     Ok(())
 }

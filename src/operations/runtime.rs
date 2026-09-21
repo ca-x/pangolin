@@ -81,7 +81,10 @@ pub async fn execute(state: &AppState, claim: &jobs::Claim) -> Result<(), ApiErr
             let source = payload["source_id"].as_str().ok_or(ApiError::NotFound)?;
             let current = crate::catalog::repository::source(&state.db, source).await?;
             if payload["revision"].as_i64() == Some(current.revision) {
-                crate::catalog::refresh::refresh(&state.db, source).await?;
+                // A scheduled refresh has no interactive actor, so it records no audit
+                // row (as before); the mutation still goes through the same
+                // transactional repository call as the admin-triggered paths.
+                crate::catalog::refresh::refresh(&state.db, source, None).await?;
             }
             Ok(())
         }
