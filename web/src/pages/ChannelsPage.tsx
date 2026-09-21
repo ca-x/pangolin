@@ -59,6 +59,9 @@ function useResourceTotal(resource: 'channels' | 'credentials') {
   // `null` means the count is unknown (still loading, or the request failed), and
   // an unknown count must not be treated as empty: that would drop the bulk
   // controls from a populated page whenever this auxiliary request failed.
+  // TanStack Query keeps the last `data` through a failed refetch, so a stale
+  // zero after an error would read as "no rows" — the error state comes first.
+  if (query.isError) return null
   return query.data ? (query.data.total ?? query.data.data?.length ?? 0) : null
 }
 

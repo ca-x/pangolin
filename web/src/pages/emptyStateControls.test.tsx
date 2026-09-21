@@ -84,6 +84,27 @@ describe('empty states drop controls that cannot do anything', () => {
     expect(await screen.findByText('Bulk enable or disable')).toBeInTheDocument()
   })
 
+  it('keeps the bulk form when a refetch fails after a zero count', async () => {
+    // A cached zero survives a failed refetch, and reading it as "no rows" would
+    // hide a usable control — the failure state the count guard exists for.
+    let failCount = false
+    vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
+      const path = String(input)
+      if (path.includes('limit=1')) {
+        return failCount ? Promise.reject(new Error('count unavailable')) : json({ data: [], total: 0, offset: 0, limit: 1 })
+      }
+      return base(path) ?? json({ data: [{ id: 'c1', name: 'Primary', kind: 'openai', base_url: 'https://api.openai.com', enabled: true }], total: 1, offset: 0, limit: 25 })
+    }))
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    render(<QueryClientProvider client={client}><MemoryRouter><ProjectProvider><ChannelsPage /></ProjectProvider></MemoryRouter></QueryClientProvider>)
+    // No rows yet, so the bulk form is correctly absent.
+    expect(await screen.findByRole('button', { name: 'Add channel' })).toBeInTheDocument()
+    expect(screen.queryByText('Bulk enable or disable')).not.toBeInTheDocument()
+    failCount = true
+    await client.invalidateQueries({ queryKey: ['resource', 'p1', 'channels'] })
+    expect(await screen.findByText('Bulk enable or disable')).toBeInTheDocument()
+  })
+
   it('keeps a required JSON editor open, so an invalid one can be reported', async () => {
     // A collapsed editor keeps `required` on a control the browser cannot focus,
     // which blocks Save with no actionable error.
