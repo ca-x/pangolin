@@ -1270,6 +1270,63 @@ async fn task5_webhook_outbox_retries_and_gc_preserves_usage_and_latest_quota() 
     );
 }
 
+/// A typo in a routing condition used to be stored happily and then abort
+/// candidate generation for the whole project, so every request through it
+/// answered a generic 500 with nothing naming the rule. It is now a 400 on the
+/// form, and nothing is written.
+#[tokio::test]
+async fn a_malformed_routing_condition_is_rejected_at_write_time() {
+    let f = fixture(Router::new()).await;
+    let cookie = owner(&f).await;
+    let path = format!(
+        "/api/admin/v1/projects/{}/operations/associations",
+        db::DEFAULT_PROJECT_ID
+    );
+    for conditions in [
+        json!({"version":1,"field":"/body/model","op":"eq","value":"m","typo":true}),
+        json!({"version":1,"field":"/body/model","op":"matches","value":"m"}),
+        json!({"version":1,"field":"body/model","op":"eq","value":"m"}),
+        json!({"version":1,"field":"/body/model","op":"regex","value":"[unclosed"}),
+        json!({"version":2}),
+    ] {
+        let response = admin(
+            &f,
+            &cookie,
+            http::Method::POST,
+            &path,
+            json!({"match_type":"exact","pattern":"m","conditions":conditions}),
+            true,
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "conditions should be rejected on the form: {conditions}"
+        );
+    }
+    assert_eq!(
+        count(&f, "SELECT COUNT(*) AS n FROM model_associations").await,
+        0,
+        "a rejected condition must not be stored"
+    );
+
+    // A well-formed condition still saves.
+    let response = admin(
+        &f,
+        &cookie,
+        http::Method::POST,
+        &path,
+        json!({"match_type":"exact","pattern":"m","conditions":{"version":1,"field":"/body/temperature","op":"lt","value":1}}),
+        true,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        count(&f, "SELECT COUNT(*) AS n FROM model_associations").await,
+        1
+    );
+}
+
 #[tokio::test]
 async fn task5_concurrent_streams_cannot_oversubscribe_durable_budget() {
     let calls = Arc::new(AtomicUsize::new(0));

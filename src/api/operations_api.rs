@@ -903,6 +903,19 @@ async fn mutate(
             if match_type == "regex" {
                 crate::orchestration::policy::regex(text(&value, "pattern")?)?;
             }
+            // Validate the condition tree with the evaluator that will run it.
+            // A malformed condition used to be stored happily and then abort
+            // candidate generation for the whole project, surfacing as a generic
+            // 500 on every request with nothing naming the offending rule.
+            let conditions = value
+                .get("conditions")
+                .cloned()
+                .unwrap_or_else(|| json!({"version":1}));
+            crate::orchestration::policy::validate_conditions(&conditions).map_err(|_| {
+                ApiError::BadRequest(
+                    "invalid conditions: only version, all, any, field, op and value are allowed; field must be a JSON pointer; value must match the operator".into(),
+                )
+            })?;
             let model = value
                 .get("model_id")
                 .and_then(Value::as_str)

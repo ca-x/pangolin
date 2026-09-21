@@ -206,6 +206,22 @@ pub fn matches(condition: &Value, context: &Value) -> Result<bool> {
     evaluate(condition, context, 0)
 }
 
+/// Check a condition tree exactly as the evaluator will, before it is stored.
+///
+/// The evaluator rejects unknown keys, a missing `field`/`op`, a bad regex and a
+/// value of the wrong type — but it runs per request, so one malformed condition
+/// used to abort candidate generation for the whole project and surface as a
+/// generic 500 on every request, with nothing naming the offending rule. Running
+/// it here against a synthetic context turns that into a 400 on the form.
+pub fn validate_conditions(condition: &Value) -> Result<()> {
+    let context = json!({
+        "body": {},
+        "headers": {},
+        "endpoint": "/v1/chat/completions",
+    });
+    matches(condition, &context).map(|_| ())
+}
+
 fn evaluate(condition: &Value, context: &Value, depth: usize) -> Result<bool> {
     if depth > 16 {
         return Err(Error::Configuration);

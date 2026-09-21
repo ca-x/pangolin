@@ -928,6 +928,47 @@ async fn multiple_enabled_credentials_produce_separate_candidates() {
     assert_ne!(result.candidates[0].id(), result.candidates[1].id());
 }
 
+#[test]
+fn a_malformed_condition_is_rejected_by_the_evaluator_itself() {
+    // `validate_conditions` runs the real evaluator against a synthetic context,
+    // so everything the router would reject at request time is rejected here.
+    use crate::orchestration::policy::validate_conditions;
+    for valid in [
+        json!({"version":1}),
+        json!({"version":1,"all":[]}),
+        json!({"version":1,"field":"/body/temperature","op":"lt","value":1}),
+        json!({"version":1,"any":[{"field":"/endpoint","op":"eq","value":"/v1/chat/completions"}]}),
+        json!({"version":1,"field":"/headers/x-tag","op":"in","value":["a","b"]}),
+    ] {
+        assert!(
+            validate_conditions(&valid).is_ok(),
+            "should be valid: {valid}"
+        );
+    }
+    for invalid in [
+        // an unknown key was accepted and stored, then aborted every request
+        json!({"version":1,"field":"/body/model","op":"eq","value":"m","typo":true}),
+        // an unknown operator
+        json!({"version":1,"field":"/body/model","op":"matches","value":"m"}),
+        // a field that is not a JSON pointer
+        json!({"version":1,"field":"body/model","op":"eq","value":"m"}),
+        // a missing operator
+        json!({"version":1,"field":"/body/model"}),
+        // a value of the wrong type for the operator
+        json!({"version":1,"field":"/body/temperature","op":"lt","value":"warm"}),
+        json!({"version":1,"field":"/body/model","op":"exists","value":"yes"}),
+        // an uncompilable regex
+        json!({"version":1,"field":"/body/model","op":"regex","value":"[unclosed"}),
+        // not an object at all
+        json!("nope"),
+    ] {
+        assert!(
+            validate_conditions(&invalid).is_err(),
+            "should be rejected: {invalid}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn credential_priority_decides_the_order_inside_a_model_tier() {
     // The provider's own credential sits at priority 100 (see `create_provider`).
