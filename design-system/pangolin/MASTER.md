@@ -10,6 +10,12 @@ Two references set the current bar. **AxonHub** (Apache-2.0, behaviour reference
 
 Rejected: glassmorphism card stacks, atmospheric gradients, decorative 01/02/03 labels, animated charts, page transitions, and command-menu animation. Daily-use data products lose clarity to showy motion.
 
+### 主题轴与默认外观 / Theme axes
+
+This file describes the **house** look — the default skin, which is what the product ships with. Pangolin additionally offers a skin axis (15 themes adapted from the `ui-ux-pro-max` style catalogue) and a palette axis (20 colour families), both orthogonal to light/dark. See [`THEMES.md`](THEMES.md) for those axes, their provenance, and the console contract that constrains them: expressive effects live on chrome only, table text stays ≥14px, rows ≥44px, text contrast ≥4.5:1, control borders ≥3:1. Where a catalogue style and this file disagree about the house look, this file wins; a user-selected skin may deviate from it deliberately (the frosted, clay and chrome skins do), but never below the accessibility floors.
+
+Glassmorphism is rejected as a *default*; it remains available as an explicit skin, where translucency is backed by a real ambient layer rather than a blur over nothing.
+
 ## Typography
 
 - UI: `Geist Sans`, bundled locally through `@fontsource-variable` (a self-hosted binary never fetches fonts from a CDN), with system sans fallbacks.
