@@ -298,7 +298,6 @@ pub mod parity {
         pub parameter_overrides_json: String,
         pub retry_statuses_json: String,
         pub auto_disable_policy_json: String,
-        pub proxy_settings_json: String,
     }
 
     #[derive(Debug, Clone, FromQueryResult)]

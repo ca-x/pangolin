@@ -275,7 +275,7 @@ fn query(resource: &str) -> Result<(&'static str, &'static str, &'static str), A
         "channel-settings" => (
             "channel_settings",
             "provider_id IN (SELECT id FROM providers WHERE project_id=?)",
-            "json_object('id',provider_id,'provider_id',provider_id,'endpoint_mappings',json(endpoint_mappings_json),'model_rules',json(model_rules_json),'parameter_overrides',json(parameter_overrides_json),'retry_statuses',json(retry_statuses_json),'auto_disable_policy',json(auto_disable_policy_json),'proxy_settings',json(proxy_settings_json),'updated_at',updated_at)",
+            "json_object('id',provider_id,'provider_id',provider_id,'endpoint_mappings',json(endpoint_mappings_json),'model_rules',json(model_rules_json),'parameter_overrides',json(parameter_overrides_json),'retry_statuses',json(retry_statuses_json),'auto_disable_policy',json(auto_disable_policy_json),'updated_at',updated_at)",
         ),
         "models" => (
             "models",
@@ -856,7 +856,7 @@ async fn mutate(
         }
         "channel-settings" => {
             let provider = text(&value, "provider_id")?;
-            let current=transaction.query_one(sql("SELECT endpoint_mappings_json,model_rules_json,parameter_overrides_json,retry_statuses_json,auto_disable_policy_json,proxy_settings_json FROM channel_settings WHERE provider_id=? AND provider_id IN (SELECT id FROM providers WHERE project_id=?)",vec![provider.into(),project.clone().into()])).await?.ok_or(ApiError::NotFound)?;
+            let current=transaction.query_one(sql("SELECT endpoint_mappings_json,model_rules_json,parameter_overrides_json,retry_statuses_json,auto_disable_policy_json FROM channel_settings WHERE provider_id=? AND provider_id IN (SELECT id FROM providers WHERE project_id=?)",vec![provider.into(),project.clone().into()])).await?.ok_or(ApiError::NotFound)?;
             let document = |key: &str, column: &str| -> Result<String, ApiError> {
                 Ok(value
                     .get(key)
@@ -864,7 +864,7 @@ async fn mutate(
                     .map(Value::to_string)
                     .unwrap_or(current.try_get::<String>("", column)?))
             };
-            let changed = transaction.execute(sql("UPDATE channel_settings SET endpoint_mappings_json=?,model_rules_json=?,parameter_overrides_json=?,retry_statuses_json=?,auto_disable_policy_json=?,proxy_settings_json=?,updated_at=? WHERE provider_id=? AND provider_id IN (SELECT id FROM providers WHERE project_id=?)",vec![document("endpoint_mappings","endpoint_mappings_json")?.into(),document("model_rules","model_rules_json")?.into(),document("parameter_overrides","parameter_overrides_json")?.into(),document("retry_statuses","retry_statuses_json")?.into(),document("auto_disable_policy","auto_disable_policy_json")?.into(),document("proxy_settings","proxy_settings_json")?.into(),db::now().into(),provider.into(),project.clone().into()])).await?.rows_affected();
+            let changed = transaction.execute(sql("UPDATE channel_settings SET endpoint_mappings_json=?,model_rules_json=?,parameter_overrides_json=?,retry_statuses_json=?,auto_disable_policy_json=?,updated_at=? WHERE provider_id=? AND provider_id IN (SELECT id FROM providers WHERE project_id=?)",vec![document("endpoint_mappings","endpoint_mappings_json")?.into(),document("model_rules","model_rules_json")?.into(),document("parameter_overrides","parameter_overrides_json")?.into(),document("retry_statuses","retry_statuses_json")?.into(),document("auto_disable_policy","auto_disable_policy_json")?.into(),db::now().into(),provider.into(),project.clone().into()])).await?.rows_affected();
             if changed != 1 {
                 return Err(ApiError::NotFound);
             }

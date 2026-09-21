@@ -348,7 +348,6 @@ CREATE TABLE channel_settings (
     parameter_overrides_json TEXT NOT NULL DEFAULT '{"version":1}',
     retry_statuses_json TEXT NOT NULL DEFAULT '{"version":1,"statuses":[408,409,429,500,502,503,504]}',
     auto_disable_policy_json TEXT NOT NULL DEFAULT '{"version":1,"enabled":false}',
-    proxy_settings_json TEXT NOT NULL DEFAULT '{"version":1}',
     updated_at INTEGER NOT NULL
 );
 

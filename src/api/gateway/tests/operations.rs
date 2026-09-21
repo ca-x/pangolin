@@ -1803,3 +1803,49 @@ async fn task5_quota_sequence_overrides_wall_clock_order() {
         f.providers[0]
     );
 }
+
+// -- Issue 2: proxy_settings is removed from channel-settings API --
+
+#[tokio::test]
+async fn channel_settings_response_excludes_proxy_settings() {
+    let f = fixture(success()).await;
+    let cookie = owner(&f).await;
+    let base = format!(
+        "/api/admin/v1/projects/{}/operations",
+        db::DEFAULT_PROJECT_ID
+    );
+    let response = json_body(
+        admin(
+            &f,
+            &cookie,
+            http::Method::GET,
+            &format!("{base}/channel-settings"),
+            Value::Null,
+            false,
+        )
+        .await,
+    )
+    .await;
+    let data = response["data"].as_array().unwrap();
+    assert!(
+        !data.is_empty(),
+        "channel-settings list should not be empty"
+    );
+    for item in data {
+        assert!(
+            item.get("proxy_settings").is_none(),
+            "channel-settings item must not contain proxy_settings: {item}"
+        );
+    }
+    // Patching channel-settings without proxy_settings must succeed.
+    let patched = admin(
+        &f,
+        &cookie,
+        http::Method::POST,
+        &format!("{base}/channel-settings"),
+        json!({"provider_id": f.providers[0], "model_rules": null}),
+        true,
+    )
+    .await;
+    assert_eq!(patched.status(), StatusCode::OK);
+}
