@@ -1,7 +1,8 @@
 import { AppShell, Avatar, Burger, Button, Group, Menu, NavLink as MantineNavLink, Select, Stack, Text, Alert, UnstyledButton } from '@mantine/core'
-import { useDisclosure } from '@mantine/hooks'
+import { useDisclosure, useMediaQuery } from '@mantine/hooks'
 import { Activity, Boxes, FlaskConical, Gauge, KeyRound, LogOut, MessageSquareText, Settings, Unplug } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
+import { useEffect } from 'react'
 import { Link as RouterLink, Outlet, useLocation, useNavigate } from 'react-router'
 import { api } from './api'
 import type { Branding, User } from './api'
@@ -18,6 +19,17 @@ function ShellContent({ user, branding }: { user: User; branding: Branding }) {
   const { project, projects, permissions, setProjectId } = useProject()
   const navigate = useNavigate()
   const [mobileOpen, { toggle: toggleMobile, close: closeMobile }] = useDisclosure(false)
+  // Below the md breakpoint the navbar is an off-canvas drawer, and an off-canvas
+  // drawer has to behave like one: dismissible, and modal for assistive tech.
+  const mobile = useMediaQuery('(max-width: 61.99em)', true, { getInitialValueInEffect: false })
+  useEffect(() => {
+    if (!mobile || !mobileOpen) return
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') closeMobile()
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [mobile, mobileOpen, closeMobile])
   const can = (permission: string) => permissions.has('*') || permissions.has(permission)
   const canAccess = ['project:manage', 'api_key:manage', 'role:manage', 'user:manage', 'oidc:manage'].some(can)
   const groups = [
@@ -59,7 +71,14 @@ function ShellContent({ user, branding }: { user: User; branding: Branding }) {
       </AppShell.Header>
 
       {/* Sidebar (desktop: floating panel; mobile: Drawer via AppShell) */}
-      <AppShell.Navbar p="md" className="pm-shell-navbar" data-open={mobileOpen ? 'true' : 'false'}>
+      <AppShell.Navbar
+        p="md"
+        className="pm-shell-navbar"
+        data-open={mobileOpen ? 'true' : 'false'}
+        role={mobile && mobileOpen ? 'dialog' : undefined}
+        aria-modal={mobile && mobileOpen ? true : undefined}
+        aria-label={mobile && mobileOpen ? t('primaryNavigation') : undefined}
+      >
         {/* Desktop brand. On mobile the drawer opens below the header, which
             already carries the brand and the toggle, so repeating them here
             would show two brand rows and two close buttons. */}
@@ -117,7 +136,11 @@ function ShellContent({ user, branding }: { user: User; branding: Branding }) {
       </AppShell.Navbar>
 
       {/* Main content */}
-      <AppShell.Main id="main-content">
+      {mobile && mobileOpen && (
+        <button type="button" className="nav-scrim" aria-label={t('close')} onClick={closeMobile} />
+      )}
+
+      <AppShell.Main id="main-content" inert={mobile && mobileOpen ? true : undefined}>
         {/* Onboarding competes with the page's own primary action on every
             screen, so it only takes the full width on the overview. Elsewhere it
             drops its title and demotes its action to a text button, which keeps

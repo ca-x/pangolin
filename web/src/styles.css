@@ -278,11 +278,11 @@ td code { color: var(--ink); font-size: 13.5px; }
 .tag-row { display: inline-flex; align-items: center; gap: 4px; }
 .tag { padding: 2px 8px; border: 1px solid var(--border); border-radius: 999px; background: var(--surface-muted); color: var(--muted); font-size: 11px; font-weight: 560; }
 .tag-more { border-color: transparent; background: transparent; color: var(--faint); }
-.toolbar .search-control { margin-bottom: 0; }
 
 /* ----------------------------------------------------------- overlays ---- */
 
-.dialog-overlay, .nav-scrim { position: fixed; inset: 0; z-index: 70; background: var(--overlay); }
+.dialog-overlay, .nav-scrim { position: fixed; inset: 0; z-index: 70; background: var(--overlay); border: 0; padding: 0; cursor: default; }
+.nav-scrim:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; }
 .dialog-overlay[data-state='open'] { animation: overlay-in 180ms var(--ease-out); }
 .dialog-overlay[data-state='closed'] { animation: overlay-out 140ms var(--ease-out); }
 .request-drawer { position: fixed; z-index: 80; border: 1px solid var(--border); background: var(--elevated); box-shadow: var(--shadow-overlay); }
@@ -299,12 +299,12 @@ td code { color: var(--ink); font-size: 13.5px; }
 /* -------------------------------------------------------------- forms ---- */
 .field { display: grid; gap: 7px; min-width: 0; }
 .field-hint { min-height: 18px; color: var(--faint); font-size: 12px; }
-input:not([type='checkbox']):not([type='radio']), textarea { width: 100%; min-height: var(--control-height); border: 1px solid var(--control-border); border-radius: var(--radius-control); background: var(--surface); color: var(--ink); }
+input:not([type='checkbox']):not([type='radio']):not(.mantine-Input-input), textarea:not(.mantine-Input-input) { width: 100%; min-height: var(--control-height); border: 1px solid var(--control-border); border-radius: var(--radius-control); background: var(--surface); color: var(--ink); }
 select:not([aria-hidden='true']) { width: 100%; min-height: var(--control-height); padding: 0 10px; border: 1px solid var(--control-border); border-radius: var(--radius-control); background: var(--surface); color: var(--ink); transition: border-color 140ms ease, box-shadow 140ms ease; }
-input:not([type='checkbox']):not([type='radio']), textarea { padding: 0 12px; transition: border-color 140ms ease, box-shadow 140ms ease; }
-input:not([type='checkbox']):not([type='radio'])::placeholder, textarea::placeholder { color: var(--faint); }
+input:not([type='checkbox']):not([type='radio']):not(.mantine-Input-input), textarea:not(.mantine-Input-input) { padding: 0 12px; transition: border-color 140ms ease, box-shadow 140ms ease; }
+input:not([type='checkbox']):not([type='radio']):not(.mantine-Input-input)::placeholder, textarea:not(.mantine-Input-input)::placeholder { color: var(--faint); }
 textarea { min-height: 104px; padding-block: 10px; line-height: 1.55; resize: vertical; }
-input:not([type='checkbox']):not([type='radio']):focus, textarea:focus, select:not([aria-hidden='true']):focus { border-color: var(--focus); outline: 0; box-shadow: 0 0 0 3px color-mix(in srgb, var(--focus) 18%, transparent); }
+input:not([type='checkbox']):not([type='radio']):not(.mantine-Input-input):focus, textarea:not(.mantine-Input-input):focus, select:not([aria-hidden='true']):not(.mantine-Input-input):focus { border-color: var(--focus); outline: 0; box-shadow: 0 0 0 3px color-mix(in srgb, var(--focus) 18%, transparent); }
 .select-content { z-index: 100; min-width: var(--radix-select-trigger-width); padding: 5px; border: 1px solid var(--border); border-radius: 12px; background: var(--elevated); box-shadow: var(--shadow-overlay); transform-origin: var(--radix-select-content-transform-origin); }
 .select-content[data-state='open'] { animation: popover-in 180ms var(--ease-out); }
 .select-content[data-state='closed'] { animation: popover-out 140ms var(--ease-out); }
@@ -353,8 +353,6 @@ input:not([type='checkbox']):not([type='radio']):focus, textarea:focus, select:n
 .boot-screen img { width: 84px; height: 84px; margin: auto; object-fit: contain; }
 
 /* --------------------------------------------------- tabs, filters, misc ---- */
-.search-control { display: flex; width: min(360px,100%); align-items: center; gap: 8px; margin-bottom: 12px; color: var(--faint); }
-.search-control input { min-height: 38px; }
 .provider-cell { display: inline-flex; align-items: center; gap: 10px; }
 .compact-list { display: grid; }
 .compact-list a { display: grid; grid-template-columns: max-content minmax(0,1fr) auto; gap: 10px; align-items: center; min-height: 50px; border-bottom: 1px solid var(--border-subtle); text-decoration: none; font-size: 14px; transition: background-color 120ms ease; }
