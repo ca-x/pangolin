@@ -60,14 +60,6 @@ pub async fn create_initial_admin(db: &DatabaseConnection, request: &SetupReques
     if request.password.len() < 12 {
         bail!("password must contain at least 12 characters");
     }
-    let transaction = db.begin().await?;
-    transaction
-        .execute(stmt(
-            "INSERT INTO instance_state(id,initialized_at) VALUES(1,?)",
-            vec![now().into()],
-        ))
-        .await
-        .map_err(|_| anyhow::anyhow!("instance is already initialized"))?;
     let user = User {
         id: Uuid::new_v4().to_string(),
         email: request.email.trim().to_ascii_lowercase(),
@@ -77,55 +69,69 @@ pub async fn create_initial_admin(db: &DatabaseConnection, request: &SetupReques
         theme: "system:bronze".into(),
         created_at: now(),
     };
-    transaction.execute(stmt(
+    let tx = db.begin().await?;
+    create_initial_admin_in(&tx, request, &user).await?;
+    tx.commit().await?;
+    Ok(user)
+}
+
+/// Core setup logic that runs on any connection — intended for callers that already hold a
+/// transaction so the setup and its audit entry commit or roll back together.
+pub async fn create_initial_admin_in<C: ConnectionTrait>(
+    db: &C,
+    request: &SetupRequest,
+    user: &User,
+) -> Result<()> {
+    db.execute(stmt(
+        "INSERT INTO instance_state(id,initialized_at) VALUES(1,?)",
+        vec![now().into()],
+    ))
+    .await
+    .map_err(|_| anyhow::anyhow!("instance is already initialized"))?;
+    db.execute(stmt(
         "INSERT INTO users(id,email,password_hash,role,language,theme,created_at,display_name,enabled,updated_at) VALUES(?,?,?,?,?,?,?,?,1,?)",
         vec![user.id.clone().into(), user.email.clone().into(), user.password_hash.clone().into(), user.role.clone().into(), user.language.clone().into(), user.theme.clone().into(), user.created_at.into(), user.email.clone().into(), user.created_at.into()],
     )).await?;
-    transaction
-        .execute(stmt(
-            "UPDATE projects SET owner_user_id=? WHERE id=? AND owner_user_id IS NULL",
-            vec![user.id.clone().into(), DEFAULT_PROJECT_ID.into()],
-        ))
-        .await?;
-    transaction
-        .execute(stmt(
-            "INSERT OR IGNORE INTO project_memberships(id,project_id,user_id,role_id,status,created_at,updated_at) VALUES(?,?,?,?,\'active\',?,?)",
-            vec![
-                user.id.clone().into(),
-                DEFAULT_PROJECT_ID.into(),
-                user.id.clone().into(),
-                SYSTEM_OWNER_ROLE_ID.into(),
-                user.created_at.into(),
-                user.created_at.into(),
-            ],
-        ))
-        .await?;
-    transaction
-        .execute(stmt(
-            "INSERT OR IGNORE INTO user_role_bindings(id,user_id,role_id,project_id,created_at) VALUES(?,?,?,?,?)",
-            vec![
-                user.id.clone().into(),
-                user.id.clone().into(),
-                SYSTEM_OWNER_ROLE_ID.into(),
-                sea_orm::Value::String(None),
-                user.created_at.into(),
-            ],
-        ))
-        .await?;
+    db.execute(stmt(
+        "UPDATE projects SET owner_user_id=? WHERE id=? AND owner_user_id IS NULL",
+        vec![user.id.clone().into(), DEFAULT_PROJECT_ID.into()],
+    ))
+    .await?;
+    db.execute(stmt(
+        "INSERT OR IGNORE INTO project_memberships(id,project_id,user_id,role_id,status,created_at,updated_at) VALUES(?,?,?,?,\'active\',?,?)",
+        vec![
+            user.id.clone().into(),
+            DEFAULT_PROJECT_ID.into(),
+            user.id.clone().into(),
+            SYSTEM_OWNER_ROLE_ID.into(),
+            user.created_at.into(),
+            user.created_at.into(),
+        ],
+    ))
+    .await?;
+    db.execute(stmt(
+        "INSERT OR IGNORE INTO user_role_bindings(id,user_id,role_id,project_id,created_at) VALUES(?,?,?,?,?)",
+        vec![
+            user.id.clone().into(),
+            user.id.clone().into(),
+            SYSTEM_OWNER_ROLE_ID.into(),
+            sea_orm::Value::String(None),
+            user.created_at.into(),
+        ],
+    ))
+    .await?;
     if let Some(name) = request
         .instance_name
         .as_ref()
         .filter(|name| !name.trim().is_empty())
     {
-        transaction
-            .execute(stmt(
-                "INSERT OR REPLACE INTO settings(key,value,updated_at) VALUES('instance_name',?,?)",
-                vec![name.trim().to_owned().into(), now().into()],
-            ))
-            .await?;
+        db.execute(stmt(
+            "INSERT OR REPLACE INTO settings(key,value,updated_at) VALUES('instance_name',?,?)",
+            vec![name.trim().to_owned().into(), now().into()],
+        ))
+        .await?;
     }
-    transaction.commit().await?;
-    Ok(user)
+    Ok(())
 }
 
 pub async fn find_user_by_email(db: &DatabaseConnection, email: &str) -> Result<Option<User>> {
@@ -179,6 +185,7 @@ pub async fn list_providers(db: &DatabaseConnection, project_id: &str) -> Result
     .await?)
 }
 
+#[allow(dead_code)]
 pub async fn create_provider(
     db: &DatabaseConnection,
     input: &ProviderInput,
@@ -205,8 +212,6 @@ pub async fn create_provider(
     } else {
         input.base_url.trim()
     };
-    let id = Uuid::new_v4().to_string();
-    let timestamp = now();
     let mut catalog_paths = serde_json::Map::new();
     if let Some(preset) = preset {
         for endpoint in &preset.default_endpoints {
@@ -226,30 +231,62 @@ pub async fn create_provider(
             }
         }
     }
-    let transaction = db.begin().await?;
-    transaction.execute(stmt(
+    let tx = db.begin().await?;
+    let context = ProviderCatalogContext {
+        kind,
+        base_url,
+        catalog_paths,
+        catalog_preset_id: preset.map(|p| &p.id),
+        catalog_version: &catalog.version,
+    };
+    let provider = create_provider_in(&tx, input, secret_envelope, &context).await?;
+    tx.commit().await?;
+    Ok(provider)
+}
+
+pub struct ProviderCatalogContext<'a> {
+    pub kind: &'a str,
+    pub base_url: &'a str,
+    pub catalog_paths: serde_json::Map<String, serde_json::Value>,
+    pub catalog_preset_id: Option<&'a String>,
+    pub catalog_version: &'a str,
+}
+
+/// Insert provider rows on any connection — intended for callers that already hold a transaction.
+pub async fn create_provider_in<C: ConnectionTrait>(
+    db: &C,
+    input: &ProviderInput,
+    secret_envelope: String,
+    context: &ProviderCatalogContext<'_>,
+) -> Result<Provider> {
+    let id = Uuid::new_v4().to_string();
+    let timestamp = now();
+    db.execute(stmt(
         "INSERT INTO providers(id,name,kind,base_url,enabled,created_at,updated_at,project_id,settings_json) VALUES(?,?,?,?,1,?,?,?,?)",
-        vec![id.clone().into(), input.name.trim().to_owned().into(), kind.into(), base_url.trim_end_matches('/').to_owned().into(), timestamp.into(), timestamp.into(), DEFAULT_PROJECT_ID.into(),serde_json::json!({"version":1,"catalog_preset_id":preset.map(|p|&p.id),"catalog_version":catalog.version}).to_string().into()],
+        vec![id.clone().into(), input.name.trim().to_owned().into(), context.kind.into(), context.base_url.trim_end_matches('/').to_owned().into(), timestamp.into(), timestamp.into(), DEFAULT_PROJECT_ID.into(),serde_json::json!({"version":1,"catalog_preset_id":context.catalog_preset_id,"catalog_version":context.catalog_version}).to_string().into()],
     )).await?;
-    transaction
-        .execute(stmt(
-            "INSERT INTO channel_credentials(id,provider_id,credential_type,secret_envelope,suffix,priority,enabled,created_at,updated_at) VALUES(?,?,'api_key',?,'',100,1,?,?)",
-            vec![
-                id.clone().into(),
-                id.clone().into(),
-                secret_envelope.into(),
-                timestamp.into(),
-                timestamp.into(),
-            ],
-        ))
-        .await?;
-    transaction
-        .execute(stmt(
-            "INSERT INTO channel_settings(provider_id,updated_at,endpoint_mappings_json) VALUES(?,?,?)",
-            vec![id.clone().into(), timestamp.into(),serde_json::json!({"version":1,"paths":catalog_paths}).to_string().into()],
-        ))
-        .await?;
-    transaction.commit().await?;
+    db.execute(stmt(
+        "INSERT INTO channel_credentials(id,provider_id,credential_type,secret_envelope,suffix,priority,enabled,created_at,updated_at) VALUES(?,?,'api_key',?,'',100,1,?,?)",
+        vec![
+            id.clone().into(),
+            id.clone().into(),
+            secret_envelope.into(),
+            timestamp.into(),
+            timestamp.into(),
+        ],
+    ))
+    .await?;
+    db.execute(stmt(
+        "INSERT INTO channel_settings(provider_id,updated_at,endpoint_mappings_json) VALUES(?,?,?)",
+        vec![
+            id.clone().into(),
+            timestamp.into(),
+            serde_json::json!({"version":1,"paths":&context.catalog_paths})
+                .to_string()
+                .into(),
+        ],
+    ))
+    .await?;
     Ok(Provider::find_by_statement(stmt(
         "SELECT id,name,kind,base_url,enabled,created_at,updated_at FROM providers WHERE id=?",
         vec![id.into()],
@@ -259,7 +296,12 @@ pub async fn create_provider(
     .expect("inserted provider exists"))
 }
 
-pub async fn delete_provider(db: &DatabaseConnection, id: &str, project_id: &str) -> Result<bool> {
+/// Run the DELETE on any connection — intended for callers that hold a transaction.
+pub async fn delete_provider_in<C: ConnectionTrait>(
+    db: &C,
+    id: &str,
+    project_id: &str,
+) -> Result<bool> {
     Ok(db
         .execute(stmt(
             "DELETE FROM providers WHERE id=? AND project_id=?",
@@ -277,22 +319,12 @@ pub async fn list_models(db: &DatabaseConnection, project_id: &str) -> Result<Ve
     )).all(db).await?)
 }
 
+#[allow(dead_code)]
 pub async fn create_model(
     db: &DatabaseConnection,
     input: &ModelInput,
     project_id: &str,
 ) -> Result<Model> {
-    let id = Uuid::new_v4().to_string();
-    let owned = Provider::find_by_statement(stmt(
-        "SELECT id,name,kind,base_url,enabled,created_at,updated_at FROM providers WHERE id=? AND project_id=?",
-        vec![input.provider_id.clone().into(), project_id.into()],
-    ))
-    .one(db)
-    .await?
-    .is_some();
-    if !owned {
-        return Err(anyhow::anyhow!("provider is not in this project"));
-    }
     let catalog = crate::catalog::repository::effective(db).await?;
     let defaults = catalog.models.iter().find(|model| {
         model.upstream_id == input.upstream_name
@@ -308,12 +340,6 @@ pub async fn create_model(
                 "messages".to_owned(),
             ]
         });
-    let capabilities = serde_json::to_string(
-        input
-            .capabilities
-            .as_deref()
-            .unwrap_or(&default_capabilities),
-    )?;
     let price = |value: Option<f64>| {
         value
             .filter(|value| {
@@ -326,11 +352,53 @@ pub async fn create_model(
         model.cost_defaults.currency.as_deref() == Some("USD")
             && model.cost_defaults.unit.as_deref() == Some("per_million_tokens")
     });
-    let metadata =
-        serde_json::json!({"catalog_version":catalog.version,"card":defaults}).to_string();
+    let resolved = ModelCatalogDefaults {
+        capabilities: default_capabilities,
+        input_price_micros: price(default_prices.and_then(|model| model.cost_defaults.input)),
+        output_price_micros: price(default_prices.and_then(|model| model.cost_defaults.output)),
+        metadata: serde_json::json!({"catalog_version":catalog.version,"card":defaults})
+            .to_string(),
+    };
+    let tx = db.begin().await?;
+    let model = create_model_in(&tx, input, project_id, &resolved).await?;
+    tx.commit().await?;
+    Ok(model)
+}
+
+pub struct ModelCatalogDefaults {
+    pub capabilities: Vec<String>,
+    pub input_price_micros: i64,
+    pub output_price_micros: i64,
+    pub metadata: String,
+}
+
+/// Insert a model on any connection — intended for callers that already hold a transaction.
+pub async fn create_model_in<C: ConnectionTrait>(
+    db: &C,
+    input: &ModelInput,
+    project_id: &str,
+    resolved: &ModelCatalogDefaults,
+) -> Result<Model> {
+    let id = Uuid::new_v4().to_string();
+    let owned = Provider::find_by_statement(stmt(
+        "SELECT id,name,kind,base_url,enabled,created_at,updated_at FROM providers WHERE id=? AND project_id=?",
+        vec![input.provider_id.clone().into(), project_id.into()],
+    ))
+    .one(db)
+    .await?
+    .is_some();
+    if !owned {
+        return Err(anyhow::anyhow!("provider is not in this project"));
+    }
+    let capabilities = serde_json::to_string(
+        input
+            .capabilities
+            .as_deref()
+            .unwrap_or(&resolved.capabilities),
+    )?;
     db.execute(stmt(
         "INSERT INTO models(id,provider_id,public_name,upstream_name,capabilities,input_price_micros,output_price_micros,priority,enabled,created_at,catalog_metadata_json) VALUES(?,?,?,?,?,?,?,?,1,?,?)",
-        vec![id.clone().into(), input.provider_id.clone().into(), input.public_name.trim().to_owned().into(), input.upstream_name.trim().to_owned().into(), capabilities.into(), input.input_price_micros.unwrap_or_else(||price(default_prices.and_then(|model|model.cost_defaults.input))).into(), input.output_price_micros.unwrap_or_else(||price(default_prices.and_then(|model|model.cost_defaults.output))).into(), input.priority.unwrap_or(100).into(), now().into(),metadata.into()],
+        vec![id.clone().into(), input.provider_id.clone().into(), input.public_name.trim().to_owned().into(), input.upstream_name.trim().to_owned().into(), capabilities.into(), input.input_price_micros.unwrap_or(resolved.input_price_micros).into(), input.output_price_micros.unwrap_or(resolved.output_price_micros).into(), input.priority.unwrap_or(100).into(), now().into(),resolved.metadata.clone().into()],
     )).await?;
     Ok(Model::find_by_statement(stmt(
         "SELECT m.*,p.name AS provider_name FROM models m JOIN providers p ON p.id=m.provider_id WHERE m.id=?",
@@ -338,7 +406,11 @@ pub async fn create_model(
     )).one(db).await?.expect("inserted model exists"))
 }
 
-pub async fn delete_model(db: &DatabaseConnection, id: &str, project_id: &str) -> Result<bool> {
+pub async fn delete_model_in<C: ConnectionTrait>(
+    db: &C,
+    id: &str,
+    project_id: &str,
+) -> Result<bool> {
     Ok(db
         .execute(stmt(
             "DELETE FROM models WHERE id=? AND provider_id IN (SELECT id FROM providers WHERE project_id=?)",
@@ -353,8 +425,19 @@ pub async fn list_api_keys(db: &DatabaseConnection) -> Result<Vec<ApiKey>> {
     Ok(ApiKey::find_by_statement(stmt("SELECT id,name,key_prefix,scopes,budget_micros,spent_micros,enabled,last_used_at,created_at FROM api_keys WHERE project_id=? ORDER BY created_at DESC", vec![DEFAULT_PROJECT_ID.into()])).all(db).await?)
 }
 
+#[allow(dead_code)]
 pub async fn create_api_key(
     db: &DatabaseConnection,
+    input: &ApiKeyInput,
+) -> Result<(ApiKey, String)> {
+    let tx = db.begin().await?;
+    let result = create_api_key_in(&tx, input).await?;
+    tx.commit().await?;
+    Ok(result)
+}
+
+pub async fn create_api_key_in<C: ConnectionTrait>(
+    db: &C,
     input: &ApiKeyInput,
 ) -> Result<(ApiKey, String)> {
     let token = match input.token_mode {
@@ -382,7 +465,7 @@ pub async fn create_api_key(
     Ok((key, token))
 }
 
-pub async fn delete_api_key(db: &DatabaseConnection, id: &str) -> Result<bool> {
+pub async fn delete_api_key_in<C: ConnectionTrait>(db: &C, id: &str) -> Result<bool> {
     Ok(db
         .execute(stmt(
             "DELETE FROM api_keys WHERE id=? AND project_id=?",

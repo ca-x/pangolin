@@ -9,7 +9,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{delete, get, post},
 };
-use sea_orm::{ConnectionTrait, DatabaseConnection};
+use sea_orm::{ConnectionTrait, DatabaseConnection, TransactionTrait};
 use serde_json::{Map, Value, json};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use uuid::Uuid;
@@ -101,8 +101,10 @@ impl ApiError {
             Self::RateLimited(message) => {
                 (StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", message)
             }
-            Self::Internal(_) => {
-                tracing::error!("internal API error");
+            Self::Internal(error) => {
+                // The client gets a generic message on purpose; the operator needs
+                // the cause, otherwise a 500 in production is undiagnosable.
+                tracing::error!(error = %error, "internal API error");
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "internal_error",
@@ -332,20 +334,47 @@ async fn setup(
     State(state): State<AppState>,
     Json(request): Json<SetupRequest>,
 ) -> Result<Response, ApiError> {
-    let user = db::create_initial_admin(&state.db, &request)
+    if request.email.trim().is_empty() || !request.email.contains('@') {
+        return Err(ApiError::BadRequest("a valid email is required".into()));
+    }
+    if request.password.len() < 12 {
+        return Err(ApiError::BadRequest(
+            "password must contain at least 12 characters".into(),
+        ));
+    }
+    let user = crate::models::User {
+        id: Uuid::new_v4().to_string(),
+        email: request.email.trim().to_ascii_lowercase(),
+        password_hash: crate::crypto::hash_password(&request.password)
+            .map_err(ApiError::Internal)?,
+        role: "admin".into(),
+        language: request.language.clone().unwrap_or_else(|| "zh-CN".into()),
+        theme: "system:bronze".into(),
+        created_at: db::now(),
+    };
+    let tx = state
+        .db
+        .begin()
         .await
-        .map_err(bad_request)?;
+        .map_err(|e| ApiError::Internal(e.into()))?;
     // Authentication events are the backbone of an audit trail: record the first administrator
     // even though no actor existed before this request.
-    db::record_audit_event(
-        &state.db,
+    db::create_initial_admin_in(&tx, &request, &user)
+        .await
+        .map_err(bad_request)?;
+    db::record_audit_event_in(
+        &tx,
         &user.id,
         "setup",
         "user",
         &user.id,
         json!({"email": user.email}),
     )
-    .await?;
+    .await
+    .map_err(ApiError::Internal)?;
+    tx.commit()
+        .await
+        .map_err(|e| ApiError::Internal(e.into()))?;
     session_response(&state, &user).await
 }
 
@@ -375,13 +404,18 @@ async fn login(
 
 /// A failed login has no authenticated actor; record it anonymously and never let the audit
 /// write change the response the client sees.
+/// Records a rejected login. The endpoint is unauthenticated, so the identifier
+/// is attacker-controlled: keep it bounded (RFC 5321 caps an address at 254
+/// characters) rather than letting a caller write body-sized rows into the
+/// audit table on every attempt.
 async fn record_login_failure(state: &AppState, email: &str) {
+    let identifier: String = email.trim().chars().take(254).collect();
     if let Err(error) = db::record_anonymous_audit_event(
         &state.db,
         "login_failed",
         "user",
         "",
-        json!({"email": email}),
+        json!({"email": identifier}),
     )
     .await
     {
@@ -442,18 +476,81 @@ async fn create_provider(
         .secrets
         .encrypt(input.api_key.trim())
         .map_err(ApiError::Internal)?;
-    let provider = db::create_provider(&state.db, &input, envelope)
+    // Resolve catalog defaults outside the transaction (reads `effective` which opens
+    // its own connection).
+    let catalog = crate::catalog::repository::effective(&state.db)
+        .await
+        .map_err(|e| ApiError::Internal(e.into()))?;
+    let preset = catalog.providers.iter().find(|p| p.id == input.kind.trim());
+    let kind = if crate::providers::KINDS.contains(&input.kind.trim()) {
+        input.kind.trim().to_owned()
+    } else {
+        preset
+            .and_then(|p| p.adapter_kind.as_deref())
+            .filter(|k| crate::providers::KINDS.contains(k))
+            .ok_or_else(|| {
+                ApiError::BadRequest("provider preset has no implemented adapter".into())
+            })?
+            .to_owned()
+    };
+    let base_url = if input.base_url.trim().is_empty() {
+        preset
+            .and_then(|p| p.default_base_url.as_deref())
+            .or_else(|| crate::providers::default_base(&kind))
+            .ok_or_else(|| ApiError::BadRequest("base URL is required for this provider".into()))?
+            .to_owned()
+    } else {
+        input.base_url.trim().to_owned()
+    };
+    let mut catalog_paths = serde_json::Map::new();
+    if let Some(preset) = preset {
+        for endpoint in &preset.default_endpoints {
+            if matches!(
+                endpoint.transport,
+                crate::catalog::types::Transport::Websocket
+            ) {
+                return Err(ApiError::BadRequest(
+                    "upstream WebSocket presets are not implemented".into(),
+                ));
+            }
+            if let Some(canonical) = crate::providers::ENDPOINTS
+                .iter()
+                .find(|path| crate::providers::capability(path) == endpoint.protocol)
+                && !endpoint.path.contains('{')
+                && endpoint.path != *canonical
+            {
+                catalog_paths.insert((*canonical).into(), serde_json::json!(endpoint.path));
+            }
+        }
+    }
+    let tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|e| ApiError::Internal(e.into()))?;
+    let context = db::ProviderCatalogContext {
+        kind: &kind,
+        base_url: &base_url,
+        catalog_paths,
+        catalog_preset_id: preset.map(|p| &p.id),
+        catalog_version: &catalog.version,
+    };
+    let provider = db::create_provider_in(&tx, &input, envelope, &context)
         .await
         .map_err(bad_request)?;
-    db::record_audit_event(
-        &state.db,
+    db::record_audit_event_in(
+        &tx,
         &user.id,
         "create",
         "provider",
         &provider.id,
         json!({"name":provider.name,"kind":provider.kind}),
     )
-    .await?;
+    .await
+    .map_err(ApiError::Internal)?;
+    tx.commit()
+        .await
+        .map_err(|e| ApiError::Internal(e.into()))?;
     Ok((StatusCode::CREATED, Json(provider)))
 }
 
@@ -463,8 +560,18 @@ async fn delete_provider(
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     let user = require_user_permission(&state, &headers, "project:manage").await?;
-    if db::delete_provider(&state.db, &id, db::DEFAULT_PROJECT_ID).await? {
-        db::record_audit_event(&state.db, &user.id, "delete", "provider", &id, json!({})).await?;
+    let tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|e| ApiError::Internal(e.into()))?;
+    if db::delete_provider_in(&tx, &id, db::DEFAULT_PROJECT_ID).await? {
+        db::record_audit_event_in(&tx, &user.id, "delete", "provider", &id, json!({}))
+            .await
+            .map_err(ApiError::Internal)?;
+        tx.commit()
+            .await
+            .map_err(|e| ApiError::Internal(e.into()))?;
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(ApiError::NotFound)
@@ -490,18 +597,64 @@ async fn create_model(
     if input.public_name.trim().is_empty() || input.upstream_name.trim().is_empty() {
         return Err(ApiError::BadRequest("model names are required".into()));
     }
-    let model = db::create_model(&state.db, &input, db::DEFAULT_PROJECT_ID)
+    // Resolve catalog defaults outside the transaction.
+    let catalog = crate::catalog::repository::effective(&state.db)
+        .await
+        .map_err(|e| ApiError::Internal(e.into()))?;
+    let defaults = catalog.models.iter().find(|model| {
+        model.upstream_id == input.upstream_name
+            || model.id == input.upstream_name
+            || model.aliases.contains(&input.upstream_name)
+    });
+    let default_capabilities = defaults
+        .map(|model| model.gateway_capabilities())
+        .unwrap_or_else(|| {
+            vec![
+                "chat".to_owned(),
+                "responses".to_owned(),
+                "messages".to_owned(),
+            ]
+        });
+    let price = |value: Option<f64>| {
+        value
+            .filter(|value| {
+                value.is_finite() && *value >= 0.0 && *value <= (i64::MAX as f64 / 1_000_000.0)
+            })
+            .map(|value| (value * 1_000_000.0).round() as i64)
+            .unwrap_or(0)
+    };
+    let default_prices = defaults.filter(|model| {
+        model.cost_defaults.currency.as_deref() == Some("USD")
+            && model.cost_defaults.unit.as_deref() == Some("per_million_tokens")
+    });
+    let resolved = db::ModelCatalogDefaults {
+        capabilities: default_capabilities,
+        input_price_micros: price(default_prices.and_then(|model| model.cost_defaults.input)),
+        output_price_micros: price(default_prices.and_then(|model| model.cost_defaults.output)),
+        metadata: serde_json::json!({"catalog_version":catalog.version,"card":defaults})
+            .to_string(),
+    };
+    let tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|e| ApiError::Internal(e.into()))?;
+    let model = db::create_model_in(&tx, &input, db::DEFAULT_PROJECT_ID, &resolved)
         .await
         .map_err(bad_request)?;
-    db::record_audit_event(
-        &state.db,
+    db::record_audit_event_in(
+        &tx,
         &user.id,
         "create",
         "model",
         &model.id,
         json!({"public_name":model.public_name,"upstream_name":model.upstream_name}),
     )
-    .await?;
+    .await
+    .map_err(ApiError::Internal)?;
+    tx.commit()
+        .await
+        .map_err(|e| ApiError::Internal(e.into()))?;
     Ok((StatusCode::CREATED, Json(model)))
 }
 
@@ -511,8 +664,18 @@ async fn delete_model(
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     let user = require_user_permission(&state, &headers, "project:manage").await?;
-    if db::delete_model(&state.db, &id, db::DEFAULT_PROJECT_ID).await? {
-        db::record_audit_event(&state.db, &user.id, "delete", "model", &id, json!({})).await?;
+    let tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|e| ApiError::Internal(e.into()))?;
+    if db::delete_model_in(&tx, &id, db::DEFAULT_PROJECT_ID).await? {
+        db::record_audit_event_in(&tx, &user.id, "delete", "model", &id, json!({}))
+            .await
+            .map_err(ApiError::Internal)?;
+        tx.commit()
+            .await
+            .map_err(|e| ApiError::Internal(e.into()))?;
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(ApiError::NotFound)
@@ -537,18 +700,27 @@ async fn create_api_key(
         return Err(ApiError::BadRequest("name is required".into()));
     }
     let imported = input.token_mode == crate::models::ApiKeyTokenMode::ImportExisting;
-    let (key, token) = db::create_api_key(&state.db, &input)
+    let tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|e| ApiError::Internal(e.into()))?;
+    let (key, token) = db::create_api_key_in(&tx, &input)
         .await
         .map_err(bad_request)?;
-    db::record_audit_event(
-        &state.db,
+    db::record_audit_event_in(
+        &tx,
         &user.id,
         "create",
         "api_key",
         &key.id,
         json!({"name":key.name,"fingerprint":key.key_prefix,"token_mode":if imported {"import_existing"} else {"generated"}}),
     )
-    .await?;
+    .await
+    .map_err(ApiError::Internal)?;
+    tx.commit()
+        .await
+        .map_err(|e| ApiError::Internal(e.into()))?;
     Ok((
         StatusCode::CREATED,
         Json(if imported {
@@ -565,8 +737,18 @@ async fn delete_api_key(
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     let user = require_user_permission(&state, &headers, "api_key:manage").await?;
-    if db::delete_api_key(&state.db, &id).await? {
-        db::record_audit_event(&state.db, &user.id, "delete", "api_key", &id, json!({})).await?;
+    let tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|e| ApiError::Internal(e.into()))?;
+    if db::delete_api_key_in(&tx, &id).await? {
+        db::record_audit_event_in(&tx, &user.id, "delete", "api_key", &id, json!({}))
+            .await
+            .map_err(ApiError::Internal)?;
+        tx.commit()
+            .await
+            .map_err(|e| ApiError::Internal(e.into()))?;
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(ApiError::NotFound)

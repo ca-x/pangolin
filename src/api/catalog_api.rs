@@ -58,9 +58,12 @@ async fn manager(state: &AppState, headers: &HeaderMap) -> Result<User, ApiError
     })?;
     Ok(user)
 }
-async fn audit(state: &AppState, user: &User, action: &str, id: &str) -> Result<(), ApiError> {
-    db::record_audit_event(&state.db, &user.id, action, "catalog", id, json!({})).await?;
-    Ok(())
+/// Build a catalog audit context for a transactional repository call.
+fn audit_ctx<'a>(user: &'a User, action: &'a str) -> repo::CatalogAudit<'a> {
+    repo::CatalogAudit {
+        actor_user_id: &user.id,
+        action,
+    }
 }
 
 async fn export(
@@ -206,8 +209,8 @@ async fn import(
     body: axum::body::Bytes,
 ) -> Result<Json<Value>, ApiError> {
     let user = manager(&state, &headers).await?;
-    let (providers, models) = repo::import(&state.db, &body).await?;
-    audit(&state, &user, "import", "local-overrides").await?;
+    let (providers, models) =
+        repo::import(&state.db, &body, Some(audit_ctx(&user, "import"))).await?;
     Ok(Json(
         json!({"providers":providers,"models":models,"mode":"upsert_local_overrides"}),
     ))
@@ -229,8 +232,12 @@ async fn override_entry(
         "model" => document["models"] = json!([value]),
         _ => return Err(invalid("override kind must be provider or model")),
     };
-    repo::import(&state.db, document.to_string().as_bytes()).await?;
-    audit(&state, &user, "override", &id).await?;
+    repo::import(
+        &state.db,
+        document.to_string().as_bytes(),
+        Some(audit_ctx(&user, "override")),
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 async fn remove_override(
@@ -239,8 +246,13 @@ async fn remove_override(
     Path((kind, id)): Path<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
     let user = manager(&state, &headers).await?;
-    repo::remove_override(&state.db, &kind, &id).await?;
-    audit(&state, &user, "remove_override", &id).await?;
+    repo::remove_override(
+        &state.db,
+        &kind,
+        &id,
+        Some(audit_ctx(&user, "remove_override")),
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -257,8 +269,8 @@ async fn create_source(
     Json(input): Json<repo::SourceInput>,
 ) -> Result<(StatusCode, Json<repo::Source>), ApiError> {
     let user = manager(&state, &headers).await?;
-    let source = repo::create_source(&state.db, input).await?;
-    audit(&state, &user, "create_source", &source.id).await?;
+    let source =
+        repo::create_source(&state.db, input, Some(audit_ctx(&user, "create_source"))).await?;
     Ok((StatusCode::CREATED, Json(source)))
 }
 #[derive(Deserialize)]
@@ -274,8 +286,14 @@ async fn update_source(
     Json(input): Json<SourceUpdate>,
 ) -> Result<Json<repo::Source>, ApiError> {
     let user = manager(&state, &headers).await?;
-    let source = repo::update_source(&state.db, &id, input.revision, input.source).await?;
-    audit(&state, &user, "update_source", &id).await?;
+    let source = repo::update_source(
+        &state.db,
+        &id,
+        input.revision,
+        input.source,
+        Some(audit_ctx(&user, "update_source")),
+    )
+    .await?;
     Ok(Json(source))
 }
 async fn delete_source(
@@ -284,10 +302,11 @@ async fn delete_source(
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     let user = manager(&state, &headers).await?;
-    repo::delete_source(&state.db, &id).await?;
-    audit(&state, &user, "delete_source", &id).await?;
+    repo::delete_source(&state.db, &id, Some(audit_ctx(&user, "delete_source"))).await?;
     Ok(StatusCode::NO_CONTENT)
 }
+/// Refresh fetches catalog data over the network, so the audit cannot share a SQLite
+/// transaction with the fetch — it is intentionally recorded after the refresh completes.
 async fn refresh(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -295,9 +314,18 @@ async fn refresh(
 ) -> Result<Json<catalog::refresh::Outcome>, ApiError> {
     let user = manager(&state, &headers).await?;
     let result = catalog::refresh::refresh(&state.db, &id).await?;
-    audit(&state, &user, "refresh_source", &id).await?;
+    db::record_audit_event(
+        &state.db,
+        &user.id,
+        "refresh_source",
+        "catalog",
+        &id,
+        json!({}),
+    )
+    .await?;
     Ok(Json(result))
 }
+/// Refresh-due runs multiple network fetches; same constraint as refresh above.
 async fn refresh_due(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -312,7 +340,15 @@ async fn refresh_due(
             ),
         }
     }
-    audit(&state, &user, "refresh_due", "sources").await?;
+    db::record_audit_event(
+        &state.db,
+        &user.id,
+        "refresh_due",
+        "catalog",
+        "sources",
+        json!({}),
+    )
+    .await?;
     Ok(Json(results))
 }
 async fn snapshots(
@@ -336,7 +372,13 @@ async fn rollback(
     Json(input): Json<Rollback>,
 ) -> Result<StatusCode, ApiError> {
     let user = manager(&state, &headers).await?;
-    repo::rollback(&state.db, &id, &input.snapshot_id, input.revision).await?;
-    audit(&state, &user, "rollback_source", &id).await?;
+    repo::rollback(
+        &state.db,
+        &id,
+        &input.snapshot_id,
+        input.revision,
+        Some(audit_ctx(&user, "rollback_source")),
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }

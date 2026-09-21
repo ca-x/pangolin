@@ -11,6 +11,13 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
+/// Audit metadata injected into catalog mutations so the audit row is recorded inside the
+/// same transaction — if the mutation rolls back, no audit trace remains.
+pub struct CatalogAudit<'a> {
+    pub actor_user_id: &'a str,
+    pub action: &'a str,
+}
+
 fn sql(query: &str, values: Vec<sea_orm::Value>) -> Statement {
     Statement::from_sql_and_values(DbBackend::Sqlite, query, values)
 }
@@ -94,6 +101,7 @@ pub async fn source(db: &DatabaseConnection, id: &str) -> Result<Source, ApiErro
 pub async fn create_source(
     db: &DatabaseConnection,
     input: SourceInput,
+    audit: Option<CatalogAudit<'_>>,
 ) -> Result<Source, ApiError> {
     input.validate()?;
     let tx = db.begin().await?;
@@ -107,6 +115,17 @@ pub async fn create_source(
     }
     let id = Uuid::new_v4().to_string();
     tx.execute(sql("INSERT INTO catalog_sources(id,name,url,priority,refresh_interval_secs,enabled,signature_policy,public_key,revision) VALUES(?,?,?,?,?,?,?,?,1)",vec![id.clone().into(),input.name.into(),input.url.into(),input.priority.into(),input.refresh_interval_secs.into(),input.enabled.into(),input.signature_policy.into(),input.public_key.into()])).await?;
+    if let Some(audit) = &audit {
+        db::record_audit_event_in(
+            &tx,
+            audit.actor_user_id,
+            audit.action,
+            "catalog",
+            &id,
+            json!({}),
+        )
+        .await?;
+    }
     tx.commit().await?;
     source(db, &id).await
 }
@@ -116,6 +135,7 @@ pub async fn update_source(
     id: &str,
     revision: i64,
     input: SourceInput,
+    audit: Option<CatalogAudit<'_>>,
 ) -> Result<Source, ApiError> {
     input.validate()?;
     let tx = db.begin().await?;
@@ -126,11 +146,26 @@ pub async fn update_source(
         ));
     }
     assemble(&tx).await?;
+    if let Some(audit) = &audit {
+        db::record_audit_event_in(
+            &tx,
+            audit.actor_user_id,
+            audit.action,
+            "catalog",
+            id,
+            json!({}),
+        )
+        .await?;
+    }
     tx.commit().await?;
     source(db, id).await
 }
 
-pub async fn delete_source(db: &DatabaseConnection, id: &str) -> Result<(), ApiError> {
+pub async fn delete_source(
+    db: &DatabaseConnection,
+    id: &str,
+    audit: Option<CatalogAudit<'_>>,
+) -> Result<(), ApiError> {
     let tx = db.begin().await?;
     if tx
         .execute(sql(
@@ -144,6 +179,17 @@ pub async fn delete_source(db: &DatabaseConnection, id: &str) -> Result<(), ApiE
         return Err(ApiError::NotFound);
     }
     assemble(&tx).await?;
+    if let Some(audit) = &audit {
+        db::record_audit_event_in(
+            &tx,
+            audit.actor_user_id,
+            audit.action,
+            "catalog",
+            id,
+            json!({}),
+        )
+        .await?;
+    }
     tx.commit().await?;
     Ok(())
 }
@@ -222,6 +268,7 @@ pub async fn rollback(
     id: &str,
     snapshot_id: &str,
     revision: i64,
+    audit: Option<CatalogAudit<'_>>,
 ) -> Result<(), ApiError> {
     let tx = db.begin().await?;
     let row = tx
@@ -239,11 +286,26 @@ pub async fn rollback(
         ));
     }
     assemble(&tx).await?;
+    if let Some(audit) = &audit {
+        db::record_audit_event_in(
+            &tx,
+            audit.actor_user_id,
+            audit.action,
+            "catalog",
+            id,
+            json!({}),
+        )
+        .await?;
+    }
     tx.commit().await?;
     Ok(())
 }
 
-pub async fn import(db: &DatabaseConnection, body: &[u8]) -> Result<(usize, usize), ApiError> {
+pub async fn import(
+    db: &DatabaseConnection,
+    body: &[u8],
+    audit: Option<CatalogAudit<'_>>,
+) -> Result<(usize, usize), ApiError> {
     let document = Catalog::parse(body)?;
     let counts = (document.providers.len(), document.models.len());
     let tx = db.begin().await?;
@@ -274,6 +336,17 @@ pub async fn import(db: &DatabaseConnection, body: &[u8]) -> Result<(usize, usiz
         }
     }
     assemble(&tx).await?;
+    if let Some(audit) = &audit {
+        db::record_audit_event_in(
+            &tx,
+            audit.actor_user_id,
+            audit.action,
+            "catalog",
+            "local-overrides",
+            json!({}),
+        )
+        .await?;
+    }
     tx.commit().await?;
     Ok(counts)
 }
@@ -282,6 +355,7 @@ pub async fn remove_override(
     db: &DatabaseConnection,
     kind: &str,
     id: &str,
+    audit: Option<CatalogAudit<'_>>,
 ) -> Result<(), ApiError> {
     if !matches!(kind, "provider" | "model") {
         return Err(invalid("invalid override kind"));
@@ -299,6 +373,17 @@ pub async fn remove_override(
         return Err(ApiError::NotFound);
     }
     assemble(&tx).await?;
+    if let Some(audit) = &audit {
+        db::record_audit_event_in(
+            &tx,
+            audit.actor_user_id,
+            audit.action,
+            "catalog",
+            id,
+            json!({}),
+        )
+        .await?;
+    }
     tx.commit().await?;
     Ok(())
 }

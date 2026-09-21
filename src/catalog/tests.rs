@@ -21,10 +21,10 @@ fn encoded(doc: &Catalog) -> Vec<u8> {
 #[tokio::test]
 async fn task4_document_extensions_merge_atomically_and_roundtrip_separately_from_capabilities() {
     let db = db::connect("sqlite::memory:").await.unwrap();
-    let low = repository::create_source(&db, source_input(1))
+    let low = repository::create_source(&db, source_input(1), None)
         .await
         .unwrap();
-    let high = repository::create_source(&db, source_input(2))
+    let high = repository::create_source(&db, source_input(2), None)
         .await
         .unwrap();
     let mut lower = document("extensions-low", "Low");
@@ -53,7 +53,9 @@ async fn task4_document_extensions_merge_atomically_and_roundtrip_separately_fro
         json!({"collision":null,"local_only":{"unknown":true},"builtin_version":"publisher-value"}),
     )
     .unwrap();
-    repository::import(&db, &encoded(&local)).await.unwrap();
+    repository::import(&db, &encoded(&local), None)
+        .await
+        .unwrap();
     let current = repository::source(&db, &high.id).await.unwrap();
     higher
         .extensions
@@ -68,7 +70,7 @@ async fn task4_document_extensions_merge_atomically_and_roundtrip_separately_fro
         json!("publisher-value")
     );
     let imported = db::connect("sqlite::memory:").await.unwrap();
-    repository::import(&imported, &encoded(&exported))
+    repository::import(&imported, &encoded(&exported), None)
         .await
         .unwrap();
     assert_eq!(
@@ -190,10 +192,10 @@ fn offline_bundle_contains_real_provider_presets_model_cards_and_logo_fallbacks(
 #[tokio::test]
 async fn merge_priority_local_override_and_import_export_are_lossless() {
     let db = db::connect("sqlite::memory:").await.unwrap();
-    let lower = repository::create_source(&db, source_input(10))
+    let lower = repository::create_source(&db, source_input(10), None)
         .await
         .unwrap();
-    let higher = repository::create_source(&db, source_input(20))
+    let higher = repository::create_source(&db, source_input(20), None)
         .await
         .unwrap();
     repository::activate(
@@ -232,7 +234,9 @@ async fn merge_priority_local_override_and_import_export_are_lossless() {
         json!({"supported":true,"units":"widgets"}),
     );
     local.models[0].id = "local/custom".into();
-    repository::import(&db, &encoded(&local)).await.unwrap();
+    repository::import(&db, &encoded(&local), None)
+        .await
+        .unwrap();
     let updated = repository::source(&db, &higher.id).await.unwrap();
     repository::activate(
         &db,
@@ -256,7 +260,7 @@ async fn merge_priority_local_override_and_import_export_are_lossless() {
     );
     assert!(effective.models.iter().any(|m| m.id == "local/custom"));
     let other = db::connect("sqlite::memory:").await.unwrap();
-    repository::import(&other, &encoded(&effective))
+    repository::import(&other, &encoded(&effective), None)
         .await
         .unwrap();
     let exported = repository::effective(&other).await.unwrap();
@@ -283,7 +287,7 @@ async fn merge_priority_local_override_and_import_export_are_lossless() {
 #[tokio::test]
 async fn conditional_refresh_and_failed_staging_preserve_last_known_good() {
     let db = db::connect("sqlite::memory:").await.unwrap();
-    let source = repository::create_source(&db, source_input(1))
+    let source = repository::create_source(&db, source_input(1), None)
         .await
         .unwrap();
     let mut not_modified = download(vec![]);
@@ -347,7 +351,7 @@ async fn pinned_ed25519_signatures_rollback_and_revision_fencing() {
     let mut input = source_input(5);
     input.signature_policy = "required".into();
     input.public_key = Some(STANDARD.encode(signing.verifying_key().as_bytes()));
-    let source = repository::create_source(&db, input).await.unwrap();
+    let source = repository::create_source(&db, input, None).await.unwrap();
     let mut good = download(encoded(&document("signed-v1", "Signed")));
     good.signature = Some(STANDARD.encode(signing.sign(&good.body).to_bytes()));
     let mut bad = download(encoded(&document("tampered", "Bad")));
@@ -408,6 +412,7 @@ async fn pinned_ed25519_signatures_rollback_and_revision_fencing() {
         &source.id,
         first.snapshot_id.as_ref().unwrap(),
         current.revision,
+        None,
     )
     .await
     .unwrap();
@@ -418,7 +423,9 @@ async fn pinned_ed25519_signatures_rollback_and_revision_fencing() {
             .previous_snapshot_id,
         Some(second)
     );
-    repository::delete_source(&db, &source.id).await.unwrap();
+    repository::delete_source(&db, &source.id, None)
+        .await
+        .unwrap();
     assert!(repository::sources(&db).await.unwrap().is_empty());
 }
 

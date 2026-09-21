@@ -2,6 +2,7 @@ use super::*;
 
 mod auth_audit;
 mod catalog;
+mod control_plane_audit;
 mod instance_backup;
 mod isolation;
 mod operations;
