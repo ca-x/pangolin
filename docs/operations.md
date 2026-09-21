@@ -97,3 +97,11 @@ GC expires session history and configured request/payload/probe/quota records. T
 Hourly GC applies project request/payload retention to DuckDB too. Payload-only expiry clears both bodies and the capture flag while retaining metadata; request expiry removes the derived row. Queued/late events obey the active rules, and startup/instance restore refreshes them. Derived retention failure disables analytics reads without blocking authoritative settlement. Legacy derived rows without a project identifier expire conservatively under applicable retention cutoffs.
 
 The implementation is contract-tested locally. S3 service behavior, Redis deployment limits, quota endpoints and provider-native compaction need deployment-specific validation with real services. Quota collectors support API-key families and reject structured cloud credentials until a dedicated quota adapter exists; they never send a cloud credential document as a bearer token. Thinking rectifiers, automatic Anthropic cache-marker injection, client desktop integration and header-casing preservation remain provider/client adaptation work rather than implicit operational behavior.
+
+## Build provenance
+
+A release binary embeds the built console assets, so a binary compiled before `web/dist` was rebuilt serves a console that does not match its sources. The build records what it came from: `build.rs` captures the short commit (suffixed `-dirty` when the tree had uncommitted changes), the build time (honouring `SOURCE_DATE_EPOCH` for reproducible rebuilds), the target and the profile, and the console build writes its own revision to `web/dist/build.json`, which the binary embeds alongside them.
+
+`GET /api/v1/version` reports all of it without a session, `bootstrap` carries the same object for the console, and the startup log names the version, commit and build time. `console_matches` says whether the embedded console came from the same revision as the backend; `null` means one side could not be determined, which is not a match. The console's About screen (System settings) shows both revisions and warns when they differ.
+
+Container builds have no `.git`, so pass the revision explicitly — `PANGOLIN_BUILD_COMMIT` (or `GITHUB_SHA`) wins over git, and the image build sets it from the workflow.
