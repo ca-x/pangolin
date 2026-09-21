@@ -1,6 +1,7 @@
 mod access;
 mod access_api;
 mod api;
+mod build_info;
 mod catalog;
 mod config;
 mod crypto;
@@ -76,7 +77,18 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(config.bind)
         .await
         .with_context(|| format!("failed to bind {}", config.bind))?;
-    tracing::info!(address = %config.bind, product = "Pangolin / 鲮鲤", "server listening");
+    // Logged on every start: the first question about a misbehaving instance is
+    // which build it actually is.
+    let build = crate::build_info::build_info();
+    tracing::info!(
+        address = %config.bind,
+        product = "Pangolin / 鲮鲤",
+        version = build.version,
+        commit = build.commit,
+        built_at = %build.built_at,
+        target = build.target,
+        "server listening"
+    );
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),

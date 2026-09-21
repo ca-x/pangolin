@@ -243,3 +243,74 @@ async fn model_catalog_defaults_preserve_explicit_admin_prices_and_capabilities(
     assert_eq!(explicit.capabilities, "[\"rerank\"]");
     assert_eq!(explicit.input_price_micros, 0);
 }
+#[tokio::test]
+async fn override_audits_identify_the_kind_as_well_as_the_entry() {
+    // Overrides are keyed by (kind, entry_id), so a provider and a model may
+    // legitimately share an id. Updates and deletions must record the same
+    // composite identity, or the audit trail cannot tell them apart.
+    let f = fixture(Router::new()).await;
+    let cookie = session(&f).await;
+    let exported = json_body(
+        admin(
+            &f,
+            &cookie,
+            http::Method::GET,
+            "/api/admin/v1/catalog/export",
+            Value::Null,
+        )
+        .await,
+    )
+    .await;
+    let shared = "shared-id";
+    // Real entries, so the override documents pass catalog validation.
+    for (kind, entry) in [
+        ("provider", &exported["providers"][0]),
+        ("model", &exported["models"][0]),
+    ] {
+        let mut document = entry.clone();
+        document["id"] = json!(shared);
+        let response = admin(
+            &f,
+            &cookie,
+            http::Method::PUT,
+            &format!("/api/admin/v1/catalog/overrides/{kind}/{shared}"),
+            document,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT, "{kind} override");
+    }
+    assert_eq!(
+        admin(
+            &f,
+            &cookie,
+            http::Method::DELETE,
+            &format!("/api/admin/v1/catalog/overrides/model/{shared}"),
+            Value::Null,
+        )
+        .await
+        .status(),
+        StatusCode::NO_CONTENT
+    );
+
+    let rows: Vec<String> = sea_orm::ConnectionTrait::query_all(
+        &f.state.db,
+        Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT resource_id FROM audit_events WHERE resource_type='catalog' AND action IN ('override','remove_override') ORDER BY action, resource_id",
+            vec![],
+        ),
+    )
+    .await
+    .unwrap()
+    .iter()
+    .map(|row| row.try_get::<String>("", "resource_id").unwrap())
+    .collect();
+    assert_eq!(
+        rows,
+        vec![
+            format!("model:{shared}"),
+            format!("provider:{shared}"),
+            format!("model:{shared}"),
+        ]
+    );
+}

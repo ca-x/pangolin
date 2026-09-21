@@ -264,7 +264,11 @@ async fn remove_override(
         &state.db,
         &kind,
         &id,
-        Some(audit_ctx(&user, "remove_override")),
+        Some(audit_ctx_for(
+            &user,
+            "remove_override",
+            &format!("{kind}:{id}"),
+        )),
     )
     .await?;
     Ok(StatusCode::NO_CONTENT)

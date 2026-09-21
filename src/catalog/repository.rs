@@ -378,12 +378,14 @@ pub async fn remove_override(
     }
     assemble(&tx).await?;
     if let Some(audit) = &audit {
+        // Overrides are keyed by (kind, entry_id), so the caller passes a
+        // composite identity to tell a provider and a model apart.
         db::record_audit_event_in(
             &tx,
             audit.actor_user_id,
             audit.action,
             "catalog",
-            id,
+            audit.resource_id.unwrap_or(id),
             json!({}),
         )
         .await?;

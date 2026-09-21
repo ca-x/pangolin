@@ -156,6 +156,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/health/live", get(live))
         .route("/api/health/ready", get(ready))
         .route("/api/v1/bootstrap", get(bootstrap))
+        .route("/api/v1/version", get(version))
         .route("/api/v1/setup", post(setup))
         .route("/api/v1/auth/login", post(login))
         .route("/api/v1/auth/logout", post(logout))
@@ -326,8 +327,13 @@ async fn bootstrap(
         "public_url": state.config.public_url,
         "capture_payloads": state.config.capture_payloads,
         "observability_available": state.observations.is_available(),
+        "build": crate::build_info::build_info_json(),
         "branding": system,
     })))
+}
+
+async fn version() -> Json<Value> {
+    Json(crate::build_info::build_info_json())
 }
 
 async fn setup(
