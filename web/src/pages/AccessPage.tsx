@@ -63,6 +63,8 @@ function KeysPanel() {
   const [editing, setEditing] = useState<ScopedKey | null>(null)
   const [mode, setMode] = useState('generated')
   const [token, setToken] = useState<string | null>(null)
+  const [profile, setProfile] = useState('__none__')
+  const [editProfile, setEditProfile] = useState('__none__')
   const path = `/api/admin/v1/projects/${project.id}/api-keys`
   const query = useQuery({ queryKey: ['keys', project.id], queryFn: () => api<ScopedKey[]>(path) })
   const profiles = useQuery({ queryKey: ['profile-options', project.id], queryFn: () => api<{ data: Array<{ id: string; name: string }> }>(`/api/admin/v1/projects/${project.id}/operations/key-profiles?limit=500`) })
@@ -71,7 +73,7 @@ function KeysPanel() {
   const update = useMutation({ mutationFn: ({ id, body }: { id: string; body: unknown }) => api(`${path}/${id}`, { method: 'PATCH', body: JSON.stringify(body) }), onSuccess: () => void client.invalidateQueries({ queryKey: ['keys', project.id] }), onError: (error: Error) => toast.error(error.message) })
   const remove = useMutation({ mutationFn: (id: string) => api(`${path}/${id}`, { method: 'DELETE' }), onSuccess: () => void client.invalidateQueries({ queryKey: ['keys', project.id] }), onError: (error: Error) => toast.error(error.message) })
   const submit = (event: FormEvent<HTMLFormElement>) => { event.preventDefault(); const data = new FormData(event.currentTarget); create.mutate({ name: data.get('name'), token_mode: mode, token: mode === 'import_existing' ? data.get('token') : null, key_type: 'service', scopes: ['gateway:use'], profile_id: data.get('profile_id') === '__none__' ? null : data.get('profile_id') || null, budget_micros: data.get('budget_micros') ? Number(data.get('budget_micros')) : null, expires_at: data.get('expires_at') ? Number(data.get('expires_at')) : null, allowed_ips: String(data.get('allowed_ips') || '').split(',').map((v) => v.trim()).filter(Boolean), denied_ips: String(data.get('denied_ips') || '').split(',').map((v) => v.trim()).filter(Boolean) }) }
-  const submitEdit = (event: FormEvent<HTMLFormElement>) => { event.preventDefault(); if (!editing) return; const data = new FormData(event.currentTarget); update.mutate({ id: editing.id, body: { name: data.get('name'), profile_id: data.get('profile_id') === '__none__' ? null : data.get('profile_id') || null, budget_micros: data.get('budget_micros') ? Number(data.get('budget_micros')) : null, expires_at: data.get('expires_at') ? Number(data.get('expires_at')) : null, allowed_ips: String(data.get('allowed_ips') || '').split(',').map((v) => v.trim()).filter(Boolean), denied_ips: String(data.get('denied_ips') || '').split(',').map((v) => v.trim()).filter(Boolean) } }); setEditing(null) }
+  const submitEdit = (event: FormEvent<HTMLFormElement>) => { event.preventDefault(); if (!editing) return; const data = new FormData(event.currentTarget); update.mutate({ id: editing.id, body: { name: data.get('name'), profile_id: data.get('profile_id') === '__none__' ? null : data.get('profile_id') || null, budget_micros: data.get('budget_micros') ? Number(data.get('budget_micros')) : null, expires_at: data.get('expires_at') ? Number(data.get('expires_at')) : null, allowed_ips: String(data.get('allowed_ips') || '').split(',').map((v) => v.trim()).filter(Boolean), denied_ips: String(data.get('denied_ips') || '').split(',').map((v) => v.trim()).filter(Boolean) } }); setEditing(null); setEditProfile('__none__') }
   return (
     <>
       <PageHeader title={t('keys')} description={t('keysDescription')} action={<Button leftSection={<Plus size={17} />} onClick={() => setOpen(true)}>{t('addKey')}</Button>} />
@@ -110,7 +112,7 @@ function KeysPanel() {
                   </Table.Td>
                   <Table.Td>
                     <Group gap={4} justify="flex-end" wrap="nowrap">
-                      <Button variant="subtle" size="compact-sm" onClick={() => setEditing(key)}>{t('edit')}</Button>
+                      <Button variant="subtle" size="compact-sm" onClick={() => { setEditing(key); setEditProfile(key.profile_id || '__none__') }}>{t('edit')}</Button>
                       <ActionIcon variant="subtle" color="red" aria-label={`${t('delete')} ${key.name}`} onClick={() => confirm(t('deleteConfirm')) && remove.mutate(key.id)}>
                         <Trash2 size={16} />
                       </ActionIcon>
@@ -128,7 +130,7 @@ function KeysPanel() {
             <SelectField label={t('tokenMode')} value={mode} onValueChange={setMode} options={[{ value: 'generated', label: t('generateToken') }, { value: 'import_existing', label: t('importExisting') }]} />
             {mode === 'import_existing' && <PasswordInput name="token" label={t('existingToken')} description={t('importTokenHint')} minLength={32} maxLength={1024} autoComplete="off" required />}
             <TextInput name="name" label={t('keyName')} required autoFocus />
-            <SelectField name="profile_id" label={t('profileId')} value="__none__" onValueChange={() => { }} options={profileOptions} />
+            <SelectField name="profile_id" label={t('profileId')} value={profile} onValueChange={setProfile} options={profileOptions} />
             <Group gap="md" grow>
               <NumberInput name="budget_micros" label={t('budgetMicros')} min={0} hideControls />
               <NumberInput name="expires_at" label={t('expiresAtEpoch')} min={1} hideControls />
@@ -148,7 +150,7 @@ function KeysPanel() {
         <form onSubmit={submitEdit}>
           <Stack gap="md">
             <TextInput name="name" label={t('keyName')} required defaultValue={editing?.name} />
-            <SelectField name="profile_id" label={t('profileId')} value={editing?.profile_id || '__none__'} onValueChange={() => { }} options={profileOptions} />
+            <SelectField name="profile_id" label={t('profileId')} value={editProfile} onValueChange={setEditProfile} options={profileOptions} />
             <Group gap="md" grow>
               <NumberInput name="budget_micros" label={t('budgetMicros')} min={0} defaultValue={editing?.budget_micros ?? ''} hideControls />
               <NumberInput name="expires_at" label={t('expiresAtEpoch')} min={1} defaultValue={editing?.expires_at ?? ''} hideControls />

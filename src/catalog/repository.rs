@@ -16,6 +16,10 @@ use uuid::Uuid;
 pub struct CatalogAudit<'a> {
     pub actor_user_id: &'a str,
     pub action: &'a str,
+    /// Audit identifier for the mutated resource. Batch operations fall back to
+    /// the batch label; single-entry operations pass the entry id so the audit
+    /// trail can tell entries apart.
+    pub resource_id: Option<&'a str>,
 }
 
 fn sql(query: &str, values: Vec<sea_orm::Value>) -> Statement {
@@ -342,7 +346,7 @@ pub async fn import(
             audit.actor_user_id,
             audit.action,
             "catalog",
-            "local-overrides",
+            audit.resource_id.unwrap_or("local-overrides"),
             json!({}),
         )
         .await?;

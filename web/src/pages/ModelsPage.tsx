@@ -1,4 +1,4 @@
-import { ActionIcon, Button, Checkbox, Collapse, Group, NumberInput, Paper, Select, Stack, Table, TableScrollContainer, Tabs, Text, Textarea, TextInput, Title } from '@mantine/core'
+import { ActionIcon, Button, Checkbox, Collapse, Group, NumberInput, Paper, Select, Stack, Table, TableScrollContainer, Tabs, Text, Textarea, TextInput, Title, UnstyledButton } from '@mantine/core'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Download, Plus, RefreshCw, RotateCcw, Trash2, Upload } from 'lucide-react'
 import { useEffect, useState, type FormEvent } from 'react'
@@ -152,9 +152,11 @@ function CatalogOverrideEditor() {
   const submit = (event: FormEvent<HTMLFormElement>) => { event.preventDefault(); const data = new FormData(event.currentTarget); try { const id = String(data.get('id')); const document = JSON.parse(String(data.get('document'))); mutate.mutate({ id, document: { ...document, id } }) } catch { toast.error(t('invalidJson')) } }
   return (
     <Paper p="md" withBorder mt="lg">
-      <Group justify="space-between" onClick={() => setOpen(!open)} style={{ cursor: 'pointer' }}>
-        <Text fw={600}>{t('localOverrides')}</Text>
-      </Group>
+      <UnstyledButton onClick={() => setOpen(!open)} w="100%" aria-expanded={open}>
+        <Group justify="space-between">
+          <Text fw={600}>{t('localOverrides')}</Text>
+        </Group>
+      </UnstyledButton>
       <Collapse expanded={open}>
         <form onSubmit={submit} style={{ marginTop: 14 }}>
           <Stack gap="md">

@@ -45,6 +45,25 @@ describe('form contract after the component migration', () => {
     expect(values).toEqual([{ mode: 'import_existing', name: 'Primary', enabled: 'on' }])
   })
 
+  it('submits the first option when an enum select is left untouched', async () => {
+    // The pre-migration selector defaulted to its first option; a select that
+    // submits null for a required enum makes the default Save action fail.
+    const values: Array<Record<string, unknown>> = []
+    render(
+      <form
+        onSubmit={(event) => {
+          event.preventDefault()
+          values.push({ kind: new FormData(event.currentTarget).get('kind') })
+        }}
+      >
+        <SelectField name="kind" label="Kind" value="" onValueChange={() => {}} options={[{ value: 'automatic_backup', label: 'Automatic backup' }, { value: 'probe', label: 'Probe' }]} />
+        <button type="submit">Save</button>
+      </form>,
+    )
+    await userEvent.click(screen.getByRole('button', { name: 'Save' }))
+    expect(values).toEqual([{ kind: 'automatic_backup' }])
+  })
+
   it('associates the label with the control it wraps', () => {
     render(<Harness onSubmit={() => {}} />)
     expect(screen.getByLabelText('Name')).toHaveValue('Primary')

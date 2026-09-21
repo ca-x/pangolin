@@ -37,11 +37,15 @@ export function Modal({ open, onOpenChange, title, description, trigger, childre
 }
 
 export function SelectField({ value, onValueChange, label, options, name }: { value: string; onValueChange: (value: string) => void; label: string; options: Array<{ value: string; label: string }>; name?: string }) {
+  // An enum select with no selection submits nothing, which makes a form whose
+  // field is required fail on the default Save. Fall back to the first option,
+  // matching what the select displays.
+  const selected = value || options[0]?.value || ''
   return (
     <Select
       name={name}
       label={label}
-      value={value}
+      value={selected}
       onChange={(next) => { if (next !== null) onValueChange(next) }}
       data={options}
       allowDeselect={false}

@@ -342,6 +342,11 @@ async fn setup(
             "password must contain at least 12 characters".into(),
         ));
     }
+    // This route is unauthenticated and hashing is deliberately expensive, so
+    // refuse a repeat setup before spending that work on it.
+    if db::is_initialized(&state.db).await? {
+        return Err(ApiError::Conflict("instance is already initialized".into()));
+    }
     let user = crate::models::User {
         id: Uuid::new_v4().to_string(),
         email: request.email.trim().to_ascii_lowercase(),
@@ -700,12 +705,15 @@ async fn create_api_key(
         return Err(ApiError::BadRequest("name is required".into()));
     }
     let imported = input.token_mode == crate::models::ApiKeyTokenMode::ImportExisting;
+    // Argon2 is intentionally slow and `begin()` checks out the only SQLite
+    // connection, so prepare the credential material first.
+    let prepared = db::prepare_api_key(&input).map_err(bad_request)?;
     let tx = state
         .db
         .begin()
         .await
         .map_err(|e| ApiError::Internal(e.into()))?;
-    let (key, token) = db::create_api_key_in(&tx, &input)
+    let (key, token) = db::create_api_key_in(&tx, &input, prepared)
         .await
         .map_err(bad_request)?;
     db::record_audit_event_in(

@@ -172,7 +172,7 @@ function TraceFacts({ data }: { data: RequestDetail }) {
     [t('latency'), data.latency_ms >= 0 ? `${data.latency_ms} ms` : '—'],
     ['TTFT', data.ttft_ms == null ? '—' : `${data.ttft_ms} ms`],
     [t('tokens'), `${data.input_tokens} / ${data.output_tokens}`],
-    [t('cost'), `${(data.cost_micros / 1_000_000).toFixed(6)}`],
+    [t('cost'), `$${(data.cost_micros / 1_000_000).toFixed(6)}`],
   ]
   return <Stack gap="lg">
     <Card p={0} style={{ overflow: 'hidden' }}>

@@ -63,6 +63,20 @@ fn audit_ctx<'a>(user: &'a User, action: &'a str) -> repo::CatalogAudit<'a> {
     repo::CatalogAudit {
         actor_user_id: &user.id,
         action,
+        resource_id: None,
+    }
+}
+
+/// Same, but naming the single entry the operation touched.
+fn audit_ctx_for<'a>(
+    user: &'a User,
+    action: &'a str,
+    resource_id: &'a str,
+) -> repo::CatalogAudit<'a> {
+    repo::CatalogAudit {
+        actor_user_id: &user.id,
+        action,
+        resource_id: Some(resource_id),
     }
 }
 
@@ -235,7 +249,7 @@ async fn override_entry(
     repo::import(
         &state.db,
         document.to_string().as_bytes(),
-        Some(audit_ctx(&user, "override")),
+        Some(audit_ctx_for(&user, "override", &id)),
     )
     .await?;
     Ok(StatusCode::NO_CONTENT)

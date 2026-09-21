@@ -1,8 +1,8 @@
-import { AppShell, Avatar, Burger, Button, Group, Menu, NavLink as MantineNavLink, Select, Stack, Text, Alert } from '@mantine/core'
+import { AppShell, Avatar, Burger, Button, Group, Menu, NavLink as MantineNavLink, Select, Stack, Text, Alert, UnstyledButton } from '@mantine/core'
 import { useDisclosure } from '@mantine/hooks'
 import { Activity, Boxes, FlaskConical, Gauge, KeyRound, LogOut, MessageSquareText, Settings, Unplug } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
-import { Outlet, useLocation, useNavigate } from 'react-router'
+import { Link as RouterLink, Outlet, useLocation, useNavigate } from 'react-router'
 import { api } from './api'
 import type { Branding, User } from './api'
 import { ProjectProvider, useProject } from './project'
@@ -28,7 +28,7 @@ function ShellContent({ user, branding }: { user: User; branding: Branding }) {
 
   return (
     <AppShell
-      header={{ height: 60 }}
+      header={{ height: { base: 60, md: 0 } }}
       navbar={{
         width: 260,
         breakpoint: 'md',
@@ -106,12 +106,12 @@ function ShellContent({ user, branding }: { user: User; branding: Branding }) {
         <AppShell.Section mt="auto" pt="sm" style={{ borderTop: '1px solid var(--mantine-color-default-border)' }}>
           <Menu shadow="md" width={200}>
             <Menu.Target>
-              <Group gap="sm" px="xs" py={4} style={{ cursor: 'pointer', borderRadius: 'var(--mantine-radius-md)' }}
-                onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.background = 'var(--mantine-color-default-hover)' }}
-                onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.background = '' }}>
-                <Avatar color="pangolin" radius="md" size={28}>{user.email.slice(0, 2).toUpperCase()}</Avatar>
-                <Text size="xs" c="dimmed" truncate="end" style={{ maxWidth: 160 }} title={user.email}>{user.email}</Text>
-              </Group>
+              <UnstyledButton px="xs" py={4} w="100%" style={{ borderRadius: 'var(--mantine-radius-md)' }}>
+                <Group gap="sm" wrap="nowrap">
+                  <Avatar color="pangolin" radius="md" size={28}>{user.email.slice(0, 2).toUpperCase()}</Avatar>
+                  <Text size="xs" c="dimmed" truncate="end" style={{ maxWidth: 160 }} title={user.email}>{user.email}</Text>
+                </Group>
+              </UnstyledButton>
             </Menu.Target>
             <Menu.Dropdown>
               <Menu.Item leftSection={<LogOut size={16} />} onClick={signOut}>
@@ -154,7 +154,8 @@ function NavItem({ to, label, icon: Icon, end, onClick }: {
 
   return (
     <MantineNavLink
-      href={to}
+      component={RouterLink}
+      to={to}
       label={label}
       leftSection={<Icon size={18} strokeWidth={1.8} />}
       active={active}

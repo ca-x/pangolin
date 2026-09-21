@@ -431,15 +431,23 @@ pub async fn create_api_key(
     input: &ApiKeyInput,
 ) -> Result<(ApiKey, String)> {
     let tx = db.begin().await?;
-    let result = create_api_key_in(&tx, input).await?;
+    let prepared = prepare_api_key(input)?;
+    let result = create_api_key_in(&tx, input, prepared).await?;
     tx.commit().await?;
     Ok(result)
 }
 
-pub async fn create_api_key_in<C: ConnectionTrait>(
-    db: &C,
-    input: &ApiKeyInput,
-) -> Result<(ApiKey, String)> {
+/// Credential material for a new API key, prepared before any transaction is
+/// opened: generating and hashing a token is deliberately expensive and must not
+/// hold the single SQLite connection.
+pub struct PreparedApiKey {
+    token: String,
+    lookup_digest: String,
+    prefix: String,
+    hash: String,
+}
+
+pub fn prepare_api_key(input: &ApiKeyInput) -> Result<PreparedApiKey> {
     let token = match input.token_mode {
         ApiKeyTokenMode::Generated => crypto::opaque_token("pg_"),
         ApiKeyTokenMode::ImportExisting => {
@@ -456,6 +464,25 @@ pub async fn create_api_key_in<C: ConnectionTrait>(
     let lookup_digest = crypto::token_hash(&token);
     let prefix = lookup_digest[..8].to_owned();
     let hash = crypto::hash_password(&token)?;
+    Ok(PreparedApiKey {
+        token,
+        lookup_digest,
+        prefix,
+        hash,
+    })
+}
+
+pub async fn create_api_key_in<C: ConnectionTrait>(
+    db: &C,
+    input: &ApiKeyInput,
+    prepared: PreparedApiKey,
+) -> Result<(ApiKey, String)> {
+    let PreparedApiKey {
+        token,
+        lookup_digest,
+        prefix,
+        hash,
+    } = prepared;
     let id = Uuid::new_v4().to_string();
     db.execute(stmt(
         "INSERT INTO api_keys(id,name,key_prefix,key_hash,lookup_digest,scopes,budget_micros,spent_micros,enabled,created_at,project_id) VALUES(?,?,?,?,?,'[\"gateway\"]',?,0,1,?,?)",
