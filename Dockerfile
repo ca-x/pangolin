@@ -1,6 +1,9 @@
 # syntax=docker/dockerfile:1.7
 
 FROM node:26.9.0-bookworm-slim AS web-builder
+ARG GIT_COMMIT=unknown
+# No `.git` in the build context, so the console records this instead.
+ENV PANGOLIN_WEB_COMMIT=${GIT_COMMIT}
 WORKDIR /src/web
 RUN npm install --global pnpm@11.0.0 --ignore-scripts
 COPY web/package.json web/pnpm-lock.yaml ./
@@ -10,6 +13,9 @@ COPY web/ ./
 RUN pnpm build
 
 FROM rust:1.98.0-bookworm AS rust-builder
+ARG GIT_COMMIT=unknown
+# Same reason: `build.rs` falls back to this when git is unavailable.
+ENV PANGOLIN_BUILD_COMMIT=${GIT_COMMIT}
 WORKDIR /src
 RUN apt-get update && apt-get install --yes --no-install-recommends g++ && rm -rf /var/lib/apt/lists/*
 COPY Cargo.toml Cargo.lock rust-toolchain.toml build.rs ./
