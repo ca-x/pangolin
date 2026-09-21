@@ -201,6 +201,26 @@ export function buildResolver(paletteId: string, highContrast = false): CSSVaria
   const scheme = (tokens: PaletteTokens) => ({
     '--mantine-color-bright': tokens.ink,
     '--mantine-color-text': tokens.ink,
+    // Mantine resolves the light/default/outline variants *by colour name*, from
+    // the generated ramp, so their label and background land on opposite ends of
+    // it: a `variant="light"` button measured near-white text (#fff1ea) on a
+    // near-black surface (#2d0f00) instead of the accent's own tint and ink. Map
+    // the by-name variables onto the palette tokens so every variant agrees with
+    // the design system rather than with the ramp's extremes.
+    '--mantine-color-pangolin-filled': tokens.accent,
+    '--mantine-color-pangolin-filled-hover': tokens.accentStrong,
+    '--mantine-color-pangolin-light': tokens.accentSoft,
+    // The hover step must differ from the resting one, or the variant stops
+    // responding to the pointer. There is no "accent soft hover" token, so mix
+    // the accent into the soft fill.
+    '--mantine-color-pangolin-light-hover': `color-mix(in srgb, ${tokens.accentSoft} 88%, ${tokens.accent})`,
+    '--mantine-color-pangolin-light-color': tokens.accentStrong,
+    '--mantine-color-pangolin-outline': tokens.accent,
+    '--mantine-color-pangolin-outline-hover': `color-mix(in srgb, ${tokens.accent} 12%, transparent)`,
+    '--mantine-color-pangolin-text': tokens.accentStrong,
+    '--mantine-color-pangolin-default': tokens.accentSoft,
+    '--mantine-color-pangolin-default-hover': `color-mix(in srgb, ${tokens.accentSoft} 88%, ${tokens.accent})`,
+    '--mantine-color-pangolin-contrast': tokens.accentContrast,
     '--mantine-color-body': tokens.canvas,
     '--mantine-color-error': tokens.danger,
     '--mantine-color-success': tokens.success,

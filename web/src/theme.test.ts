@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { buildResolver, buildTheme } from './mantine'
+import { contrastRatio } from './color'
 import { palettes, resolvePalette } from './palettes'
 
 const modes = ['light', 'dark'] as const
@@ -17,6 +18,27 @@ describe('filled controls', () => {
       })
     }
   }
+
+  it('maps the by-name colour variables onto the palette, not the ramp extremes', () => {
+    // Mantine's light/default/outline variants resolve `--mantine-color-pangolin-*`
+    // by name. Left to the generated ramp, a light button measured near-white text
+    // on a near-black surface — legible, but not a button.
+    const resolver = buildResolver('bronze')({} as never)
+    for (const [mode, variables] of [['light', resolver.light], ['dark', resolver.dark]] as const) {
+      const tokens = resolvePalette('bronze', mode)
+      const vars = variables as Record<string, string>
+      expect(vars['--mantine-color-pangolin-light'], mode).toBe(tokens.accentSoft)
+      expect(vars['--mantine-color-pangolin-light-color'], mode).toBe(tokens.accentStrong)
+      // A hover that equals the resting state is a variant that ignores the
+      // pointer, which is how the first version of this mapping regressed.
+      expect(vars['--mantine-color-pangolin-light-hover'], mode).not.toBe(vars['--mantine-color-pangolin-light'])
+      expect(vars['--mantine-color-pangolin-outline-hover'], mode).not.toBe(vars['--mantine-color-pangolin-outline'])
+      expect(vars['--mantine-color-pangolin-filled'], mode).toBe(tokens.accent)
+      expect(vars['--mantine-color-pangolin-contrast'], mode).toBe(tokens.accentContrast)
+      // The light variant must stay readable, which is what made the old pair wrong.
+      expect(contrastRatio(tokens.accentStrong, tokens.accentSoft), mode).toBeGreaterThanOrEqual(4.5)
+    }
+  })
 
   it('gives every button the class the material layer hooks onto', () => {
     const theme = buildTheme('house', 'bronze', 'dark')
