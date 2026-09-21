@@ -1,7 +1,7 @@
 import { Accordion, ActionIcon, Button, Code, Group, NumberInput, Paper, PasswordInput, Select, SimpleGrid, Stack, Tabs, Table, TableScrollContainer, Text, TextInput, Textarea, Title } from '@mantine/core'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { KeyRound, Plus, Trash2 } from 'lucide-react'
-import { useState, type FormEvent } from 'react'
+import { useEffect, useState, type FormEvent } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 import { api } from '../api'
@@ -64,6 +64,8 @@ function KeysPanel() {
   const [mode, setMode] = useState('generated')
   const [token, setToken] = useState<string | null>(null)
   const [profile, setProfile] = useState('__none__')
+  // Profiles belong to a project, so drop the selection when the project changes.
+  useEffect(() => { setProfile('__none__'); setEditProfile('__none__') }, [project.id])
   const [editProfile, setEditProfile] = useState('__none__')
   const path = `/api/admin/v1/projects/${project.id}/api-keys`
   const query = useQuery({ queryKey: ['keys', project.id], queryFn: () => api<ScopedKey[]>(path) })

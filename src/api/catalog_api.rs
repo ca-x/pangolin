@@ -249,7 +249,7 @@ async fn override_entry(
     repo::import(
         &state.db,
         document.to_string().as_bytes(),
-        Some(audit_ctx_for(&user, "override", &id)),
+        Some(audit_ctx_for(&user, "override", &format!("{kind}:{id}"))),
     )
     .await?;
     Ok(StatusCode::NO_CONTENT)

@@ -1,6 +1,6 @@
 import { Badge, Input, Modal as MantineModal, Select, Skeleton, Stack, Text, ThemeIcon, Title, Tooltip } from '@mantine/core'
 import { AlertTriangle, Check } from 'lucide-react'
-import { cloneElement, isValidElement, useId, useState, type ReactNode } from 'react'
+import { cloneElement, isValidElement, useEffect, useId, useState, type ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
 
 export function Field({ label, hint, children }: { label: string; hint?: string; children: ReactNode }) {
@@ -38,9 +38,13 @@ export function Modal({ open, onOpenChange, title, description, trigger, childre
 
 export function SelectField({ value, onValueChange, label, options, name }: { value: string; onValueChange: (value: string) => void; label: string; options: Array<{ value: string; label: string }>; name?: string }) {
   // An enum select with no selection submits nothing, which makes a form whose
-  // field is required fail on the default Save. Fall back to the first option,
-  // matching what the select displays.
+  // field is required fail on the default Save. Adopt the first option through
+  // the caller's state rather than only displaying it, so a submit button gated
+  // on that state enables once options arrive.
   const selected = value || options[0]?.value || ''
+  useEffect(() => {
+    if (!value && options[0]) onValueChange(options[0].value)
+  }, [value, options, onValueChange])
   return (
     <Select
       name={name}
