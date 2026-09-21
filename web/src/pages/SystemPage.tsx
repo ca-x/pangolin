@@ -1,17 +1,18 @@
-import { Button, Checkbox, Paper, Select, SimpleGrid, Stack, Switch, Tabs, Text, Textarea, TextInput, Title } from '@mantine/core'
+import { Alert, Button, Checkbox, Group, Paper, Select, SimpleGrid, Stack, Switch, Tabs, Text, Textarea, TextInput, Title } from '@mantine/core'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { AlertTriangle, Copy } from 'lucide-react'
 import { useState, type FormEvent } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
-import { api } from '../api'
+import { api, type Bootstrap } from '../api'
 import { EnabledPill, SelectField, SkeletonRows } from '../components'
 import { palettes } from '../palettes'
 import { useProject } from '../project'
 import { resolveSkin, skinLabel, skins } from '../skins'
 import { useTheme, type ColorMode } from '../theme'
-import { PageHeader, QueryError, ResourcePage } from './shared'
+import { PageHeader, QueryError, ResourcePage, displayValue } from './shared'
 
-const SYSTEM_TABS = ['appearance', 'orchestrationSettings', 'requestLogging', 'storage', 'backups', 'webhooks', 'jobs', 'retention'] as const
+const SYSTEM_TABS = ['appearance', 'orchestrationSettings', 'requestLogging', 'storage', 'backups', 'webhooks', 'jobs', 'retention', 'about'] as const
 
 export default function SystemPage() {
   const { t } = useTranslation()
@@ -38,7 +39,123 @@ export default function SystemPage() {
       <Tabs.Panel value="retention">
         <ResourcePage resource="retention" title={t('retention')} description={t('retentionDescription')} empty={t('retentionEmpty')} createLabel={t('addPolicy')} columns={[{ key: 'resource_type', label: t('type') }, { key: 'retention_days', label: t('retentionDays') }, { key: 'retain_payloads', label: t('retainPayloads') }]} fields={[{ key: 'resource_type', label: t('type'), kind: 'select', options: ['requests', 'payloads', 'probes', 'quota'].map((value) => ({ value, label: t(value) })) }, { key: 'retention_days', label: t('retentionDays'), kind: 'number', defaultValue: 30 }, { key: 'retain_payloads', label: t('retainPayloads'), kind: 'checkbox' }]} />
       </Tabs.Panel>
+      <Tabs.Panel value="about"><About /></Tabs.Panel>
     </Tabs>
+  )
+}
+
+/** Identity of the console bundle itself, injected by `vite.config.ts` at build time. */
+export type WebBuild = { version: string; commit: string; builtAt: string }
+
+/**
+ * The console's own build identity. Returns `null` when the bundle was built
+ * without the injection, so the About panel degrades to `—` instead of throwing.
+ */
+export function consoleBuild(): WebBuild | null {
+  return typeof __WEB_BUILD__ === 'undefined' ? null : __WEB_BUILD__
+}
+
+/**
+ * Two builds are the same revision when their short commits match. A trailing
+ * `-dirty` only records uncommitted changes at build time, and a commit neither
+ * side could measure must not raise a false alarm.
+ */
+export function commitsDiffer(backend?: string | null, web?: string | null): boolean {
+  const known = (value?: string | null) => {
+    const trimmed = value?.trim().replace(/-dirty$/, '') ?? ''
+    return trimmed === 'unknown' ? '' : trimmed
+  }
+  const left = known(backend)
+  const right = known(web)
+  return left !== '' && right !== '' && left !== right
+}
+
+/**
+ * Build times arrive as RFC 3339 UTC. Render them in the reader's local format;
+ * a value that is not a timestamp is shown verbatim rather than invented.
+ */
+export function formatBuildTime(value: string | null | undefined, language: string): string {
+  if (!value) return '—'
+  const moment = new Date(value)
+  if (Number.isNaN(moment.getTime())) return value
+  return new Intl.DateTimeFormat(language, { dateStyle: 'medium', timeStyle: 'short' }).format(moment)
+}
+
+function BuildFacts({ title, facts }: { title: string; facts: Array<{ label: string; value: string }> }) {
+  return (
+    <Paper withBorder p="lg">
+      <Title order={2} mb="md">{title}</Title>
+      <Stack component="dl" gap="sm" m={0}>
+        {facts.map((fact) => (
+          <Group key={fact.label} component="div" justify="space-between" align="flex-start" gap="md" wrap="nowrap">
+            <Text component="dt" size="sm" c="dimmed" fw={600} style={{ flex: '0 0 auto' }}>{fact.label}</Text>
+            <Text component="dd" size="md" ff="monospace" style={{ margin: 0, minWidth: 0, textAlign: 'right', overflowWrap: 'anywhere' }}>{fact.value}</Text>
+          </Group>
+        ))}
+      </Stack>
+    </Paper>
+  )
+}
+
+/**
+ * The release binary embeds `web/dist` at compile time, so a binary and a console
+ * built from different revisions are indistinguishable from the outside. This
+ * panel is where that pair is compared.
+ */
+function About() {
+  const { t, i18n } = useTranslation()
+  const query = useQuery({ queryKey: ['bootstrap'], queryFn: () => api<Bootstrap>('/api/v1/bootstrap'), retry: false })
+  if (query.isError) return <QueryError retry={() => void query.refetch()} />
+  if (query.isLoading || !query.data) return <SkeletonRows />
+  const backend = query.data.build
+  const bundle = consoleBuild()
+  const mismatch = commitsDiffer(backend?.commit, bundle?.commit)
+  const diagnostics = [
+    t('productName'),
+    `backend.version=${displayValue(backend?.version)}`,
+    `backend.commit=${displayValue(backend?.commit)}`,
+    `backend.built_at=${displayValue(backend?.built_at)}`,
+    `backend.target=${displayValue(backend?.target)}`,
+    `backend.profile=${displayValue(backend?.profile)}`,
+    `console.version=${displayValue(bundle?.version)}`,
+    `console.commit=${displayValue(bundle?.commit)}`,
+    `console.builtAt=${displayValue(bundle?.builtAt)}`,
+  ].join('\n')
+  const copyDiagnostics = () => {
+    const written = navigator.clipboard?.writeText(diagnostics)
+    if (!written) { toast.error(t('copyFailed')); return }
+    void written.then(() => toast.success(t('copied')), () => toast.error(t('copyFailed')))
+  }
+  return (
+    <>
+      <PageHeader title={t('about')} description={t('aboutDescription')} />
+      {mismatch && (
+        <Alert variant="light" color="yellow" radius="lg" title={t('buildMismatchTitle')} icon={<AlertTriangle />} mb="lg">
+          <Text size="md">{t('buildMismatchHint', { backend: displayValue(backend?.commit), console: displayValue(bundle?.commit) })}</Text>
+        </Alert>
+      )}
+      <Paper withBorder p="lg" mb="md">
+        <Title order={2}>{t('productName')}</Title>
+        <Text size="md" c="dimmed" mt={4}>{t('productSubtitle')}</Text>
+      </Paper>
+      <SimpleGrid cols={{ base: 1, md: 2 }} spacing="md">
+        <BuildFacts title={t('backendBuild')} facts={[
+          { label: t('version'), value: displayValue(backend?.version) },
+          { label: t('commit'), value: displayValue(backend?.commit) },
+          { label: t('buildTime'), value: formatBuildTime(backend?.built_at, i18n.language) },
+          { label: t('buildTarget'), value: displayValue(backend?.target) },
+          { label: t('buildProfile'), value: displayValue(backend?.profile) },
+        ]} />
+        <BuildFacts title={t('consoleBuild')} facts={[
+          { label: t('version'), value: displayValue(bundle?.version) },
+          { label: t('commit'), value: displayValue(bundle?.commit) },
+          { label: t('buildTime'), value: formatBuildTime(bundle?.builtAt, i18n.language) },
+        ]} />
+      </SimpleGrid>
+      <Group mt="lg">
+        <Button variant="default" leftSection={<Copy size={16} />} onClick={copyDiagnostics}>{t('copyDiagnostics')}</Button>
+      </Group>
+    </>
   )
 }
 
