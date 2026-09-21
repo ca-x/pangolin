@@ -410,16 +410,26 @@ async fn task4_websocket_lanes_are_concurrent_and_same_lane_is_fifo() {
             .await
             .unwrap();
     }
-    let first = tokio::time::timeout(Duration::from_secs(5), starts.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    let second = tokio::time::timeout(Duration::from_secs(5), starts.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    assert!([first.as_str(), second.as_str()].contains(&"a1"));
-    assert!([first.as_str(), second.as_str()].contains(&"b1"));
+    // Lanes are independent, so a1 and b1 may reach the upstream in either order,
+    // and a2 must stay parked behind a1. Drain until both lanes have started
+    // instead of assuming the first two events are them — that assumption is what
+    // made this test flaky under a loaded suite.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut started_lanes: Vec<String> = Vec::new();
+    while !(started_lanes.iter().any(|name| name == "a1")
+        && started_lanes.iter().any(|name| name == "b1"))
+    {
+        let name = tokio::time::timeout_at(deadline, starts.recv())
+            .await
+            .expect("both lanes should start while a1 is parked")
+            .expect("upstream start channel closed");
+        started_lanes.push(name);
+    }
+    assert_eq!(
+        started_lanes.len(),
+        2,
+        "a2 must not start before a1 completes: {started_lanes:?}"
+    );
     assert!(starts.try_recv().is_err());
     let b = ws_event(&mut socket).await;
     assert_eq!(b["stream_id"], "b");

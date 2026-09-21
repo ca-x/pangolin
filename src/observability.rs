@@ -136,6 +136,10 @@ struct DropCounters {
     writer_down: AtomicU64,
     stale_generation: AtomicU64,
     batch_failed: AtomicU64,
+    /// Events refused because the writer was marked unusable after repeated
+    /// batch failures — distinct from a generation mismatch, which the store
+    /// recovers from on its own.
+    poisoned: AtomicU64,
 }
 
 impl DropCounters {
@@ -144,6 +148,7 @@ impl DropCounters {
             + self.writer_down.load(Ordering::Relaxed)
             + self.stale_generation.load(Ordering::Relaxed)
             + self.batch_failed.load(Ordering::Relaxed)
+            + self.poisoned.load(Ordering::Relaxed)
     }
 }
 
@@ -277,7 +282,7 @@ impl ObservationStore {
     }
 
     /// Drops by cause: queue pressure, a dead writer, stale generations, failed batches.
-    pub fn dropped_breakdown(&self) -> [(&'static str, u64); 4] {
+    pub fn dropped_breakdown(&self) -> [(&'static str, u64); 5] {
         [
             (
                 "queue_full",
@@ -295,6 +300,7 @@ impl ObservationStore {
                 "batch_failed",
                 self.dropped.batch_failed.load(Ordering::Relaxed),
             ),
+            ("poisoned", self.dropped.poisoned.load(Ordering::Relaxed)),
         ]
     }
 
@@ -306,10 +312,14 @@ impl ObservationStore {
         self.generation.load(Ordering::Acquire)
     }
     pub fn record_at(&self, event: RequestEvent, generation: u64) {
-        if generation != self.generation() || self.poisoned.load(Ordering::Acquire) {
+        if generation != self.generation() {
             self.dropped
                 .stale_generation
                 .fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        if self.poisoned.load(Ordering::Acquire) {
+            self.dropped.poisoned.fetch_add(1, Ordering::Relaxed);
             return;
         }
         let Some(sender) = &self.sender else {
