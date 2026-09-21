@@ -592,7 +592,6 @@ CREATE TABLE data_retention_policies (
     project_id TEXT REFERENCES projects(id) ON DELETE CASCADE,
     resource_type TEXT NOT NULL,
     retention_days INTEGER NOT NULL CHECK(retention_days >= 0),
-    retain_payloads INTEGER NOT NULL DEFAULT 0 CHECK(retain_payloads IN (0,1)),
     updated_at INTEGER NOT NULL,
     UNIQUE(project_id,resource_type)
 );

@@ -626,7 +626,12 @@ pub async fn gc(state: &AppState) -> Result<(), ApiError> {
         vec![now.into()],
     ))
     .await?;
-    let policies=tx.query_all(sql("SELECT project_id,resource_type,retention_days,retain_payloads FROM data_retention_policies",vec![])).await?;
+    let policies = tx
+        .query_all(sql(
+            "SELECT project_id,resource_type,retention_days FROM data_retention_policies",
+            vec![],
+        ))
+        .await?;
     let mut policies_for_facts: Vec<(Option<String>, i64)> = vec![];
     for row in policies.iter() {
         let resource: String = row.try_get("", "resource_type")?;

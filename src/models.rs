@@ -512,7 +512,6 @@ pub mod parity {
         pub project_id: Option<String>,
         pub resource_type: String,
         pub retention_days: i32,
-        pub retain_payloads: bool,
         pub updated_at: i64,
     }
 

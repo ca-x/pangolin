@@ -395,7 +395,7 @@ fn query(resource: &str) -> Result<(&'static str, &'static str, &'static str), A
         "retention" => (
             "data_retention_policies",
             "project_id=?",
-            "json_object('id',id,'resource_type',resource_type,'retention_days',retention_days,'retain_payloads',retain_payloads)",
+            "json_object('id',id,'resource_type',resource_type,'retention_days',retention_days)",
         ),
         "audit" => (
             "audit_events",
@@ -1220,7 +1220,7 @@ async fn mutate(
             if !(1..=3650).contains(&days) {
                 return Err(ApiError::BadRequest("retention days must be 1–3650".into()));
             }
-            transaction.execute(sql("INSERT INTO data_retention_policies(id,project_id,resource_type,retention_days,retain_payloads,updated_at) VALUES(?,?,?,?,?,?) ON CONFLICT(project_id,resource_type) DO UPDATE SET retention_days=excluded.retention_days,retain_payloads=excluded.retain_payloads,updated_at=excluded.updated_at",vec![resource_id.clone().into(),project.clone().into(),kind.into(),days.into(),value["retain_payloads"].as_bool().unwrap_or(false).into(),db::now().into()])).await?;
+            transaction.execute(sql("INSERT INTO data_retention_policies(id,project_id,resource_type,retention_days,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(project_id,resource_type) DO UPDATE SET retention_days=excluded.retention_days,updated_at=excluded.updated_at",vec![resource_id.clone().into(),project.clone().into(),kind.into(),days.into(),db::now().into()])).await?;
         }
         "webhooks" => {
             let url = text(&value, "url")?;

@@ -127,3 +127,50 @@ async fn requests_retention_prunes_the_authoritative_ledger_and_keeps_running_wo
         "the lifetime budget counter must survive retention"
     );
 }
+/// The retention form used to offer a "retain payloads" switch that nothing read:
+/// the GC selects the column and deletes on resource type and days alone, and
+/// `request_contents` cascades from `requests`. An operator who ticked it got the
+/// bodies deleted anyway. Bodies are governed by the separate `payloads`
+/// resource, and this pins both facts so the UI cannot drift from them again.
+#[tokio::test]
+async fn payload_retention_is_its_own_resource_and_the_projection_does_not_offer_a_dead_switch() {
+    let f = fixture(success()).await;
+    sql(
+        &f,
+        "INSERT INTO traces(id,project_id,status,started_at) VALUES('tr','00000000-0000-0000-0000-000000000001','succeeded',1)",
+        vec![],
+    )
+    .await;
+    sql(
+        &f,
+        "INSERT INTO requests(id,trace_id,protocol,endpoint,requested_model,status,started_at,finished_at) \
+         VALUES('old-req','tr','openai','/v1/chat/completions','m','succeeded',1,2)",
+        vec![],
+    )
+    .await;
+    sql(
+        &f,
+        "INSERT INTO request_contents(request_id,request_json,response_json) VALUES('old-req','{}','{}')",
+        vec![],
+    )
+    .await;
+    // A payloads policy expires bodies on its own schedule.
+    sql(
+        &f,
+        "INSERT INTO data_retention_policies(id,project_id,resource_type,retention_days,updated_at) \
+         VALUES('p','00000000-0000-0000-0000-000000000001','payloads',1,0)",
+        vec![],
+    )
+    .await;
+    ops_runtime::gc(&f.state).await.unwrap();
+    assert_eq!(
+        count(&f, "SELECT COUNT(*) AS n FROM request_contents").await,
+        0,
+        "a payloads policy is what expires captured bodies"
+    );
+    assert_eq!(
+        count(&f, "SELECT COUNT(*) AS n FROM requests WHERE id='old-req'").await,
+        1,
+        "expiring bodies must not delete the request itself"
+    );
+}
