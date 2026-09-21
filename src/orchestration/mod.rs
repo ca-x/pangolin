@@ -43,6 +43,10 @@ pub struct Candidate {
     pub model_id: String,
     pub credential_id: String,
     pub priority: i32,
+    /// The credential's own priority. Ordering inside a model tier is by this,
+    /// then by id; without it a priority-100 credential could be tried before a
+    /// priority-10 one purely because of its UUID.
+    pub credential_priority: i32,
     pub weight: u32,
     pub limits: Limits,
     pub retry: Retry,

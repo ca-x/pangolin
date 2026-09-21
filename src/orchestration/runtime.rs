@@ -215,8 +215,14 @@ impl Runtime {
         if candidates.is_empty() {
             return;
         }
-        // Priority tiers remain strict for every strategy. IDs break every score tie.
-        candidates.sort_by(|a, b| a.priority.cmp(&b.priority).then(a.id().cmp(&b.id())));
+        // Priority tiers remain strict for every strategy. Inside a tier the
+        // credential's own priority decides, and IDs break what is still tied.
+        candidates.sort_by(|a, b| {
+            a.priority
+                .cmp(&b.priority)
+                .then(a.credential_priority.cmp(&b.credential_priority))
+                .then(a.id().cmp(&b.id()))
+        });
         let tick = if strategy == Strategy::RoundRobin && candidates.len() > 1 {
             // A fixed-size digest also bounds memory for unusually long model IDs.
             self.rotations

@@ -104,6 +104,7 @@ pub(super) fn candidate(id: &str, weight: u32) -> Candidate {
         model_id: id.into(),
         credential_id: id.into(),
         priority: 100,
+        credential_priority: 100,
         weight,
         limits: Limits::default(),
         retry: Retry::default(),
@@ -925,6 +926,32 @@ async fn multiple_enabled_credentials_produce_separate_candidates() {
     assert!(ids.contains(&"cred-two".to_string()));
     // Each candidate must have a unique id (credential_id embedded).
     assert_ne!(result.candidates[0].id(), result.candidates[1].id());
+}
+
+#[tokio::test]
+async fn credential_priority_decides_the_order_inside_a_model_tier() {
+    // The provider's own credential sits at priority 100 (see `create_provider`).
+    // This one is worse by priority but sorts first by id, so ordering by id
+    // alone would try it first — which is how a failover could pick a
+    // priority-500 credential ahead of a priority-100 one because of its UUID.
+    let f = database_fixture().await;
+    let (provider, _) = add_model(&f, "a", "public", "actual").await;
+    sql(
+        &f,
+        "INSERT INTO channel_credentials(id,provider_id,secret_envelope,priority,created_at,updated_at) VALUES('aaa-cred',?,?,500,0,0)",
+        vec![provider.clone().into(), f.secrets.encrypt("later-key").unwrap().into()],
+    )
+    .await;
+    let result = plan(&f, json!({"model":"public"})).await.unwrap();
+    assert_eq!(result.candidates.len(), 2);
+    assert_eq!(
+        result.candidates[0].credential_id, provider,
+        "the lower-priority-number credential must be tried first"
+    );
+    assert!(
+        result.candidates[0].credential_priority < result.candidates[1].credential_priority,
+        "credential priority must survive candidate expansion"
+    );
 }
 
 #[tokio::test]
