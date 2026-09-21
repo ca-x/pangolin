@@ -1,63 +1,178 @@
-import { Activity, Boxes, FlaskConical, Gauge, KeyRound, LogOut, Menu, MessageSquareText, Settings, Unplug, X } from 'lucide-react'
-import { useEffect, useRef, useState, type KeyboardEvent } from 'react'
+import { AppShell, Avatar, Burger, Button, Group, Menu, NavLink as MantineNavLink, Select, Stack, Text, Alert } from '@mantine/core'
+import { useDisclosure } from '@mantine/hooks'
+import { Activity, Boxes, FlaskConical, Gauge, KeyRound, LogOut, MessageSquareText, Settings, Unplug } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
-import { NavLink, Outlet, useNavigate } from 'react-router'
+import { Outlet, useLocation, useNavigate } from 'react-router'
 import { api } from './api'
 import type { Branding, User } from './api'
 import { ProjectProvider, useProject } from './project'
 
-export default function Shell({ user,branding }: { user: User; branding: Branding }) {
-  return <ProjectProvider><ShellContent user={user} branding={branding}/></ProjectProvider>
+export default function Shell({ user, branding }: { user: User; branding: Branding }) {
+  return <ProjectProvider><ShellContent user={user} branding={branding} /></ProjectProvider>
 }
 
-function ShellContent({ user,branding }: { user: User; branding: Branding }) {
+function ShellContent({ user, branding }: { user: User; branding: Branding }) {
   const { t } = useTranslation()
   const { project, projects, permissions, setProjectId } = useProject()
   const navigate = useNavigate()
-  const [mobileOpen, setMobileOpen] = useState(false)
-  const menuButton = useRef<HTMLButtonElement>(null)
-  const closeButton = useRef<HTMLButtonElement>(null)
-  const menuWasOpened = useRef(false)
+  const [mobileOpen, { toggle: toggleMobile, close: closeMobile }] = useDisclosure(false)
   const can = (permission: string) => permissions.has('*') || permissions.has(permission)
-  const canAccess = ['project:manage','api_key:manage','role:manage','user:manage','oidc:manage'].some(can)
+  const canAccess = ['project:manage', 'api_key:manage', 'role:manage', 'user:manage', 'oidc:manage'].some(can)
   const groups = [
-    { label: t('workspace'), links: [{ to: '/', label: t('overview'), icon: Gauge, end: true },...(can('project:manage')?[{ to: '/channels', label: t('channels'), icon: Unplug },{ to: '/models', label: t('models'), icon: Boxes },{ to: '/prompts', label: t('prompts'), icon: MessageSquareText }]:[]),{ to: '/playground', label: t('playground'), icon: FlaskConical }] },
+    { label: t('workspace'), links: [{ to: '/', label: t('overview'), icon: Gauge, end: true }, ...(can('project:manage') ? [{ to: '/channels', label: t('channels'), icon: Unplug }, { to: '/models', label: t('models'), icon: Boxes }, { to: '/prompts', label: t('prompts'), icon: MessageSquareText }] : []), { to: '/playground', label: t('playground'), icon: FlaskConical }] },
     { label: t('observe'), links: [{ to: '/operations', label: t('operations'), icon: Activity }] },
-    ...((canAccess||can('catalog:manage')) ? [{ label: t('administration'), links: [...(canAccess?[{ to: '/access', label: t('access'), icon: KeyRound }]:[]),...(can('catalog:manage')?[{ to: '/system', label: t('systemSettings'), icon: Settings }]:[])] }] : []),
+    ...((canAccess || can('catalog:manage')) ? [{ label: t('administration'), links: [...(canAccess ? [{ to: '/access', label: t('access'), icon: KeyRound }] : []), ...(can('catalog:manage') ? [{ to: '/system', label: t('systemSettings'), icon: Settings }] : [])] }] : []),
   ]
-  useEffect(() => {
-    if (mobileOpen) {
-      menuWasOpened.current = true
-      closeButton.current?.focus()
-    } else if (menuWasOpened.current) {
-      menuButton.current?.focus()
-    }
-  }, [mobileOpen])
-  const trapNavigationFocus = (event: KeyboardEvent<HTMLElement>) => {
-    if (!mobileOpen) return
-    if (event.key === 'Escape') { setMobileOpen(false); return }
-    if (event.key !== 'Tab') return
-    const focusable = Array.from(event.currentTarget.querySelectorAll<HTMLElement>('a[href], button:not([disabled])')).filter((element) => element.offsetParent !== null)
-    const first = focusable[0]; const last = focusable.at(-1)
-    if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus() }
-    else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus() }
-  }
+
   const signOut = async () => { await api('/api/v1/auth/logout', { method: 'POST' }); navigate('/login'); location.reload() }
-  return <div className="app-shell">
-    <a className="skip-link" href="#main-content">{t('skipToContent')}</a>
-    <header className="mobile-header"><Brand compact name={branding.branding_name}/><button ref={menuButton} className="icon-button" onClick={() => setMobileOpen(true)} aria-label={t('menu')}><Menu size={20} /></button></header>
-    {mobileOpen && <button className="nav-scrim" onClick={() => setMobileOpen(false)} aria-label={t('close')} />}
-    <aside className={`sidebar ${mobileOpen ? 'sidebar-open' : ''}`} role={mobileOpen ? 'dialog' : undefined} aria-modal={mobileOpen || undefined} aria-label={mobileOpen ? t('menu') : undefined} onKeyDown={trapNavigationFocus}>
-      <div className="sidebar-top"><Brand name={branding.branding_name}/><button ref={closeButton} className="icon-button sidebar-close" onClick={() => setMobileOpen(false)} aria-label={t('close')}><X size={18} /></button></div>
-      {projects.length > 1 && <label className="project-switcher"><span>{t('project')}</span><select value={project.id} onChange={(event) => setProjectId(event.target.value)}>{projects.filter((item)=>item.enabled).map((item)=><option key={item.id} value={item.id}>{item.name}</option>)}</select></label>}
-      <nav aria-label={t('primaryNavigation')}>{groups.map((group)=><section className="nav-group" key={group.label}><h2>{group.label}</h2>{group.links.map(({ to, label, icon: Icon, end }) => <NavLink onClick={() => setMobileOpen(false)} className={({ isActive }) => isActive ? 'nav-link nav-link-active' : 'nav-link'} key={to} to={to} end={end}><Icon size={18} strokeWidth={1.8} /><span>{label}</span></NavLink>)}</section>)}</nav>
-      <div className="account-block"><div className="account-identity"><span className="account-avatar" aria-hidden="true">{user.email.slice(0, 2)}</span><span title={user.email}>{user.email}</span></div><button className="signout" onClick={signOut}><LogOut size={16} aria-hidden="true" />{t('signOut')}</button></div>
-    </aside>
-    <main id="main-content" className="content" tabIndex={-1} inert={mobileOpen || undefined} aria-hidden={mobileOpen || undefined}>{!branding.onboarding_complete&&<aside className="onboarding-banner"><div><strong>{t('onboardingTitle')}</strong><span>{t('onboardingHint')}</span></div><NavLink className="button button-quiet" to="/channels">{t('configureChannel')}</NavLink></aside>}<Outlet /></main>
-  </div>
+
+  return (
+    <AppShell
+      header={{ height: 60 }}
+      navbar={{
+        width: 260,
+        breakpoint: 'md',
+        collapsed: { mobile: !mobileOpen, desktop: false },
+      }}
+      padding="md"
+    >
+      {/* Skip link */}
+      <a href="#main-content" style={{
+        position: 'fixed', left: 16, top: 12, zIndex: 150,
+        padding: '10px 14px', borderRadius: 'var(--mantine-radius-md)',
+        background: 'var(--mantine-color-body)', color: 'var(--mantine-color-text)',
+        boxShadow: 'var(--mantine-shadow-lg)', transform: 'translateY(-200%)',
+        transition: 'transform 160ms ease',
+      }} onFocus={(e) => { (e.currentTarget as HTMLElement).style.transform = 'translateY(0)' }}
+        onBlur={(e) => { (e.currentTarget as HTMLElement).style.transform = 'translateY(-200%)' }}>
+        {t('skipToContent')}
+      </a>
+
+      {/* Mobile header */}
+      <AppShell.Header hiddenFrom="md" px="sm">
+        <Group justify="space-between" h="100%">
+          <Brand compact name={branding.branding_name} />
+          <Burger opened={mobileOpen} onClick={toggleMobile} aria-label={t('menu')} size="sm" />
+        </Group>
+      </AppShell.Header>
+
+      {/* Sidebar (desktop: floating panel; mobile: Drawer via AppShell) */}
+      <AppShell.Navbar
+        p="md"
+        style={{
+          margin: 'var(--mantine-spacing-xs)',
+          marginInlineEnd: 0,
+          borderRadius: 'var(--mantine-radius-xl)',
+          border: '1px solid var(--mantine-color-default-border)',
+          boxShadow: 'var(--mantine-shadow-md)',
+        }}
+      >
+        {/* Desktop brand + mobile drawer close */}
+        <Group justify="space-between" mb="md" mt={2} mx={6}>
+          <Brand name={branding.branding_name} />
+          <Burger opened={mobileOpen} onClick={toggleMobile} hiddenFrom="md" size="sm" aria-label={t('close')} />
+        </Group>
+
+        {/* Project switcher */}
+        {projects.length > 1 && (
+          <Select
+            mb="md"
+            mx={4}
+            label={t('project')}
+            value={project.id}
+            onChange={(value) => value && setProjectId(value)}
+            data={projects.filter((item) => item.enabled).map((item) => ({ value: item.id, label: item.name }))}
+            size="sm"
+          />
+        )}
+
+        {/* Navigation */}
+        <AppShell.Section grow component={Stack} gap="lg">
+          <nav aria-label={t('primaryNavigation')}>
+            {groups.map((group) => (
+              <Stack key={group.label} gap={2} mb="md">
+                <Text size="xs" fw={600} c="dimmed" px="xs" mb={4} style={{ letterSpacing: 0 }}>
+                  {group.label}
+                </Text>
+                {group.links.map(({ to, label, icon: Icon, end }) => (
+                  <NavItem key={to} to={to} label={label} icon={Icon} end={end} onClick={closeMobile} />
+                ))}
+              </Stack>
+            ))}
+          </nav>
+        </AppShell.Section>
+
+        {/* Account area */}
+        <AppShell.Section mt="auto" pt="sm" style={{ borderTop: '1px solid var(--mantine-color-default-border)' }}>
+          <Menu shadow="md" width={200}>
+            <Menu.Target>
+              <Group gap="sm" px="xs" py={4} style={{ cursor: 'pointer', borderRadius: 'var(--mantine-radius-md)' }}
+                onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.background = 'var(--mantine-color-default-hover)' }}
+                onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.background = '' }}>
+                <Avatar color="pangolin" radius="md" size={28}>{user.email.slice(0, 2).toUpperCase()}</Avatar>
+                <Text size="xs" c="dimmed" truncate="end" style={{ maxWidth: 160 }} title={user.email}>{user.email}</Text>
+              </Group>
+            </Menu.Target>
+            <Menu.Dropdown>
+              <Menu.Item leftSection={<LogOut size={16} />} onClick={signOut}>
+                {t('signOut')}
+              </Menu.Item>
+            </Menu.Dropdown>
+          </Menu>
+        </AppShell.Section>
+      </AppShell.Navbar>
+
+      {/* Main content */}
+      <AppShell.Main id="main-content">
+        {!branding.onboarding_complete && (
+          <Alert variant="light" color="pangolin" mb="lg" title={t('onboardingTitle')} radius="md">
+            <Group justify="space-between" align="center" gap="md">
+              <Text size="sm">{t('onboardingHint')}</Text>
+              <Button component="a" href="/channels" variant="light" size="sm">
+                {t('configureChannel')}
+              </Button>
+            </Group>
+          </Alert>
+        )}
+        <Outlet />
+      </AppShell.Main>
+    </AppShell>
+  )
 }
 
-function Brand({ compact = false,name }: { compact?: boolean;name:string }) {
+function NavItem({ to, label, icon: Icon, end, onClick }: {
+  to: string
+  label: string
+  icon: typeof Gauge
+  end?: boolean
+  onClick: () => void
+}) {
+  const location = useLocation()
+  const active = end
+    ? location.pathname === to
+    : location.pathname === to || location.pathname.startsWith(to + '/')
+
+  return (
+    <MantineNavLink
+      href={to}
+      label={label}
+      leftSection={<Icon size={18} strokeWidth={1.8} />}
+      active={active}
+      onClick={onClick}
+    />
+  )
+}
+
+function Brand({ compact = false, name }: { compact?: boolean; name: string }) {
   const { t } = useTranslation()
-  return <div className={`brand ${compact ? 'brand-compact' : ''}`}><img src="/logo.webp" alt="" /><div><strong>{name||t('product')}</strong><span>{t('productSubtitle')}</span></div></div>
+  return (
+    <Group gap="sm" wrap="nowrap" style={{ minWidth: 0 }}>
+      <img src="/logo.webp" alt="" width={compact ? 32 : 38} height={compact ? 32 : 38}
+        style={{ objectFit: 'contain', filter: 'drop-shadow(0 2px 3px rgb(45 25 18 / .12))' }} />
+      <Stack gap={0} style={{ minWidth: 0 }}>
+        <Text fw={620} size="md" lh="1.25" style={{ letterSpacing: '-.012em' }}>{name || t('product')}</Text>
+        <Text size="xs" c="dimmed">{t('productSubtitle')}</Text>
+      </Stack>
+    </Group>
+  )
 }

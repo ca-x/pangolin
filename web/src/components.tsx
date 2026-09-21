@@ -1,55 +1,76 @@
-import * as Dialog from '@radix-ui/react-dialog'
-import * as Select from '@radix-ui/react-select'
-import * as Tooltip from '@radix-ui/react-tooltip'
-import { AlertTriangle, Check, ChevronDown, X } from 'lucide-react'
-import { useEffect, useState, type ReactNode } from 'react'
+import { Badge, Input, Modal as MantineModal, Select, Skeleton, Stack, Text, ThemeIcon, Title, Tooltip } from '@mantine/core'
+import { AlertTriangle, Check } from 'lucide-react'
+import { cloneElement, isValidElement, useId, useState, type ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
 
 export function Field({ label, hint, children }: { label: string; hint?: string; children: ReactNode }) {
-  return <label className="field"><span className="field-label">{label}</span>{children}{hint && <span className="field-hint">{hint}</span>}</label>
+  const id = useId()
+  return (
+    <Input.Wrapper id={id} label={label} description={hint}>
+      {isValidElement(children) ? cloneElement(children as React.ReactElement<{ id?: string }>, { id }) : children}
+    </Input.Wrapper>
+  )
 }
 
 export function Modal({ open, onOpenChange, title, description, trigger, children }: { open?: boolean; onOpenChange?: (open: boolean) => void; title: string; description?: string; trigger?: ReactNode; children: ReactNode }) {
   const { t } = useTranslation()
-  return <Dialog.Root open={open} onOpenChange={onOpenChange}>
-    {trigger && <Dialog.Trigger asChild>{trigger}</Dialog.Trigger>}
-    <Dialog.Portal>
-      <Dialog.Overlay className="dialog-overlay" />
-      <Dialog.Content className="dialog-content">
-        <div className="dialog-heading"><div><Dialog.Title>{title}</Dialog.Title>{description ? <Dialog.Description>{description}</Dialog.Description> : <Dialog.Description className="sr-only">{title}</Dialog.Description>}</div><Dialog.Close className="icon-button" aria-label={t('close')}><X size={18} /></Dialog.Close></div>
+  const [internalOpen, setInternalOpen] = useState(false)
+  const controlled = open !== undefined
+  const opened = controlled ? (open as boolean) : internalOpen
+  const handleOpen = () => {
+    if (onOpenChange) onOpenChange(true)
+    if (!controlled) setInternalOpen(true)
+  }
+  const handleClose = () => {
+    if (onOpenChange) onOpenChange(false)
+    if (!controlled) setInternalOpen(false)
+  }
+  return (
+    <>
+      {trigger && !controlled && cloneElement(trigger as React.ReactElement<{ onClick?: React.MouseEventHandler }>, { onClick: (e: React.MouseEvent) => { handleOpen(); (trigger as React.ReactElement<{ onClick?: React.MouseEventHandler }>).props.onClick?.(e) } })}
+      <MantineModal opened={opened} onClose={handleClose} title={title} closeButtonProps={{ 'aria-label': t('close') }} returnFocus size="md">
+        {description ? <Text size="sm" c="dimmed" mb="md">{description}</Text> : <Text className="sr-only">{title}</Text>}
         {children}
-      </Dialog.Content>
-    </Dialog.Portal>
-  </Dialog.Root>
+      </MantineModal>
+    </>
+  )
 }
 
 export function SelectField({ value, onValueChange, label, options, name }: { value: string; onValueChange: (value: string) => void; label: string; options: Array<{ value: string; label: string }>; name?: string }) {
-  const [internal,setInternal]=useState(value)
-  useEffect(()=>setInternal(value),[value])
-  return <Field label={label}><Select.Root name={name} value={internal} onValueChange={(next)=>{setInternal(next);onValueChange(next)}}><Select.Trigger className="select-trigger"><Select.Value /><Select.Icon><ChevronDown size={16} /></Select.Icon></Select.Trigger><Select.Portal><Select.Content className="select-content" position="popper" sideOffset={6}><Select.Viewport>{options.map((option) => <Select.Item className="select-item" key={option.value} value={option.value}><Select.ItemText>{option.label}</Select.ItemText><Select.ItemIndicator><Check size={15} /></Select.ItemIndicator></Select.Item>)}</Select.Viewport></Select.Content></Select.Portal></Select.Root></Field>
+  return (
+    <Select
+      name={name}
+      label={label}
+      value={value}
+      onChange={(next) => { if (next !== null) onValueChange(next) }}
+      data={options}
+      allowDeselect={false}
+    />
+  )
 }
 
 export function Tip({ label, children }: { label: string; children: ReactNode }) {
-  return <Tooltip.Root>
-    <Tooltip.Trigger asChild>{children}</Tooltip.Trigger>
-    <Tooltip.Portal>
-      <Tooltip.Content className="tooltip-content" sideOffset={6}>
-        {label}
-        <Tooltip.Arrow className="tooltip-arrow" width={10} height={5} />
-      </Tooltip.Content>
-    </Tooltip.Portal>
-  </Tooltip.Root>
+  return <Tooltip label={label}>{children}</Tooltip>
 }
 
 export function Status({ code }: { code: number }) {
   const healthy = code < 400
-  return <span className={`status ${healthy ? 'status-good' : 'status-bad'}`}><span aria-hidden="true">{healthy ? <Check size={11} strokeWidth={3.2} /> : <AlertTriangle size={11} strokeWidth={2.8} />}</span>{code}</span>
+  return (
+    <Badge variant="light" color={healthy ? 'teal' : 'red'} leftSection={healthy ? <Check size={11} strokeWidth={3.2} /> : <AlertTriangle size={11} strokeWidth={2.8} />}>
+      {code}
+    </Badge>
+  )
 }
 
 export function EnabledPill({ enabled, tone }: { enabled: unknown; tone?: 'accent' | 'warning' }) {
   const { t } = useTranslation()
   const on = Boolean(Number(enabled))
-  return <span className={`pill ${on ? (tone ? `pill-${tone}` : 'pill-good') : 'pill-muted'}`}><span className="pill-dot" aria-hidden="true" />{on ? t('enabled') : t('disabled')}</span>
+  const color = on ? (tone === 'warning' ? 'yellow' : tone === 'accent' ? 'pangolin' : 'teal') : 'gray'
+  return (
+    <Badge variant="light" color={color} leftSection={<span aria-hidden="true" style={{ width: 6, height: 6, borderRadius: '50%', background: 'currentColor' }} />}>
+      {on ? t('enabled') : t('disabled')}
+    </Badge>
+  )
 }
 
 export function CapabilityTags({ value, max = 3 }: { value: unknown; max?: number }) {
@@ -60,13 +81,29 @@ export function CapabilityTags({ value, max = 3 }: { value: unknown; max?: numbe
       : typeof value === 'string' && value.trim() ? value.split(',').map((item) => item.trim()).filter(Boolean) : []
   if (!list.length) return <>—</>
   const shown = list.slice(0, max)
-  return <span className="tag-row">{shown.map((item) => <span className="tag" key={item}>{item}</span>)}{list.length > shown.length && <span className="tag tag-more">+{list.length - shown.length}</span>}</span>
+  return (
+    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+      {shown.map((item) => <Badge key={item} variant="default" size="xs">{item}</Badge>)}
+      {list.length > shown.length && <Badge variant="transparent" size="xs" c="dimmed">+{list.length - shown.length}</Badge>}
+    </span>
+  )
 }
 
 export function EmptyState({ icon, title, copy, action }: { icon: ReactNode; title: string; copy: string; action?: ReactNode }) {
-  return <div className="empty-state"><span className="empty-icon" aria-hidden="true">{icon}</span><h3>{title}</h3><p>{copy}</p>{action}</div>
+  return (
+    <Stack align="center" gap="md" py="xl" style={{ border: '1px dashed var(--mantine-color-default-border)', borderRadius: 'var(--mantine-radius-default)' }}>
+      <ThemeIcon variant="light" size={54} radius="lg">{icon}</ThemeIcon>
+      <Title order={3}>{title}</Title>
+      <Text size="sm" c="dimmed" maw={420} ta="center">{copy}</Text>
+      {action}
+    </Stack>
+  )
 }
 
 export function SkeletonRows({ count = 4 }: { count?: number }) {
-  return <div className="skeleton-stack" aria-label="Loading">{Array.from({ length: count }, (_, index) => <div className="skeleton" key={index} />)}</div>
+  return (
+    <Stack aria-label="Loading" gap="xs">
+      {Array.from({ length: count }, (_, index) => <Skeleton key={index} height={58} radius="md" />)}
+    </Stack>
+  )
 }

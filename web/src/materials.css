@@ -1,0 +1,178 @@
+/* ==========================================================================
+   Pangolin — material layer
+
+   Components come from Mantine; this file holds only the handful of treatments
+   a component library cannot express — translucent chrome, clay modelling,
+   metal, a HUD grid, paper grain, an aurora field. The theme attaches our own
+   `pm-*` class names to the components that need them, so nothing here reaches
+   into Mantine's hashed internal classes.
+
+   Every material degrades under `prefers-reduced-transparency`,
+   `prefers-reduced-motion` and `prefers-contrast`, and none of them is allowed
+   behind tabular data: legibility of the numbers comes first.
+   ========================================================================== */
+
+/* The ambient field. A blur with nothing behind it is decoration, so the
+   materials that use translucency paint a real layer for it to sample. */
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 220ms var(--ease-out);
+}
+
+[data-material='glass'] body::before {
+  opacity: 1;
+  background:
+    radial-gradient(58% 46% at 12% 8%, color-mix(in srgb, var(--accent) 46%, transparent), transparent 70%),
+    radial-gradient(46% 40% at 92% 4%, color-mix(in srgb, var(--focus) 40%, transparent), transparent 72%),
+    radial-gradient(52% 44% at 70% 96%, color-mix(in srgb, var(--accent-strong) 34%, transparent), transparent 70%);
+}
+
+[data-material='aurora'] body::before {
+  opacity: 1;
+  background:
+    radial-gradient(58% 46% at 10% 4%, color-mix(in srgb, var(--accent) 78%, transparent), transparent 62%),
+    radial-gradient(48% 42% at 78% 0%, color-mix(in srgb, var(--focus) 72%, transparent), transparent 64%),
+    radial-gradient(52% 40% at 46% 46%, color-mix(in srgb, var(--success) 42%, transparent), transparent 66%),
+    radial-gradient(64% 54% at 74% 100%, color-mix(in srgb, var(--accent-strong) 62%, transparent), transparent 68%);
+  animation: aurora-drift 18s ease-in-out infinite alternate;
+}
+
+@keyframes aurora-drift {
+  from { transform: translate3d(-1.5%, -1%, 0) scale(1.02); }
+  to { transform: translate3d(1.5%, 1.5%, 0) scale(1.06); }
+}
+
+[data-material='paper'] body::before {
+  opacity: .85;
+  background-image: radial-gradient(color-mix(in srgb, var(--ink) 16%, transparent) .7px, transparent .7px);
+  background-size: 4px 4px;
+}
+
+[data-material='hud'] body::before {
+  opacity: .35;
+  background-image:
+    linear-gradient(to right, color-mix(in srgb, var(--accent) 12%, transparent) 1px, transparent 1px),
+    linear-gradient(to bottom, color-mix(in srgb, var(--accent) 12%, transparent) 1px, transparent 1px);
+  background-size: 44px 44px;
+}
+
+/* App shell chrome floats above the field. */
+[data-material='glass'] .pm-glass-chrome {
+  background: color-mix(in srgb, var(--surface) 62%, transparent);
+  box-shadow: inset 0 1px 0 color-mix(in srgb, white 55%, transparent), var(--shadow-chrome);
+  backdrop-filter: blur(18px) saturate(150%);
+  -webkit-backdrop-filter: blur(18px) saturate(150%);
+  border-color: color-mix(in srgb, var(--ink) 12%, transparent);
+}
+
+[data-material='aurora'] .pm-aurora-chrome {
+  background: color-mix(in srgb, var(--surface) 78%, transparent);
+  backdrop-filter: blur(20px) saturate(140%);
+  -webkit-backdrop-filter: blur(20px) saturate(140%);
+  border-color: color-mix(in srgb, var(--ink) 14%, transparent);
+}
+
+[data-material='hud'] .pm-hud-chrome {
+  background: color-mix(in srgb, var(--surface) 88%, transparent);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  border: 1px solid color-mix(in srgb, var(--accent) 26%, transparent);
+  box-shadow: 0 0 18px -8px color-mix(in srgb, var(--accent) 60%, transparent);
+}
+
+/* Surfaces. */
+[data-material='glass'] .pm-glass-surface {
+  background: color-mix(in srgb, var(--surface) 58%, transparent);
+  box-shadow: inset 0 1px 0 color-mix(in srgb, white 50%, transparent), var(--shadow-raised);
+  backdrop-filter: blur(16px) saturate(140%);
+  -webkit-backdrop-filter: blur(16px) saturate(140%);
+  border-color: color-mix(in srgb, var(--ink) 10%, transparent);
+}
+
+[data-material='bevel'] .pm-bevel-surface,
+[data-material='bevel'] .pm-bevel-control {
+  background-image: linear-gradient(180deg, color-mix(in srgb, var(--surface) 88%, white), var(--surface) 58%);
+  box-shadow: inset 0 1px 0 color-mix(in srgb, white 70%, transparent), 0 1px 2px color-mix(in srgb, var(--ink) 16%, transparent);
+}
+
+[data-material='soft'] .pm-soft-surface,
+[data-material='soft'] .pm-soft-control {
+  border-color: color-mix(in srgb, var(--surface) 60%, transparent);
+}
+
+[data-material='clay'] .pm-clay-surface,
+[data-material='clay'] .pm-clay-control {
+  border-width: 3px;
+  border-color: color-mix(in srgb, var(--surface) 55%, white);
+  background-image: linear-gradient(180deg, color-mix(in srgb, var(--surface) 86%, white), var(--surface));
+}
+
+[data-material='block'] .pm-block-surface,
+[data-material='block'] .pm-block-control {
+  border-width: 2px;
+  border-color: var(--ink);
+}
+
+[data-material='chrome'] .pm-chrome-surface,
+[data-material='chrome'] .pm-chrome-control {
+  background-image: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--surface) 52%, white) 0%,
+    color-mix(in srgb, var(--surface) 88%, white) 22%,
+    var(--surface) 52%,
+    color-mix(in srgb, var(--surface) 84%, var(--ink)) 100%
+  );
+  border-color: color-mix(in srgb, var(--ink) 34%, transparent);
+  box-shadow: inset 0 1px 0 color-mix(in srgb, white 80%, transparent), var(--shadow-raised);
+}
+
+[data-material='hud'] .pm-hud-surface {
+  background-image: linear-gradient(180deg, color-mix(in srgb, var(--accent) 5%, transparent), transparent 40%);
+  border-color: color-mix(in srgb, var(--accent) 22%, transparent);
+}
+
+/* Motion character. Durations stay under 300ms and only transform/opacity move. */
+[data-motion='crisp'] .pm-motion-target { transition-duration: 120ms; }
+[data-motion='calm'] .pm-motion-target { transition-duration: 200ms; }
+[data-motion='soft'] .pm-motion-target { transition-duration: 180ms; }
+[data-motion='precise'] .pm-motion-target { transition-duration: 90ms; }
+[data-motion='bouncy'] .pm-motion-target { transition-timing-function: cubic-bezier(.34, 1.56, .64, 1); }
+
+/* Compact density trims chrome without touching table legibility. */
+[data-density='compact'] .pm-main { padding-block: 20px; }
+
+@media (prefers-reduced-transparency: reduce) {
+  [data-material] body::before { opacity: 0; animation: none; }
+  [data-material] .pm-glass-chrome,
+  [data-material] .pm-aurora-chrome,
+  [data-material] .pm-hud-chrome,
+  [data-material] .pm-glass-surface {
+    background: var(--surface);
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  body::before { animation: none !important; transition: none; }
+  [data-motion] .pm-motion-target { transition-duration: 120ms; transition-timing-function: ease-out; }
+}
+
+@media (prefers-contrast: more) {
+  [data-material] body::before { opacity: 0; }
+  [data-material='glass'] .pm-glass-chrome,
+  [data-material='glass'] .pm-glass-surface,
+  [data-material='aurora'] .pm-aurora-chrome,
+  [data-material='hud'] .pm-hud-chrome,
+  [data-material='hud'] .pm-hud-surface {
+    background: var(--surface);
+    border-color: var(--ink);
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+  }
+}

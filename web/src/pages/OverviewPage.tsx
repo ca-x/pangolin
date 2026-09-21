@@ -8,6 +8,7 @@ import { EmptyState, SkeletonRows, Status } from '../components'
 import i18n from '../i18n'
 import { PageHeader, QueryError, displayValue, formatDate } from './shared'
 import { useProject } from '../project'
+import { Button, Card, Group, SimpleGrid, Stack, Text, ThemeIcon, Title } from '@mantine/core'
 
 const formatNumber = (value: number) => new Intl.NumberFormat(i18n.language, { notation: value > 9999 ? 'compact' : 'standard', maximumFractionDigits: 1 }).format(value)
 const formatShortDate = (value: number) => new Intl.DateTimeFormat(i18n.language, { month: 'numeric', day: 'numeric', hour: 'numeric' }).format(new Date(value * 1000))
@@ -30,18 +31,27 @@ export default function OverviewPage() {
   const tokens = value ? (value.input_tokens || 0) + (value.output_tokens || 0) : 0
   const failed = value && value.error_rate != null ? Math.round(value.requests * value.error_rate) : null
   return <><PageHeader title={t('overview')} description={t('last24h')} />
-    <section className="stats-grid" aria-label={t('last24h')}>
+    <SimpleGrid cols={{ base: 1, xs: 2, md: 4 }} mb="lg" aria-label={t('last24h')}>
       <Stat icon={<Activity />} label={t('totalRequests')} value={value ? formatNumber(value.requests) : '—'} sub={value && tokens > 0 ? `${formatNumber(tokens)} ${t('tokens')}` : undefined} />
-      <Stat icon={<ShieldCheck />} label={t('errorRate')} value={value && value.requests > 0 && value.error_rate != null ? <>{(value.error_rate * 100).toFixed(1)}<em>%</em></> : '—'} sub={failed != null && value!.requests > 0 ? t('failedRequests', { count: failed }) : undefined} tone={value?.error_rate != null && value.error_rate > .05 ? 'danger' : undefined} />
-      <Stat icon={<Clock3 />} label={t('p95Latency')} value={value && value.requests > 0 && value.p95_latency_ms != null ? <>{Math.round(value.p95_latency_ms)}<em> ms</em></> : '—'} />
-      <Stat icon={<CircleDollarSign />} label={t('cost')} value={value ? <><em>$</em>{(value.cost_micros / 1_000_000).toFixed(4)}</> : '—'} sub={value && value.requests > 0 ? `${(value.cost_micros / value.requests / 1_000_000).toFixed(5)} ${t('perRequest')}` : undefined} />
-    </section>
-    {summary.isLoading || requests.isLoading ? <SkeletonRows count={5}/> : value?.requests === 0 ? <section className="overview-empty"><div><Server aria-hidden="true"/><h2>{t('overviewEmptyTitle')}</h2><p>{t('overviewEmptyCopy')}</p></div><Link className="button button-primary" to="/channels">{t('configureChannel')}</Link></section> : <div className="overview-grid"><section className="panel chart-panel"><div className="panel-heading"><div><h2>{t('requestTrend')}</h2><p>{`${formatNumber(value?.requests || 0)} · ${formatNumber(tokens)} ${t('tokens')}`}</p></div></div><TrendChart series={value?.series || []}/><details className="chart-table"><summary>{t('dataTable')}</summary><table><tbody>{value?.series.map((point) => <tr key={point.bucket}><td>{formatDate(point.bucket)}</td><td>{point.requests}</td></tr>)}</tbody></table></details></section><section className="panel"><div className="panel-heading"><h2>{t('recentRequests')}</h2><Link to="/operations">{t('viewAll')}</Link></div><CompactRequests rows={requests.data?.data || []}/></section></div>}
+      <Stat icon={<ShieldCheck />} label={t('errorRate')} value={value && value.requests > 0 && value.error_rate != null ? <>{(value.error_rate * 100).toFixed(1)}<Text component="span" fz=".62em" fw={500} c="dimmed">%</Text></> : '—'} sub={failed != null && value!.requests > 0 ? t('failedRequests', { count: failed }) : undefined} tone={value?.error_rate != null && value.error_rate > .05 ? 'danger' : undefined} />
+      <Stat icon={<Clock3 />} label={t('p95Latency')} value={value && value.requests > 0 && value.p95_latency_ms != null ? <>{Math.round(value.p95_latency_ms)}<Text component="span" fz=".62em" fw={500} c="dimmed"> ms</Text></> : '—'} />
+      <Stat icon={<CircleDollarSign />} label={t('cost')} value={value ? <><Text component="span" fz=".62em" fw={500} c="dimmed">$</Text>{(value.cost_micros / 1_000_000).toFixed(4)}</> : '—'} sub={value && value.requests > 0 ? `${(value.cost_micros / value.requests / 1_000_000).toFixed(5)} ${t('perRequest')}` : undefined} />
+    </SimpleGrid>
+    {summary.isLoading || requests.isLoading ? <SkeletonRows count={5}/> : value?.requests === 0 ? <EmptyState icon={<Server />} title={t('overviewEmptyTitle')} copy={t('overviewEmptyCopy')} action={<Button component={Link} to="/channels">{t('configureChannel')}</Button>} /> : <div className="overview-grid"><Card p="lg"><Group justify="space-between" align="flex-start" mb="sm"><Stack gap={2}><Title order={2}>{t('requestTrend')}</Title><Text size="sm" c="dimmed">{`${formatNumber(value?.requests || 0)} · ${formatNumber(tokens)} ${t('tokens')}`}</Text></Stack></Group><TrendChart series={value?.series || []}/><details className="chart-table"><summary>{t('dataTable')}</summary><table><tbody>{value?.series.map((point) => <tr key={point.bucket}><td>{formatDate(point.bucket)}</td><td>{point.requests}</td></tr>)}</tbody></table></details></Card><Card p="lg"><Group justify="space-between" align="flex-start" mb="sm"><Title order={2}>{t('recentRequests')}</Title><Button variant="subtle" size="compact-sm" component={Link} to="/operations">{t('viewAll')}</Button></Group><CompactRequests rows={requests.data?.data || []}/></Card></div>}
   </>
 }
 
 function Stat({ icon, label, value, sub, tone }: { icon: React.ReactNode; label: string; value: React.ReactNode; sub?: string; tone?: 'danger' }) {
-  return <article className={`stat ${tone ? `stat-${tone}` : ''}`}><div className="stat-icon">{icon}</div><div><span>{label}</span><strong>{value}</strong>{sub && <small className="stat-sub">{sub}</small>}</div></article>
+  return <Card p="md">
+    <Group gap="sm" align="flex-start" wrap="nowrap">
+      <ThemeIcon variant="light" size="lg" color={tone === 'danger' ? 'red' : undefined}>{icon}</ThemeIcon>
+      <Stack gap={2} style={{ minWidth: 0 }}>
+        <Text size="xs" c="dimmed" fw={540}>{label}</Text>
+        <Text component="span" fz="1.6rem" fw={620} lh="1.15" className="stat-value">{value}</Text>
+        {sub && <Text size="xs" c="dimmed" className="stat-sub">{sub}</Text>}
+      </Stack>
+    </Group>
+  </Card>
 }
 
 type SeriesPoint = Summary['series'][number]
@@ -100,5 +110,5 @@ function TrendChart({ series }: { series: SeriesPoint[] }) {
 function CompactRequests({ rows }: { rows: RequestItem[] }) {
   const { t } = useTranslation()
   if (!rows.length) return <EmptyState icon={<Activity/>} title={t('recentRequests')} copy={t('noRequests24h')}/>
-  return <div className="compact-list">{rows.map((row) => <Link to={`/operations/requests/${row.request_id}`} key={row.request_id}><Status code={row.status_code} /><strong>{displayValue(row.requested_model)}</strong><small>{row.latency_ms >= 0 ? `${row.latency_ms} ms` : '—'}</small></Link>)}</div>
+  return <div className="compact-list">{rows.map((row) => <Link to={`/operations/requests/${row.request_id}`} key={row.request_id}><Status code={row.status_code} /><Text fw={560}>{displayValue(row.requested_model)}</Text><small>{row.latency_ms >= 0 ? `${row.latency_ms} ms` : '—'}</small></Link>)}</div>
 }

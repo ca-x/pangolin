@@ -1,4 +1,4 @@
-import * as Tooltip from '@radix-ui/react-tooltip'
+import { ActionIcon, Alert, Button, Checkbox, Group, Modal, NumberInput, Pagination, Paper, PasswordInput, Select, Stack, Table, TableScrollContainer, Text, Textarea, TextInput, Title, Tooltip } from '@mantine/core'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { createColumnHelper, flexRender, getCoreRowModel, getFilteredRowModel, useReactTable } from '@tanstack/react-table'
 import { AlertTriangle, Copy, Inbox, Plus, Search, Trash2 } from 'lucide-react'
@@ -6,17 +6,17 @@ import { useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 import { api, type Document, type Paged } from '../api'
-import { EmptyState, EnabledPill, Field, Modal, SelectField, SkeletonRows, Tip } from '../components'
+import { EmptyState, EnabledPill, SkeletonRows } from '../components'
 import i18n from '../i18n'
 import { projectOperationPath, useProject } from '../project'
 
 export function PageHeader({ title, description, action }: { title: string; description?: string; action?: ReactNode }) {
-  return <header className="page-header"><div><h1>{title}</h1>{description && <p>{description}</p>}</div>{action}</header>
+  return <Group component="header" justify="space-between" align="flex-start" mb="lg" className="page-header"><Stack gap={0}><Title order={1}>{title}</Title>{description && <Text size="sm" c="dimmed">{description}</Text>}</Stack>{action}</Group>
 }
 
 export function QueryError({ retry }: { retry: () => void }) {
   const { t } = useTranslation()
-  return <div className="query-error" role="alert"><AlertTriangle aria-hidden="true" /><div><strong>{t('networkError')}</strong><p>{t('retryHint')}</p></div><button className="button" onClick={retry}>{t('retry')}</button></div>
+  return <Alert variant="light" color="red" radius="lg" title={t('networkError')} icon={<AlertTriangle />} className="query-error"><Group justify="space-between" align="center" wrap="nowrap"><Text size="sm">{t('retryHint')}</Text><Button variant="outline" color="red" size="compact-sm" onClick={retry}>{t('retry')}</Button></Group></Alert>
 }
 
 export const formatDate = (value: unknown) => typeof value === 'number' && value > 0
@@ -96,9 +96,11 @@ export function ResourcePage({ resource, title, description, empty, columns, fie
   const allRows = useMemo(() => Array.isArray(query.data) ? query.data.filter((row) => !filter.trim() || JSON.stringify(row).toLowerCase().includes(filter.trim().toLowerCase())) : query.data?.data || [], [filter, query.data])
   const rows = Array.isArray(query.data) ? allRows.slice(offset, offset + limit) : allRows
   const total = Array.isArray(query.data) ? allRows.length : query.data?.total ?? rows.length
+  const totalPages = Math.max(1, Math.ceil(total / limit))
+  const currentPage = Math.floor(offset / limit) + 1
   const save = useMutation({
     mutationFn: ({ body, current }: { body: Record<string, unknown>; current: Document | null }) => api(current && itemEndpoint ? itemEndpoint(current.id, project.id) : path, { method: current ? updateMethod : createMethod, body: JSON.stringify(body) }),
-    onSuccess: () => { toast.success(t('saved')); setOpen(false); setEditing(null); requestAnimationFrame(()=>lastTrigger.current?.focus()); void client.invalidateQueries({ queryKey: ['resource', project.id, resource] }) },
+    onSuccess: () => { toast.success(t('saved')); setOpen(false); setEditing(null); requestAnimationFrame(() => lastTrigger.current?.focus()); void client.invalidateQueries({ queryKey: ['resource', project.id, resource] }) },
     onError: (error: Error) => toast.error(error.message),
   })
   const remove = useMutation({
@@ -109,7 +111,7 @@ export function ResourcePage({ resource, title, description, empty, columns, fie
   const columnHelper = createColumnHelper<Document>()
   const tableColumns = useMemo(() => [
     ...columns.map((column) => columnHelper.accessor((row) => row[column.key], { id: column.key, header: column.label, cell: (info) => <span className={column.mono ? 'mono-cell' : ''}>{column.render ? column.render(info.getValue(), info.row.original) : displayValue(info.getValue())}</span> })),
-    ...((!immutable && !appendOnly && fields.length) || rowActions ? [columnHelper.display({ id: 'actions', header: () => <span className="sr-only">{t('actions')}</span>, cell: ({ row }) => <div className="row-actions">{!immutable && !appendOnly && !forbids(editDisabled, row.original) && fields.length > 0 && <button className="button button-quiet" onClick={(event) => { lastTrigger.current=event.currentTarget;setEditing(row.original);setOpen(true) }}>{t('edit')}</button>}<Tip label={t('copyId')}><button className="icon-button" aria-label={`${t('copyId')} ${displayValue(row.original.name || row.original.id)}`} onClick={()=>void navigator.clipboard?.writeText(String(row.original.id))}><Copy size={15}/></button></Tip>{!immutable && !appendOnly && allows(canDelete, row.original) && <Tip label={t('delete')}><button className="icon-button danger" aria-label={`${t('delete')} ${displayValue(row.original.name || row.original.id)}`} onClick={() => confirm(t('deleteConfirm')) && remove.mutate(row.original.id)}><Trash2 size={16}/></button></Tip>}{rowActions?.(row.original)}</div> })] : []),
+    ...((!immutable && !appendOnly && fields.length) || rowActions ? [columnHelper.display({ id: 'actions', header: () => <span className="sr-only">{t('actions')}</span>, cell: ({ row }) => <Group gap={4} justify="flex-end" wrap="nowrap">{!immutable && !appendOnly && !forbids(editDisabled, row.original) && fields.length > 0 && <Button variant="subtle" size="compact-sm" onClick={(event) => { lastTrigger.current = event.currentTarget as HTMLButtonElement; setEditing(row.original); setOpen(true) }}>{t('edit')}</Button>}<Tooltip label={t('copyId')}><ActionIcon variant="subtle" color="gray" aria-label={`${t('copyId')} ${displayValue(row.original.name || row.original.id)}`} onClick={() => void navigator.clipboard?.writeText(String(row.original.id))}><Copy size={15} /></ActionIcon></Tooltip>{!immutable && !appendOnly && allows(canDelete, row.original) && <Tooltip label={t('delete')}><ActionIcon variant="subtle" color="red" aria-label={`${t('delete')} ${displayValue(row.original.name || row.original.id)}`} onClick={() => confirm(t('deleteConfirm')) && remove.mutate(row.original.id)}><Trash2 size={16} /></ActionIcon></Tooltip>}{rowActions?.(row.original)}</Group> })] : []),
   ], [appendOnly, canDelete, columns, editDisabled, fields.length, immutable, rowActions, t])
   const table = useReactTable({ data: rows, columns: tableColumns, getCoreRowModel: getCoreRowModel(), getFilteredRowModel: getFilteredRowModel() })
   const submit = (event: FormEvent<HTMLFormElement>) => {
@@ -119,30 +121,86 @@ export function ResourcePage({ resource, title, description, empty, columns, fie
       save.mutate({ body: normalize ? normalize(values, editing) : { ...values, ...(editing && !itemEndpoint ? { id: editing.id } : {}) }, current: editing })
     } catch { toast.error(t('invalidJson')) }
   }
-  const beginCreate = (trigger: HTMLButtonElement) => { lastTrigger.current=trigger;setEditing(null);setOpen(true) }
-  return <Tooltip.Provider delayDuration={400} skipDelayDuration={300}>
-    <PageHeader title={title} description={description} action={!immutable && fields.length ? <button className="button button-primary" onClick={(event)=>beginCreate(event.currentTarget)}><Plus size={17}/>{createLabel || t('add')}</button> : undefined} />
-    {(total > 0 || filter) && <label className="search-control"><Search size={17} aria-hidden="true"/><span className="sr-only">{t('search')}</span><input value={filter} onChange={(event) => {setFilter(event.target.value);setOffset(0)}} placeholder={t('search')} /></label>}
-    {query.isError ? <QueryError retry={() => void query.refetch()} /> : query.isLoading ? <SkeletonRows /> : rows.length === 0 ? <EmptyState icon={<Inbox />} title={title} copy={filter ? t('noSearchResults') : empty} action={!filter && !immutable && fields.length ? <button className="button" onClick={(event)=>beginCreate(event.currentTarget)}>{createLabel || t('add')}</button> : undefined} /> : <><div className="table-wrap desktop-resource-table" role="region" aria-label={title} tabIndex={0}><table><thead>{table.getHeaderGroups().map((group) => <tr key={group.id}>{group.headers.map((header) => <th key={header.id}>{flexRender(header.column.columnDef.header, header.getContext())}</th>)}</tr>)}</thead><tbody>{table.getRowModel().rows.map((row) => <tr key={row.id}>{row.getVisibleCells().map((cell) => <td key={cell.id}>{flexRender(cell.column.columnDef.cell, cell.getContext())}</td>)}</tr>)}</tbody></table></div><MobileResources rows={rows} columns={columns} rowActions={rowActions} onEdit={!immutable&&!appendOnly&&fields.length? (row,trigger)=>{lastTrigger.current=trigger;setEditing(row);setOpen(true)}:undefined} editDisabled={editDisabled} onDelete={!immutable&&!appendOnly?(row)=>confirm(t('deleteConfirm'))&&remove.mutate(row.id):undefined} canDelete={canDelete}/></>}
-    {total > limit && <nav className="pagination" aria-label={t('pagination')}><button className="button button-quiet" disabled={offset===0} onClick={()=>setOffset(Math.max(0,offset-limit))}>{t('previous')}</button><span>{offset+1}–{Math.min(offset+limit,total)} / {total}</span><button className="button button-quiet" disabled={offset+limit>=total} onClick={()=>setOffset(offset+limit)}>{t('next')}</button><select aria-label={t('pageSize')} value={limit} onChange={(event)=>{setLimit(Number(event.target.value));setOffset(0)}}><option value="10">10</option><option value="25">25</option><option value="50">50</option></select></nav>}
-    <Modal open={open} onOpenChange={(value) => { setOpen(value); if (!value) {setEditing(null);requestAnimationFrame(()=>lastTrigger.current?.focus())} }} title={editing ? `${t('edit')} ${title}` : createLabel || `${t('add')} ${title}`}>
-      <form className="form-stack" onSubmit={submit}>{fields.map((field) => <ResourceField key={field.key} field={field} value={editing?.[field.sourceKey || field.key] ?? field.defaultValue}/>) }<div className="form-actions"><button type="button" className="button" onClick={() => setOpen(false)}>{t('cancel')}</button><button className="button button-primary" disabled={save.isPending}>{save.isPending ? t('loading') : t('save')}</button></div></form>
+  const beginCreate = (trigger: HTMLButtonElement) => { lastTrigger.current = trigger; setEditing(null); setOpen(true) }
+  const handleClose = () => { setOpen(false); setEditing(null); requestAnimationFrame(() => lastTrigger.current?.focus()) }
+  return <>
+    <PageHeader title={title} description={description} action={!immutable && fields.length ? <Button leftSection={<Plus size={17} />} onClick={(event) => beginCreate(event.currentTarget)}>{createLabel || t('add')}</Button> : undefined} />
+    {(total > 0 || filter) && <TextInput leftSection={<Search size={17} />} placeholder={t('search')} value={filter} onChange={(event) => { setFilter(event.target.value); setOffset(0) }} aria-label={t('search')} mb="md" className="search-control" />}
+    {query.isError ? <QueryError retry={() => void query.refetch()} /> : query.isLoading ? <SkeletonRows /> : rows.length === 0 ? <EmptyState icon={<Inbox />} title={title} copy={filter ? t('noSearchResults') : empty} action={!filter && !immutable && fields.length ? <Button variant="default" onClick={(event) => beginCreate(event.currentTarget)}>{createLabel || t('add')}</Button> : undefined} /> : <><TableScrollContainer minWidth={700} className="desktop-resource-table" style={{ maxHeight: 'min(74vh, 900px)' }}><Table stickyHeader highlightOnHover><Table.Thead>{table.getHeaderGroups().map((group) => <Table.Tr key={group.id}>{group.headers.map((header) => <Table.Th key={header.id}>{flexRender(header.column.columnDef.header, header.getContext())}</Table.Th>)}</Table.Tr>)}</Table.Thead><Table.Tbody>{table.getRowModel().rows.map((row) => <Table.Tr key={row.id}>{row.getVisibleCells().map((cell) => <Table.Td key={cell.id}>{flexRender(cell.column.columnDef.cell, cell.getContext())}</Table.Td>)}</Table.Tr>)}</Table.Tbody></Table></TableScrollContainer><MobileResources rows={rows} columns={columns} rowActions={rowActions} onEdit={!immutable && !appendOnly && fields.length ? (row, trigger) => { lastTrigger.current = trigger; setEditing(row); setOpen(true) } : undefined} editDisabled={editDisabled} onDelete={!immutable && !appendOnly ? (row) => confirm(t('deleteConfirm')) && remove.mutate(row.id) : undefined} canDelete={canDelete} /></>}
+    {total > limit && <Group justify="flex-end" gap="sm" mt="md" className="pagination"><Pagination total={totalPages} value={currentPage} onChange={(page) => setOffset((page - 1) * limit)} getControlProps={(control) => {
+      if (control === 'previous') return { 'aria-label': t('previous') }
+      if (control === 'next') return { 'aria-label': t('next') }
+      return {}
+    }} /><Text size="sm" c="dimmed">{offset + 1}–{Math.min(offset + limit, total)} / {total}</Text><Select aria-label={t('pageSize')} data={['10', '25', '50']} value={String(limit)} onChange={(value) => { value && setLimit(Number(value)); setOffset(0) }} size="sm" style={{ width: 80 }} /></Group>}
+    <Modal opened={open} onClose={handleClose} title={editing ? `${t('edit')} ${title}` : createLabel || `${t('add')} ${title}`}>
+      <form onSubmit={submit}><Stack gap="md">{fields.map((field) => <ResourceField key={field.key} field={field} value={editing?.[field.sourceKey || field.key] ?? field.defaultValue} />)}<Group justify="flex-end" gap="xs" pt="xs"><Button variant="default" type="button" onClick={handleClose}>{t('cancel')}</Button><Button type="submit" loading={save.isPending}>{t('save')}</Button></Group></Stack></form>
     </Modal>
-  </Tooltip.Provider>
+  </>
 }
 
-function MobileResources({rows,columns,onEdit,onDelete,rowActions,editDisabled,canDelete}:{rows:Document[];columns:Array<{key:string;label:string;mono?:boolean;render?:(value:unknown,row:Document)=>ReactNode}>;onEdit?: (row:Document,trigger:HTMLButtonElement)=>void;onDelete?: (row:Document)=>void;rowActions?:(row:Document)=>ReactNode;editDisabled?:boolean|((row:Document)=>boolean);canDelete?:boolean|((row:Document)=>boolean)}) {
-  const {t}=useTranslation()
-  const primary=(row:Document)=>String(row.name||row.public_name||row.email||row.pattern||row.suffix||row.id)
-  const state=(row:Document)=>row.enabled!=null?<EnabledPill enabled={row.enabled}/>:displayValue(row.status)
-  const visible=columns.filter(column=>column.key!=='id').slice(0,3)
-  return <div className="mobile-resource-list">{rows.map(row=><article key={row.id}><header><div><strong>{primary(row)}</strong><button className="copy-id" onClick={()=>void navigator.clipboard?.writeText(String(row.id))}>{t('copyId')}</button></div><span>{state(row)}</span></header><dl>{visible.filter(column=>String(row[column.key]??'')!==primary(row)).map(column=><div key={column.key}><dt>{column.label}</dt><dd className={column.mono?'mono-cell':''}>{column.render?column.render(row[column.key],row):displayValue(row[column.key])}</dd></div>)}</dl>{(onEdit||onDelete||rowActions)&&<footer>{onEdit&&!forbids(editDisabled,row)&&<button className="button button-quiet" onClick={(event)=>onEdit(row,event.currentTarget)}>{t('edit')}</button>}{onDelete&&allows(canDelete,row)&&<button className="button button-quiet danger" onClick={()=>onDelete(row)}>{t('delete')}</button>}{rowActions?.(row)}</footer>}</article>)}</div>
+function MobileResources({ rows, columns, onEdit, onDelete, rowActions, editDisabled, canDelete }: { rows: Document[]; columns: Array<{ key: string; label: string; mono?: boolean; render?: (value: unknown, row: Document) => ReactNode }>; onEdit?: (row: Document, trigger: HTMLButtonElement) => void; onDelete?: (row: Document) => void; rowActions?: (row: Document) => ReactNode; editDisabled?: boolean | ((row: Document) => boolean); canDelete?: boolean | ((row: Document) => boolean) }) {
+  const { t } = useTranslation()
+  const primary = (row: Document) => String(row.name || row.public_name || row.email || row.pattern || row.suffix || row.id)
+  const state = (row: Document) => row.enabled != null ? <EnabledPill enabled={row.enabled} /> : displayValue(row.status)
+  const visible = columns.filter((column) => column.key !== 'id').slice(0, 3)
+  return <Stack gap="sm" className="mobile-resource-list">{rows.map((row) => <Paper key={row.id} p="md" withBorder><Group justify="space-between" align="flex-start" mb="sm"><Stack gap={4} style={{ minWidth: 0 }}><Text fw={600} style={{ overflowWrap: 'anywhere' }}>{primary(row)}</Text><Button variant="subtle" size="compact-xs" c="dimmed" onClick={() => void navigator.clipboard?.writeText(String(row.id))}>{t('copyId')}</Button></Stack><Text component="div" size="sm">{state(row)}</Text></Group><Stack gap="xs" mb={onEdit || onDelete || rowActions ? 'sm' : undefined} style={{ minWidth: 0 }}>{visible.filter((column) => String(row[column.key] ?? '') !== primary(row)).map((column) => <Group key={column.key} gap="xs" wrap="nowrap" style={{ minWidth: 0 }}><Text size="sm" c="dimmed" style={{ minWidth: '88px', flex: '0 0 auto' }}>{column.label}</Text><Text component="div" size="sm" className={column.mono ? 'mono-cell' : undefined} style={{ flex: 1, minWidth: 0 }}>{column.render ? column.render(row[column.key], row) : displayValue(row[column.key])}</Text></Group>)}</Stack>{(onEdit || onDelete || rowActions) && <Group gap="xs">{onEdit && !forbids(editDisabled, row) && <Button variant="subtle" size="compact-sm" onClick={(event) => onEdit(row, event.currentTarget)}>{t('edit')}</Button>}{onDelete && allows(canDelete, row) && <Button variant="subtle" color="red" size="compact-sm" onClick={() => onDelete(row)}>{t('delete')}</Button>}{rowActions?.(row)}</Group>}</Paper>)}</Stack>
 }
 
 function ResourceField({ field, value }: { field: FormField; value: unknown }) {
-  const [selected, setSelected] = useState(String(value ?? field.options?.[0]?.value ?? ''))
-  if (field.kind === 'select' && field.options) return <SelectField name={field.key} label={field.label} value={selected} onValueChange={setSelected} options={field.options}/>
-  if (field.kind === 'checkbox') return <label className="check-field"><input name={field.key} type="checkbox" defaultChecked={value == null ? true : Boolean(value)}/><span>{field.label}</span></label>
-  const initial = field.kind === 'json' && typeof value === 'object' ? JSON.stringify(value, null, 2) : String(value ?? '')
-  return <Field label={field.label} hint={field.hint}>{field.kind === 'textarea' || field.kind === 'json' ? <textarea name={field.key} required={field.required} defaultValue={initial} rows={field.kind === 'json' ? 7 : 4}/> : <input name={field.key} type={field.kind === 'secret' ? 'password' : field.kind === 'number' ? 'number' : 'text'} required={field.required} defaultValue={initial}/>}</Field>
+  if (field.kind === 'select' && field.options) {
+    return <Select
+      name={field.key}
+      label={field.label}
+      description={field.hint}
+      data={field.options.map((o) => ({ value: o.value, label: o.label }))}
+      defaultValue={String(value ?? '')}
+      required={field.required}
+    />
+  }
+  if (field.kind === 'checkbox') {
+    return <Checkbox
+      name={field.key}
+      label={field.label}
+      description={field.hint}
+      defaultChecked={value == null ? true : Boolean(value)}
+    />
+  }
+  if (field.kind === 'number') {
+    return <NumberInput
+      name={field.key}
+      label={field.label}
+      description={field.hint}
+      defaultValue={value != null && value !== '' ? Number(value) : ''}
+      required={field.required}
+      thousandSeparator=""
+      hideControls
+    />
+  }
+  if (field.kind === 'secret') {
+    return <PasswordInput
+      name={field.key}
+      label={field.label}
+      description={field.hint}
+      defaultValue={String(value ?? '')}
+      required={field.required}
+    />
+  }
+  if (field.kind === 'textarea' || field.kind === 'json') {
+    const initial = field.kind === 'json' && typeof value === 'object' ? JSON.stringify(value, null, 2) : String(value ?? '')
+    return <Textarea
+      name={field.key}
+      label={field.label}
+      description={field.hint}
+      defaultValue={initial}
+      required={field.required}
+      rows={field.kind === 'json' ? 7 : 4}
+    />
+  }
+  return <TextInput
+    name={field.key}
+    label={field.label}
+    description={field.hint}
+    defaultValue={String(value ?? '')}
+    required={field.required}
+  />
 }

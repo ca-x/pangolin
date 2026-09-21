@@ -12,6 +12,7 @@ import SiGithubcopilot from '@icons-pack/react-simple-icons/icons/SiGithubcopilo
 import SiOllama from '@icons-pack/react-simple-icons/icons/SiOllama'
 import SiX from '@icons-pack/react-simple-icons/icons/SiX'
 import type { ComponentType, SVGProps } from 'react'
+import { ThemeIcon } from '@mantine/core'
 
 const lobe: Record<string, ComponentType<{ size?: string | number; title?: string }>> = { Anthropic, Aws, Azure, Cloudflare, DeepSeek, Gemini, Github, Groq, OpenAI, Qwen }
 const simple: Record<string, ComponentType<SVGProps<SVGSVGElement> & { size?: string | number; title?: string }>> = { GithubCopilot: SiGithubcopilot, Ollama: SiOllama, X: SiX }
@@ -19,9 +20,9 @@ const simple: Record<string, ComponentType<SVGProps<SVGSVGElement> & { size?: st
 export function ProviderIcon({ logoKey, name }: { logoKey?: string; name: string }) {
   const [source, key = ''] = (logoKey || '').split(':', 2)
   const LobeIcon = source === 'lobehub' ? lobe[key] : undefined
-  if (LobeIcon) return <span className="provider-mark"><LobeIcon size={22} title={name}/></span>
+  if (LobeIcon) return <ThemeIcon variant="light" size={32} radius="md" aria-label={name}><LobeIcon size={22} title={name} /></ThemeIcon>
   const SimpleIcon = source === 'simple' ? simple[key] : simple[key]
-  if (SimpleIcon) return <span className="provider-mark"><SimpleIcon size={21} title={name}/></span>
+  if (SimpleIcon) return <ThemeIcon variant="light" size={32} radius="md" aria-label={name}><SimpleIcon size={21} title={name} /></ThemeIcon>
   const fallback = source === 'initials' && key ? key : name.split(/\s+/).map((word) => word[0]).join('').slice(0, 2)
-  return <span className="provider-mark provider-initials" role="img" aria-label={name}>{fallback.toUpperCase()}</span>
+  return <ThemeIcon variant="light" size={32} radius="md" color="pangolin" role="img" aria-label={name} style={{ fontSize: 11, fontWeight: 720 }}>{fallback.toUpperCase()}</ThemeIcon>
 }
