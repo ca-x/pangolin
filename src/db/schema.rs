@@ -1029,6 +1029,10 @@ CREATE TABLE provider_oauth_states (
 CREATE INDEX idx_provider_oauth_states_expiry ON provider_oauth_states(expires_at);
 "#;
 
+const V26_PROBE_OUTPUT_TOKENS: &str = r#"
+ALTER TABLE channel_probes ADD COLUMN output_tokens INTEGER CHECK(output_tokens IS NULL OR output_tokens >= 0);
+"#;
+
 #[derive(FromQueryResult)]
 struct Count {
     count: i64,
@@ -1478,6 +1482,25 @@ pub async fn migrate(db: &DatabaseConnection) -> Result<()> {
             .await?;
         transaction.commit().await?;
     }
+    let probe_output_tokens_applied = Count::find_by_statement(statement(
+        "SELECT COUNT(*) AS count FROM schema_migrations WHERE version=26",
+    ))
+    .one(db)
+    .await?
+    .is_some_and(|row| row.count > 0);
+    if !probe_output_tokens_applied {
+        let transaction = db.begin().await?;
+        transaction
+            .execute_unprepared(V26_PROBE_OUTPUT_TOKENS)
+            .await
+            .context("failed to add probe output-token measurement")?;
+        transaction
+            .execute(statement(
+                "INSERT INTO schema_migrations(version,applied_at) VALUES(26,unixepoch())",
+            ))
+            .await?;
+        transaction.commit().await?;
+    }
     Ok(())
 }
 
@@ -1515,7 +1538,15 @@ mod tests {
 
         assert_eq!(
             scalar(&db, "SELECT MAX(version) AS count FROM schema_migrations").await,
-            25
+            26
+        );
+        assert_eq!(
+            scalar(
+                &db,
+                "SELECT COUNT(*) AS count FROM pragma_table_info('channel_probes') WHERE name='output_tokens'"
+            )
+            .await,
+            1
         );
         assert_eq!(
             scalar(
@@ -1832,7 +1863,7 @@ mod tests {
 
         assert_eq!(
             scalar(&db, "SELECT COUNT(*) AS count FROM schema_migrations").await,
-            22
+            23
         );
         assert_eq!(
             scalar(
@@ -2274,7 +2305,7 @@ mod tests {
 
         assert_eq!(
             scalar(&db, "SELECT MAX(version) AS count FROM schema_migrations").await,
-            25
+            26
         );
         assert_eq!(
             scalar(
@@ -2394,7 +2425,7 @@ mod tests {
 
         assert_eq!(
             scalar(&db, "SELECT MAX(version) AS count FROM schema_migrations").await,
-            25
+            26
         );
         assert_eq!(
             scalar(
@@ -2699,6 +2730,38 @@ mod tests {
             )
             .await,
             0
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_output_tokens_migration_is_additive_and_idempotent() {
+        let db = memory_database().await;
+        migrate(&db).await.unwrap();
+        db.execute_unprepared(
+            "ALTER TABLE channel_probes DROP COLUMN output_tokens;
+             DELETE FROM schema_migrations WHERE version=26;",
+        )
+        .await
+        .unwrap();
+
+        migrate(&db).await.unwrap();
+        migrate(&db).await.unwrap();
+
+        assert_eq!(
+            scalar(
+                &db,
+                "SELECT COUNT(*) AS count FROM pragma_table_info('channel_probes') WHERE name='output_tokens'"
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            scalar(
+                &db,
+                "SELECT COUNT(*) AS count FROM schema_migrations WHERE version=26"
+            )
+            .await,
+            1
         );
     }
 }

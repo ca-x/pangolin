@@ -4,7 +4,6 @@ ALTER TABLE usage_logs ADD COLUMN settlement_kind TEXT NOT NULL DEFAULT 'reporte
 ALTER TABLE usage_logs ADD COLUMN image_input_tokens INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE usage_logs ADD COLUMN image_output_tokens INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE usage_logs ADD COLUMN cache_savings_micros INTEGER NOT NULL DEFAULT 0 CHECK(cache_savings_micros>=0);
-ALTER TABLE channel_probes ADD COLUMN output_tokens INTEGER;
 CREATE TABLE service_groups (
  id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
  name TEXT NOT NULL, tier TEXT NOT NULL DEFAULT 'standard', ratio_millionths INTEGER NOT NULL DEFAULT 1000000 CHECK(ratio_millionths BETWEEN 0 AND 100000000),
