@@ -9,6 +9,7 @@ fn logging_policy_matrix_and_secrets() {
             for disable in [false, true] {
                 for key in [Inherit, Off, Metadata, RedactedBody, FullBody] {
                     let policy = Policy {
+                        version: logging::CURRENT_POLICY_VERSION,
                         enabled,
                         default_level: Metadata,
                         key_override_enabled: overrides,
@@ -35,6 +36,72 @@ fn logging_policy_matrix_and_secrets() {
     assert!(Off.body(&document).is_none());
 }
 
+#[test]
+fn request_logging_policy_version_contract_round_trips_and_refuses_unknown_versions() {
+    use logging::{
+        CURRENT_POLICY_VERSION, Level, Policy, PolicyInput, StoredPolicyError, parse_stored,
+    };
+
+    let versioned = json!({
+        "version": CURRENT_POLICY_VERSION,
+        "enabled": false,
+        "default_level": "redacted_body",
+        "key_override_enabled": true,
+        "key_disable_allowed": true,
+    });
+    let policy: Policy = PolicyInput::parse(versioned.clone()).unwrap().into();
+    assert_eq!(serde_json::to_value(&policy).unwrap(), versioned);
+
+    let defaulted: Policy = PolicyInput::parse(json!({})).unwrap().into();
+    assert_eq!(defaulted.version, CURRENT_POLICY_VERSION);
+    assert_eq!(defaulted.default_level, Level::Metadata);
+
+    let legacy = parse_stored(
+        &json!({
+            "enabled": true,
+            "default_level": "off",
+            "key_override_enabled": false,
+            "key_disable_allowed": false,
+        })
+        .to_string(),
+    )
+    .expect("the unversioned legacy shape is upgraded to version 1");
+    assert_eq!(legacy.version, CURRENT_POLICY_VERSION);
+    assert_eq!(legacy.default_level, Level::Off);
+
+    let tolerant = parse_stored(
+        &json!({
+            "version": CURRENT_POLICY_VERSION,
+            "enabled": true,
+            "default_level": "full_body",
+            "key_override_enabled": true,
+            "key_disable_allowed": true,
+            "future_field": {"kept_by_a_newer_build": true},
+        })
+        .to_string(),
+    )
+    .expect("unknown stored fields are tolerated within a supported version");
+    assert_eq!(tolerant.resolve(Level::Inherit), Level::FullBody);
+
+    let error = PolicyInput::parse(json!({"version": 2})).unwrap_err();
+    let (status, kind, _) = error.public_parts();
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+    assert_eq!(kind, "invalid_request_error");
+    assert_eq!(
+        parse_stored(r#"{"version":2,"enabled":true}"#),
+        Err(StoredPolicyError::UnsupportedVersion),
+    );
+    assert_eq!(
+        parse_stored(r#"{"version":"one","enabled":true}"#),
+        Err(StoredPolicyError::Malformed),
+    );
+    assert_eq!(
+        parse_stored(r#"{"version":1,"default_level":"inherit"}"#),
+        Err(StoredPolicyError::Malformed),
+        "inherit is a key-level choice, never a valid stored site default",
+    );
+}
+
 /// The write contract and the stored/runtime contract are different by design:
 /// the same document is rejected at the boundary and tolerated in the record
 /// system. Both halves are asserted here so neither can be "fixed" into the
@@ -54,7 +121,7 @@ fn the_request_logging_write_contract_is_strict_while_the_stored_policy_tolerate
     assert!(!parsed.key_disable_allowed);
     assert_eq!(parsed.resolve(Level::FullBody), Level::Off);
 
-    let full = json!({"enabled":false,"default_level":"redacted_body","key_override_enabled":true,"key_disable_allowed":true});
+    let full = json!({"version":logging::CURRENT_POLICY_VERSION,"enabled":false,"default_level":"redacted_body","key_override_enabled":true,"key_disable_allowed":true});
     let parsed: Policy = PolicyInput::parse(full.clone()).unwrap().into();
     assert_eq!(
         serde_json::to_value(&parsed).unwrap(),
@@ -96,13 +163,17 @@ fn the_request_logging_write_contract_is_strict_while_the_stored_policy_tolerate
 
     // The stored/runtime policy stays tolerant: an unknown field must not fail
     // resolution on the admission path.
-    let stored: Policy = serde_json::from_value(json!({
-        "enabled": true,
-        "default_level": "full_body",
-        "key_override_enabled": true,
-        "key_disable_allowed": true,
-        "retained_from_an_older_build": true,
-    }))
+    let stored = logging::parse_stored(
+        &json!({
+            "version": logging::CURRENT_POLICY_VERSION,
+            "enabled": true,
+            "default_level": "full_body",
+            "key_override_enabled": true,
+            "key_disable_allowed": true,
+            "retained_from_an_older_build": true,
+        })
+        .to_string(),
+    )
     .expect("a stored document with a forward-compatible field must still parse");
     assert_eq!(
         stored.resolve(Level::Inherit),

@@ -8,7 +8,7 @@ import i18n from '../i18n'
 import { ConfirmHost } from '../components'
 import { ProjectProvider } from '../project'
 import { ThemeProvider } from '../theme'
-import SystemPage from './SystemPage'
+import SystemPage, { LoggingPolicy } from './SystemPage'
 
 /**
  * The backup tab is a workflow, not three text boxes: an export downloads a
@@ -392,13 +392,40 @@ describe('project and instance scope', () => {
       const path = String(input)
       if (path.endsWith('/projects')) return json([project])
       if (path.includes('/permissions')) return json(['*'])
-      if (path.includes('/settings/request-logging')) return json({ enabled: false, default_level: 'off', key_override_enabled: false, key_disable_allowed: false })
+      if (path.includes('/settings/request-logging')) return json({ version: 1, enabled: false, default_level: 'off', key_override_enabled: false, key_disable_allowed: false })
       return paged([])
     }))
     renderPage()
     expect(await screen.findByRole('tab', { name: 'Request logging' })).toBeInTheDocument()
     await userEvent.click(screen.getByRole('tab', { name: 'Request logging' }))
     expect(await screen.findByRole('heading', { name: 'Request logging' })).toBeInTheDocument()
+  })
+
+  it('round-trips the request logging policy version', async () => {
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input)
+      if (path.includes('/settings/request-logging') && init?.method === 'PUT') return json({ ok: true })
+      if (path.includes('/settings/request-logging')) return json({ version: 1, enabled: false, default_level: 'off', key_override_enabled: false, key_disable_allowed: false })
+      return paged([])
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    render(
+      <QueryClientProvider client={client}>
+        <ThemeProvider><LoggingPolicy /></ThemeProvider>
+      </QueryClientProvider>,
+    )
+    await userEvent.click(await screen.findByRole('switch', { name: /Enable request logging/ }))
+
+    await waitFor(() => expect(fetchMock.mock.calls.some(([, init]) => init?.method === 'PUT')).toBe(true))
+    const [, init] = fetchMock.mock.calls.find(([, request]) => request?.method === 'PUT') as [string, RequestInit]
+    expect(JSON.parse(String(init.body))).toEqual({
+      version: 1,
+      enabled: true,
+      default_level: 'off',
+      key_override_enabled: false,
+      key_disable_allowed: false,
+    })
   })
 
   it('explains itself when neither scope is available', async () => {

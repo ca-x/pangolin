@@ -4,7 +4,7 @@ import { AlertTriangle, Copy, DatabaseBackup, Download, History, Play, RotateCcw
 import { useMemo, useState, type FormEvent } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
-import { api, type Bootstrap, type Document, type Paged } from '../api'
+import { api, type Bootstrap, type Document, type Paged, type RequestLoggingPolicy } from '../api'
 import { confirmAction, EmptyState, EnabledPill, InlineQueryError, SecretInput, SelectField, SkeletonRows } from '../components'
 import { restoreOnboarding } from '../onboarding'
 import { palettes } from '../palettes'
@@ -304,12 +304,11 @@ function OrchestrationSettings() {
   )
 }
 
-type Policy = { enabled: boolean; default_level: string; key_override_enabled: boolean; key_disable_allowed: boolean }
-function LoggingPolicy() {
+export function LoggingPolicy() {
   const { t } = useTranslation()
   const client = useQueryClient()
-  const query = useQuery({ queryKey: ['logging-policy'], queryFn: () => api<Policy>('/api/admin/v1/settings/request-logging') })
-  const update = useMutation({ mutationFn: (policy: Policy) => api('/api/admin/v1/settings/request-logging', { method: 'PUT', body: JSON.stringify(policy) }), onSuccess: () => { toast.success(t('saved')); void client.invalidateQueries({ queryKey: ['logging-policy'] }) }, onError: (error: Error) => toast.error(error.message) })
+  const query = useQuery({ queryKey: ['logging-policy'], queryFn: () => api<RequestLoggingPolicy>('/api/admin/v1/settings/request-logging') })
+  const update = useMutation({ mutationFn: (policy: RequestLoggingPolicy) => api('/api/admin/v1/settings/request-logging', { method: 'PUT', body: JSON.stringify(policy) }), onSuccess: () => { toast.success(t('saved')); void client.invalidateQueries({ queryKey: ['logging-policy'] }) }, onError: (error: Error) => toast.error(error.message) })
   if (query.isError) return <QueryError retry={() => void query.refetch()} />
   if (query.isLoading || !query.data) return <SkeletonRows />
   const policy = query.data

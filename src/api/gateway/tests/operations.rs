@@ -3346,6 +3346,7 @@ async fn a_stored_logging_policy_with_an_unknown_field_does_not_break_the_gatewa
         &f,
         "INSERT INTO settings(key,value,updated_at) VALUES('request_logging',?,0) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
         vec![json!({
+            "version": ops::logging::CURRENT_POLICY_VERSION,
             "enabled": true,
             "default_level": "metadata",
             "key_override_enabled": true,
@@ -3389,6 +3390,204 @@ async fn logging_audits(f: &Fixture) -> i64 {
     .await
 }
 
+#[tokio::test]
+async fn versioned_request_logging_policy_round_trips_and_is_audited() {
+    let f = fixture(success()).await;
+    let cookie = owner(&f).await;
+    let default = admin(
+        &f,
+        &cookie,
+        http::Method::GET,
+        LOG_POLICY_PATH,
+        Value::Null,
+        false,
+    )
+    .await;
+    assert_eq!(default.status(), StatusCode::OK);
+    assert_eq!(
+        json_body(default).await,
+        json!({
+            "version": ops::logging::CURRENT_POLICY_VERSION,
+            "enabled": true,
+            "default_level": "metadata",
+            "key_override_enabled": false,
+            "key_disable_allowed": false,
+        })
+    );
+
+    let versioned = json!({
+        "version": ops::logging::CURRENT_POLICY_VERSION,
+        "enabled": false,
+        "default_level": "redacted_body",
+        "key_override_enabled": true,
+        "key_disable_allowed": true,
+    });
+    assert_eq!(
+        admin(
+            &f,
+            &cookie,
+            http::Method::PUT,
+            LOG_POLICY_PATH,
+            versioned.clone(),
+            true,
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    let read = admin(
+        &f,
+        &cookie,
+        http::Method::GET,
+        LOG_POLICY_PATH,
+        Value::Null,
+        false,
+    )
+    .await;
+    assert_eq!(read.status(), StatusCode::OK);
+    assert_eq!(json_body(read).await, versioned);
+    assert_eq!(stored_logging_policy(&f).await, versioned);
+    assert_eq!(logging_audits(&f).await, 1);
+}
+
+#[tokio::test]
+async fn an_unknown_request_logging_version_is_rejected_and_nothing_is_written() {
+    let f = fixture(success()).await;
+    let cookie = owner(&f).await;
+    let response = admin(
+        &f,
+        &cookie,
+        http::Method::PUT,
+        LOG_POLICY_PATH,
+        json!({"version": 2, "default_level": "full_body"}),
+        true,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        json_body(response).await["error"]["type"],
+        "invalid_request_error"
+    );
+    assert_eq!(stored_logging_policy(&f).await, Value::Null);
+    assert_eq!(logging_audits(&f).await, 0);
+}
+
+#[tokio::test]
+async fn malformed_or_unknown_stored_logging_policy_keeps_admission_private_and_available() {
+    for document in [
+        "{malformed-policy}".to_owned(),
+        json!({
+            "version": 2,
+            "enabled": true,
+            "default_level": "full_body",
+            "key_override_enabled": true,
+            "key_disable_allowed": true,
+        })
+        .to_string(),
+    ] {
+        let f = fixture(success()).await;
+        sql(
+            &f,
+            "INSERT INTO settings(key,value,updated_at) VALUES('request_logging',?,0) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            vec![document.into()],
+        )
+        .await;
+
+        let response = request(&f, "/v1/chat/completions", chat()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            count(&f, "SELECT COUNT(*) AS n FROM requests").await,
+            0,
+            "an invalid policy must never enable browsable metadata or bodies"
+        );
+        assert_eq!(
+            count(&f, "SELECT COUNT(*) AS n FROM request_contents").await,
+            0,
+            "an invalid policy must never capture a request body"
+        );
+        assert_eq!(
+            count(&f, "SELECT COUNT(*) AS n FROM request_facts").await,
+            1,
+            "privacy fallback must not stop authoritative accounting"
+        );
+
+        let cookie = owner(&f).await;
+        let read = admin(
+            &f,
+            &cookie,
+            http::Method::GET,
+            LOG_POLICY_PATH,
+            Value::Null,
+            false,
+        )
+        .await;
+        assert_eq!(read.status(), StatusCode::OK);
+        assert_eq!(
+            json_body(read).await,
+            json!({
+                "version": ops::logging::CURRENT_POLICY_VERSION,
+                "enabled": false,
+                "default_level": "metadata",
+                "key_override_enabled": false,
+                "key_disable_allowed": false,
+            }),
+            "the console gets a writable fail-closed shape, never fields from the invalid document"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_non_text_stored_logging_policy_keeps_admission_private_and_repairable() {
+    for stored_value in ["X'7B7D'", "CAST(X'80' AS TEXT)", "17"] {
+        let f = fixture(success()).await;
+        let insert = format!(
+            "INSERT INTO settings(key,value,updated_at) VALUES('request_logging',{stored_value},0) ON CONFLICT(key) DO UPDATE SET value=excluded.value"
+        );
+        sql(&f, &insert, vec![]).await;
+
+        let response = request(&f, "/v1/chat/completions", chat()).await;
+        assert_eq!(response.status(), StatusCode::OK, "{stored_value}");
+        assert_eq!(
+            count(&f, "SELECT COUNT(*) AS n FROM requests").await,
+            0,
+            "an invalid SQLite value must not enable browsable metadata: {stored_value}"
+        );
+        assert_eq!(
+            count(&f, "SELECT COUNT(*) AS n FROM request_contents").await,
+            0,
+            "an invalid SQLite value must not capture bodies: {stored_value}"
+        );
+        assert_eq!(
+            count(&f, "SELECT COUNT(*) AS n FROM request_facts").await,
+            1,
+            "accounting must continue: {stored_value}"
+        );
+
+        let cookie = owner(&f).await;
+        let read = admin(
+            &f,
+            &cookie,
+            http::Method::GET,
+            LOG_POLICY_PATH,
+            Value::Null,
+            false,
+        )
+        .await;
+        assert_eq!(read.status(), StatusCode::OK, "{stored_value}");
+        assert_eq!(
+            json_body(read).await,
+            json!({
+                "version": ops::logging::CURRENT_POLICY_VERSION,
+                "enabled": false,
+                "default_level": "metadata",
+                "key_override_enabled": false,
+                "key_disable_allowed": false,
+            }),
+            "GET must return the writable repair shape: {stored_value}"
+        );
+    }
+}
+
 /// The write path is the only place an operator typo can install a logging
 /// policy nobody asked for. `PUT` deserialized straight into the tolerant
 /// `Policy`, so `{"enabledd": false}` was accepted and stored the default
@@ -3401,7 +3600,7 @@ async fn logging_audits(f: &Fixture) -> i64 {
 async fn an_unknown_request_logging_field_is_rejected_and_nothing_is_written() {
     let f = fixture(success()).await;
     let cookie = owner(&f).await;
-    let known = json!({"enabled":true,"default_level":"off","key_override_enabled":true,"key_disable_allowed":true});
+    let known = json!({"version":ops::logging::CURRENT_POLICY_VERSION,"enabled":true,"default_level":"off","key_override_enabled":true,"key_disable_allowed":true});
     assert_eq!(
         admin(
             &f,
@@ -3472,7 +3671,7 @@ async fn an_unknown_request_logging_field_is_rejected_and_nothing_is_written() {
 async fn an_invalid_request_logging_level_or_type_is_rejected() {
     let f = fixture(success()).await;
     let cookie = owner(&f).await;
-    let known = json!({"enabled":true,"default_level":"metadata","key_override_enabled":false,"key_disable_allowed":false});
+    let known = json!({"version":ops::logging::CURRENT_POLICY_VERSION,"enabled":true,"default_level":"metadata","key_override_enabled":false,"key_disable_allowed":false});
     assert_eq!(
         admin(
             &f,
@@ -3541,7 +3740,7 @@ async fn an_invalid_request_logging_level_or_type_is_rejected() {
 async fn the_site_default_still_cannot_inherit() {
     let f = fixture(success()).await;
     let cookie = owner(&f).await;
-    let known = json!({"enabled":true,"default_level":"metadata","key_override_enabled":false,"key_disable_allowed":false});
+    let known = json!({"version":ops::logging::CURRENT_POLICY_VERSION,"enabled":true,"default_level":"metadata","key_override_enabled":false,"key_disable_allowed":false});
     assert_eq!(
         admin(
             &f,
@@ -3600,12 +3799,12 @@ async fn a_valid_request_logging_policy_commits_with_one_audit_row() {
     );
     assert_eq!(
         stored_logging_policy(&f).await,
-        json!({"enabled":true,"default_level":"full_body","key_override_enabled":false,"key_disable_allowed":false}),
+        json!({"version":ops::logging::CURRENT_POLICY_VERSION,"enabled":true,"default_level":"full_body","key_override_enabled":false,"key_disable_allowed":false}),
         "an omitted field keeps its documented default"
     );
     assert_eq!(logging_audits(&f).await, 1);
 
-    let full = json!({"enabled":false,"default_level":"redacted_body","key_override_enabled":true,"key_disable_allowed":true});
+    let full = json!({"version":ops::logging::CURRENT_POLICY_VERSION,"enabled":false,"default_level":"redacted_body","key_override_enabled":true,"key_disable_allowed":true});
     assert_eq!(
         admin(
             &f,
@@ -3670,7 +3869,7 @@ async fn a_stored_logging_policy_with_an_unknown_field_stays_writable_from_the_c
     let document = json_body(read).await;
     assert_eq!(
         document,
-        json!({"enabled":false,"default_level":"off","key_override_enabled":false,"key_disable_allowed":false}),
+        json!({"version":ops::logging::CURRENT_POLICY_VERSION,"enabled":false,"default_level":"off","key_override_enabled":false,"key_disable_allowed":false}),
         "the read returns the effective policy, not the raw stored document"
     );
 
@@ -3690,7 +3889,7 @@ async fn a_stored_logging_policy_with_an_unknown_field_stays_writable_from_the_c
     );
     assert_eq!(
         stored_logging_policy(&f).await,
-        json!({"enabled":false,"default_level":"off","key_override_enabled":false,"key_disable_allowed":false}),
+        json!({"version":ops::logging::CURRENT_POLICY_VERSION,"enabled":false,"default_level":"off","key_override_enabled":false,"key_disable_allowed":false}),
         "the accepted write replaces the document with the known fields"
     );
 }

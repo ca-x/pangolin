@@ -55,13 +55,13 @@ states plainly that no test guards it yet.
 | prompts & playground | 6 | 12 | 1 | 0 | 0 | 0 | 1 | 20 |
 | models, routing & pricing | 6 | 4 | 2 | 3 | 9 | 2 | 0 | 26 |
 | access control | 2 | 16 | 2 | 0 | 0 | 1 | 0 | 21 |
-| system settings & background work | 8 | 8 | 5 | 2 | 5 | 2 | 1 | 31 |
+| system settings & background work | 8 | 9 | 5 | 1 | 5 | 2 | 1 | 31 |
 | console-wide UX | 3 | 9 | 1 | 2 | 0 | 0 | 0 | 15 |
-| **total** | **30** | **59** | **11** | **9** | **17** | **5** | **2** | **133** |
+| **total** | **30** | **60** | **11** | **8** | **17** | **5** | **2** | **133** |
 
 Row count is unchanged at 133 — the six area reports' own findings. No row was
-dropped, merged or added. What changed is the status: **100 rows need no work**
-(30 already matched, 59 fixed, 11 refuted), **31 rows need work** (`partial` +
+dropped, merged or added. What changed is the status: **101 rows need no work**
+(30 already matched, 60 fixed, 11 refuted), **30 rows need work** (`partial` +
 `open` + `feature-build`), and **2 rows are recorded divergences** whose only
 remaining difference is deliberate.
 
@@ -209,7 +209,7 @@ Report: [parity-system-settings.md](parity-system-settings.md).
 | 8 | Retention model | closed | parity | Per-project policies for requests/payloads/probes/quota plus an env default, applied by the hourly `gc` job | five instance-level cleanup options | `operations.rs` retention cases |
 | 9 | Instance-wide IP blocking | divergence | — | Per-key `allowed_ips`/`denied_ips` enforced at admission and editable per key (`db.rs`, `AccessPage.tsx:233-234`) | instance blocklist | D3 below |
 | 10 | The retention form still offers the removed `retain_payloads` switch | closed | fixed | Gone from the console, the projection and both locales (`rg retain_payloads` is empty) | n/a | `SystemPage.test.tsx` retention case |
-| 11 | The stored request-logging policy is parsed with `deny_unknown_fields` and has no `version` | partial | — | Reads are tolerant (`operations/logging.rs:35-36`) and writes are strict (`PolicyInput`, `:56-119`), so the admission 500 and the silent-typo write are both fixed; the document still has no `version` and is not validated at startup | `internal/server/biz/system.go:988-1004` | a versioned document with a startup validation test |
+| 11 | The stored request-logging policy is parsed with `deny_unknown_fields` and has no `version` | closed | fixed | Version 1 is explicit on reads/writes; strict request parsing rejects unknown/unsupported input while stored v1 documents tolerate forward fields and legacy unversioned rows upgrade in memory. Startup emits bounded diagnostics for malformed/unsupported rows; admission stays available with logging disabled and GET returns a writable repair shape. | `internal/server/biz/system.go:988-1004` | version/strict-write/startup/fail-closed Rust cases plus `SystemPage.test.tsx` round-trip |
 | 12 | A broken schedule fails silently | closed | fixed | `last_error` is projected (`operations_api.rs:404`) and rendered as a red badge or `—` (`SystemPage.tsx:840`) | `backup-settings.tsx:560-586` | `backupScheduleRetention.test.tsx` |
 | 13 | No cron, time-of-day or timezone for schedules | open | — | `interval_secs` only, bounded 30 s–1 year (`operations_api.rs:1430-1434`, `SystemPage.tsx:840`); cron + timezone exist only inside the per-channel auto-disable policy (`operations_api.rs:1289-1302`) | `internal/server/backup/autobackup.go:27-28,76-81` | a schedule test for a daily time in an IANA timezone |
 | 14 | Auto-backup retention count only via raw JSON | closed | fixed | `keep` is a first-class field with a hint and range check (`SystemPage.tsx:840,492-493`) | `backup-settings.tsx:547-556` | `backupScheduleRetention.test.tsx` |

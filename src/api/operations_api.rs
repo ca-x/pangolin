@@ -235,11 +235,11 @@ async fn audit_in(
 ) -> Result<(), ApiError> {
     operations::audit(db, Some(user), project, action, resource).await
 }
-/// The effective policy: the stored document parsed tolerantly, so a field this
-/// build does not know neither breaks admission nor makes the settings form
-/// unrepairable. The console reads the policy and writes back what it read, so a
-/// read that echoed an unknown field would leave the operator with a form whose
-/// only answer is the strict write contract's 400.
+/// The effective policy: supported stored versions tolerate unknown fields, and
+/// refused documents become the writable logging-off repair shape. The console
+/// reads the policy and writes back what it read, so raw unknown fields would
+/// otherwise leave the operator with a form whose only answer is the strict
+/// write contract's 400.
 async fn log_policy(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -248,13 +248,22 @@ async fn log_policy(
     let row = state
         .db
         .query_one(sql(
-            "SELECT value FROM settings WHERE key='request_logging'",
+            "SELECT CASE WHEN typeof(value)='text' THEN value END AS value,typeof(value) AS value_type FROM settings WHERE key='request_logging'",
             vec![],
         ))
         .await?;
     Ok(Json(match row {
-        Some(row) => serde_json::from_str(&row.try_get::<String>("", "value")?)
-            .map_err(|e| ApiError::Internal(e.into()))?,
+        Some(row) => match logging::parse_stored_row(&row) {
+            Ok(Some(policy)) => policy,
+            Ok(None) => logging::Policy::default(),
+            Err(problem) => {
+                tracing::warn!(
+                    problem = problem.code(),
+                    "stored request-logging policy is invalid; settings read is using a writable logging-off repair shape"
+                );
+                logging::Policy::fail_closed()
+            }
+        },
         None => logging::Policy::default(),
     }))
 }

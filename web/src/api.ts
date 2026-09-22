@@ -8,7 +8,7 @@ export type BuildInfo = { version: string; commit: string; built_at: string; tar
  */
 export type Bootstrap = { initialized: boolean; authenticated: boolean; user: User | null; capture_payloads: boolean; observability_available?: boolean; branding: Branding; build?: BuildInfo }
 /** Site request-logging policy. `off` (or a disabled policy) means no request event is ever written. */
-export type RequestLoggingPolicy = { enabled: boolean; default_level: string; key_override_enabled: boolean; key_disable_allowed: boolean }
+export type RequestLoggingPolicy = { version: number; enabled: boolean; default_level: string; key_override_enabled: boolean; key_disable_allowed: boolean }
 export type User = { id: string; email: string; role: string; language: string; theme: string; created_at: number }
 export type Provider = { id: string; name: string; kind: string; base_url: string; enabled: boolean; created_at: number; updated_at: number }
 export type Model = { id: string; provider_id: string; provider_name: string; public_name: string; upstream_name: string; capabilities: string; input_price_micros: number; output_price_micros: number; priority: number; enabled: boolean; created_at: number }

@@ -13,10 +13,34 @@ On startup, interrupted attempts settle before the HTTP listener starts. DuckDB 
 `GET/PUT /api/admin/v1/settings/request-logging` is system-only. The document contains:
 
 ```json
-{"enabled":true,"default_level":"metadata","key_override_enabled":false,"key_disable_allowed":false}
+{"version":1,"enabled":true,"default_level":"metadata","key_override_enabled":false,"key_disable_allowed":false}
 ```
 
-The write document is strict: an unknown field, an unknown level or a field of the wrong type is a 400 that stores nothing and appends no `logging.update` audit row, so a typo cannot silently install a different policy. A field omitted from an accepted document keeps its documented default (`enabled` stays `true`). The stored document is read tolerantly — a field written by another build neither breaks admission nor breaks the settings form — and `GET` answers with the effective policy in the shape above.
+The current contract is version `1`. The write document is strict: an unknown
+field, an unsupported version, an unknown level or a field of the wrong type is a
+400 that stores nothing and appends no `logging.update` audit row, so a typo cannot
+silently install a different policy. A field omitted from an accepted document
+keeps its documented default (`version` stays `1` and `enabled` stays `true`). The
+console keeps the version returned by `GET` in every mutation.
+
+Stored reads deliberately have a different compatibility contract. The legacy
+unversioned shape is upgraded in memory to version `1`; a version `1` document may
+contain unknown future fields, which are ignored while known fields retain their
+documented types and meaning. Any explicit version other than `1`, a non-integer
+version, malformed JSON or malformed known field is refused rather than silently
+interpreted as today's policy. `GET` normally returns the effective version `1`
+shape above. For an invalid stored document it returns a writable version `1`
+repair shape with `enabled:false` and `default_level:"metadata"`; no field from
+the invalid document is used.
+
+Startup validates the authoritative row before the HTTP listener starts. An
+invalid document emits only the bounded reason code `malformed_document` or
+`unsupported_version` plus instructions to save a supported policy in **System >
+Request logging**; stored content and parser/database causes are not logged. The
+invalid row does not take the gateway down. Until an owner repairs it, admission
+uses logging `off`: inference and authoritative accounting continue, but no
+browsable request metadata or body is captured. This fail-closed fallback cannot
+turn a malformed policy into `redacted_body` or `full_body` logging.
 
 Keys select `inherit`, `off`, `metadata`, `redacted_body` or `full_body` through the project `key-logging` mutation. Site disable always wins. Key choices require site override permission; key disable additionally requires `key_disable_allowed`. Defaults store metadata only. `off` creates no browsable thread/trace/request/execution/content rows and sends no DuckDB event, while retaining minimal accounting and security audit records. Existing encrypted Responses history remains an operational session store.
 

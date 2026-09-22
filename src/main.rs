@@ -39,6 +39,7 @@ async fn main() -> Result<()> {
     fs::create_dir_all(&config.data_dir).context("failed to create data directory")?;
     let database = db::connect(&config.database_url).await?;
     bootstrap_from_environment(&database, &config).await?;
+    validate_request_logging_policy_at_startup(&database).await?;
     let secrets = SecretBox::load(&config.data_dir, config.master_key.as_deref())?;
     let observations = match ObservationStore::open(
         &config.observation_path,
@@ -143,6 +144,18 @@ async fn bootstrap_from_environment(
     }
 }
 
+async fn validate_request_logging_policy_at_startup(
+    database: &sea_orm::DatabaseConnection,
+) -> Result<()> {
+    if let Some(problem) = operations::logging::startup_problem(database).await? {
+        tracing::warn!(
+            problem = problem.code(),
+            "stored request-logging policy is invalid; admission will use logging off until an owner saves a supported policy in System > Request logging"
+        );
+    }
+    Ok(())
+}
+
 async fn shutdown_signal() {
     let ctrl_c = async {
         tokio::signal::ctrl_c()
@@ -159,4 +172,107 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     let terminate = std::future::pending::<()>();
     tokio::select! { _ = ctrl_c => {}, _ = terminate => {} }
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::*;
+    use sea_orm::{DbBackend, Statement};
+    use std::sync::{Arc, Mutex};
+    use tracing::instrument::WithSubscriber;
+
+    #[derive(Clone)]
+    struct LogCapture(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self {
+            self.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_or_unknown_stored_logging_policy_is_reported_without_stopping_startup() {
+        let database = db::connect("sqlite::memory:").await.unwrap();
+        for (document, code, secret) in [
+            (
+                "{not-json:startup-secret}",
+                "malformed_document",
+                "startup-secret",
+            ),
+            (
+                r#"{"version":99,"future_secret":"version-secret"}"#,
+                "unsupported_version",
+                "version-secret",
+            ),
+        ] {
+            database
+                .execute(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    "INSERT INTO settings(key,value,updated_at) VALUES('request_logging',?,0) ON CONFLICT(key) DO UPDATE SET value=excluded.value"
+                        .to_owned(),
+                    [document.into()],
+                ))
+                .await
+                .unwrap();
+            let capture = LogCapture(Arc::new(Mutex::new(vec![])));
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::WARN)
+                .with_ansi(false)
+                .with_writer(capture.clone())
+                .finish();
+
+            validate_request_logging_policy_at_startup(&database)
+                .with_subscriber(subscriber)
+                .await
+                .expect("an invalid document must not stop startup");
+
+            let logs = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+            assert!(logs.contains(code), "{logs}");
+            assert!(logs.contains("System > Request logging"), "{logs}");
+            assert!(logs.contains("logging off"), "{logs}");
+            assert!(!logs.contains(secret), "stored content leaked: {logs}");
+            assert!(!logs.contains("serde") && logs.len() < 1024, "{logs}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_non_text_stored_logging_policy_is_reported_without_stopping_startup() {
+        let database = db::connect("sqlite::memory:").await.unwrap();
+        for stored_value in ["X'7B7D'", "CAST(X'80' AS TEXT)", "17"] {
+            database
+                .execute(Statement::from_string(
+                    DbBackend::Sqlite,
+                    format!(
+                        "INSERT INTO settings(key,value,updated_at) VALUES('request_logging',{stored_value},0) ON CONFLICT(key) DO UPDATE SET value=excluded.value"
+                    ),
+                ))
+                .await
+                .unwrap();
+            let capture = LogCapture(Arc::new(Mutex::new(vec![])));
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::WARN)
+                .with_ansi(false)
+                .with_writer(capture.clone())
+                .finish();
+
+            validate_request_logging_policy_at_startup(&database)
+                .with_subscriber(subscriber)
+                .await
+                .expect("an invalid SQLite value must not stop startup");
+
+            let logs = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+            assert!(logs.contains("malformed_document"), "{logs}");
+            assert!(logs.contains("logging off"), "{logs}");
+            assert!(logs.len() < 1024, "{logs}");
+        }
+    }
 }
