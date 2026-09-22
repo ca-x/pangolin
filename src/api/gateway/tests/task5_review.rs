@@ -226,10 +226,12 @@ async fn task5_review_project_retention_removes_derived_payloads_and_requests() 
     expired.started_at = db::now() - 2 * 86400;
     f.state.observations.record(expired.clone());
     let mut other = expired.clone();
+    other.id = "internal-other".into();
     other.request_id = "other-project-event".into();
     other.project_id = "other-project".into();
     f.state.observations.record(other);
     let mut recent = original.clone();
+    recent.id = "internal-recent".into();
     recent.request_id = "recent-event".into();
     f.state.observations.record(recent);
     f.state.observations.flush().await;

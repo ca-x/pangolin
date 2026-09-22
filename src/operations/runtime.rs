@@ -6,6 +6,8 @@ use crate::{
 use futures_util::StreamExt;
 use sea_orm::{ConnectionTrait, TransactionTrait};
 use serde_json::{Value, json};
+use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub fn start(state: AppState) -> tokio::task::JoinHandle<()> {
@@ -152,7 +154,7 @@ pub(super) async fn recover_in(
             tx.execute(sql("INSERT INTO usage_cost_items(id,usage_log_id,quantity,subtotal_micros) VALUES(?,?,1,?)",vec![id().into(),usage.into(),cost.into()])).await?;
             tx.execute(sql("UPDATE api_keys SET spent_micros=spent_micros+? WHERE id=(SELECT api_key_id FROM request_facts WHERE id=?)",vec![cost.into(),request.into()])).await?;
         }
-        tx.execute(sql("UPDATE request_executions SET status='interrupted',retry_reason='process_restart',finished_at=? WHERE id=?",vec![db::now().into(),execution.into()])).await?;
+        tx.execute(sql("UPDATE request_executions SET status='interrupted',retry_reason='process_restart',error_kind='interrupted',finished_at=? WHERE id=?",vec![db::now().into(),execution.into()])).await?;
     }
     for table in ["request_facts", "requests"] {
         tx.execute(sql(
@@ -166,19 +168,104 @@ pub(super) async fn recover_in(
 }
 
 pub(super) async fn sync_retention(state: &AppState) -> Result<bool, ApiError> {
-    let mut rules = vec![crate::observability::Retention {
-        project_id: None,
-        days: state.config.observation_retention_days.min(i64::MAX as u64) as i64,
-        payloads_only: false,
-    }];
+    sync_retention_within(state, RETAINED_ID_PAGE, MAX_RETAINED_REQUESTS).await
+}
+
+/// How many pinned request ids one page carries out of the record system, and how
+/// many may be pinned before the derived projection refuses to apply retention at
+/// all. Both are hard bounds: the projection is a convenience, and an unbounded
+/// read would let one operator's pin list decide the memory of a background pass.
+const RETAINED_ID_PAGE: i64 = 500;
+const MAX_RETAINED_REQUESTS: usize = 50_000;
+
+/// The retention pass with its bounds named, so the ceiling is testable without
+/// pinning fifty thousand requests.
+///
+/// Returns whether derived retention was applied. A pass that cannot name every
+/// pinned request disables derived retention entirely instead of cleaning up with
+/// an incomplete preserve set: a partial pin list would delete the events of the
+/// pins it did not carry, which is the very promise the operator asked for.
+pub(crate) async fn sync_retention_within(
+    state: &AppState,
+    page: i64,
+    ceiling: usize,
+) -> Result<bool, ApiError> {
+    let Some(pinned) = retained_request_ids(state, page, ceiling).await? else {
+        // Fail safe: no rule deletes a row and no rule clears a payload — for the
+        // events already stored and for the ones still arriving — so nothing pinned
+        // is expired by a pass that cannot see all of it. The record system keeps
+        // enforcing the pin and the projection stays readable; only the projection's
+        // own expiry is off until the pin set fits again.
+        tracing::warn!(
+            ceiling,
+            "more requests are pinned than the derived projection will track; derived retention is disabled for this pass so no pinned run is expired"
+        );
+        state.observations.apply_retention(Vec::new()).await;
+        return Ok(false);
+    };
+    let mut rules = vec![crate::observability::Retention::new(
+        None,
+        state.config.observation_retention_days.min(i64::MAX as u64) as i64,
+        false,
+    )];
     for row in state.db.query_all(sql("SELECT project_id,resource_type,retention_days FROM data_retention_policies WHERE resource_type IN ('requests','payloads')",vec![])).await? {
-        rules.push(crate::observability::Retention {
-            project_id: row.try_get("", "project_id")?,
-            days: row.try_get("", "retention_days")?,
-            payloads_only: row.try_get::<String>("", "resource_type")? == "payloads",
-        });
+        rules.push(crate::observability::Retention::new(
+            row.try_get("", "project_id")?,
+            row.try_get("", "retention_days")?,
+            row.try_get::<String>("", "resource_type")? == "payloads",
+        ));
     }
+    // Every rule carries the pin, the instance-wide window included: a pin that
+    // only survived the project's own policy would still be expired by the default
+    // window, which is the rule that reaches every event.
+    let rules = rules
+        .into_iter()
+        .map(|rule| rule.preserving(pinned.clone()))
+        .collect();
     Ok(state.observations.apply_retention(rules).await)
+}
+
+/// The requests a retained trace owns, by Pangolin's own request uuid.
+///
+/// This is the whole bridge between the record system and the derived projection:
+/// `RequestEvent.id` is the same value as `requests.id`, so the projection can
+/// spare exactly those events by identity, with no caller-supplied string and no
+/// per-event query. The read is paged by keyset rather than offset — the tables are
+/// live, and a row inserted between two pages must not shift the window and hide
+/// another pinned request — and `None` says the pin set does not fit, never a
+/// truncated set.
+async fn retained_request_ids(
+    state: &AppState,
+    page: i64,
+    ceiling: usize,
+) -> Result<Option<Arc<HashSet<String>>>, ApiError> {
+    let mut ids = HashSet::new();
+    let mut after: Option<String> = None;
+    loop {
+        let rows = state
+            .db
+            .query_all(sql(
+                "SELECT r.id AS id FROM requests r JOIN traces t ON t.id=r.trace_id WHERE t.lifecycle='retained' AND (? IS NULL OR r.id>?) ORDER BY r.id LIMIT ?",
+                vec![after.clone().into(), after.clone().into(), page.into()],
+            ))
+            .await?;
+        let filled = rows.len() as i64 >= page;
+        for row in rows {
+            let id: String = row.try_get("", "id")?;
+            after = Some(id.clone());
+            ids.insert(id);
+        }
+        // The ceiling is checked before the partial page can succeed: a set that
+        // only exceeds it on the last, partial page is still a set that does not
+        // fit, and accepting it here applied rules whose pin list had just been
+        // declared unbounded.
+        if ids.len() > ceiling {
+            return Ok(None);
+        }
+        if !filled {
+            return Ok(Some(Arc::new(ids)));
+        }
+    }
 }
 async fn target(
     state: &AppState,
@@ -675,6 +762,22 @@ pub async fn gc(state: &AppState) -> Result<(), ApiError> {
         } else {
             ""
         };
+        // A retained trace is the operator's one way to keep a run out of the
+        // retention policy. Every row needed to open it stays, and the guard is
+        // written against the row the policy is about to delete rather than through
+        // a table the same pass is emptying. `requests.id` is `request_facts.id`, so
+        // one predicate reaches the request, its captured body and the authoritative
+        // ledger alike — for a project-scoped policy and a global one, because the
+        // guard is added to the scope instead of replacing it.
+        let retained = match resource.as_str() {
+            "requests" => {
+                " AND NOT EXISTS(SELECT 1 FROM traces t WHERE t.id=requests.trace_id AND t.lifecycle='retained')"
+            }
+            "payloads" => {
+                " AND NOT EXISTS(SELECT 1 FROM requests r JOIN traces t ON t.id=r.trace_id WHERE r.id=request_contents.request_id AND t.lifecycle='retained')"
+            }
+            _ => "",
+        };
         let (scope, args) = if let Some(project) = project {
             (
                 format!(" AND ({scope})"),
@@ -684,7 +787,7 @@ pub async fn gc(state: &AppState) -> Result<(), ApiError> {
             (String::new(), vec![before.into()])
         };
         tx.execute(sql(
-            format!("DELETE FROM {table} WHERE {time}<?{scope}{preserve}"),
+            format!("DELETE FROM {table} WHERE {time}<?{scope}{preserve}{retained}"),
             args,
         ))
         .await?;
@@ -702,7 +805,7 @@ pub async fn gc(state: &AppState) -> Result<(), ApiError> {
             ("", vec![before.into()])
         };
         tx.execute(sql(
-            format!("DELETE FROM request_facts WHERE started_at<? AND status!='running'{scope}"),
+            format!("DELETE FROM request_facts WHERE started_at<? AND status!='running'{scope} AND NOT EXISTS(SELECT 1 FROM requests r JOIN traces t ON t.id=r.trace_id WHERE r.id=request_facts.id AND t.lifecycle='retained')"),
             args,
         ))
         .await?;
@@ -713,7 +816,9 @@ pub async fn gc(state: &AppState) -> Result<(), ApiError> {
         vec![],
     ))
     .await?;
-    tx.execute(sql("DELETE FROM traces WHERE finished_at IS NOT NULL AND NOT EXISTS(SELECT 1 FROM requests WHERE trace_id=traces.id)",vec![])).await?;
+    // A trace whose requests survived because it is retained must survive with
+    // them; the lifecycle is the only thing that keeps it here.
+    tx.execute(sql("DELETE FROM traces WHERE lifecycle!='retained' AND finished_at IS NOT NULL AND NOT EXISTS(SELECT 1 FROM requests WHERE trace_id=traces.id)",vec![])).await?;
     tx.execute(sql(
         "DELETE FROM threads WHERE NOT EXISTS(SELECT 1 FROM traces WHERE thread_id=threads.id)",
         vec![],

@@ -7,6 +7,25 @@
     <meta name="description" content="Pangolin / 鲮鲤 AI API gateway" />
     <link rel="icon" type="image/webp" href="/logo.webp" />
     <title>Pangolin · 鲮鲤</title>
+    <script>
+      // First paint, before any module loads. The bundle resolves both the colour
+      // mode and the language, so a hard reload in dark mode flashed a cream
+      // splash and `<html lang>` stayed the hard-coded zh-CN until React ran —
+      // which also made a Chinese-reading screen reader announce an English
+      // document. Storage can be blocked, so nothing here may throw.
+      (function () {
+        try {
+          var mode = localStorage.getItem('pangolin-color-mode') || 'system'
+          var dark = mode === 'dark' || (mode === 'system' && window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches)
+          document.documentElement.dataset.mode = dark ? 'dark' : 'light'
+          var meta = document.querySelector('meta[name="theme-color"]')
+          if (meta) meta.setAttribute('content', dark ? '#151312' : '#f4f2ee')
+          document.documentElement.lang = localStorage.getItem('pangolin-language') || (navigator.language && navigator.language.indexOf('zh') === 0 ? 'zh-CN' : 'en')
+        } catch (error) {
+          document.documentElement.dataset.mode = 'light'
+        }
+      })()
+    </script>
   </head>
   <body>
     <div id="root"></div>

@@ -3,6 +3,40 @@ use crate::orchestration::{self, AttemptGuard, AttemptOutcome, policy::ErrorMode
 use futures_util::StreamExt;
 use std::time::Duration;
 
+#[derive(Clone)]
+enum KeySource {
+    Header,
+    Delegated { project: String, key_id: String },
+}
+
+impl KeySource {
+    async fn load(
+        &self,
+        state: &AppState,
+        headers: &HeaderMap,
+    ) -> Result<crate::models::ApiKeyCredential, ApiError> {
+        let credential = match self {
+            Self::Header => gateway_key(state, headers).await?,
+            Self::Delegated { project, key_id } => db::api_key_credential_for_use_by_id(
+                &state.db,
+                project,
+                key_id,
+                trusted_client_ip(headers),
+            )
+            .await?
+            .ok_or(ApiError::NotFound)?,
+        };
+        let scopes = serde_json::from_str::<Vec<String>>(&credential.scopes).unwrap_or_default();
+        if !scopes
+            .iter()
+            .any(|scope| matches!(scope.as_str(), "gateway" | "gateway:use" | "*"))
+        {
+            return Err(ApiError::Unauthorized);
+        }
+        Ok(credential)
+    }
+}
+
 pub(crate) async fn execute(
     state: AppState,
     headers: HeaderMap,
@@ -26,9 +60,31 @@ pub(super) fn execute_input(
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Response, ApiError>> + Send>> {
     Box::pin(async move {
         let guard = state.maintenance.clone().read_owned().await;
-        execute_inner(state, headers, input)
+        execute_inner(state, headers, input, KeySource::Header, None)
             .await
             .map(|response| super::hold_maintenance(response, guard))
+    })
+}
+
+pub(super) fn execute_admin_input(
+    state: AppState,
+    headers: HeaderMap,
+    input: super::protocols::Input,
+    project: String,
+    key_id: String,
+    provider_id: Option<String>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Response, ApiError>> + Send>> {
+    Box::pin(async move {
+        let guard = state.maintenance.clone().read_owned().await;
+        execute_inner(
+            state,
+            headers,
+            input,
+            KeySource::Delegated { project, key_id },
+            provider_id,
+        )
+        .await
+        .map(|response| super::hold_maintenance(response, guard))
     })
 }
 
@@ -36,6 +92,8 @@ async fn execute_inner(
     state: AppState,
     mut headers: HeaderMap,
     input: super::protocols::Input,
+    key_source: KeySource,
+    provider_filter: Option<String>,
 ) -> Result<Response, ApiError> {
     if headers.contains_key("x-pangolin-websocket-session")
         && headers
@@ -59,7 +117,7 @@ async fn execute_inner(
     let trace_id = context_id(&headers, "x-trace-id", "");
     headers.insert("x-request-id", HeaderValue::from_str(&request_id).unwrap());
     headers.insert("x-trace-id", HeaderValue::from_str(&trace_id).unwrap());
-    let initial = gateway_key(&state, &headers).await?;
+    let initial = key_source.load(&state, &headers).await?;
     let initial_profile = orchestration::load_profile(&state.db, &initial).await?;
     let mut payload = input.payload.clone();
     if !payload.is_object() {
@@ -134,7 +192,7 @@ async fn execute_inner(
         None
     };
     let credential = if _key_budget.is_some() || _profile_budget.is_some() {
-        gateway_key(&state, &headers).await?
+        key_source.load(&state, &headers).await?
     } else {
         initial
     };
@@ -155,6 +213,10 @@ async fn execute_inner(
         endpoint,
     )
     .await?;
+    if let Some(provider) = provider_filter {
+        plan.candidates
+            .retain(|candidate| candidate.provider_id == provider);
+    }
     if let Wire::Task {
         provider,
         credential,
@@ -415,6 +477,11 @@ async fn execute_inner(
                 }
             };
             let status = upstream.status();
+            // The response has been observed, so its exact status is a fact about
+            // this attempt — including a `2xx` that is not `200`. Recording it here
+            // covers every later branch: the encoding refusal, the failure paths and
+            // the stream/non-stream successes.
+            attempt.observed_status(status.as_u16());
             if upstream
                 .headers()
                 .get_all(header::CONTENT_ENCODING)
@@ -504,7 +571,7 @@ async fn execute_inner(
                     let mut event=first;
                     loop {
                         let terminal=terminal_state.terminal(&event,endpoint);
-                        if let Ok(value)=serde_json::from_str::<Value>(&event.data) {attempt.stream_event(&value,terminal);}
+                        attempt.stream_event(&event.event,&event.data,terminal);
                         let failed=sse::failed(&event);
                         if let Some(response)=sse::completed_response(&event)
                             && runtime.sessions.persist(&database,&secrets,&session_credential,&session_request,&response).await.is_err() {
@@ -677,9 +744,11 @@ pub(super) async fn discovery_response(
     lifecycle.complete_local(&value).await?;
     if lifecycle.logs_enabled() {
         lifecycle.record_event(RequestEvent {
+            id: lifecycle.internal_id(),
             project_id: key.project_id.clone(),
             request_id: request_id.clone(),
             trace_id: trace_id.clone(),
+            source_ip: lifecycle.source_ip(),
             started_at: db::now(),
             finished_at: db::now(),
             endpoint: endpoint.into(),
@@ -687,13 +756,22 @@ pub(super) async fn discovery_response(
             provider: None,
             requested_model: None,
             resolved_model: None,
-            status_code: 200,
+            // Discovery is answered by Pangolin: no upstream was contacted, so there
+            // is no upstream status to report. `200` here would be this process's own
+            // answer masquerading as a provider's.
+            status_code: None,
             error_kind: None,
             latency_ms: 0,
             ttft_ms: None,
             input_tokens: 0,
             output_tokens: 0,
             cached_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
+            // This request never chose to stream anything, and the endpoint has no
+            // stream choice to record: `false` would be a claim about a provider
+            // request that never happened.
+            stream: crate::providers::streamed(endpoint, &json!({})),
             cost_micros: 0,
             payload_captured: false,
             request_json: None,

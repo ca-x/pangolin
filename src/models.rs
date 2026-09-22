@@ -36,6 +36,7 @@ pub struct Model {
     pub output_price_micros: i64,
     pub priority: i32,
     pub enabled: bool,
+    pub lifecycle: String,
     pub created_at: i64,
     pub catalog_metadata_json: String,
 }
@@ -50,6 +51,9 @@ pub struct ApiKey {
     pub spent_micros: i64,
     pub enabled: bool,
     pub last_used_at: Option<i64>,
+    /// When the key stops working. Without it the console cannot tell an expired
+    /// key from a working one and reports both as enabled.
+    pub expires_at: Option<i64>,
     pub created_at: i64,
 }
 
@@ -210,6 +214,10 @@ pub mod parity {
     pub struct OidcProvider {
         pub id: String,
         pub name: String,
+        pub display_name: String,
+        pub button_color: Option<String>,
+        pub logo_key: Option<String>,
+        pub login_only: bool,
         pub issuer_url: String,
         pub client_id: String,
         pub client_secret_envelope: String,
@@ -409,6 +417,14 @@ pub mod parity {
         pub status: String,
         pub retry_reason: Option<String>,
         pub credential_suffix: Option<String>,
+        /// The channel's display name, frozen when the attempt was created, so a
+        /// later rename cannot relabel history.
+        pub provider_name: Option<String>,
+        /// The exact upstream status when an HTTP response was observed, otherwise
+        /// NULL. A local failure never answered with one.
+        pub http_status: Option<i32>,
+        /// The same terminal classification the live observation event carried.
+        pub error_kind: Option<String>,
     }
 
     #[derive(Debug, Clone, FromQueryResult)]

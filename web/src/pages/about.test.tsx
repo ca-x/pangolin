@@ -4,6 +4,7 @@ import userEvent from '@testing-library/user-event'
 import { MemoryRouter } from 'react-router'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import i18n from '../i18n'
+import { ProjectProvider } from '../project'
 import { ThemeProvider } from '../theme'
 import SystemPage, { commitsDiffer, consoleBuild, formatBuildTime } from './SystemPage'
 
@@ -24,14 +25,20 @@ function consoleCommit() {
 const otherCommit = (commit: string) => (commit.replace(/-dirty$/, '') === 'ffffffffffff' ? 'fffffffffffe' : 'ffffffffffff')
 
 function stubBootstrap(build: unknown) {
-  vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => String(input).includes('bootstrap')
-    ? response({ initialized: true, authenticated: true, user: { id: 'owner', email: 'owner@example.test', role: 'admin', language: 'en', theme: 'system:bronze', created_at: 1 }, capture_payloads: false, build })
-    : response({ data: [], total: 0 })))
+  vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
+    const path = String(input)
+    if (path.includes('bootstrap')) return response({ initialized: true, authenticated: true, user: { id: 'owner', email: 'owner@example.test', role: 'admin', language: 'en', theme: 'system:bronze', created_at: 1 }, capture_payloads: false, build })
+    // The page reads its permissions from the project context, so the harness
+    // supplies one project and the owner scope.
+    if (path.endsWith('/projects')) return response([{ id: 'p1', name: 'Project A', slug: 'project-a', owner_user_id: 'u1', is_default: true, enabled: true }])
+    if (path.includes('/permissions')) return response(['*'])
+    return response({ data: [], total: 0 })
+  }))
 }
 
 async function openAbout() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-  render(<QueryClientProvider client={client}><ThemeProvider><MemoryRouter><SystemPage /></MemoryRouter></ThemeProvider></QueryClientProvider>)
+  render(<QueryClientProvider client={client}><ThemeProvider><MemoryRouter><ProjectProvider><SystemPage /></ProjectProvider></MemoryRouter></ThemeProvider></QueryClientProvider>)
   await userEvent.click(await screen.findByRole('tab', { name: 'About' }))
 }
 

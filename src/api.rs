@@ -19,13 +19,14 @@ pub(crate) mod errors;
 pub(crate) mod gateway;
 mod operations_api;
 mod protocols;
+mod trace_preview;
 
 use crate::{
     config::Config,
     crypto::{self, SecretBox},
     db,
     models::{ApiKeyInput, LoginRequest, ModelInput, ProviderInput, SetupRequest, User},
-    observability::{ObservationStore, RequestEvent, RequestFilter},
+    observability::{ObservationStore, RequestEvent, RequestFilter, Summary, SummaryFilter},
 };
 
 #[derive(Clone)]
@@ -67,6 +68,10 @@ pub enum ApiError {
     NotFound,
     #[error("{0}")]
     Conflict(String),
+    /// A conflict the client can name in its own language: the code is the
+    /// contract, the message carries the colliding value.
+    #[error("{1}")]
+    ConflictNamed(&'static str, String),
     #[error("{0}")]
     Upstream(String),
     #[error("{0}")]
@@ -97,6 +102,7 @@ impl ApiError {
             Self::Forbidden => (StatusCode::FORBIDDEN, "permission_error", self.to_string()),
             Self::NotFound => (StatusCode::NOT_FOUND, "not_found_error", self.to_string()),
             Self::Conflict(message) => (StatusCode::CONFLICT, "conflict_error", message),
+            Self::ConflictNamed(code, message) => (StatusCode::CONFLICT, code, message),
             Self::Upstream(message) => (StatusCode::BAD_GATEWAY, "upstream_error", message),
             Self::RateLimited(message) => {
                 (StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", message)
@@ -128,6 +134,14 @@ impl IntoResponse for ApiError {
 
 impl From<sea_orm::DbErr> for ApiError {
     fn from(value: sea_orm::DbErr) -> Self {
+        // A uniqueness violation is a client mistake, not an internal fault. It
+        // used to surface as an opaque 500 whose only clue was the constraint
+        // name in the server log. The message stays generic: the constraint is
+        // schema detail. Handlers that can name the colliding field pre-check and
+        // say so; this is the safety net for the rest.
+        if value.to_string().contains("UNIQUE constraint failed") {
+            return Self::Conflict("a record with those values already exists".into());
+        }
         Self::Internal(value.into())
     }
 }
@@ -210,7 +224,10 @@ async fn browser_csrf(request: axum::extract::Request, next: Next) -> Response {
                 .split(';')
                 .any(|cookie| cookie.trim().starts_with("pangolin_session="))
         });
-    if request.uri().path().starts_with("/api/admin/v1/")
+    let path = request.uri().path();
+    let csrf_protected = path.starts_with("/api/admin/v1/")
+        || (path.starts_with("/api/v1/auth/oidc/") && path.ends_with("/link/start"));
+    if csrf_protected
         && unsafe_method
         && browser_session
         && (request
@@ -393,12 +410,19 @@ async fn login(
     State(state): State<AppState>,
     Json(request): Json<LoginRequest>,
 ) -> Result<Response, ApiError> {
+    if !crate::oidc::password_login_allowed(&state.db)
+        .await
+        .map_err(errors::access)?
+    {
+        record_login_failure(&state, "login_only_policy").await;
+        return Err(ApiError::Unauthorized);
+    }
     let Some(user) = db::find_user_by_email(&state.db, &request.email).await? else {
-        record_login_failure(&state, &request.email).await;
+        record_login_failure(&state, "invalid_credentials").await;
         return Err(ApiError::Unauthorized);
     };
     if !crypto::verify_password(&request.password, &user.password_hash) {
-        record_login_failure(&state, &request.email).await;
+        record_login_failure(&state, "invalid_credentials").await;
         return Err(ApiError::Unauthorized);
     }
     db::record_audit_event(
@@ -413,20 +437,16 @@ async fn login(
     session_response(&state, &user).await
 }
 
-/// A failed login has no authenticated actor; record it anonymously and never let the audit
-/// write change the response the client sees.
-/// Records a rejected login. The endpoint is unauthenticated, so the identifier
-/// is attacker-controlled: keep it bounded (RFC 5321 caps an address at 254
-/// characters) rather than letting a caller write body-sized rows into the
-/// audit table on every attempt.
-async fn record_login_failure(state: &AppState, email: &str) {
-    let identifier: String = email.trim().chars().take(254).collect();
+/// A failed login has no authenticated actor. Record the attempted method and
+/// coarse reason, never the supplied identifier, so neither policy refusals nor
+/// bad credentials reveal whether an account exists in audit data.
+async fn record_login_failure(state: &AppState, reason: &'static str) {
     if let Err(error) = db::record_anonymous_audit_event(
         &state.db,
         "login_failed",
-        "user",
+        "authentication",
         "",
-        json!({"email": identifier}),
+        json!({"method":"password","reason":reason}),
     )
     .await
     {
@@ -608,43 +628,10 @@ async fn create_model(
     if input.public_name.trim().is_empty() || input.upstream_name.trim().is_empty() {
         return Err(ApiError::BadRequest("model names are required".into()));
     }
-    // Resolve catalog defaults outside the transaction.
-    let catalog = crate::catalog::repository::effective(&state.db)
-        .await
-        .map_err(|e| ApiError::Internal(e.into()))?;
-    let defaults = catalog.models.iter().find(|model| {
-        model.upstream_id == input.upstream_name
-            || model.id == input.upstream_name
-            || model.aliases.contains(&input.upstream_name)
-    });
-    let default_capabilities = defaults
-        .map(|model| model.gateway_capabilities())
-        .unwrap_or_else(|| {
-            vec![
-                "chat".to_owned(),
-                "responses".to_owned(),
-                "messages".to_owned(),
-            ]
-        });
-    let price = |value: Option<f64>| {
-        value
-            .filter(|value| {
-                value.is_finite() && *value >= 0.0 && *value <= (i64::MAX as f64 / 1_000_000.0)
-            })
-            .map(|value| (value * 1_000_000.0).round() as i64)
-            .unwrap_or(0)
-    };
-    let default_prices = defaults.filter(|model| {
-        model.cost_defaults.currency.as_deref() == Some("USD")
-            && model.cost_defaults.unit.as_deref() == Some("per_million_tokens")
-    });
-    let resolved = db::ModelCatalogDefaults {
-        capabilities: default_capabilities,
-        input_price_micros: price(default_prices.and_then(|model| model.cost_defaults.input)),
-        output_price_micros: price(default_prices.and_then(|model| model.cost_defaults.output)),
-        metadata: serde_json::json!({"catalog_version":catalog.version,"card":defaults})
-            .to_string(),
-    };
+    // This legacy endpoint creates manual models. The console's catalog-aware
+    // path resolves an explicit stable card id through the shared DB helper;
+    // guessing from an upstream name would create a second, weaker contract.
+    let resolved = db::ModelCatalogDefaults::manual();
     let tx = state
         .db
         .begin()
@@ -680,6 +667,27 @@ async fn delete_model(
         .begin()
         .await
         .map_err(|e| ApiError::Internal(e.into()))?;
+    let owned = tx
+        .query_one(crate::operations::sql(
+            "SELECT lifecycle,(SELECT COUNT(*) FROM model_prices WHERE model_id=models.id)+(SELECT COUNT(*) FROM usage_logs WHERE model_id=models.id) AS history FROM models WHERE id=? AND provider_id IN (SELECT id FROM providers WHERE project_id=?)",
+            vec![id.clone().into(), db::DEFAULT_PROJECT_ID.into()],
+        ))
+        .await?;
+    let Some(owned) = owned else {
+        return Err(ApiError::NotFound);
+    };
+    if owned.try_get::<String>("", "lifecycle")? != "archived" {
+        return Err(ApiError::ConflictNamed(
+            "archive_required",
+            "archive the model and review its delete impact before deleting it".into(),
+        ));
+    }
+    if owned.try_get::<i64>("", "history")? > 0 {
+        return Err(ApiError::ConflictNamed(
+            "history_retained",
+            "this archived model has immutable price or usage history and cannot be deleted".into(),
+        ));
+    }
     if db::delete_model_in(&tx, &id, db::DEFAULT_PROJECT_ID).await? {
         db::record_audit_event_in(&tx, &user.id, "delete", "model", &id, json!({}))
             .await
@@ -687,6 +695,7 @@ async fn delete_model(
         tx.commit()
             .await
             .map_err(|e| ApiError::Internal(e.into()))?;
+        state.orchestrator.reset_derived();
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(ApiError::NotFound)
@@ -769,15 +778,30 @@ async fn delete_api_key(
     }
 }
 
+/// A window that ends before it starts describes nothing. Answering an empty
+/// summary would look like a quiet instance, so the routes refuse it — with the
+/// console's own error envelope, and without naming a query, a table or any other
+/// cause behind the refusal.
+fn reject_inverted_window(filter: &SummaryFilter) -> Result<(), ApiError> {
+    if filter.is_ordered() {
+        return Ok(());
+    }
+    Err(ApiError::BadRequest(
+        "the observation window ends before it starts".into(),
+    ))
+}
+
 async fn observation_summary(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(filter): Query<SummaryFilter>,
 ) -> Result<impl IntoResponse, ApiError> {
     operations_api::actor(&state, &headers, None, false).await?;
+    reject_inverted_window(&filter)?;
     Ok(Json(
         state
             .observations
-            .summary()
+            .summary(filter)
             .await
             .map_err(ApiError::Internal)?,
     ))
@@ -814,32 +838,85 @@ async fn observation_detail(
 }
 
 async fn metrics(State(state): State<AppState>) -> Result<Response, ApiError> {
-    let summary = state.observations.summary().await.unwrap_or_default();
-    let drops = state.observations.dropped_breakdown();
+    let summary = state
+        .observations
+        .summary(SummaryFilter::default())
+        .await
+        .unwrap_or_default();
     let body = format!(
-        "# HELP pangolin_requests_total Requests observed in the last 24 hours\n# TYPE pangolin_requests_total gauge\npangolin_requests_total {}\n# HELP pangolin_errors_total Errors observed in the last 24 hours\n# TYPE pangolin_errors_total gauge\npangolin_errors_total {}\n# HELP pangolin_tokens_total Tokens observed in the last 24 hours\n# TYPE pangolin_tokens_total gauge\npangolin_tokens_total{{direction=\"input\"}} {}\npangolin_tokens_total{{direction=\"output\"}} {}\n# HELP pangolin_observability_available Whether the observation store is available\n# TYPE pangolin_observability_available gauge\npangolin_observability_available {}\n# HELP pangolin_observation_events_dropped_total Observation events dropped since process start\n# TYPE pangolin_observation_events_dropped_total counter\npangolin_observation_events_dropped_total {}\n# HELP pangolin_observation_drops_by_reason Events dropped by cause\n# TYPE pangolin_observation_drops_by_reason counter\npangolin_observation_drops_by_reason{{reason=\"queue_full\"}} {}\npangolin_observation_drops_by_reason{{reason=\"writer_down\"}} {}\npangolin_observation_drops_by_reason{{reason=\"stale_generation\"}} {}\npangolin_observation_drops_by_reason{{reason=\"batch_failed\"}} {}\n",
+        "{}{}",
+        observation_metrics(
+            &summary,
+            state.observations.is_available(),
+            state.observations.dropped_events(),
+            state.observations.dropped_breakdown(),
+        ),
+        state.orchestrator.metrics()
+    );
+    Ok(([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], body).into_response())
+}
+
+/// The observation half of the scrape body.
+///
+/// A window that measured no usage has no token total, so those gauges are absent
+/// rather than zero: `0` here would be a measurement nobody made, the same rule the
+/// console's `—` follows. The request and error counts keep their meaning.
+fn observation_metrics(
+    summary: &Summary,
+    available: bool,
+    dropped: u64,
+    drops: [(&str, u64); 5],
+) -> String {
+    let tokens = match (summary.input_tokens, summary.output_tokens) {
+        (Some(input), Some(output)) => format!(
+            "# HELP pangolin_tokens_total Tokens observed in the last 24 hours\n# TYPE pangolin_tokens_total gauge\npangolin_tokens_total{{direction=\"input\"}} {input}\npangolin_tokens_total{{direction=\"output\"}} {output}\n"
+        ),
+        _ => String::new(),
+    };
+    format!(
+        "# HELP pangolin_requests_total Requests observed in the last 24 hours\n# TYPE pangolin_requests_total gauge\npangolin_requests_total {}\n# HELP pangolin_errors_total Errors observed in the last 24 hours\n# TYPE pangolin_errors_total gauge\npangolin_errors_total {}\n{tokens}# HELP pangolin_observability_available Whether the observation store is available\n# TYPE pangolin_observability_available gauge\npangolin_observability_available {}\n# HELP pangolin_observation_events_dropped_total Observation events dropped since process start\n# TYPE pangolin_observation_events_dropped_total counter\npangolin_observation_events_dropped_total {}\n# HELP pangolin_observation_drops_by_reason Events dropped by cause\n# TYPE pangolin_observation_drops_by_reason counter\npangolin_observation_drops_by_reason{{reason=\"queue_full\"}} {}\npangolin_observation_drops_by_reason{{reason=\"writer_down\"}} {}\npangolin_observation_drops_by_reason{{reason=\"stale_generation\"}} {}\npangolin_observation_drops_by_reason{{reason=\"batch_failed\"}} {}\n",
         summary.requests,
         summary.errors,
-        summary.input_tokens,
-        summary.output_tokens,
-        i32::from(state.observations.is_available()),
-        state.observations.dropped_events(),
+        i32::from(available),
+        dropped,
         drops[0].1,
         drops[1].1,
         drops[2].1,
         drops[3].1,
-    );
-    let body = format!("{body}{}", state.orchestrator.metrics());
-    Ok(([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], body).into_response())
+    )
 }
 
 async fn gateway_models(
     State(state): State<AppState>,
+    Query(query): Query<GatewayModelsQuery>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let _maintenance = state.maintenance.clone().read_owned().await;
     let credential = gateway_key(&state, &headers).await?;
-    let models = crate::orchestration::visible_models(&state.db, &credential, &headers).await?;
+    let endpoints = if let Some(requested) = query.endpoint.as_deref() {
+        let endpoint = crate::providers::ENDPOINTS
+            .iter()
+            .copied()
+            .find(|endpoint| *endpoint == requested)
+            .ok_or_else(|| ApiError::BadRequest("unsupported model endpoint filter".into()))?;
+        vec![endpoint]
+    } else {
+        crate::providers::ENDPOINTS.to_vec()
+    };
+    // Unknown include values deliberately retain the historical response shape.
+    // Only the explicit compatibility opt-in may widen the document.
+    let models = if query.include.as_deref() == Some("all") {
+        crate::orchestration::visible_models_with_metadata_for(
+            &state.db,
+            &credential,
+            &headers,
+            &endpoints,
+        )
+        .await?
+    } else {
+        crate::orchestration::visible_models_for(&state.db, &credential, &headers, &endpoints)
+            .await?
+    };
     gateway::discovery_response(
         &state,
         &headers,
@@ -848,6 +925,16 @@ async fn gateway_models(
         "/v1/models",
     )
     .await
+}
+
+#[derive(Default, serde::Deserialize)]
+struct GatewayModelsQuery {
+    /// Restrict discovery to one concrete gateway endpoint. Omitting this keeps
+    /// the OpenAI-compatible aggregate list used by existing clients.
+    endpoint: Option<String>,
+    /// `all` opts into the bounded catalog-card projection. Unknown values are
+    /// compatibility no-ops and never widen the response.
+    include: Option<String>,
 }
 
 async fn gateway_chat(
@@ -1118,6 +1205,9 @@ async fn call_anthropic_chat(
     }
     let upstream = client.execute(request).await?;
     let status = upstream.status();
+    if let Some(accounting) = accounting.as_deref_mut() {
+        accounting.observed_status(status.as_u16());
+    }
     let bytes = gateway::read_body(upstream).await?;
     let body: Value = serde_json::from_slice(&bytes)
         .map_err(|_| std::io::Error::other("upstream JSON response is invalid"))?;
@@ -1348,6 +1438,102 @@ mod tests {
     use axum::{body::to_bytes, http::Request};
     use tower::ServiceExt as _;
 
+    #[tokio::test]
+    async fn client_network_identity_comes_only_from_the_server_connection() {
+        let app = Router::new()
+            .route(
+                "/peer",
+                get(|headers: HeaderMap| async move {
+                    trusted_client_ip(&headers)
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "—".into())
+                }),
+            )
+            .layer(middleware::from_fn(capture_trusted_client_ip));
+
+        let mut request = Request::get("/peer")
+            .header(TRUSTED_CLIENT_IP_HEADER, "198.51.100.1")
+            .header("x-forwarded-for", "198.51.100.2")
+            .header("forwarded", "for=198.51.100.3")
+            .header("user-agent", "private-agent")
+            .body(Body::empty())
+            .unwrap();
+        request.extensions_mut().insert(ConnectInfo(
+            "203.0.113.7:443".parse::<SocketAddr>().unwrap(),
+        ));
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(
+            to_bytes(response.into_body(), 1024).await.unwrap(),
+            "203.0.113.7"
+        );
+
+        let response = app
+            .oneshot(
+                Request::get("/peer")
+                    .header(TRUSTED_CLIENT_IP_HEADER, "198.51.100.1")
+                    .header("x-forwarded-for", "198.51.100.2")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(to_bytes(response.into_body(), 1024).await.unwrap(), "—");
+    }
+
+    /// A scrape publishes a token total only when the window measured one. The
+    /// console prints `—` for the same fact; a gauge of `0` would be a measurement
+    /// nobody made, and a measured zero stays a published zero.
+    #[test]
+    fn the_scrape_omits_a_token_total_it_could_not_measure() {
+        let unmeasured = Summary {
+            requests: 4,
+            errors: 2,
+            error_rate: 0.5,
+            p95_latency_ms: 12.0,
+            input_tokens: None,
+            output_tokens: None,
+            cost_micros: None,
+            series: vec![],
+        };
+        let drops = [
+            ("queue_full", 0),
+            ("writer_down", 0),
+            ("stale_generation", 0),
+            ("batch_failed", 0),
+            ("poisoned", 0),
+        ];
+        let body = observation_metrics(&unmeasured, true, 0, drops);
+        assert!(
+            !body.contains("pangolin_tokens_total"),
+            "an unmeasured window has no token total to publish: {body}"
+        );
+        assert!(body.contains("pangolin_requests_total 4"));
+        assert!(body.contains("pangolin_errors_total 2"));
+        assert!(body.contains("pangolin_observability_available 1"));
+
+        let measured = Summary {
+            input_tokens: Some(10),
+            output_tokens: Some(4),
+            ..unmeasured.clone()
+        };
+        let body = observation_metrics(&measured, true, 0, drops);
+        assert!(body.contains("pangolin_tokens_total{direction=\"input\"} 10"));
+        assert!(body.contains("pangolin_tokens_total{direction=\"output\"} 4"));
+
+        let zero = Summary {
+            input_tokens: Some(0),
+            output_tokens: Some(0),
+            ..unmeasured
+        };
+        let body = observation_metrics(&zero, false, 3, drops);
+        assert!(
+            body.contains("pangolin_tokens_total{direction=\"input\"} 0"),
+            "a measured zero is a real zero and is published as one: {body}"
+        );
+        assert!(body.contains("pangolin_observability_available 0"));
+        assert!(body.contains("pangolin_observation_events_dropped_total 3"));
+    }
+
     #[test]
     fn joins_upstream_paths_and_redacts_nested_secrets() {
         assert_eq!(
@@ -1430,6 +1616,95 @@ mod tests {
         assert!(cookie.starts_with("pangolin_session=ps_"));
         assert!(cookie.contains("HttpOnly"));
         assert!(cookie.contains("SameSite=Strict"));
+    }
+
+    #[tokio::test]
+    async fn local_password_login_refuses_all_login_only_but_allows_mixed_providers() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = db::connect("sqlite::memory:").await.unwrap();
+        db::create_initial_admin(
+            &database,
+            &SetupRequest {
+                email: "admin@example.com".into(),
+                password: "a secure password".into(),
+                instance_name: None,
+                language: None,
+            },
+        )
+        .await
+        .unwrap();
+        database.execute(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DbBackend::Sqlite,
+            "INSERT INTO oidc_providers(id,name,issuer_url,client_id,client_secret_envelope,enabled,login_only,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+            vec!["only".into(), "Only SSO".into(), "https://id.example.test".into(), "client".into(), "encrypted".into(), true.into(), true.into(), 1_i64.into(), 1_i64.into()],
+        )).await.unwrap();
+        let observations =
+            ObservationStore::open(directory.path().join("login-policy.duckdb"), 30).unwrap();
+        let app = router(AppState {
+            db: database.clone(),
+            config: Arc::new(Config {
+                bind: "127.0.0.1:0".parse().unwrap(),
+                data_dir: directory.path().into(),
+                database_url: "sqlite::memory:".into(),
+                observation_path: directory.path().join("login-policy.duckdb"),
+                observation_retention_days: 30,
+                public_url: None,
+                session_secure: false,
+                capture_payloads: false,
+                upstream_timeout: std::time::Duration::from_secs(30),
+                admin_email: None,
+                admin_password: None,
+                master_key: None,
+            }),
+            secrets: SecretBox::load(directory.path(), None).unwrap(),
+            observations,
+            client: reqwest::Client::new(),
+            oidc_client: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap(),
+            budget_locks: Arc::new(Mutex::new(HashMap::new())),
+            maintenance: Arc::new(tokio::sync::RwLock::new(())),
+            orchestrator: Arc::new(crate::orchestration::Runtime::default()),
+        });
+        let login_request = || {
+            Request::post("/api/v1/auth/login")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"email":"admin@example.com","password":"a secure password"}).to_string(),
+                ))
+                .unwrap()
+        };
+
+        let refused = app.clone().oneshot(login_request()).await.unwrap();
+        assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
+        assert!(refused.headers().get(header::SET_COOKIE).is_none());
+        let body = String::from_utf8(
+            axum::body::to_bytes(refused.into_body(), 4096)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(body.contains("authentication required"));
+        assert!(!body.contains("admin@example.com"));
+        let audit = database.query_one(sea_orm::Statement::from_string(
+            sea_orm::DbBackend::Sqlite,
+            "SELECT details FROM audit_events WHERE action='login_failed' ORDER BY created_at DESC,id DESC LIMIT 1",
+        )).await.unwrap().unwrap();
+        let details = audit.try_get::<String>("", "details").unwrap();
+        assert!(details.contains("\"method\":\"password\""));
+        assert!(!details.contains("admin@example.com"));
+
+        database.execute(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DbBackend::Sqlite,
+            "INSERT INTO oidc_providers(id,name,issuer_url,client_id,client_secret_envelope,enabled,login_only,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+            vec!["mixed".into(), "Mixed SSO".into(), "https://mixed.example.test".into(), "client".into(), "encrypted".into(), true.into(), false.into(), 1_i64.into(), 1_i64.into()],
+        )).await.unwrap();
+        assert_eq!(
+            app.oneshot(login_request()).await.unwrap().status(),
+            StatusCode::OK
+        );
     }
 
     #[tokio::test]
@@ -1561,7 +1836,14 @@ mod tests {
         assert_eq!(models_response.status(), StatusCode::OK);
         assert!(models_response.headers().contains_key("x-trace-id"));
         observations.flush().await;
-        assert_eq!(observations.summary().await.unwrap().requests, 2);
+        assert_eq!(
+            observations
+                .summary(SummaryFilter::default())
+                .await
+                .unwrap()
+                .requests,
+            2
+        );
         server.abort();
     }
 

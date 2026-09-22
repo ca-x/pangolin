@@ -114,6 +114,37 @@ impl Selection {
         Ok(())
     }
 }
+/// The restorable document for one stored artifact.
+///
+/// The console's restore parser requires `version`, `project_id` and `resources`
+/// alongside the envelope, so every route that hands an artifact to a client must
+/// build it here rather than return a subset of the row.
+pub async fn read_artifact(
+    db: &sea_orm::DatabaseConnection,
+    id: &str,
+    project: &str,
+) -> Result<Option<Artifact>, ApiError> {
+    let row = db
+        .query_one(sql(
+            "SELECT id,project_id,digest,manifest_json,envelope,created_at FROM backup_artifacts WHERE id=? AND project_id=?",
+            vec![id.into(), project.into()],
+        ))
+        .await?;
+    let Some(row) = row else { return Ok(None) };
+    let manifest: Value = serde_json::from_str(&row.try_get::<String>("", "manifest_json")?)
+        .map_err(|e| ApiError::Internal(e.into()))?;
+    Ok(Some(Artifact {
+        version: 1,
+        id: row.try_get("", "id")?,
+        project_id: row.try_get("", "project_id")?,
+        created_at: row.try_get("", "created_at")?,
+        digest: row.try_get("", "digest")?,
+        envelope: row.try_get("", "envelope")?,
+        resources: serde_json::from_value(manifest["resources"].clone())
+            .map_err(|e| ApiError::Internal(e.into()))?,
+    }))
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Artifact {

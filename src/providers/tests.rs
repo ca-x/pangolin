@@ -178,6 +178,58 @@ fn join_handles_version_prefixes_without_losing_model_slashes() {
     assert!(anthropic_text_request("claude-test",&json!({"model":"claude-test","messages":[{"role":"user","content":"hello"}],"max_tokens":32})).is_some());
 }
 
+/// The stream decision is the protocol's own, taken once at admission. A client
+/// flag is an answer only on the endpoints that accept one; the Gemini streaming
+/// action is an answer by URL shape; an endpoint with no stream choice at all has
+/// no answer to record, and `None` is how the record says so.
+#[test]
+fn the_stream_decision_is_the_protocol_shape_not_a_guess() {
+    assert_eq!(
+        streamed("/v1/chat/completions", &json!({"stream": true})),
+        Some(true)
+    );
+    assert_eq!(
+        streamed("/v1/chat/completions", &json!({"stream": false})),
+        Some(false)
+    );
+    assert_eq!(
+        streamed("/v1/responses", &json!({"model": "public"})),
+        Some(false),
+        "the endpoints that accept `stream` decide it even when the client omits it"
+    );
+    assert_eq!(
+        streamed("/v1/messages", &json!({"stream": true})),
+        Some(true)
+    );
+    assert_eq!(
+        streamed(
+            "/v1beta/models:streamGenerateContent",
+            &json!({"contents": []})
+        ),
+        Some(true),
+        "the streaming action is chosen by the URL, not by a body field"
+    );
+    assert_eq!(
+        streamed("/v1beta/models:generateContent", &json!({"contents": []})),
+        Some(false)
+    );
+    assert_eq!(
+        streamed("/v1/embeddings", &json!({"model": "public", "input": "hi"})),
+        None,
+        "an endpoint with no stream choice has none to record"
+    );
+    assert_eq!(
+        streamed("/v1/models", &json!({})),
+        None,
+        "a locally answered request never decided to stream anything"
+    );
+    assert_eq!(
+        streamed("/v1/chat/completions", &json!({"stream": "yes"})),
+        None,
+        "a value that is not a boolean is not a decision"
+    );
+}
+
 #[tokio::test]
 async fn task4_sigv4_matches_the_botocore_canonical_signature_fixture() {
     // Public AWS example credentials and LiteLLM's independently generated

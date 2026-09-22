@@ -7,6 +7,7 @@ import { InvitationAccept, Login, Setup } from './Auth'
 import Shell from './Shell'
 import { SkeletonRows } from './components'
 const AccessPage = lazy(() => import('./pages/AccessPage'))
+const AccountPage = lazy(() => import('./pages/AccountPage'))
 const ChannelsPage = lazy(() => import('./pages/ChannelsPage'))
 const ModelsPage = lazy(() => import('./pages/ModelsPage'))
 const OperationsPage = lazy(() => import('./pages/OperationsPage'))
@@ -64,6 +65,7 @@ export default function App() {
           <Route path="channels" element={<ChannelsPage />} />
           <Route path="models" element={<ModelsPage />} />
           <Route path="access" element={<AccessPage />} />
+          <Route path="account" element={<AccountPage />} />
           <Route path="prompts" element={<PromptsPage />} />
           <Route path="operations" element={<OperationsPage />} />
           <Route path="operations/requests/:id" element={<RequestDetailPage />} />

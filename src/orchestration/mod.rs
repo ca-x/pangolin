@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use crate::models::{ApiKeyCredential, RouteTarget};
 use policy::{CircuitPolicy, Limits, Retry, Routing, StickyMode};
+pub use protection::preview as preview_protection;
 pub use runtime::Runtime;
 
 #[derive(Debug, thiserror::Error)]
@@ -115,7 +116,7 @@ pub async fn visible_models(
     key: &ApiKeyCredential,
     headers: &HeaderMap,
 ) -> Result<Vec<Value>> {
-    visible_models_for(db, key, headers, crate::providers::ENDPOINTS).await
+    visible_models_internal(db, key, headers, crate::providers::ENDPOINTS, false).await
 }
 
 pub async fn visible_models_for(
@@ -124,9 +125,28 @@ pub async fn visible_models_for(
     headers: &HeaderMap,
     endpoints: &[&str],
 ) -> Result<Vec<Value>> {
+    visible_models_internal(db, key, headers, endpoints, false).await
+}
+
+pub async fn visible_models_with_metadata_for(
+    db: &DatabaseConnection,
+    key: &ApiKeyCredential,
+    headers: &HeaderMap,
+    endpoints: &[&str],
+) -> Result<Vec<Value>> {
+    visible_models_internal(db, key, headers, endpoints, true).await
+}
+
+async fn visible_models_internal(
+    db: &DatabaseConnection,
+    key: &ApiKeyCredential,
+    headers: &HeaderMap,
+    endpoints: &[&str],
+    include_metadata: bool,
+) -> Result<Vec<Value>> {
     use sea_orm::ConnectionTrait;
     let profile = load_profile(db, key).await?;
-    let rows=db.query_all(repository::statement("SELECT DISTINCT m.public_name,m.created_at FROM models m JOIN providers p ON p.id=m.provider_id WHERE p.project_id=? AND p.enabled=1 AND m.enabled=1 ORDER BY m.public_name",vec![key.project_id.clone().into()])).await?;
+    let rows=db.query_all(repository::statement("SELECT DISTINCT m.public_name,m.created_at FROM models m JOIN providers p ON p.id=m.provider_id WHERE p.project_id=? AND p.enabled=1 AND m.enabled=1 AND m.lifecycle='active' ORDER BY m.public_name",vec![key.project_id.clone().into()])).await?;
     let mut names = std::collections::BTreeMap::new();
     for row in rows {
         names.insert(
@@ -155,12 +175,43 @@ pub async fn visible_models_for(
             {
                 continue;
             }
-            let context = policy::context(&serde_json::json!({"model":mapped}), headers, endpoint);
-            if !repository::candidates(db, key, &mapped, &context, &profile.routing, &mut vec![])
-                .await?
-                .is_empty()
-            {
-                visible.push(serde_json::json!({"id":name,"object":"model","created":created,"owned_by":"pangolin"}));
+            let context = policy::context(
+                &serde_json::json!({"model":mapped}),
+                headers,
+                endpoint,
+                Some((&key.project_id, &key.id)),
+            );
+            let candidates =
+                repository::candidates(db, key, &mapped, &context, &profile.routing, &mut vec![])
+                    .await?;
+            if !candidates.is_empty() {
+                let mut model = serde_json::json!({"id":name,"object":"model","created":created,"owned_by":"pangolin"});
+                if include_metadata {
+                    // Candidate generation remains the authority: only after it
+                    // admits a target do we read and project that target's card.
+                    let mut card = None;
+                    for candidate in &candidates {
+                        let row = db
+                            .query_one(repository::statement(
+                                "SELECT m.catalog_metadata_json FROM models m JOIN providers p ON p.id=m.provider_id WHERE m.id=? AND p.project_id=?",
+                                vec![candidate.model_id.clone().into(), key.project_id.clone().into()],
+                            ))
+                            .await?;
+                        card = row
+                            .map(|row| row.try_get::<String>("", "catalog_metadata_json"))
+                            .transpose()?
+                            .as_deref()
+                            .and_then(crate::catalog::types::StoredModelMetadata::parse)
+                            .and_then(|metadata| metadata.card);
+                        if card.is_some() {
+                            break;
+                        }
+                    }
+                    if let Some(card) = card {
+                        model["metadata"] = serde_json::json!(card);
+                    }
+                }
+                visible.push(model);
                 break;
             }
         }
@@ -223,7 +274,12 @@ pub async fn prepare(
     let mapped = profile.map_model(requested)?;
     payload["model"] = Value::String(mapped.clone());
     let scope = format!("{}:{}", key.project_id, key.id);
-    let context = policy::context(&payload, headers, endpoint);
+    let context = policy::context(
+        &payload,
+        headers,
+        endpoint,
+        Some((&key.project_id, &key.id)),
+    );
     let mut decisions = vec![
         Decision {
             stage: "access",
@@ -288,7 +344,15 @@ pub async fn prepare(
         &mut session_request,
         profile.routing.allowed_tools.as_deref(),
     )?;
-    protection::inject(db, &key.project_id, &mut payload, &context, endpoint).await?;
+    protection::inject(
+        db,
+        &key.project_id,
+        &mut payload,
+        &context,
+        endpoint,
+        &mut decisions,
+    )
+    .await?;
     protection::apply(&protection, &mut payload, &context, &mut decisions)?;
     protection::tools(&mut payload, profile.routing.allowed_tools.as_deref())?;
     // Until a provider tokenizer is available, UTF-8 bytes plus the requested output

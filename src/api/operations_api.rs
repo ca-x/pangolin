@@ -1,7 +1,9 @@
 use super::*;
 use crate::operations::{self, backup, id, jobs, logging, pricing, sql, storage};
-use sea_orm::{ConnectionTrait, TransactionTrait};
+use sea_orm::{ConnectionTrait, DatabaseTransaction, TransactionTrait};
 use serde::{Deserialize, Serialize};
+
+use super::trace_preview;
 
 pub(super) fn router(state: AppState) -> Router<AppState> {
     let instance = Router::new()
@@ -15,6 +17,28 @@ pub(super) fn router(state: AppState) -> Router<AppState> {
             operations::instance_backup::MAX_ARTIFACT_BYTES,
         ))
         .layer(middleware::from_fn_with_state(state, instance_owner));
+    let profile_templates = Router::new()
+        .route(
+            "/api/admin/v1/projects/{project}/profile-templates",
+            get(list_profile_templates).post(create_profile_template),
+        )
+        .route(
+            "/api/admin/v1/projects/{project}/profile-templates/import",
+            post(import_profile_template),
+        )
+        .route(
+            "/api/admin/v1/projects/{project}/profile-templates/{id}",
+            axum::routing::put(update_profile_template).delete(delete_profile_template),
+        )
+        .route(
+            "/api/admin/v1/projects/{project}/profile-templates/{id}/export",
+            get(export_profile_template),
+        )
+        .route(
+            "/api/admin/v1/projects/{project}/profile-templates/{id}/apply",
+            post(apply_profile_template),
+        )
+        .layer(axum::extract::DefaultBodyLimit::max(128 * 1024));
     Router::new()
         .route(
             "/api/admin/v1/settings/request-logging",
@@ -31,6 +55,26 @@ pub(super) fn router(state: AppState) -> Router<AppState> {
         .route(
             "/api/admin/v1/projects/{project}/operations/{resource}/{id}",
             get(detail).delete(remove),
+        )
+        .route(
+            "/api/admin/v1/projects/{project}/traces/{id}/lifecycle",
+            post(trace_lifecycle),
+        )
+        .route(
+            "/api/admin/v1/projects/{project}/models/{id}/lifecycle",
+            post(model_lifecycle),
+        )
+        .route(
+            "/api/admin/v1/projects/{project}/models/{id}/delete-impact",
+            get(model_delete_impact),
+        )
+        .route(
+            "/api/admin/v1/projects/{project}/playground/chat",
+            post(playground_chat).layer(axum::extract::DefaultBodyLimit::max(8 * 1024 * 1024)),
+        )
+        .route(
+            "/api/admin/v1/projects/{project}/playground/models",
+            get(playground_models),
         )
         .route("/api/admin/v1/projects/{project}/analytics", get(analytics))
         .route(
@@ -54,12 +98,24 @@ pub(super) fn router(state: AppState) -> Router<AppState> {
             post(routing_preview),
         )
         .route(
+            "/api/admin/v1/projects/{project}/protection-preview",
+            post(protection_preview).layer(axum::extract::DefaultBodyLimit::max(32 * 1024)),
+        )
+        .route(
             "/api/admin/v1/projects/{project}/backup/export",
             post(export),
         )
         .route(
             "/api/admin/v1/projects/{project}/backup/restore",
             post(restore),
+        )
+        .route(
+            "/api/admin/v1/projects/{project}/backup/artifacts",
+            get(list_artifacts),
+        )
+        .route(
+            "/api/admin/v1/projects/{project}/backup/artifacts/{artifact}",
+            get(get_artifact),
         )
         .route(
             "/api/admin/v1/projects/{project}/backup/run",
@@ -70,6 +126,7 @@ pub(super) fn router(state: AppState) -> Router<AppState> {
             post(retry_backup),
         )
         .layer(axum::extract::DefaultBodyLimit::max(48 * 1024 * 1024))
+        .merge(profile_templates)
         .merge(instance)
 }
 async fn instance_owner(
@@ -122,10 +179,9 @@ pub(super) async fn actor(
     project: Option<&str>,
     write: bool,
 ) -> Result<crate::access::Principal, ApiError> {
-    let user = crate::access_api::principal(state, headers).await?;
-    crate::access::authorize(
-        &state.db,
-        &user,
+    actor_for(
+        state,
+        headers,
         project,
         if project.is_none() {
             "*"
@@ -134,9 +190,29 @@ pub(super) async fn actor(
         } else {
             "project:read"
         },
+        write,
     )
     .await
-    .map_err(|_| ApiError::Forbidden)?;
+}
+/// The same principal resolution with the required permission named explicitly.
+///
+/// Generic operations require `project:manage`, but a mutation that belongs to a
+/// narrower contract must require *that* contract's permission: a custom role holding
+/// only `api_key:manage` may change a key through the dedicated route, so the bulk key
+/// action has to accept exactly the same authority instead of the generic gate. The
+/// browser-mutation guard is not part of the permission question and is applied
+/// identically for both.
+async fn actor_for(
+    state: &AppState,
+    headers: &HeaderMap,
+    project: Option<&str>,
+    permission: &str,
+    write: bool,
+) -> Result<crate::access::Principal, ApiError> {
+    let user = crate::access_api::principal(state, headers).await?;
+    crate::access::authorize(&state.db, &user, project, permission)
+        .await
+        .map_err(|_| ApiError::Forbidden)?;
     if write && user.kind == crate::access::PrincipalKind::Session {
         // A required non-simple header forces browser cross-origin mutations through
         // CORS preflight; these routes grant no cross-origin CORS permission.
@@ -159,10 +235,15 @@ async fn audit_in(
 ) -> Result<(), ApiError> {
     operations::audit(db, Some(user), project, action, resource).await
 }
+/// The effective policy: the stored document parsed tolerantly, so a field this
+/// build does not know neither breaks admission nor makes the settings form
+/// unrepairable. The console reads the policy and writes back what it read, so a
+/// read that echoed an unknown field would leave the operator with a form whose
+/// only answer is the strict write contract's 400.
 async fn log_policy(
     State(state): State<AppState>,
     headers: HeaderMap,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<logging::Policy>, ApiError> {
     actor(&state, &headers, None, false).await?;
     let row = state
         .db
@@ -171,19 +252,23 @@ async fn log_policy(
             vec![],
         ))
         .await?;
-    Ok(Json(if let Some(row) = row {
-        serde_json::from_str(&row.try_get::<String>("", "value")?)
-            .map_err(|e| ApiError::Internal(e.into()))?
-    } else {
-        serde_json::to_value(logging::Policy::default()).unwrap()
+    Ok(Json(match row {
+        Some(row) => serde_json::from_str(&row.try_get::<String>("", "value")?)
+            .map_err(|e| ApiError::Internal(e.into()))?,
+        None => logging::Policy::default(),
     }))
 }
 async fn set_log_policy(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(policy): Json<logging::Policy>,
+    Json(document): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
     let user = actor(&state, &headers, None, true).await?;
+    // Strict at the boundary, tolerant in the record system: the extracted
+    // document is validated by the write contract before anything is converted
+    // into the runtime policy, so a typo is a 400 that writes nothing rather than
+    // a silently different policy that is stored and audited.
+    let policy: logging::Policy = logging::PolicyInput::parse(document)?.into();
     let tx = state.db.begin().await?;
     logging::set_policy(&tx, &policy).await?;
     audit_in(&tx, &user, "", "logging.update", "request_logging").await?;
@@ -258,6 +343,43 @@ struct Filter {
     provider: Option<String>,
     api_key: Option<String>,
     q: Option<String>,
+    /// The trace list's own lifecycle facet. Only the traces resource reads it.
+    lifecycle: Option<String>,
+}
+
+/// A resource's stable point-in-time event column. Keeping the SQL spelling in a
+/// closed type prevents a request value from ever becoming a SQL identifier.
+#[derive(Clone, Copy)]
+enum EventTimeColumn {
+    Created,
+    Started,
+    Probed,
+    Collected,
+}
+
+impl EventTimeColumn {
+    const fn sql(self) -> &'static str {
+        match self {
+            Self::Created => "created_at",
+            Self::Started => "started_at",
+            Self::Probed => "probed_at",
+            Self::Collected => "collected_at",
+        }
+    }
+}
+
+/// The generic list filters only stable event times. Mutable state timestamps,
+/// future schedule times and validity intervals are intentionally not events.
+fn event_time_column(resource: &str) -> Option<EventTimeColumn> {
+    match resource {
+        "channels" | "credentials" | "models" | "associations" | "key-profiles" | "prompts"
+        | "protection" | "threads" | "usage" | "prices" | "storage" | "jobs" | "webhooks"
+        | "webhook-deliveries" | "audit" => Some(EventTimeColumn::Created),
+        "traces" | "requests" | "executions" => Some(EventTimeColumn::Started),
+        "probes" => Some(EventTimeColumn::Probed),
+        "quotas" => Some(EventTimeColumn::Collected),
+        _ => None,
+    }
 }
 fn query(resource: &str) -> Result<(&'static str, &'static str, &'static str), ApiError> {
     // Public projections deliberately omit encrypted secrets and raw job payloads.
@@ -280,7 +402,7 @@ fn query(resource: &str) -> Result<(&'static str, &'static str, &'static str), A
         "models" => (
             "models",
             "provider_id IN (SELECT id FROM providers WHERE project_id=?)",
-            "json_object('id',id,'provider_id',provider_id,'provider_name',(SELECT name FROM providers WHERE id=models.provider_id),'public_name',public_name,'upstream_name',upstream_name,'capabilities',json(capabilities),'input_price_micros',input_price_micros,'output_price_micros',output_price_micros,'priority',priority,'enabled',enabled,'catalog_metadata',json(catalog_metadata_json),'created_at',created_at)",
+            "json_object('id',id,'provider_id',provider_id,'provider_name',(SELECT name FROM providers WHERE id=models.provider_id),'public_name',public_name,'upstream_name',upstream_name,'capabilities',json(capabilities),'input_price_micros',input_price_micros,'output_price_micros',output_price_micros,'priority',priority,'enabled',enabled,'lifecycle',lifecycle,'catalog_metadata_raw',catalog_metadata_json,'created_at',created_at)",
         ),
         "associations" => (
             "model_associations",
@@ -295,12 +417,12 @@ fn query(resource: &str) -> Result<(&'static str, &'static str, &'static str), A
         "prompts" => (
             "prompts",
             "project_id=?",
-            "json_object('id',id,'name',name,'role',role,'content',content,'activation',json(activation_json),'enabled',enabled,'created_at',created_at,'updated_at',updated_at)",
+            "json_object('id',id,'name',name,'role',role,'content',content,'activation',json(activation_json),'order',\"order\",'action',action,'enabled',enabled,'created_at',created_at,'updated_at',updated_at)",
         ),
         "protection" => (
             "prompt_protection_rules",
             "project_id=?",
-            "json_object('id',id,'name',name,'role_pattern',role_pattern,'content_pattern',content_pattern,'action',action,'replacement',replacement,'scopes',json(scopes_json),'test_mode',test_mode,'enabled',enabled,'created_at',created_at,'updated_at',updated_at)",
+            "json_object('id',id,'name',name,'description',description,'role_pattern',role_pattern,'content_pattern',content_pattern,'action',action,'replacement',replacement,'scopes',json(scopes_json),'test_mode',test_mode,'enabled',enabled,'state',state,'created_at',created_at,'updated_at',updated_at)",
         ),
         "health" => (
             "channel_health_state",
@@ -310,7 +432,7 @@ fn query(resource: &str) -> Result<(&'static str, &'static str, &'static str), A
         "credential-health" => (
             "credential_health_state",
             "credential_id IN (SELECT c.id FROM channel_credentials c JOIN providers p ON p.id=c.provider_id WHERE p.project_id=?)",
-            "json_object('id',credential_id,'consecutive_failures',consecutive_failures,'disabled_until',disabled_until,'updated_at',updated_at)",
+            "json_object('id',credential_id,'credential_id',credential_id,'consecutive_failures',consecutive_failures,'disabled_until',disabled_until,'updated_at',updated_at)",
         ),
         "threads" => (
             "threads",
@@ -320,17 +442,23 @@ fn query(resource: &str) -> Result<(&'static str, &'static str, &'static str), A
         "traces" => (
             "traces",
             "project_id=?",
-            "json_object('id',id,'thread_id',thread_id,'external_id',external_id,'api_key_id',api_key_id,'status',status,'started_at',started_at,'finished_at',finished_at)",
+            // `request_count` is a count of the record system's own request rows,
+            // not of the projection: it stays right while observability is down.
+            // `first_user_query` is filled in from the stored bodies of the page
+            // by `trace_previews`, which is the only place a body is read.
+            // `status` is what the run did and `lifecycle` is where the operator
+            // filed it: two different facts, so they are two different columns.
+            "json_object('id',id,'thread_id',thread_id,'external_id',external_id,'api_key_id',api_key_id,'status',status,'lifecycle',lifecycle,'started_at',started_at,'finished_at',finished_at,'request_count',(SELECT COUNT(*) FROM requests WHERE trace_id=traces.id),'first_user_query',NULL)",
         ),
         "requests" => (
             "requests",
             "trace_id IN (SELECT id FROM traces WHERE project_id=?)",
-            "json_object('id',id,'trace_id',trace_id,'protocol',protocol,'endpoint',endpoint,'model',requested_model,'status',status,'started_at',started_at,'finished_at',finished_at,'metadata',json(request_metadata_json))",
+            "json_object('id',id,'trace_id',trace_id,'protocol',protocol,'endpoint',endpoint,'model',requested_model,'status',status,'source_ip',source_ip,'started_at',started_at,'finished_at',finished_at,'metadata',json(request_metadata_json))",
         ),
         "executions" => (
             "request_executions",
             "request_id IN (SELECT r.id FROM requests r JOIN traces t ON t.id=r.trace_id WHERE t.project_id=?)",
-            "json_object('id',id,'request_id',request_id,'provider_id',provider_id,'credential_suffix',credential_suffix,'attempt',attempt,'model',model,'status',status,'retry_reason',retry_reason,'latency_ms',latency_ms,'first_token_at',first_token_at)",
+            "json_object('id',id,'request_id',request_id,'provider_id',provider_id,'provider_name',provider_name,'credential_suffix',credential_suffix,'attempt',attempt,'model',model,'status',status,'retry_reason',retry_reason,'latency_ms',latency_ms,'first_token_at',first_token_at,'http_status',http_status,'error_kind',error_kind)",
         ),
         "usage" => (
             "usage_logs",
@@ -365,7 +493,7 @@ fn query(resource: &str) -> Result<(&'static str, &'static str, &'static str), A
         "schedules" => (
             "operation_schedules",
             "project_id=?",
-            "json_object('id',id,'kind',kind,'payload',json(payload_json),'interval_secs',interval_secs,'next_run_at',next_run_at,'enabled',enabled,'revision',revision)",
+            "json_object('id',id,'kind',kind,'payload',json(payload_json),'interval_secs',interval_secs,'next_run_at',next_run_at,'enabled',enabled,'revision',revision,'last_error',last_error)",
         ),
         "jobs" => (
             "operation_jobs",
@@ -411,16 +539,90 @@ async fn list(
     Path((project, resource)): Path<(String, String)>,
     Query(filter): Query<Filter>,
 ) -> Result<Json<Value>, ApiError> {
-    actor(&state, &headers, Some(&project), false).await?;
+    actor_for(
+        &state,
+        &headers,
+        Some(&project),
+        if resource == "key-profiles" {
+            "api_key:manage"
+        } else {
+            "project:read"
+        },
+        false,
+    )
+    .await?;
     let (table, scope, projection) = query(&resource)?;
     let query = filter
         .q
         .filter(|value| !value.trim().is_empty() && value.len() <= 128)
         .map(|value| format!("%{}%", value.trim()));
-    let rows=state.db.query_all(sql(format!("SELECT document FROM (SELECT {projection} AS document,rowid AS source_rowid FROM {table} WHERE {scope}) WHERE (? IS NULL OR document LIKE ?) ORDER BY source_rowid DESC LIMIT ? OFFSET ?"),vec![project.clone().into(),query.clone().into(),query.clone().into(),i64::from(filter.limit.unwrap_or(100).clamp(1,500)).into(),i64::from(filter.offset).into()])).await?;
-    let total=state.db.query_one(sql(format!("SELECT COUNT(*) AS total FROM (SELECT {projection} AS document FROM {table} WHERE {scope}) WHERE (? IS NULL OR document LIKE ?)"),vec![project.into(),query.clone().into(),query.into()])).await?.map(|row|row.try_get::<i64>("","total")).transpose()?.unwrap_or(0);
+    // The trace lifecycle facet is a predicate on the record system's own column,
+    // not a text search: the default view is the one the operator contract names —
+    // active and retained — and the archived traces stay reachable by asking for
+    // them. Every value is a literal from this list, so nothing a caller sends
+    // reaches the statement.
+    let lifecycle = match (resource.as_str(), filter.lifecycle.as_deref()) {
+        ("traces", None) => Some("lifecycle!='archived'"),
+        ("traces", Some("active")) => Some("lifecycle='active'"),
+        ("traces", Some("retained")) => Some("lifecycle='retained'"),
+        ("traces", Some("archived")) => Some("lifecycle='archived'"),
+        ("traces", Some("all")) => None,
+        ("traces", Some(_)) => {
+            return Err(ApiError::BadRequest(
+                "unknown trace lifecycle filter".into(),
+            ));
+        }
+        ("models", None | Some("active")) => Some("lifecycle='active'"),
+        ("models", Some("archived")) => Some("lifecycle='archived'"),
+        ("models", Some("all")) => None,
+        ("models", Some(_)) => {
+            return Err(ApiError::BadRequest(
+                "unknown model lifecycle filter".into(),
+            ));
+        }
+        _ => None,
+    };
+    let lifecycle = lifecycle
+        .map(|predicate| format!(" AND ({predicate})"))
+        .unwrap_or_default();
+    // Build the project, resource-state and event-time predicates once. The page
+    // and its total clone the same values, so pagination can never describe a
+    // different window from the rows it accompanies.
+    let mut predicate = format!("{scope}{lifecycle}");
+    let mut scoped_values: Vec<sea_orm::Value> = vec![project.into()];
+    if let Some(column) = event_time_column(&resource) {
+        if let Some(from) = filter.from {
+            predicate.push_str(&format!(" AND {}>=?", column.sql()));
+            scoped_values.push(from.into());
+        }
+        if let Some(until) = filter.until {
+            predicate.push_str(&format!(" AND {}<?", column.sql()));
+            scoped_values.push(until.into());
+        }
+    }
+    let limit = filter.limit.unwrap_or(100).clamp(1, 500);
+    let mut row_values = scoped_values.clone();
+    row_values.extend([
+        query.clone().into(),
+        query.clone().into(),
+        i64::from(limit).into(),
+        i64::from(filter.offset).into(),
+    ]);
+    let rows=state.db.query_all(sql(format!("SELECT document FROM (SELECT {projection} AS document,rowid AS source_rowid FROM {table} WHERE {predicate}) WHERE (? IS NULL OR document LIKE ?) ORDER BY source_rowid DESC LIMIT ? OFFSET ?"),row_values)).await?;
+    let mut total_values = scoped_values;
+    total_values.extend([query.clone().into(), query.into()]);
+    let total=state.db.query_one(sql(format!("SELECT COUNT(*) AS total FROM (SELECT {projection} AS document FROM {table} WHERE {predicate}) WHERE (? IS NULL OR document LIKE ?)"),total_values)).await?.map(|row|row.try_get::<i64>("","total")).transpose()?.unwrap_or(0);
+    let mut data = documents(rows)?;
+    // The one projection whose rows carry a derived read: the page's own traces,
+    // enriched in a single bounded query rather than one read per row.
+    if resource == "traces" {
+        trace_previews(&state.db, &mut data).await?;
+    }
+    if resource == "models" {
+        project_model_catalog_cards(&mut data);
+    }
     Ok(Json(
-        json!({"data":documents(rows)?,"total":total,"offset":filter.offset,"limit":filter.limit.unwrap_or(100).clamp(1,500)}),
+        json!({"data":data,"total":total,"offset":filter.offset,"limit":limit}),
     ))
 }
 fn documents(rows: Vec<sea_orm::QueryResult>) -> Result<Vec<Value>, ApiError> {
@@ -431,20 +633,416 @@ fn documents(rows: Vec<sea_orm::QueryResult>) -> Result<Vec<Value>, ApiError> {
         })
         .collect()
 }
+
+/// Turns the immutable catalog snapshot on a model into the small, typed card
+/// projection the console and public model metadata can consume.
+///
+/// Historical databases may contain `{}`, an older card shape, or hand-edited
+/// malformed text. None of those may make the project model list unavailable:
+/// every unrecorded or wrongly typed fact stays JSON null. The original valid
+/// metadata remains in the response for compatibility, but the console never
+/// has to interpret that raw document.
+fn project_model_catalog_cards(rows: &mut [Value]) {
+    for row in rows {
+        let raw = row
+            .as_object_mut()
+            .and_then(|object| object.remove("catalog_metadata_raw"))
+            .and_then(|value| value.as_str().map(str::to_owned));
+        let metadata = raw
+            .as_deref()
+            .and_then(crate::catalog::types::StoredModelMetadata::parse);
+        let card = metadata
+            .as_ref()
+            .and_then(|metadata| metadata.card.as_ref());
+        let object = row.as_object_mut().expect("list documents are objects");
+        object.insert(
+            "catalog_metadata".into(),
+            metadata
+                .as_ref()
+                .map(|metadata| metadata.raw.clone())
+                .unwrap_or(Value::Null),
+        );
+        object.insert(
+            "catalog_developer".into(),
+            json!(card.and_then(|card| card.developer.as_deref())),
+        );
+        object.insert(
+            "catalog_model_type".into(),
+            json!(card.and_then(|card| card.model_type.as_deref())),
+        );
+        object.insert(
+            "catalog_logo_key".into(),
+            json!(card.and_then(|card| card.logo_key.as_deref())),
+        );
+        object.insert(
+            "catalog_context_limit_tokens".into(),
+            json!(card.and_then(|card| card.limits.context)),
+        );
+        object.insert(
+            "catalog_output_limit_tokens".into(),
+            json!(card.and_then(|card| card.limits.output)),
+        );
+        object.insert(
+            "catalog_input_cost".into(),
+            json!(card.and_then(|card| card.cost_defaults.input)),
+        );
+        object.insert(
+            "catalog_output_cost".into(),
+            json!(card.and_then(|card| card.cost_defaults.output)),
+        );
+        object.insert(
+            "catalog_cost_currency".into(),
+            json!(card.and_then(|card| card.cost_defaults.currency.as_deref())),
+        );
+        object.insert(
+            "catalog_cost_unit".into(),
+            json!(card.and_then(|card| card.cost_defaults.unit.as_deref())),
+        );
+    }
+}
+/// How many requests of one trace are read while looking for the earliest user
+/// input, and how large a stored body may be before it is not read at all. Both
+/// are hard bounds: a client can put a thousand requests in one trace, and a
+/// preview is a triage convenience, not a reason to read a page of megabyte bodies.
+/// The size is measured in stored bytes (`length` counts characters of text, so the
+/// value is cast), because bytes are what reading one costs.
+const PREVIEW_REQUESTS_PER_TRACE: i64 = 8;
+const PREVIEW_BODY_BYTES: i64 = 256 * 1024;
+/// Fills `first_user_query` on trace rows from the request bodies the logging
+/// policy already stored.
+///
+/// One query for the whole page — the earliest stored bodies of the traces on it,
+/// in order, never one read per row — and the extraction itself lives in
+/// `trace_preview`, because the protocol shapes are the gateway's own contract.
+/// A trace whose stored bodies hold no user text, or whose bodies were never
+/// captured, keeps NULL: the console prints `—` for a fact nobody measured.
+///
+/// The ids bound this read twice over: they are the internal trace ids of rows that
+/// were already read under the caller's project scope, and a trace id is the record
+/// system's primary key, so naming one here cannot reach a trace that scope denied.
+async fn trace_previews(db: &DatabaseConnection, rows: &mut [Value]) -> Result<(), ApiError> {
+    let mut values: Vec<sea_orm::Value> = rows
+        .iter()
+        .filter_map(|row| row["id"].as_str().map(|id| id.to_owned().into()))
+        .collect();
+    if values.is_empty() {
+        return Ok(());
+    }
+    let placeholders = vec!["?"; values.len()].join(",");
+    values.push(PREVIEW_BODY_BYTES.into());
+    values.push(PREVIEW_REQUESTS_PER_TRACE.into());
+    let candidates = db
+        .query_all(sql(
+            // "Earliest" is `started_at` and then the arrival order: request rows
+            // are stamped with a second, and several requests of one trace share it
+            // routinely, so ordering by the primary key there would have picked one
+            // at random and made the preview a coin toss.
+            format!(
+                "SELECT trace_id,request_json FROM (SELECT r.trace_id AS trace_id,c.request_json AS request_json,ROW_NUMBER() OVER (PARTITION BY r.trace_id ORDER BY r.started_at,r.rowid) AS position FROM requests r JOIN request_contents c ON c.request_id=r.id WHERE r.trace_id IN ({placeholders}) AND c.request_json IS NOT NULL AND length(CAST(c.request_json AS BLOB))<=?) WHERE position<=? ORDER BY trace_id,position"
+            ),
+            values,
+        ))
+        .await?;
+    let mut previews: HashMap<String, String> = HashMap::new();
+    for row in candidates {
+        let trace: String = row.try_get("", "trace_id")?;
+        // The rows arrive in request order per trace, so the first extraction that
+        // yields text is the earliest user input of that trace.
+        if previews.contains_key(&trace) {
+            continue;
+        }
+        let stored: Option<String> = row.try_get("", "request_json")?;
+        if let Some(text) = trace_preview::first_user_query(stored.as_deref()) {
+            previews.insert(trace, text);
+        }
+    }
+    for row in rows.iter_mut() {
+        let preview = row["id"]
+            .as_str()
+            .and_then(|id| previews.get(id))
+            .map(|text| json!(text))
+            .unwrap_or(Value::Null);
+        if let Some(object) = row.as_object_mut() {
+            object.insert("first_user_query".into(), preview);
+        }
+    }
+    Ok(())
+}
+
+/// The four trace lifecycle actions, as one project-scoped mutation.
+///
+/// The lifecycle is not the execution outcome: `traces.status` says what the run
+/// did, `traces.lifecycle` says where the operator filed it. The transition table
+/// is the operator contract and nothing else — active may be archived or retained,
+/// and each of those is released by its own action — so a repeat or a crossed
+/// transition is a typed 409 rather than a silent second status machine.
+///
+/// The state change and its audit row are one SQLite transaction, and nothing here
+/// touches the derived projection or the network.
+async fn trace_lifecycle(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((project, id)): Path<(String, String)>,
+    Json(value): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    let user = actor(&state, &headers, Some(&project), true).await?;
+    let action = value
+        .get("action")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ApiError::BadRequest("action is required".into()))?;
+    let (audit, required, next) = match action {
+        "archive" => ("trace.archive", "active", "archived"),
+        "unarchive" => ("trace.unarchive", "archived", "active"),
+        "retain" => ("trace.retain", "active", "retained"),
+        "unretain" => ("trace.unretain", "retained", "active"),
+        _ => {
+            return Err(ApiError::BadRequest(
+                "unknown trace lifecycle action".into(),
+            ));
+        }
+    };
+    let transaction = state.db.begin().await?;
+    // Ownership is proven before anything is written, and a trace of another
+    // project and a trace that does not exist get the same 404: the answer must not
+    // tell a caller which of the two it named.
+    let current: String = transaction
+        .query_one(sql(
+            "SELECT lifecycle FROM traces WHERE project_id=? AND id=?",
+            vec![project.clone().into(), id.clone().into()],
+        ))
+        .await?
+        .ok_or(ApiError::NotFound)?
+        .try_get("", "lifecycle")?;
+    if current != required {
+        return Err(ApiError::ConflictNamed(
+            "invalid_trace_transition",
+            format!("trace is {current}; {action} requires {required}"),
+        ));
+    }
+    // The same predicate guards the write, so two accepted actions cannot both
+    // land: the loser is the conflict the pre-check would have reported.
+    let changed = transaction
+        .execute(sql(
+            "UPDATE traces SET lifecycle=? WHERE project_id=? AND id=? AND lifecycle=?",
+            vec![
+                next.into(),
+                project.clone().into(),
+                id.clone().into(),
+                required.into(),
+            ],
+        ))
+        .await?
+        .rows_affected();
+    if changed != 1 {
+        return Err(ApiError::ConflictNamed(
+            "invalid_trace_transition",
+            format!("trace is no longer {required}"),
+        ));
+    }
+    audit_in(&transaction, &user, &project, audit, &id).await?;
+    transaction.commit().await?;
+    Ok(Json(json!({"id":id,"lifecycle":next})))
+}
+
+#[derive(Deserialize)]
+struct ModelLifecycleAction {
+    action: String,
+}
+
+async fn model_lifecycle(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((project, model)): Path<(String, String)>,
+    Json(input): Json<ModelLifecycleAction>,
+) -> Result<Json<Value>, ApiError> {
+    let user = actor(&state, &headers, Some(&project), true).await?;
+    let (from, to, audit) = match input.action.as_str() {
+        "archive" => ("active", "archived", "model.archive"),
+        "restore" => ("archived", "active", "model.restore"),
+        _ => {
+            return Err(ApiError::BadRequest(
+                "unknown model lifecycle action".into(),
+            ));
+        }
+    };
+    let tx = state.db.begin().await?;
+    let owned = tx
+        .query_one(sql(
+            "SELECT m.lifecycle FROM models m JOIN providers p ON p.id=m.provider_id WHERE m.id=? AND p.project_id=?",
+            vec![model.clone().into(), project.clone().into()],
+        ))
+        .await?;
+    let Some(owned) = owned else {
+        return Err(ApiError::NotFound);
+    };
+    let current: String = owned.try_get("", "lifecycle")?;
+    if current != from {
+        return Err(ApiError::Conflict(format!(
+            "model is already {current}; only {from} models may be {}d",
+            input.action
+        )));
+    }
+    let changed = tx
+        .execute(sql(
+            "UPDATE models SET lifecycle=? WHERE id=? AND lifecycle=? AND provider_id IN (SELECT id FROM providers WHERE project_id=?)",
+            vec![to.into(), model.clone().into(), from.into(), project.clone().into()],
+        ))
+        .await?
+        .rows_affected();
+    if changed != 1 {
+        return Err(ApiError::Conflict("model lifecycle changed; retry".into()));
+    }
+    audit_in(&tx, &user, &project, audit, &model).await?;
+    tx.commit().await?;
+    state.orchestrator.reset_derived();
+    Ok(Json(json!({"id":model,"lifecycle":to})))
+}
+
+async fn model_delete_impact(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((project, model)): Path<(String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    actor(&state, &headers, Some(&project), false).await?;
+    let row = state.db.query_one(sql(
+        "SELECT m.lifecycle,
+          (SELECT COUNT(*) FROM model_prices WHERE model_id=m.id) AS prices,
+          (SELECT COUNT(*) FROM model_price_components WHERE price_id IN (SELECT id FROM model_prices WHERE model_id=m.id)) AS price_components,
+          (SELECT COUNT(*) FROM usage_logs WHERE model_id=m.id OR price_id IN (SELECT id FROM model_prices WHERE model_id=m.id)) AS usage_history,
+          (SELECT COUNT(*) FROM model_associations WHERE model_id=m.id) AS associations,
+          (SELECT COUNT(*) FROM execution_facts WHERE model_id=m.id) AS executions
+         FROM models m JOIN providers p ON p.id=m.provider_id WHERE m.id=? AND p.project_id=?",
+        vec![model.clone().into(), project.into()],
+    )).await?;
+    let Some(row) = row else {
+        return Err(ApiError::NotFound);
+    };
+    let prices: i64 = row.try_get("", "prices")?;
+    let usage_history: i64 = row.try_get("", "usage_history")?;
+    Ok(Json(json!({
+        "id": model,
+        "lifecycle": row.try_get::<String>("", "lifecycle")?,
+        "prices": prices,
+        "price_components": row.try_get::<i64>("", "price_components")?,
+        "usage_history": usage_history,
+        "associations": row.try_get::<i64>("", "associations")?,
+        "executions": row.try_get::<i64>("", "executions")?,
+        "blocked": prices > 0 || usage_history > 0,
+    })))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlaygroundChat {
+    api_key_id: String,
+    provider_id: Option<String>,
+    payload: Value,
+}
+
+#[derive(Deserialize)]
+struct PlaygroundModels {
+    api_key_id: String,
+}
+
+async fn playground_models(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project): Path<String>,
+    Query(input): Query<PlaygroundModels>,
+) -> Result<Json<Value>, ApiError> {
+    let principal = actor_for(&state, &headers, Some(&project), "gateway:use", false).await?;
+    if principal.kind != crate::access::PrincipalKind::Session {
+        return Err(ApiError::Forbidden);
+    }
+    let key = db::api_key_credential_for_use_by_id(
+        &state.db,
+        &project,
+        &input.api_key_id,
+        crate::api::trusted_client_ip(&headers),
+    )
+    .await?
+    .ok_or(ApiError::NotFound)?;
+    let scopes = serde_json::from_str::<Vec<String>>(&key.scopes).unwrap_or_default();
+    if !scopes
+        .iter()
+        .any(|scope| matches!(scope.as_str(), "gateway" | "gateway:use" | "*"))
+    {
+        return Err(ApiError::Unauthorized);
+    }
+    let models =
+        crate::orchestration::visible_models_for(&state.db, &key, &headers, &["/v1/responses"])
+            .await?;
+    Ok(Json(json!({
+        "object":"list",
+        "data":models.into_iter().map(|id|json!({"id":id,"object":"model"})).collect::<Vec<_>>()
+    })))
+}
+
+/// A console-session entry into the ordinary Responses gateway pipeline. The
+/// session authorizes the control-plane action; the named project key still owns
+/// every model, IP, budget, admission, routing and accounting decision.
+async fn playground_chat(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project): Path<String>,
+    Json(input): Json<PlaygroundChat>,
+) -> Result<Response, ApiError> {
+    let principal = actor_for(&state, &headers, Some(&project), "gateway:use", true).await?;
+    if principal.kind != crate::access::PrincipalKind::Session {
+        return Err(ApiError::Forbidden);
+    }
+    if input.api_key_id.is_empty() || !input.payload.is_object() {
+        return Err(ApiError::BadRequest(
+            "api_key_id and an object payload are required".into(),
+        ));
+    }
+    crate::api::gateway::execute_admin_input(
+        state,
+        headers,
+        super::protocols::Input::json(input.payload, "/v1/responses"),
+        project,
+        input.api_key_id,
+        input.provider_id,
+    )
+    .await
+}
 async fn detail(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path((project, resource, id)): Path<(String, String, String)>,
 ) -> Result<Json<Value>, ApiError> {
-    actor(&state, &headers, Some(&project), false).await?;
+    actor_for(
+        &state,
+        &headers,
+        Some(&project),
+        if resource == "key-profiles" {
+            "api_key:manage"
+        } else {
+            "project:read"
+        },
+        false,
+    )
+    .await?;
     if resource == "trace-detail" {
-        let trace=state.db.query_one(sql("SELECT json_object('id',id,'thread_id',thread_id,'external_id',external_id,'status',status,'started_at',started_at,'finished_at',finished_at) AS document FROM traces WHERE project_id=? AND id=?",vec![project.clone().into(),id.clone().into()])).await?.ok_or(ApiError::NotFound)?;
+        let trace=state.db.query_one(sql("SELECT json_object('id',id,'thread_id',thread_id,'external_id',external_id,'status',status,'lifecycle',lifecycle,'started_at',started_at,'finished_at',finished_at) AS document FROM traces WHERE project_id=? AND (id=? OR external_id=?)",vec![project.clone().into(),id.clone().into(),id.clone().into()])).await?.ok_or(ApiError::NotFound)?;
         let trace: Value = serde_json::from_str(&trace.try_get::<String>("", "document")?)
             .map_err(|error| ApiError::Internal(error.into()))?;
-        let requests=documents(state.db.query_all(sql("SELECT json_object('id',id,'public_id',COALESCE(json_extract(request_metadata_json,'$.external_id'),id),'protocol',protocol,'endpoint',endpoint,'model',requested_model,'status',status,'started_at',started_at,'finished_at',finished_at) AS document FROM requests WHERE trace_id=? ORDER BY started_at",vec![id.clone().into()])).await?)?;
-        let executions=documents(state.db.query_all(sql("SELECT json_object('id',id,'request_id',request_id,'provider_id',provider_id,'attempt',attempt,'model',model,'status',status,'retry_reason',retry_reason,'latency_ms',latency_ms,'started_at',started_at,'finished_at',finished_at) AS document FROM request_executions WHERE request_id IN (SELECT id FROM requests WHERE trace_id=?) ORDER BY started_at",vec![id.into()])).await?)?;
+        // The caller may have passed the client's trace id, so every child query
+        // has to use the resolved internal id — otherwise the trace renders with
+        // no requests and no executions.
+        let trace_id = trace["id"]
+            .as_str()
+            .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("trace has no id")))?
+            .to_owned();
+        let requests=documents(state.db.query_all(sql("SELECT json_object('id',id,'public_id',COALESCE(json_extract(request_metadata_json,'$.external_id'),id),'protocol',protocol,'endpoint',endpoint,'model',requested_model,'status',status,'source_ip',source_ip,'started_at',started_at,'finished_at',finished_at) AS document FROM requests WHERE trace_id=? ORDER BY started_at",vec![trace_id.clone().into()])).await?)?;
+        let executions=documents(state.db.query_all(sql("SELECT json_object('id',id,'request_id',request_id,'provider_id',provider_id,'provider_name',provider_name,'attempt',attempt,'model',model,'status',status,'retry_reason',retry_reason,'latency_ms',latency_ms,'started_at',started_at,'finished_at',finished_at,'http_status',http_status,'error_kind',error_kind) AS document FROM request_executions WHERE request_id IN (SELECT id FROM requests WHERE trace_id=?) ORDER BY started_at",vec![trace_id.clone().into()])).await?)?;
+        // Tokens and money per execution, and the price components each charge was
+        // made of. Without these the console can only show a total, which cannot
+        // be checked against the price that produced it.
+        let usage=documents(state.db.query_all(sql("SELECT json_object('execution_id',u.execution_id,'model_id',u.model_id,'input_tokens',u.input_tokens,'output_tokens',u.output_tokens,'cache_read_tokens',u.cache_read_tokens,'cache_write_tokens',u.cache_write_tokens,'reasoning_tokens',u.reasoning_tokens,'total_cost_micros',u.total_cost_micros,'created_at',u.created_at) AS document FROM usage_logs u JOIN execution_facts e ON e.id=u.execution_id JOIN requests r ON r.id=e.request_id WHERE r.trace_id=? ORDER BY u.created_at",vec![trace_id.clone().into()])).await?)?;
+        let cost_items=documents(state.db.query_all(sql("SELECT json_object('execution_id',e.id,'kind',c.kind,'quantity',i.quantity,'unit_price_micros',c.unit_price_micros,'subtotal_micros',i.subtotal_micros) AS document FROM usage_cost_items i JOIN usage_logs u ON u.id=i.usage_log_id JOIN execution_facts e ON e.id=u.execution_id JOIN requests r ON r.id=e.request_id LEFT JOIN model_price_components c ON c.id=i.price_component_id WHERE r.trace_id=? ORDER BY e.id,i.id",vec![trace_id.clone().into()])).await?)?;
         return Ok(Json(
-            json!({"trace":trace,"requests":requests,"executions":executions}),
+            json!({"trace":trace,"requests":requests,"executions":executions,"usage":usage,"cost_items":cost_items}),
         ));
     }
     if resource == "content" {
@@ -459,6 +1057,54 @@ async fn detail(
         _ => "id",
     };
     let (table, scope, projection) = query(&resource)?;
+    if resource == "requests" {
+        // A request's attempts, tokens and per-component cost live in the record
+        // system, not in the projection the list is served from. Without them the
+        // console can show a request but not explain it.
+        // Fail closed for a request that belongs to another project before any
+        // of its attempts or costs are read.
+        let resolved = state
+            .db
+            .query_one(sql(
+                // The console links by the id the projection exposes as `public_id`:
+                // the client's external request id when there is one, the internal id
+                // otherwise. Resolving only the primary key made every such link 404.
+                "SELECT r.id FROM requests r JOIN traces t ON t.id=r.trace_id WHERE (r.id=? OR COALESCE(json_extract(r.request_metadata_json,'$.external_id'),r.id)=?) AND t.project_id=?",
+                vec![id.clone().into(), id.clone().into(), project.clone().into()],
+            ))
+            .await?
+            .ok_or(ApiError::NotFound)?;
+        // The pre-check above resolved the identity the console links with — the
+        // internal id, or the external one the projection exposes as `public_id` —
+        // so the row fetch has to use *that*, not the raw path segment. Binding the
+        // path segment here is why those links 404'd even once the pre-check passed.
+        let resolved_id: String = resolved.try_get("", "id")?;
+        // Every child fact is selected by that same resolved, project-scoped id. The
+        // external id is caller-controlled, so binding the raw path segment here both
+        // emptied the detail card for a legitimate external-id link and let a colliding
+        // external id read another project's attempts, tokens and costs.
+        let executions = documents(state.db.query_all(sql("SELECT json_object('id',id,'request_id',request_id,'provider_id',provider_id,'provider_name',provider_name,'attempt',attempt,'model',model,'status',status,'retry_reason',retry_reason,'latency_ms',latency_ms,'started_at',started_at,'finished_at',finished_at,'http_status',http_status,'error_kind',error_kind) AS document FROM request_executions WHERE request_id=? ORDER BY attempt", vec![resolved_id.clone().into()])).await?)?;
+        let usage = documents(state.db.query_all(sql("SELECT json_object('execution_id',u.execution_id,'model_id',u.model_id,'input_tokens',u.input_tokens,'output_tokens',u.output_tokens,'cache_read_tokens',u.cache_read_tokens,'cache_write_tokens',u.cache_write_tokens,'reasoning_tokens',u.reasoning_tokens,'total_cost_micros',u.total_cost_micros,'created_at',u.created_at) AS document FROM usage_logs u JOIN execution_facts e ON e.id=u.execution_id WHERE e.request_id=? ORDER BY u.created_at", vec![resolved_id.clone().into()])).await?)?;
+        let cost_items = documents(state.db.query_all(sql("SELECT json_object('execution_id',e.id,'kind',c.kind,'quantity',i.quantity,'unit_price_micros',c.unit_price_micros,'subtotal_micros',i.subtotal_micros) AS document FROM usage_cost_items i JOIN usage_logs u ON u.id=i.usage_log_id JOIN execution_facts e ON e.id=u.execution_id LEFT JOIN model_price_components c ON c.id=i.price_component_id WHERE e.request_id=? ORDER BY e.id,i.id", vec![resolved_id.clone().into()])).await?)?;
+        let row = state
+            .db
+            .query_one(sql(
+                format!(
+                    "SELECT {projection} AS document FROM {table} WHERE ({scope}) AND {id_column}=?"
+                ),
+                vec![project.into(), resolved_id.into()],
+            ))
+            .await?
+            .ok_or(ApiError::NotFound)?;
+        let mut document: Value = serde_json::from_str(&row.try_get::<String>("", "document")?)
+            .map_err(|error| ApiError::Internal(error.into()))?;
+        if let Some(object) = document.as_object_mut() {
+            object.insert("executions".into(), json!(executions));
+            object.insert("usage".into(), json!(usage));
+            object.insert("cost_items".into(), json!(cost_items));
+        }
+        return Ok(Json(document));
+    }
     let rows = state
         .db
         .query_all(sql(
@@ -468,12 +1114,13 @@ async fn detail(
             vec![project.into(), id.into()],
         ))
         .await?;
-    Ok(Json(
-        documents(rows)?
-            .into_iter()
-            .next()
-            .ok_or(ApiError::NotFound)?,
-    ))
+    let mut rows = documents(rows)?;
+    // One trace is the smallest possible page: the same derived read, so a detail
+    // row and a list row describe the trace the same way.
+    if resource == "traces" {
+        trace_previews(&state.db, &mut rows).await?;
+    }
+    Ok(Json(rows.into_iter().next().ok_or(ApiError::NotFound)?))
 }
 async fn analytics(
     State(state): State<AppState>,
@@ -482,6 +1129,21 @@ async fn analytics(
     Query(filter): Query<Filter>,
 ) -> Result<Json<Value>, ApiError> {
     actor(&state, &headers, Some(&project), false).await?;
+    // A key-specific analytics link is an object read, not a best-effort string
+    // filter. Resolve it inside the route project before reading facts so a
+    // foreign id and a nonexistent id are the same opaque 404.
+    if let Some(api_key) = filter.api_key.as_deref()
+        && state
+            .db
+            .query_one(sql(
+                "SELECT 1 AS present FROM api_keys WHERE id=? AND project_id=?",
+                vec![api_key.into(), project.clone().into()],
+            ))
+            .await?
+            .is_none()
+    {
+        return Err(ApiError::NotFound);
+    }
     let dimension = match filter.dimension.as_deref().unwrap_or("day") {
         "day" => "CAST(r.started_at/86400 AS TEXT)",
         "provider" => "e.provider_id",
@@ -491,7 +1153,7 @@ async fn analytics(
         "project" => "r.project_id",
         _ => return Err(ApiError::BadRequest("unknown analytics dimension".into())),
     };
-    let rows=state.db.query_all(sql(format!("SELECT json_object('dimension',{dimension},'requests',COUNT(DISTINCT r.id),'attempts',COUNT(e.id),'errors',SUM(e.status!='succeeded'),'input_tokens',COALESCE(SUM(u.input_tokens),0),'output_tokens',COALESCE(SUM(u.output_tokens),0),'cache_hit_tokens',COALESCE(SUM(u.cache_read_tokens),0),'cache_savings_micros',COALESCE(SUM(u.cache_savings_micros),0),'cost_micros',COALESCE(SUM(u.total_cost_micros),0),'latency_ms',AVG(x.latency_ms),'ttft_ms',AVG(x.first_token_at-x.started_at*1000)) AS document FROM request_facts r JOIN execution_facts e ON e.request_id=r.id LEFT JOIN usage_logs u ON u.execution_id=e.id LEFT JOIN request_executions x ON x.id=e.id WHERE r.project_id=? AND r.started_at>=? AND r.started_at<? AND (? IS NULL OR e.model_id=?) AND (? IS NULL OR e.provider_id=?) AND (? IS NULL OR r.api_key_id=?) GROUP BY {dimension} ORDER BY {dimension} LIMIT 500"),vec![project.into(),filter.from.unwrap_or(db::now()-86400*30).into(),filter.until.unwrap_or(db::now()+1).into(),filter.model.clone().into(),filter.model.into(),filter.provider.clone().into(),filter.provider.into(),filter.api_key.clone().into(),filter.api_key.into()])).await?;
+    let rows=state.db.query_all(sql(format!("SELECT json_object('dimension',{dimension},'requests',COUNT(DISTINCT r.id),'attempts',COUNT(e.id),'errors',SUM(e.status!='succeeded'),'usage_measured',CASE WHEN COUNT(u.id)>0 THEN json('true') ELSE json('false') END,'input_tokens',COALESCE(SUM(u.input_tokens),0),'output_tokens',COALESCE(SUM(u.output_tokens),0),'cache_hit_tokens',COALESCE(SUM(u.cache_read_tokens),0),'cache_savings_micros',COALESCE(SUM(u.cache_savings_micros),0),'cost_micros',COALESCE(SUM(u.total_cost_micros),0),'latency_ms',AVG(x.latency_ms),'ttft_ms',AVG(x.first_token_at-x.started_at*1000)) AS document FROM request_facts r JOIN execution_facts e ON e.request_id=r.id LEFT JOIN usage_logs u ON u.execution_id=e.id LEFT JOIN request_executions x ON x.id=e.id WHERE r.project_id=? AND r.started_at>=? AND r.started_at<? AND (? IS NULL OR e.model_id=?) AND (? IS NULL OR e.provider_id=?) AND (? IS NULL OR r.api_key_id=?) GROUP BY {dimension} ORDER BY {dimension} LIMIT 500"),vec![project.into(),filter.from.unwrap_or(db::now()-86400*30).into(),filter.until.unwrap_or(db::now()+1).into(),filter.model.clone().into(),filter.model.into(),filter.provider.clone().into(),filter.provider.into(),filter.api_key.clone().into(),filter.api_key.into()])).await?;
     Ok(Json(
         json!({"data":documents(rows)?,"source":"sqlite","derived_available":state.observations.is_available()}),
     ))
@@ -512,7 +1174,14 @@ struct OrchestrationSettings {
     version: u8,
     affinity_rules: Vec<crate::orchestration::affinity::Rule>,
     session_compaction: SessionCompactionSettings,
+    /// The project's default routing conditions. The orchestrator already reads
+    /// this; until now no route wrote it. `None` means the request did not mention
+    /// it, and the stored policy must be left alone: a form that does not carry
+    /// this field would otherwise reset the project's routing on every save.
+    #[serde(default)]
+    routing: Option<Value>,
 }
+
 impl Default for OrchestrationSettings {
     fn default() -> Self {
         Self {
@@ -525,6 +1194,7 @@ impl Default for OrchestrationSettings {
                 native: true,
                 summarizer_model: None,
             },
+            routing: None,
         }
     }
 }
@@ -546,6 +1216,11 @@ fn validate_orchestration_settings(input: &OrchestrationSettings) -> Result<(), 
             "invalid orchestration settings".into(),
         ));
     }
+    if let Some(routing) = &input.routing {
+        crate::orchestration::policy::validate_conditions(routing)
+            .map_err(|_| ApiError::BadRequest("invalid default routing conditions".into()))?;
+    }
+    {}
     for rule in &input.affinity_rules {
         rule.validate()
             .map_err(|_| ApiError::BadRequest("invalid affinity rule".into()))?;
@@ -585,6 +1260,7 @@ async fn orchestration_settings(
                 .unwrap_or(json!(default.session_compaction)),
         )
         .map_err(|_| ApiError::BadRequest("invalid stored compaction settings".into()))?,
+        routing: settings.get("routing").cloned(),
     };
     Ok(Json(output))
 }
@@ -608,6 +1284,9 @@ async fn set_orchestration_settings(
         .map_err(|error| ApiError::Internal(error.into()))?;
     settings["affinity_rules"] = json!(input.affinity_rules);
     settings["session_compaction"] = json!(input.session_compaction);
+    if let Some(routing) = &input.routing {
+        settings["routing"] = routing.clone();
+    }
     settings["version"] = json!(1);
     tx.execute(sql(
         "UPDATE projects SET settings_json=?,updated_at=? WHERE id=?",
@@ -635,12 +1314,14 @@ async fn observation_summary(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(project): Path<String>,
+    Query(filter): Query<crate::observability::SummaryFilter>,
 ) -> Result<Json<crate::observability::Summary>, ApiError> {
     actor(&state, &headers, Some(&project), false).await?;
+    reject_inverted_window(&filter)?;
     Ok(Json(
         state
             .observations
-            .summary_for(project)
+            .summary_for(project, filter)
             .await
             .map_err(ApiError::Internal)?,
     ))
@@ -738,11 +1419,634 @@ async fn routing_preview(
         json!({"candidates":candidates,"decisions":plan.decisions,"estimated_tokens":plan.estimated_tokens}),
     ))
 }
+
+const PROTECTION_PREVIEW_SAMPLE_BYTES: usize = 16 * 1024;
+
+#[derive(Deserialize)]
+struct ProtectionPreviewInput {
+    text: String,
+}
+
+async fn protection_preview(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project): Path<String>,
+    Json(input): Json<ProtectionPreviewInput>,
+) -> Result<Json<Value>, ApiError> {
+    actor(&state, &headers, Some(&project), false).await?;
+    if input.text.len() > PROTECTION_PREVIEW_SAMPLE_BYTES {
+        return Err(ApiError::BadRequest(
+            "protection preview text exceeds 16 KiB".into(),
+        ));
+    }
+    let rules = crate::orchestration::preview_protection(&state.db, &project, &input.text).await?;
+    Ok(Json(json!({ "rules": rules })))
+}
+
+const PROFILE_TEMPLATE_DOCUMENT_BYTES: usize = 64 * 1024;
+const PROFILE_TEMPLATE_ITEMS: usize = 128;
+
+fn default_profile_routing() -> Value {
+    json!({"version":1})
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProfileMappingDocument {
+    source_model: String,
+    target_model: String,
+    #[serde(default = "default_profile_mapping_priority")]
+    priority: i64,
+}
+
+const fn default_profile_mapping_priority() -> i64 {
+    100
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProfileAllowedModelDocument {
+    pattern: String,
+    #[serde(default = "default_profile_match_type")]
+    match_type: String,
+}
+
+fn default_profile_match_type() -> String {
+    "exact".into()
+}
+
+/// The complete policy portion of a profile. It deliberately excludes identity
+/// and name, so an exported document cannot select a project or silently rename
+/// the target it is applied to.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProfileTemplateDocument {
+    version: u32,
+    #[serde(default)]
+    rpm_limit: Option<i64>,
+    #[serde(default)]
+    tpm_limit: Option<i64>,
+    #[serde(default)]
+    budget_micros: Option<i64>,
+    #[serde(default = "default_profile_routing")]
+    routing_policy: Value,
+    #[serde(default)]
+    mappings: Vec<ProfileMappingDocument>,
+    #[serde(default)]
+    allowed_models: Vec<ProfileAllowedModelDocument>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProfileWriteDocument {
+    id: Option<String>,
+    name: String,
+    #[serde(default)]
+    rpm_limit: Option<i64>,
+    #[serde(default)]
+    tpm_limit: Option<i64>,
+    #[serde(default)]
+    budget_micros: Option<i64>,
+    #[serde(default = "default_profile_routing")]
+    routing_policy: Value,
+    #[serde(default)]
+    mappings: Vec<ProfileMappingDocument>,
+    #[serde(default)]
+    allowed_models: Vec<ProfileAllowedModelDocument>,
+}
+
+fn validate_profile_name(name: &str) -> Result<String, ApiError> {
+    let name = name.trim();
+    if name.is_empty() || name.len() > 128 {
+        return Err(ApiError::BadRequest(
+            "profile and template names must contain 1–128 bytes".into(),
+        ));
+    }
+    Ok(name.into())
+}
+
+fn validate_profile_document(document: &ProfileTemplateDocument) -> Result<(), ApiError> {
+    if document.version != 1
+        || document.rpm_limit.is_some_and(|value| value < 0)
+        || document.tpm_limit.is_some_and(|value| value < 0)
+        || document.budget_micros.is_some_and(|value| value < 0)
+        || document.mappings.len() > PROFILE_TEMPLATE_ITEMS
+        || document.allowed_models.len() > PROFILE_TEMPLATE_ITEMS
+    {
+        return Err(ApiError::BadRequest("invalid profile document".into()));
+    }
+    crate::orchestration::policy::Routing::parse(&document.routing_policy.to_string())
+        .map_err(|_| ApiError::BadRequest("invalid profile routing policy".into()))?;
+    let mut sources = std::collections::BTreeSet::new();
+    for mapping in &document.mappings {
+        if mapping.source_model.is_empty()
+            || mapping.source_model.len() > 256
+            || mapping.target_model.is_empty()
+            || mapping.target_model.len() > 256
+            || !sources.insert(mapping.source_model.as_str())
+        {
+            return Err(ApiError::BadRequest(
+                "invalid or duplicate model mapping".into(),
+            ));
+        }
+    }
+    let mut allowed = std::collections::BTreeSet::new();
+    for model in &document.allowed_models {
+        if model.pattern.is_empty()
+            || model.pattern.len() > 512
+            || !matches!(model.match_type.as_str(), "exact" | "regex")
+            || !allowed.insert((model.pattern.as_str(), model.match_type.as_str()))
+        {
+            return Err(ApiError::BadRequest(
+                "invalid or duplicate allowed model".into(),
+            ));
+        }
+        if model.match_type == "regex" {
+            crate::orchestration::policy::regex(&model.pattern)
+                .map_err(|_| ApiError::BadRequest("invalid allowed-model regex".into()))?;
+        }
+    }
+    if serde_json::to_vec(document)
+        .map_err(|error| ApiError::Internal(error.into()))?
+        .len()
+        > PROFILE_TEMPLATE_DOCUMENT_BYTES
+    {
+        return Err(ApiError::BadRequest(
+            "profile document exceeds 65536 bytes".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Stored documents are allowed to carry fields written by a newer Pangolin.
+/// Only the known policy fields are projected, then the same validator used for
+/// current writes decides whether applying them is safe.
+fn parse_stored_profile_document(raw: &str) -> Result<ProfileTemplateDocument, ApiError> {
+    let mut value: Value = serde_json::from_str(raw)
+        .map_err(|_| ApiError::BadRequest("stored profile template is malformed".into()))?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| ApiError::BadRequest("stored profile template is malformed".into()))?;
+    object.retain(|key, _| {
+        matches!(
+            key.as_str(),
+            "version"
+                | "rpm_limit"
+                | "tpm_limit"
+                | "budget_micros"
+                | "routing_policy"
+                | "mappings"
+                | "allowed_models"
+        )
+    });
+    let document: ProfileTemplateDocument = serde_json::from_value(value)
+        .map_err(|_| ApiError::BadRequest("stored profile template is malformed".into()))?;
+    validate_profile_document(&document)?;
+    Ok(document)
+}
+
+async fn load_profile_document(
+    db: &impl ConnectionTrait,
+    project: &str,
+    profile_id: &str,
+) -> Result<(String, ProfileTemplateDocument), ApiError> {
+    let profile = db
+        .query_one(sql(
+            "SELECT name,rpm_limit,tpm_limit,budget_micros,routing_policy_json FROM api_key_profiles WHERE id=? AND project_id=?",
+            vec![profile_id.into(), project.into()],
+        ))
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    let mappings = db
+        .query_all(sql(
+            "SELECT source_model,target_model,priority FROM api_key_profile_model_mappings WHERE profile_id=? ORDER BY priority,id",
+            vec![profile_id.into()],
+        ))
+        .await?
+        .into_iter()
+        .map(|row| {
+            Ok(ProfileMappingDocument {
+                source_model: row.try_get("", "source_model")?,
+                target_model: row.try_get("", "target_model")?,
+                priority: row.try_get("", "priority")?,
+            })
+        })
+        .collect::<Result<Vec<_>, sea_orm::DbErr>>()?;
+    let allowed_models = db
+        .query_all(sql(
+            "SELECT model_pattern,match_type FROM api_key_profile_allowed_models WHERE profile_id=? ORDER BY model_pattern,match_type",
+            vec![profile_id.into()],
+        ))
+        .await?
+        .into_iter()
+        .map(|row| {
+            Ok(ProfileAllowedModelDocument {
+                pattern: row.try_get("", "model_pattern")?,
+                match_type: row.try_get("", "match_type")?,
+            })
+        })
+        .collect::<Result<Vec<_>, sea_orm::DbErr>>()?;
+    let routing: String = profile.try_get("", "routing_policy_json")?;
+    let document = ProfileTemplateDocument {
+        version: 1,
+        rpm_limit: profile.try_get("", "rpm_limit")?,
+        tpm_limit: profile.try_get("", "tpm_limit")?,
+        budget_micros: profile.try_get("", "budget_micros")?,
+        routing_policy: serde_json::from_str(&routing)
+            .map_err(|error| ApiError::Internal(error.into()))?,
+        mappings,
+        allowed_models,
+    };
+    validate_profile_document(&document)?;
+    Ok((profile.try_get("", "name")?, document))
+}
+
+async fn write_profile_document(
+    transaction: &DatabaseTransaction,
+    project: &str,
+    profile_id: &str,
+    name: &str,
+    document: &ProfileTemplateDocument,
+) -> Result<(), ApiError> {
+    let name = validate_profile_name(name)?;
+    validate_profile_document(document)?;
+    let changed = transaction.execute(sql("INSERT INTO api_key_profiles(id,project_id,name,rpm_limit,tpm_limit,budget_micros,routing_policy_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,rpm_limit=excluded.rpm_limit,tpm_limit=excluded.tpm_limit,budget_micros=excluded.budget_micros,routing_policy_json=excluded.routing_policy_json,updated_at=excluded.updated_at WHERE api_key_profiles.project_id=excluded.project_id",vec![profile_id.into(),project.into(),name.into(),document.rpm_limit.into(),document.tpm_limit.into(),document.budget_micros.into(),document.routing_policy.to_string().into(),db::now().into(),db::now().into()])).await?.rows_affected();
+    if changed != 1 {
+        return Err(ApiError::NotFound);
+    }
+    transaction
+        .execute(sql(
+            "DELETE FROM api_key_profile_model_mappings WHERE profile_id=?",
+            vec![profile_id.into()],
+        ))
+        .await?;
+    for mapping in &document.mappings {
+        transaction.execute(sql("INSERT INTO api_key_profile_model_mappings(id,profile_id,source_model,target_model,priority) VALUES(?,?,?,?,?)",vec![id().into(),profile_id.into(),mapping.source_model.clone().into(),mapping.target_model.clone().into(),mapping.priority.into()])).await?;
+    }
+    transaction
+        .execute(sql(
+            "DELETE FROM api_key_profile_allowed_models WHERE profile_id=?",
+            vec![profile_id.into()],
+        ))
+        .await?;
+    for model in &document.allowed_models {
+        transaction.execute(sql("INSERT INTO api_key_profile_allowed_models(profile_id,model_pattern,match_type) VALUES(?,?,?)",vec![profile_id.into(),model.pattern.clone().into(),model.match_type.clone().into()])).await?;
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProfileTemplateSave {
+    name: String,
+    #[serde(default)]
+    source_profile_id: Option<String>,
+    #[serde(default)]
+    document: Option<ProfileTemplateDocument>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProfileTemplateTransfer {
+    version: u32,
+    name: String,
+    profile: ProfileTemplateDocument,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ProfileTemplateConflict {
+    Fail,
+    Overwrite,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProfileTemplateImport {
+    document: ProfileTemplateTransfer,
+    conflict: ProfileTemplateConflict,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProfileTemplateApply {
+    #[serde(default)]
+    target_profile_id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+async fn template_document_for_save(
+    transaction: &DatabaseTransaction,
+    project: &str,
+    input: ProfileTemplateSave,
+) -> Result<(String, ProfileTemplateDocument), ApiError> {
+    let name = validate_profile_name(&input.name)?;
+    let document = match (input.source_profile_id, input.document) {
+        (Some(profile_id), None) => {
+            load_profile_document(transaction, project, &profile_id)
+                .await?
+                .1
+        }
+        (None, Some(document)) => document,
+        _ => {
+            return Err(ApiError::BadRequest(
+                "provide exactly one source_profile_id or document".into(),
+            ));
+        }
+    };
+    validate_profile_document(&document)?;
+    Ok((name, document))
+}
+
+async fn list_profile_templates(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project): Path<String>,
+    Query(filter): Query<Filter>,
+) -> Result<Json<Value>, ApiError> {
+    actor_for(&state, &headers, Some(&project), "api_key:manage", false).await?;
+    let limit = filter.limit.unwrap_or(100).clamp(1, 500);
+    let rows = state.db.query_all(sql("SELECT id,name,document_json,created_at,updated_at FROM api_key_profile_templates WHERE project_id=? ORDER BY updated_at DESC,id LIMIT ? OFFSET ?",vec![project.clone().into(),i64::from(limit).into(),i64::from(filter.offset).into()])).await?;
+    let total = state
+        .db
+        .query_one(sql(
+            "SELECT COUNT(*) AS total FROM api_key_profile_templates WHERE project_id=?",
+            vec![project.into()],
+        ))
+        .await?
+        .map(|row| row.try_get::<i64>("", "total"))
+        .transpose()?
+        .unwrap_or(0);
+    let mut data = Vec::with_capacity(rows.len());
+    for row in rows {
+        let raw: String = row.try_get("", "document_json")?;
+        data.push(json!({
+            "id": row.try_get::<String>("", "id")?,
+            "name": row.try_get::<String>("", "name")?,
+            "profile": parse_stored_profile_document(&raw)?,
+            "created_at": row.try_get::<i64>("", "created_at")?,
+            "updated_at": row.try_get::<i64>("", "updated_at")?,
+        }));
+    }
+    Ok(Json(
+        json!({"total":total,"offset":filter.offset,"limit":limit,"data":data}),
+    ))
+}
+
+async fn create_profile_template(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project): Path<String>,
+    Json(input): Json<ProfileTemplateSave>,
+) -> Result<Json<Value>, ApiError> {
+    let user = actor_for(&state, &headers, Some(&project), "api_key:manage", true).await?;
+    let transaction = state.db.begin().await?;
+    let (name, document) = template_document_for_save(&transaction, &project, input).await?;
+    if transaction
+        .query_one(sql(
+            "SELECT id FROM api_key_profile_templates WHERE project_id=? AND name=? COLLATE NOCASE",
+            vec![project.clone().into(), name.clone().into()],
+        ))
+        .await?
+        .is_some()
+    {
+        return Err(ApiError::ConflictNamed(
+            "template_name_conflict",
+            "a template with this name already exists".into(),
+        ));
+    }
+    let template_id = id();
+    transaction.execute(sql("INSERT INTO api_key_profile_templates(id,project_id,name,document_json,created_at,updated_at) VALUES(?,?,?,?,?,?)",vec![template_id.clone().into(),project.clone().into(),name.into(),serde_json::to_string(&document).map_err(|error|ApiError::Internal(error.into()))?.into(),db::now().into(),db::now().into()])).await?;
+    audit_in(
+        &transaction,
+        &user,
+        &project,
+        "profile-template.create",
+        &template_id,
+    )
+    .await?;
+    transaction.commit().await?;
+    Ok(Json(json!({"id":template_id})))
+}
+
+async fn update_profile_template(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((project, template_id)): Path<(String, String)>,
+    Json(input): Json<ProfileTemplateSave>,
+) -> Result<Json<Value>, ApiError> {
+    let user = actor_for(&state, &headers, Some(&project), "api_key:manage", true).await?;
+    let transaction = state.db.begin().await?;
+    if transaction
+        .query_one(sql(
+            "SELECT id FROM api_key_profile_templates WHERE id=? AND project_id=?",
+            vec![template_id.clone().into(), project.clone().into()],
+        ))
+        .await?
+        .is_none()
+    {
+        return Err(ApiError::NotFound);
+    }
+    let (name, document) = template_document_for_save(&transaction, &project, input).await?;
+    if transaction.query_one(sql("SELECT id FROM api_key_profile_templates WHERE project_id=? AND name=? COLLATE NOCASE AND id<>?",vec![project.clone().into(),name.clone().into(),template_id.clone().into()])).await?.is_some() {
+        return Err(ApiError::ConflictNamed("template_name_conflict", "a template with this name already exists".into()));
+    }
+    transaction.execute(sql("UPDATE api_key_profile_templates SET name=?,document_json=?,updated_at=? WHERE id=? AND project_id=?",vec![name.into(),serde_json::to_string(&document).map_err(|error|ApiError::Internal(error.into()))?.into(),db::now().into(),template_id.clone().into(),project.clone().into()])).await?;
+    audit_in(
+        &transaction,
+        &user,
+        &project,
+        "profile-template.update",
+        &template_id,
+    )
+    .await?;
+    transaction.commit().await?;
+    Ok(Json(json!({"id":template_id})))
+}
+
+async fn delete_profile_template(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((project, template_id)): Path<(String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    let user = actor_for(&state, &headers, Some(&project), "api_key:manage", true).await?;
+    let transaction = state.db.begin().await?;
+    let changed = transaction
+        .execute(sql(
+            "DELETE FROM api_key_profile_templates WHERE id=? AND project_id=?",
+            vec![template_id.clone().into(), project.clone().into()],
+        ))
+        .await?
+        .rows_affected();
+    if changed != 1 {
+        return Err(ApiError::NotFound);
+    }
+    audit_in(
+        &transaction,
+        &user,
+        &project,
+        "profile-template.delete",
+        &template_id,
+    )
+    .await?;
+    transaction.commit().await?;
+    Ok(Json(json!({"ok":true})))
+}
+
+async fn export_profile_template(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((project, template_id)): Path<(String, String)>,
+) -> Result<Json<ProfileTemplateTransfer>, ApiError> {
+    actor_for(&state, &headers, Some(&project), "api_key:manage", false).await?;
+    let row = state
+        .db
+        .query_one(sql(
+            "SELECT name,document_json FROM api_key_profile_templates WHERE id=? AND project_id=?",
+            vec![template_id.into(), project.into()],
+        ))
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    let raw: String = row.try_get("", "document_json")?;
+    Ok(Json(ProfileTemplateTransfer {
+        version: 1,
+        name: row.try_get("", "name")?,
+        profile: parse_stored_profile_document(&raw)?,
+    }))
+}
+
+async fn import_profile_template(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project): Path<String>,
+    Json(input): Json<ProfileTemplateImport>,
+) -> Result<Json<Value>, ApiError> {
+    let user = actor_for(&state, &headers, Some(&project), "api_key:manage", true).await?;
+    if input.document.version != 1 {
+        return Err(ApiError::BadRequest(
+            "unsupported template document version".into(),
+        ));
+    }
+    let name = validate_profile_name(&input.document.name)?;
+    validate_profile_document(&input.document.profile)?;
+    let transaction = state.db.begin().await?;
+    let existing = transaction
+        .query_one(sql(
+            "SELECT id FROM api_key_profile_templates WHERE project_id=? AND name=? COLLATE NOCASE",
+            vec![project.clone().into(), name.clone().into()],
+        ))
+        .await?;
+    let template_id = match (existing, input.conflict) {
+        (Some(_), ProfileTemplateConflict::Fail) => {
+            return Err(ApiError::ConflictNamed(
+                "template_name_conflict",
+                "a template with this name already exists".into(),
+            ));
+        }
+        (Some(row), ProfileTemplateConflict::Overwrite) => {
+            let template_id: String = row.try_get("", "id")?;
+            transaction.execute(sql("UPDATE api_key_profile_templates SET document_json=?,updated_at=? WHERE id=? AND project_id=?",vec![serde_json::to_string(&input.document.profile).map_err(|error|ApiError::Internal(error.into()))?.into(),db::now().into(),template_id.clone().into(),project.clone().into()])).await?;
+            template_id
+        }
+        (None, _) => {
+            let template_id = id();
+            transaction.execute(sql("INSERT INTO api_key_profile_templates(id,project_id,name,document_json,created_at,updated_at) VALUES(?,?,?,?,?,?)",vec![template_id.clone().into(),project.clone().into(),name.into(),serde_json::to_string(&input.document.profile).map_err(|error|ApiError::Internal(error.into()))?.into(),db::now().into(),db::now().into()])).await?;
+            template_id
+        }
+    };
+    audit_in(
+        &transaction,
+        &user,
+        &project,
+        "profile-template.import",
+        &template_id,
+    )
+    .await?;
+    transaction.commit().await?;
+    Ok(Json(json!({"id":template_id})))
+}
+
+async fn apply_profile_template(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((project, template_id)): Path<(String, String)>,
+    Json(input): Json<ProfileTemplateApply>,
+) -> Result<Json<Value>, ApiError> {
+    let user = actor_for(&state, &headers, Some(&project), "api_key:manage", true).await?;
+    let transaction = state.db.begin().await?;
+    let row = transaction
+        .query_one(sql(
+            "SELECT document_json FROM api_key_profile_templates WHERE id=? AND project_id=?",
+            vec![template_id.clone().into(), project.clone().into()],
+        ))
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    let raw: String = row.try_get("", "document_json")?;
+    let document = parse_stored_profile_document(&raw)?;
+    let (profile_id, name) = match (input.target_profile_id, input.name) {
+        (Some(_), Some(_)) => {
+            return Err(ApiError::BadRequest(
+                "name is only valid when creating a profile".into(),
+            ));
+        }
+        (Some(profile_id), None) => {
+            let (current_name, _) =
+                load_profile_document(&transaction, &project, &profile_id).await?;
+            (profile_id, current_name)
+        }
+        (None, name) => (id(), validate_profile_name(name.as_deref().unwrap_or(""))?),
+    };
+    write_profile_document(&transaction, &project, &profile_id, &name, &document).await?;
+    audit_in(
+        &transaction,
+        &user,
+        &project,
+        "profile-template.apply",
+        &profile_id,
+    )
+    .await?;
+    transaction.commit().await?;
+    Ok(Json(json!({"id":profile_id})))
+}
+
 fn text<'a>(v: &'a Value, key: &str) -> Result<&'a str, ApiError> {
     v.get(key)
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty() && s.len() <= 2048)
         .ok_or_else(|| ApiError::BadRequest(format!("{key} is required")))
+}
+/// The console's bulk key action. Everything that decides the outcome — the
+/// `api_key:manage` authorization, the owner-membership rule for owned keys, the
+/// transaction and the audit rows — lives in the access layer, so this only checks
+/// the request shape and maps the domain error. That is what keeps bulk key state
+/// from being a second, weaker copy of the single-key contract.
+async fn bulk_toggle_api_keys(
+    state: &AppState,
+    user: &crate::access::Principal,
+    project: &str,
+    value: &Value,
+) -> Result<Json<Value>, ApiError> {
+    let ids = value["ids"]
+        .as_array()
+        .filter(|ids| !ids.is_empty() && ids.len() <= 100)
+        .ok_or_else(|| ApiError::BadRequest("ids must contain 1–100 items".into()))?;
+    let enabled = value["enabled"]
+        .as_bool()
+        .ok_or_else(|| ApiError::BadRequest("enabled is required".into()))?;
+    let ids = ids
+        .iter()
+        .map(|key| {
+            key.as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| ApiError::BadRequest("invalid id".into()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let updated =
+        crate::access::set_scoped_api_keys_enabled(&state.db, user, project, &ids, enabled)
+            .await
+            .map_err(crate::api::errors::access)?;
+    Ok(Json(json!({"updated":updated})))
 }
 async fn mutate(
     State(state): State<AppState>,
@@ -750,12 +2054,68 @@ async fn mutate(
     Path((project, resource)): Path<(String, String)>,
     Json(value): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
-    let user = actor(&state, &headers, Some(&project), true).await?;
     let resource_id = value
         .get("id")
         .and_then(Value::as_str)
         .map(str::to_owned)
         .unwrap_or_else(id);
+    // API-key lifecycle is not a table toggle. It needs the key contract's own
+    // `api_key:manage` authorization — a role holding only that permission can change
+    // a key through the dedicated route, so it must be able to do the same here — and
+    // the owner-membership rule for owned keys, so it is an access-layer operation
+    // rather than an UPDATE in this match. It runs before the generic transaction so
+    // the two never hold separate SQLite connections at the same time.
+    let key_bulk = resource == "bulk-toggle" && value["resource"].as_str() == Some("keys");
+    let user = actor_for(
+        &state,
+        &headers,
+        Some(&project),
+        if key_bulk || resource == "key-profiles" {
+            "api_key:manage"
+        } else {
+            "project:manage"
+        },
+        true,
+    )
+    .await?;
+    if key_bulk {
+        return bulk_toggle_api_keys(&state, &user, &project, &value).await;
+    }
+    // Catalog reads happen before the business transaction. An edit is scoped
+    // through the model's provider, and never re-resolves a submitted card id.
+    let existing_model = if resource == "models" {
+        match value.get("id").and_then(Value::as_str) {
+            Some(model_id) => state
+                .db
+                .query_one(sql(
+                    "SELECT m.id FROM models m JOIN providers p ON p.id=m.provider_id WHERE m.id=? AND p.project_id=?",
+                    vec![model_id.into(), project.clone().into()],
+                ))
+                .await?
+                .is_some(),
+            None => false,
+        }
+    } else {
+        false
+    };
+    let catalog_defaults = if resource == "models" && !existing_model {
+        match value
+            .get("catalog_model_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+        {
+            Some(card_id) => Some(
+                db::catalog_model_defaults(&state.db, card_id)
+                    .await?
+                    .ok_or_else(|| {
+                        ApiError::BadRequest("unknown or stale catalog model card".into())
+                    })?,
+            ),
+            None => None,
+        }
+    } else {
+        None
+    };
     let transaction = state.db.begin().await?;
     match resource.as_str() {
         "channels" => {
@@ -881,14 +2241,59 @@ async fn mutate(
             {
                 return Err(ApiError::NotFound);
             }
-            let capabilities = value
-                .get("capabilities")
-                .cloned()
-                .unwrap_or(json!(["chat"]));
+            let current_metadata = transaction
+                .query_one(sql(
+                    "SELECT catalog_metadata_json FROM models WHERE id=? AND provider_id IN (SELECT id FROM providers WHERE project_id=?)",
+                    vec![resource_id.clone().into(), project.clone().into()],
+                ))
+                .await?
+                .map(|row| row.try_get::<String>("", "catalog_metadata_json"))
+                .transpose()?;
+            let capabilities = catalog_defaults
+                .as_ref()
+                .map(|defaults| json!(defaults.capabilities))
+                .unwrap_or_else(|| {
+                    value
+                        .get("capabilities")
+                        .cloned()
+                        .unwrap_or(json!(["chat"]))
+                });
             if !capabilities.is_array() {
                 return Err(ApiError::BadRequest("capabilities must be an array".into()));
             }
-            let changed = transaction.execute(sql("INSERT INTO models(id,provider_id,public_name,upstream_name,capabilities,input_price_micros,output_price_micros,priority,enabled,created_at,catalog_metadata_json) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET provider_id=excluded.provider_id,public_name=excluded.public_name,upstream_name=excluded.upstream_name,capabilities=excluded.capabilities,input_price_micros=excluded.input_price_micros,output_price_micros=excluded.output_price_micros,priority=excluded.priority,enabled=excluded.enabled,catalog_metadata_json=excluded.catalog_metadata_json WHERE models.provider_id IN (SELECT id FROM providers WHERE project_id=?)",vec![resource_id.clone().into(),provider.into(),text(&value,"public_name")?.into(),text(&value,"upstream_name")?.into(),capabilities.to_string().into(),value["input_price_micros"].as_i64().unwrap_or(0).max(0).into(),value["output_price_micros"].as_i64().unwrap_or(0).max(0).into(),value["priority"].as_i64().unwrap_or(100).into(),value["enabled"].as_bool().unwrap_or(true).into(),db::now().into(),value.get("catalog_metadata").cloned().unwrap_or(json!({})).to_string().into(),project.clone().into()])).await?.rows_affected();
+            let input_price = catalog_defaults
+                .as_ref()
+                .map(|defaults| defaults.input_price_micros)
+                .unwrap_or_else(|| value["input_price_micros"].as_i64().unwrap_or(0).max(0));
+            let output_price = catalog_defaults
+                .as_ref()
+                .map(|defaults| defaults.output_price_micros)
+                .unwrap_or_else(|| value["output_price_micros"].as_i64().unwrap_or(0).max(0));
+            let catalog_metadata = catalog_defaults
+                .as_ref()
+                .map(|defaults| defaults.metadata.clone())
+                .or(current_metadata)
+                .unwrap_or_else(|| "{}".into());
+            // UNIQUE(provider_id, public_name, upstream_name) would otherwise
+            // surface as an opaque 500 with the constraint name only in the log.
+            let duplicate = transaction
+                .query_one(sql(
+                    "SELECT id FROM models WHERE provider_id=? AND public_name=? AND upstream_name=? AND id NOT IN (?)",
+                    vec![
+                        provider.into(),
+                        text(&value, "public_name")?.into(),
+                        text(&value, "upstream_name")?.into(),
+                        resource_id.clone().into(),
+                    ],
+                ))
+                .await?;
+            if duplicate.is_some() {
+                return Err(ApiError::ConflictNamed(
+                    "duplicate_model",
+                    "this channel already has a model with that name".into(),
+                ));
+            }
+            let changed = transaction.execute(sql("INSERT INTO models(id,provider_id,public_name,upstream_name,capabilities,input_price_micros,output_price_micros,priority,enabled,created_at,catalog_metadata_json) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET provider_id=excluded.provider_id,public_name=excluded.public_name,upstream_name=excluded.upstream_name,capabilities=excluded.capabilities,input_price_micros=excluded.input_price_micros,output_price_micros=excluded.output_price_micros,priority=excluded.priority,enabled=excluded.enabled,catalog_metadata_json=excluded.catalog_metadata_json WHERE models.provider_id IN (SELECT id FROM providers WHERE project_id=?)",vec![resource_id.clone().into(),provider.into(),text(&value,"public_name")?.into(),text(&value,"upstream_name")?.into(),capabilities.to_string().into(),input_price.into(),output_price.into(),value["priority"].as_i64().unwrap_or(100).into(),value["enabled"].as_bool().unwrap_or(true).into(),db::now().into(),catalog_metadata.into(),project.clone().into()])).await?.rows_affected();
             if changed != 1 {
                 return Err(ApiError::Forbidden);
             }
@@ -942,44 +2347,99 @@ async fn mutate(
             }
         }
         "key-profiles" => {
-            let changed = transaction.execute(sql("INSERT INTO api_key_profiles(id,project_id,name,rpm_limit,tpm_limit,budget_micros,routing_policy_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,rpm_limit=excluded.rpm_limit,tpm_limit=excluded.tpm_limit,budget_micros=excluded.budget_micros,routing_policy_json=excluded.routing_policy_json,updated_at=excluded.updated_at WHERE api_key_profiles.project_id=excluded.project_id",vec![resource_id.clone().into(),project.clone().into(),text(&value,"name")?.into(),value["rpm_limit"].as_i64().into(),value["tpm_limit"].as_i64().into(),value["budget_micros"].as_i64().into(),value.get("routing_policy").cloned().unwrap_or(json!({"version":1})).to_string().into(),db::now().into(),db::now().into()])).await?.rows_affected();
-            if changed != 1 {
-                return Err(ApiError::Forbidden);
-            }
-            if let Some(mappings) = value["mappings"].as_array() {
-                transaction
-                    .execute(sql(
-                        "DELETE FROM api_key_profile_model_mappings WHERE profile_id=?",
-                        vec![resource_id.clone().into()],
-                    ))
-                    .await?;
-                for mapping in mappings {
-                    transaction.execute(sql("INSERT INTO api_key_profile_model_mappings(id,profile_id,source_model,target_model,priority) VALUES(?,?,?,?,?)",vec![id().into(),resource_id.clone().into(),text(mapping,"source_model")?.into(),text(mapping,"target_model")?.into(),mapping["priority"].as_i64().unwrap_or(100).into()])).await?;
-                }
-            }
-            if let Some(allowed) = value["allowed_models"].as_array() {
-                transaction
-                    .execute(sql(
-                        "DELETE FROM api_key_profile_allowed_models WHERE profile_id=?",
-                        vec![resource_id.clone().into()],
-                    ))
-                    .await?;
-                for model in allowed {
-                    let kind = model["match_type"].as_str().unwrap_or("exact");
-                    if !matches!(kind, "exact" | "regex") {
-                        return Err(ApiError::BadRequest(
-                            "invalid allowed-model match type".into(),
-                        ));
-                    }
-                    if kind == "regex" {
-                        crate::orchestration::policy::regex(text(model, "pattern")?)?;
-                    }
-                    transaction.execute(sql("INSERT INTO api_key_profile_allowed_models(profile_id,model_pattern,match_type) VALUES(?,?,?)",vec![resource_id.clone().into(),text(model,"pattern")?.into(),kind.into()])).await?;
-                }
-            }
+            let input: ProfileWriteDocument =
+                serde_json::from_value(value.clone()).map_err(|error| {
+                    ApiError::BadRequest(format!("invalid profile document: {error}"))
+                })?;
+            let _submitted_id = input.id;
+            let document = ProfileTemplateDocument {
+                version: 1,
+                rpm_limit: input.rpm_limit,
+                tpm_limit: input.tpm_limit,
+                budget_micros: input.budget_micros,
+                routing_policy: input.routing_policy,
+                mappings: input.mappings,
+                allowed_models: input.allowed_models,
+            };
+            write_profile_document(&transaction, &project, &resource_id, &input.name, &document)
+                .await?;
         }
         "prompts" => {
-            let changed = transaction.execute(sql("INSERT INTO prompts(id,project_id,name,role,content,activation_json,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,role=excluded.role,content=excluded.content,activation_json=excluded.activation_json,enabled=excluded.enabled,updated_at=excluded.updated_at WHERE prompts.project_id=excluded.project_id",vec![resource_id.clone().into(),project.clone().into(),text(&value,"name")?.into(),text(&value,"role")?.into(),text(&value,"content")?.into(),value.get("activation").cloned().unwrap_or(json!({"version":1})).to_string().into(),value["enabled"].as_bool().unwrap_or(true).into(),db::now().into(),db::now().into()])).await?.rows_affected();
+            // A malformed activation used to be stored happily and then abort
+            // prompt injection for the whole project on every gateway request,
+            // surfacing as a generic 500 with nothing naming the offending rule.
+            // Validate it where it is written, like the association conditions.
+            let activation = match value.get("activation") {
+                // A cleared JSON box in the console serialises as null.
+                None | Some(Value::Null) => json!({"version":1}),
+                Some(document) => document.clone(),
+            };
+            crate::orchestration::policy::validate_conditions(&activation)
+                .map_err(|_| ApiError::BadRequest("invalid prompt activation conditions".into()))?;
+            let role = text(&value, "role")?;
+            if !matches!(role, "system" | "user" | "assistant") {
+                return Err(ApiError::BadRequest(
+                    "prompt role must be system, user or assistant".into(),
+                ));
+            }
+            let current = transaction
+                .query_one(sql(
+                    "SELECT enabled,\"order\",action FROM prompts WHERE id=? AND project_id=?",
+                    vec![resource_id.clone().into(), project.clone().into()],
+                ))
+                .await?;
+            let action = match value.get("action") {
+                None => current
+                    .as_ref()
+                    .map(|row| row.try_get::<String>("", "action"))
+                    .transpose()?
+                    .unwrap_or_else(|| "prepend".into()),
+                Some(Value::String(action)) if matches!(action.as_str(), "prepend" | "append") => {
+                    action.clone()
+                }
+                Some(_) => {
+                    return Err(ApiError::BadRequest(
+                        "prompt action must be prepend or append".into(),
+                    ));
+                }
+            };
+            let order = match value.get("order") {
+                None => current
+                    .as_ref()
+                    .map(|row| row.try_get::<i64>("", "order"))
+                    .transpose()?
+                    .unwrap_or(0),
+                Some(order) => order.as_i64().ok_or_else(|| {
+                    ApiError::BadRequest("prompt order must be an integer".into())
+                })?,
+            };
+            let enabled = match value.get("enabled") {
+                None => current
+                    .as_ref()
+                    .map(|row| row.try_get::<bool>("", "enabled"))
+                    .transpose()?
+                    .unwrap_or(false),
+                Some(enabled) => enabled.as_bool().ok_or_else(|| {
+                    ApiError::BadRequest("prompt enabled must be a boolean".into())
+                })?,
+            };
+            let existing = transaction
+                .query_one(sql(
+                    "SELECT id FROM prompts WHERE project_id=? AND name=? AND id NOT IN (?)",
+                    vec![
+                        project.clone().into(),
+                        text(&value, "name")?.into(),
+                        resource_id.clone().into(),
+                    ],
+                ))
+                .await?;
+            if existing.is_some() {
+                // UNIQUE(project_id,name) would otherwise surface as an opaque 500.
+                return Err(ApiError::Conflict(
+                    "a prompt with that name already exists in this project".into(),
+                ));
+            }
+            let changed = transaction.execute(sql("INSERT INTO prompts(id,project_id,name,role,content,activation_json,enabled,\"order\",action,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,role=excluded.role,content=excluded.content,activation_json=excluded.activation_json,enabled=excluded.enabled,\"order\"=excluded.\"order\",action=excluded.action,updated_at=excluded.updated_at WHERE prompts.project_id=excluded.project_id",vec![resource_id.clone().into(),project.clone().into(),text(&value,"name")?.into(),role.into(),text(&value,"content")?.into(),activation.to_string().into(),enabled.into(),order.into(),action.into(),db::now().into(),db::now().into()])).await?.rows_affected();
             if changed != 1 {
                 return Err(ApiError::Forbidden);
             }
@@ -993,7 +2453,54 @@ async fn mutate(
             if let Some(pattern) = value["role_pattern"].as_str() {
                 crate::orchestration::policy::regex(pattern)?;
             }
-            let changed = transaction.execute(sql("INSERT INTO prompt_protection_rules(id,project_id,name,role_pattern,content_pattern,action,replacement,scopes_json,test_mode,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,role_pattern=excluded.role_pattern,content_pattern=excluded.content_pattern,action=excluded.action,replacement=excluded.replacement,scopes_json=excluded.scopes_json,test_mode=excluded.test_mode,enabled=excluded.enabled,updated_at=excluded.updated_at WHERE prompt_protection_rules.project_id=excluded.project_id",vec![resource_id.clone().into(),project.clone().into(),text(&value,"name")?.into(),value["role_pattern"].as_str().into(),text(&value,"content_pattern")?.into(),action.into(),value["replacement"].as_str().into(),value.get("scopes").cloned().unwrap_or(json!({"version":1})).to_string().into(),value["test_mode"].as_bool().unwrap_or(false).into(),value["enabled"].as_bool().unwrap_or(true).into(),db::now().into(),db::now().into()])).await?.rows_affected();
+            // Same defect as prompts: an unvalidated scope document is only
+            // parsed per request, so a bad one 500s the whole project. A cleared
+            // JSON box serialises as null and must become the default document —
+            // persisting the literal `null` is exactly what breaks the project.
+            let scopes = match value.get("scopes") {
+                None | Some(Value::Null) => json!({"version":1}),
+                Some(document) => document.clone(),
+            };
+            crate::orchestration::policy::validate_conditions(&scopes)
+                .map_err(|_| ApiError::BadRequest("invalid protection rule scopes".into()))?;
+            let current = transaction
+                .query_one(sql(
+                    "SELECT description,state FROM prompt_protection_rules WHERE id=? AND project_id=?",
+                    vec![resource_id.clone().into(), project.clone().into()],
+                ))
+                .await?;
+            let description = match value.get("description") {
+                None => current
+                    .as_ref()
+                    .map(|row| row.try_get::<String>("", "description"))
+                    .transpose()?
+                    .unwrap_or_default(),
+                Some(Value::Null) => String::new(),
+                Some(Value::String(description)) if description.len() <= 2048 => {
+                    description.clone()
+                }
+                Some(_) => {
+                    return Err(ApiError::BadRequest(
+                        "protection description must be text up to 2048 bytes".into(),
+                    ));
+                }
+            };
+            let state_value = match value.get("state") {
+                None => current
+                    .as_ref()
+                    .map(|row| row.try_get::<String>("", "state"))
+                    .transpose()?
+                    .unwrap_or_else(|| "active".into()),
+                Some(Value::String(state)) if matches!(state.as_str(), "active" | "archived") => {
+                    state.clone()
+                }
+                Some(_) => {
+                    return Err(ApiError::BadRequest(
+                        "protection state must be active or archived".into(),
+                    ));
+                }
+            };
+            let changed = transaction.execute(sql("INSERT INTO prompt_protection_rules(id,project_id,name,description,role_pattern,content_pattern,action,replacement,scopes_json,test_mode,enabled,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,description=excluded.description,role_pattern=excluded.role_pattern,content_pattern=excluded.content_pattern,action=excluded.action,replacement=excluded.replacement,scopes_json=excluded.scopes_json,test_mode=excluded.test_mode,enabled=excluded.enabled,state=excluded.state,updated_at=excluded.updated_at WHERE prompt_protection_rules.project_id=excluded.project_id",vec![resource_id.clone().into(),project.clone().into(),text(&value,"name")?.into(),description.into(),value["role_pattern"].as_str().into(),text(&value,"content_pattern")?.into(),action.into(),value["replacement"].as_str().into(),scopes.to_string().into(),value["test_mode"].as_bool().unwrap_or(false).into(),value["enabled"].as_bool().unwrap_or(true).into(),state_value.into(),db::now().into(),db::now().into()])).await?.rows_affected();
             if changed != 1 {
                 return Err(ApiError::Forbidden);
             }
@@ -1011,12 +2518,21 @@ async fn mutate(
                 "channels" => ("providers", "project_id=?"),
                 "models" => (
                     "models",
-                    "provider_id IN (SELECT id FROM providers WHERE project_id=?)",
+                    "provider_id IN (SELECT id FROM providers WHERE project_id=?) AND lifecycle='active'",
                 ),
                 "credentials" => (
                     "channel_credentials",
                     "provider_id IN (SELECT id FROM providers WHERE project_id=?)",
                 ),
+                // Prompts and protection rules are project-scoped and carry an
+                // `enabled` flag, so they belong to the same lifecycle as the
+                // other bulk resources instead of being refused.
+                "prompts" => ("prompts", "project_id=?"),
+                // API keys carry an `enabled` flag and a `project_id`, but they are
+                // not handled here: their lifecycle belongs to the access layer (see
+                // `bulk_toggle_api_keys`), which is where the `api_key:manage`
+                // contract and the owner-membership rule live.
+                "protection" => ("prompt_protection_rules", "project_id=?"),
                 _ => return Err(ApiError::BadRequest("unsupported bulk resource".into())),
             };
             for item in ids {
@@ -1291,7 +2807,18 @@ async fn remove(
     headers: HeaderMap,
     Path((project, resource, id)): Path<(String, String, String)>,
 ) -> Result<Json<Value>, ApiError> {
-    let user = actor(&state, &headers, Some(&project), true).await?;
+    let user = actor_for(
+        &state,
+        &headers,
+        Some(&project),
+        if resource == "key-profiles" {
+            "api_key:manage"
+        } else {
+            "project:manage"
+        },
+        true,
+    )
+    .await?;
     if !matches!(
         resource.as_str(),
         "storage"
@@ -1311,6 +2838,78 @@ async fn remove(
     }
     let (table, scope, _) = query(&resource)?;
     let tx = state.db.begin().await?;
+    // Ownership first, then dependencies. The dependency checks below are not
+    // project-scoped, so running them first let a project-A manager tell a foreign
+    // channel or model that is still in use (409) from a foreign or absent id that
+    // is not (404): an oracle over another project's resources. A resource this
+    // project does not own is simply not here, and it is answered the same way an id
+    // that does not exist is — before anything else is read.
+    if tx
+        .query_one(sql(
+            format!("SELECT id FROM {table} WHERE ({scope}) AND id=?"),
+            vec![project.clone().into(), id.clone().into()],
+        ))
+        .await?
+        .is_none()
+    {
+        return Err(ApiError::NotFound);
+    }
+    if resource == "channels" {
+        // Deleting a channel cascades into its models, credentials, settings and
+        // price history. With history present the immutability trigger aborts and
+        // the operator sees an opaque 500; without it, the models and credentials
+        // vanish silently. Neither is acceptable, so refuse and say what is at
+        // stake.
+        let attached = tx
+            .query_one(sql(
+                "SELECT (SELECT COUNT(*) FROM models WHERE provider_id=?) + (SELECT COUNT(*) FROM channel_credentials WHERE provider_id=?) AS n",
+                vec![id.clone().into(), id.clone().into()],
+            ))
+            .await?
+            .and_then(|row| row.try_get::<i64>("", "n").ok())
+            .unwrap_or(0);
+        if attached > 0 {
+            return Err(ApiError::ConflictNamed(
+                "resource_in_use",
+                "this channel still has models or credentials; remove those first so nothing is deleted silently"
+                    .into(),
+            ));
+        }
+    }
+    if resource == "models" {
+        let lifecycle = tx
+            .query_one(sql(
+                "SELECT lifecycle FROM models WHERE id=? AND provider_id IN (SELECT id FROM providers WHERE project_id=?)",
+                vec![id.clone().into(), project.clone().into()],
+            ))
+            .await?
+            .and_then(|row| row.try_get::<String>("", "lifecycle").ok())
+            .ok_or(ApiError::NotFound)?;
+        if lifecycle != "archived" {
+            return Err(ApiError::ConflictNamed(
+                "archive_required",
+                "archive the model and review its delete impact before deleting it".into(),
+            ));
+        }
+        // Deleting a model cascades into immutable price history, where a trigger
+        // aborts the statement — which surfaced as an opaque 500 with nothing
+        // naming the cause. Refuse with the reason instead.
+        let referenced = tx
+            .query_one(sql(
+                "SELECT (SELECT COUNT(*) FROM model_prices WHERE model_id=?) + (SELECT COUNT(*) FROM usage_logs WHERE model_id=?) AS n",
+                vec![id.clone().into(), id.clone().into()],
+            ))
+            .await?
+            .and_then(|row| row.try_get::<i64>("", "n").ok())
+            .unwrap_or(0);
+        if referenced > 0 {
+            return Err(ApiError::ConflictNamed(
+                "history_retained",
+                "this archived model has immutable price or usage history and cannot be deleted"
+                    .into(),
+            ));
+        }
+    }
     let changed = tx
         .execute(sql(
             format!("DELETE FROM {table} WHERE ({scope}) AND id=?"),
@@ -1323,8 +2922,83 @@ async fn remove(
     }
     audit_in(&tx, &user, &project, &format!("{resource}.delete"), &id).await?;
     tx.commit().await?;
+    if resource == "models" {
+        state.orchestrator.reset_derived();
+    }
     Ok(Json(json!({"ok":true})))
 }
+/// What artifacts this project has, without their payloads. The envelope is the
+/// encrypted database image and is only returned by the single-artifact route.
+async fn list_artifacts(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    actor(&state, &headers, Some(&project), false).await?;
+    let rows = state
+        .db
+        .query_all(sql(
+            "SELECT id,digest,manifest_json,created_at FROM backup_artifacts WHERE project_id=? ORDER BY created_at DESC LIMIT 200",
+            vec![project.into()],
+        ))
+        .await?;
+    let artifacts: Vec<Value> = rows
+        .iter()
+        .filter_map(|row| {
+            Some(json!({
+                "id": row.try_get::<String>("", "id").ok()?,
+                "digest": row.try_get::<String>("", "digest").ok()?,
+                "manifest": serde_json::from_str::<Value>(
+                    &row.try_get::<String>("", "manifest_json").ok()?
+                ).ok()?,
+                "created_at": row.try_get::<i64>("", "created_at").ok()?,
+            }))
+        })
+        .collect();
+    Ok(Json(json!({"artifacts": artifacts})))
+}
+
+/// Re-download an artifact created earlier, including its encrypted payload.
+async fn get_artifact(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((project, artifact)): Path<(String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    let user = actor(&state, &headers, Some(&project), true).await?;
+    let row = state
+        .db
+        .query_one(sql(
+            "SELECT id,digest,manifest_json,envelope,created_at FROM backup_artifacts WHERE id=? AND project_id=?",
+            vec![artifact.clone().into(), project.clone().into()],
+        ))
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    // Downloading a copy of the encrypted database is worth an audit trail.
+    state
+        .db
+        .execute(sql(
+            "INSERT INTO audit_events(id,action,resource_type,resource_id,details,created_at) VALUES(?,'backup.artifact.read','backup_artifact',?,?,?)",
+            vec![
+                crate::operations::id().into(),
+                artifact.clone().into(),
+                json!({"principal_id": user.subject_id, "digest": row.try_get::<String>("", "digest").unwrap_or_default()}).to_string().into(),
+                db::now().into(),
+            ],
+        ))
+        .await?;
+    // The console restores from the document this route returns, and its parser
+    // requires `version`, `project_id` and `resources` alongside the envelope. The
+    // five-field shape this used to send made the console reject its own artifact
+    // ("该文件不是可恢复的备份产物。"), so the export path and this route now build
+    // the document the same way.
+    let artifact = crate::operations::backup::read_artifact(&state.db, &artifact, &project)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    Ok(Json(
+        serde_json::to_value(artifact).map_err(|error| ApiError::Internal(error.into()))?,
+    ))
+}
+
 async fn export(
     State(state): State<AppState>,
     headers: HeaderMap,

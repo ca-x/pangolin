@@ -33,7 +33,7 @@ impl Level {
     }
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct Policy {
     pub enabled: bool,
     pub default_level: Level,
@@ -47,6 +47,74 @@ impl Default for Policy {
             default_level: Level::Metadata,
             key_override_enabled: false,
             key_disable_allowed: false,
+        }
+    }
+}
+/// The strict write contract for the site policy — deliberately a different type
+/// from the stored/runtime [`Policy`].
+///
+/// The two ends of this document fail in opposite directions, so they need
+/// opposite strictness. `Policy` is parsed on the admission path, where a
+/// document written by another build must never be able to fail resolution and
+/// take every request in the instance down with it; it therefore ignores fields
+/// it does not know (see
+/// `a_stored_logging_policy_with_an_unknown_field_does_not_break_the_gateway`).
+/// The write path is the only place an operator typo can install a policy nobody
+/// asked for: `{"enabledd": false}` used to deserialize into the default
+/// *enabled/metadata* policy and be stored and audited as a deliberate change,
+/// the exact inverse of the intent. Unknown fields are denied here, at the
+/// boundary, and never on the stored document.
+///
+/// Conversion into `Policy` happens only after this type has accepted the input.
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PolicyInput {
+    enabled: bool,
+    default_level: Level,
+    key_override_enabled: bool,
+    key_disable_allowed: bool,
+}
+impl Default for PolicyInput {
+    /// An omitted field keeps the policy's own documented default — `enabled`
+    /// stays true, it does not fall back to `bool::default()`.
+    fn default() -> Self {
+        let policy = Policy::default();
+        Self {
+            enabled: policy.enabled,
+            default_level: policy.default_level,
+            key_override_enabled: policy.key_override_enabled,
+            key_disable_allowed: policy.key_disable_allowed,
+        }
+    }
+}
+impl PolicyInput {
+    /// Parse the strict write contract. The failure is a fixed, safe message: the
+    /// serde cause would quote field paths and line numbers, which tells a
+    /// legitimate client nothing it does not already know from the schema and
+    /// which is exactly the internal detail this boundary must not publish.
+    pub fn parse(value: Value) -> Result<Self, ApiError> {
+        // serde's derived struct visitor also accepts a *positional* sequence, so
+        // `[]` deserializes to all-defaults and would install a policy nobody
+        // wrote; `[true,"off"]` would even install a chosen one. The document is
+        // an object, and nothing else is a request-logging policy.
+        if !value.is_object() {
+            return Err(Self::invalid());
+        }
+        serde_json::from_value(value).map_err(|_| Self::invalid())
+    }
+    fn invalid() -> ApiError {
+        ApiError::BadRequest(
+            "invalid request-logging policy: only enabled, default_level, key_override_enabled and key_disable_allowed are accepted, with the documented types and levels".into(),
+        )
+    }
+}
+impl From<PolicyInput> for Policy {
+    fn from(input: PolicyInput) -> Self {
+        Self {
+            enabled: input.enabled,
+            default_level: input.default_level,
+            key_override_enabled: input.key_override_enabled,
+            key_disable_allowed: input.key_disable_allowed,
         }
     }
 }

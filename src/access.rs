@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use sea_orm::{
     ConnectionTrait, DatabaseConnection, DbBackend, FromQueryResult, Statement, TransactionTrait,
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -93,6 +93,13 @@ fn statement(sql: impl Into<String>, values: Vec<sea_orm::Value>) -> Statement {
 #[derive(FromQueryResult)]
 struct PermissionRow {
     slug: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, FromQueryResult)]
+pub struct PermissionCatalogEntry {
+    pub slug: String,
+    pub level: String,
+    pub description: String,
 }
 
 #[derive(FromQueryResult)]
@@ -207,17 +214,53 @@ pub async fn authorize(
     permission: &str,
 ) -> Result<(), AccessError> {
     let scopes = effective_scopes(db, principal, project_id).await?;
-    let project_manage = project_id.is_some()
+    if permits(&scopes, project_id.is_some(), permission) {
+        Ok(())
+    } else {
+        Err(AccessError::Forbidden)
+    }
+}
+
+fn permits(scopes: &BTreeSet<String>, project_scoped: bool, permission: &str) -> bool {
+    let project_manage = project_scoped
         && matches!(
             permission,
             "project:read" | "role:manage" | "api_key:manage"
         )
         && scopes.contains("project:manage");
-    if scopes.contains("*") || scopes.contains(permission) || project_manage {
-        Ok(())
-    } else {
-        Err(AccessError::Forbidden)
-    }
+    scopes.contains("*") || scopes.contains(permission) || project_manage
+}
+
+/// The project permissions this principal may place on a project role.
+///
+/// Reading the choices requires the same authority as writing a role. The
+/// returned rows are filtered with the exact predicate `authorize` uses, so the
+/// catalog can explain the write boundary without becoming that boundary.
+pub async fn permission_catalog(
+    db: &DatabaseConnection,
+    actor: &Principal,
+    project_id: &str,
+) -> Result<Vec<PermissionCatalogEntry>, AccessError> {
+    authorize(db, actor, Some(project_id), "role:manage").await?;
+    ProjectOwnerRow::find_by_statement(statement(
+        "SELECT owner_user_id FROM projects WHERE id=?",
+        vec![project_id.into()],
+    ))
+    .one(db)
+    .await?
+    .ok_or(AccessError::NotFound)?;
+
+    let scopes = effective_scopes(db, actor, Some(project_id)).await?;
+    let permissions = PermissionCatalogEntry::find_by_statement(statement(
+        "SELECT slug,level,description FROM permissions WHERE level='project' ORDER BY slug",
+        vec![],
+    ))
+    .all(db)
+    .await?;
+    Ok(permissions
+        .into_iter()
+        .filter(|permission| permits(&scopes, true, &permission.slug))
+        .collect())
 }
 
 #[derive(Debug, Clone, Serialize, FromQueryResult)]
@@ -267,6 +310,14 @@ pub struct UserInput {
     pub password: String,
     pub display_name: Option<String>,
     pub language: Option<String>,
+    /// Whether the account starts enabled. The console offered this switch and
+    /// the backend ignored it, always creating an enabled user.
+    #[serde(default = "enabled_by_default")]
+    pub enabled: bool,
+}
+
+fn enabled_by_default() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize)]
@@ -304,6 +355,11 @@ pub struct MembershipView {
     pub id: String,
     pub project_id: String,
     pub user_id: String,
+    /// Identity of the member. A roster that lists only opaque user ids cannot be
+    /// read by the project manager who is allowed to see it, and that manager is
+    /// not allowed to list users to look the ids up.
+    pub email: Option<String>,
+    pub display_name: Option<String>,
     pub role_id: String,
     pub status: String,
     pub created_at: i64,
@@ -437,8 +493,12 @@ pub struct ScopedApiKeyView {
     pub id: String,
     pub name: String,
     pub key_prefix: String,
+    #[serde(serialize_with = "serialize_project_scopes")]
     pub scopes: String,
     pub budget_micros: Option<i64>,
+    /// How much of the budget has been spent. Without it a key that has run out
+    /// of budget is indistinguishable from a working one in the console.
+    pub spent_micros: i64,
     pub enabled: bool,
     pub created_at: i64,
     pub project_id: String,
@@ -446,8 +506,81 @@ pub struct ScopedApiKeyView {
     pub profile_id: Option<String>,
     pub key_type: String,
     pub expires_at: Option<i64>,
+    /// When the key was last used. Without it a key nobody has used in months is
+    /// indistinguishable from one in active use.
+    pub last_used_at: Option<i64>,
     pub allowed_ips_json: String,
     pub denied_ips_json: String,
+    pub lifecycle: String,
+    pub archived_at: Option<i64>,
+}
+
+/// SQLite keeps scopes as a JSON array string, while the public API exposes the
+/// array itself. A malformed historical row is rendered as no scopes so callers
+/// fail closed instead of turning a list response into a serialization failure.
+fn serialize_project_scopes<S>(value: &str, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serde_json::from_str::<Vec<String>>(value)
+        .unwrap_or_default()
+        .serialize(serializer)
+}
+
+/// The fields the key lifecycle decides on, without the secrets or the projections.
+#[derive(FromQueryResult)]
+struct ApiKeyOwnerRow {
+    key_type: String,
+    user_id: Option<String>,
+    lifecycle: String,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct BulkApiKeyArchiveResult {
+    pub archived_ids: Vec<String>,
+    pub archived_count: usize,
+}
+
+/// Whether this user exists, is enabled and is an active member of this project.
+/// The single copy of that predicate: creating an owned key, updating one and the
+/// bulk lifecycle all decide on it.
+async fn owner_is_active_member<C: ConnectionTrait>(
+    db: &C,
+    project_id: &str,
+    user_id: &str,
+) -> Result<bool, AccessError> {
+    Ok(PermissionRow::find_by_statement(statement(
+        "SELECT 'active' AS slug FROM users user JOIN project_memberships membership ON membership.user_id=user.id AND membership.project_id=? AND membership.status='active' WHERE user.id=? AND user.enabled=1",
+        vec![project_id.into(), user_id.into()],
+    ))
+    .one(db)
+    .await?
+    .is_some())
+}
+
+/// Whether an owned key may be *enabled*. A `user`/`personal` key acts as its owner,
+/// so enabling one while the owner is disabled, suspended, missing or no longer an
+/// active member of the project would hand out a working credential for an identity
+/// that is not allowed in. The single-key update and the bulk lifecycle both call
+/// this, so the two cannot drift into different rules.
+async fn ensure_owner_can_hold_enabled_key<C: ConnectionTrait>(
+    db: &C,
+    project_id: &str,
+    key_type: &str,
+    user_id: Option<&str>,
+) -> Result<(), AccessError> {
+    if !matches!(key_type, "user" | "personal") {
+        return Ok(());
+    }
+    let Some(owner_id) = user_id else {
+        return Err(AccessError::Invalid("owned API key has no owner".into()));
+    };
+    if !owner_is_active_member(db, project_id, owner_id).await? {
+        return Err(AccessError::Invalid(
+            "cannot enable a user/personal key without an active owner membership".into(),
+        ));
+    }
+    Ok(())
 }
 
 async fn audit<C: ConnectionTrait>(
@@ -668,6 +801,24 @@ pub async fn delete_project(
         ));
     }
     let transaction = db.begin().await?;
+    // Deleting a project cascades into every table that references it. Where
+    // immutable history exists — price versions and settled usage — a trigger
+    // aborts the statement, which surfaced as an opaque 500 with nothing naming
+    // the cause. Refuse with the reason instead.
+    let history: i64 = transaction
+        .query_one(statement(
+            "SELECT (SELECT COUNT(*) FROM model_prices p JOIN models m ON m.id=p.model_id JOIN providers v ON v.id=m.provider_id WHERE v.project_id=?) + (SELECT COUNT(*) FROM usage_logs u JOIN execution_facts e ON e.id=u.execution_id JOIN request_facts f ON f.id=e.request_id WHERE f.project_id=?) AS n",
+            vec![project_id.into(), project_id.into()],
+        ))
+        .await?
+        .and_then(|row| row.try_get::<i64>("", "n").ok())
+        .unwrap_or(0);
+    if history > 0 {
+        return Err(AccessError::Invalid(
+            "this project has price or usage history and cannot be deleted; disable it instead"
+                .into(),
+        ));
+    }
     audit(
         &transaction,
         actor,
@@ -719,8 +870,8 @@ pub async fn create_user(
     let password_hash = crypto::hash_password(&input.password).map_err(AccessError::Internal)?;
     let transaction = db.begin().await?;
     transaction.execute(statement(
-        "INSERT INTO users(id,email,password_hash,role,language,theme,created_at,display_name,enabled,updated_at) VALUES(?,?,?,'member',?,'system:bronze',?,?,1,?)",
-        vec![id.clone().into(), email.clone().into(), password_hash.into(), input.language.clone().unwrap_or_else(|| "zh-CN".into()).into(), timestamp.into(), display_name.into(), timestamp.into()],
+        "INSERT INTO users(id,email,password_hash,role,language,theme,created_at,display_name,enabled,updated_at) VALUES(?,?,?,'member',?,'system:bronze',?,?,?,?)",
+        vec![id.clone().into(), email.clone().into(), password_hash.into(), input.language.clone().unwrap_or_else(|| "zh-CN".into()).into(), timestamp.into(), display_name.into(), input.enabled.into(), timestamp.into()],
     )).await.map_err(|error| AccessError::Conflict(error.to_string()))?;
     audit(
         &transaction,
@@ -1015,7 +1166,7 @@ pub async fn list_memberships(
     project_id: &str,
 ) -> Result<Vec<MembershipView>, AccessError> {
     authorize(db, actor, Some(project_id), "project:read").await?;
-    Ok(MembershipView::find_by_statement(statement("SELECT id,project_id,user_id,role_id,status,created_at,updated_at FROM project_memberships WHERE project_id=? ORDER BY created_at,id", vec![project_id.into()])).all(db).await?)
+    Ok(MembershipView::find_by_statement(statement("SELECT m.id AS id,m.project_id AS project_id,m.user_id AS user_id,u.email AS email,u.display_name AS display_name,m.role_id AS role_id,m.status AS status,m.created_at AS created_at,m.updated_at AS updated_at FROM project_memberships m LEFT JOIN users u ON u.id=m.user_id WHERE m.project_id=? ORDER BY m.created_at,m.id", vec![project_id.into()])).all(db).await?)
 }
 
 pub async fn upsert_membership(
@@ -1059,7 +1210,7 @@ pub async fn upsert_membership(
     )
     .await?;
     transaction.commit().await?;
-    MembershipView::find_by_statement(statement("SELECT id,project_id,user_id,role_id,status,created_at,updated_at FROM project_memberships WHERE project_id=? AND user_id=?", vec![project_id.into(), input.user_id.clone().into()])).one(db).await?.ok_or(AccessError::NotFound)
+    MembershipView::find_by_statement(statement("SELECT m.id AS id,m.project_id AS project_id,m.user_id AS user_id,u.email AS email,u.display_name AS display_name,m.role_id AS role_id,m.status AS status,m.created_at AS created_at,m.updated_at AS updated_at FROM project_memberships m LEFT JOIN users u ON u.id=m.user_id WHERE m.project_id=? AND m.user_id=?", vec![project_id.into(), input.user_id.clone().into()])).one(db).await?.ok_or(AccessError::NotFound)
 }
 
 pub async fn remove_membership(
@@ -1289,17 +1440,11 @@ pub async fn create_scoped_api_key(
     }
     if matches!(input.key_type.as_str(), "user" | "personal")
         && let Some(user_id) = &input.user_id
+        && !owner_is_active_member(db, &input.project_id, user_id).await?
     {
-        #[derive(FromQueryResult)]
-        struct MembershipExists {
-            present: i64,
-        }
-        let membership = MembershipExists::find_by_statement(statement("SELECT 1 AS present FROM project_memberships membership JOIN users user ON user.id=membership.user_id AND user.enabled=1 WHERE membership.project_id=? AND membership.user_id=? AND membership.status='active'", vec![input.project_id.clone().into(), user_id.clone().into()])).one(db).await?;
-        if !membership.is_some_and(|row| row.present == 1) {
-            return Err(AccessError::Invalid(
-                "user/personal API-key owner must be an active user and project member".into(),
-            ));
-        }
+        return Err(AccessError::Invalid(
+            "user/personal API-key owner must be an active user and project member".into(),
+        ));
     }
     if input.expires_at.is_some_and(|expires| expires <= db::now()) {
         return Err(AccessError::Invalid(
@@ -1365,7 +1510,7 @@ pub async fn create_scoped_api_key(
     })?;
     audit(&transaction, actor, "create", "api_key", &id, json!({"project_id":input.project_id,"name":name,"fingerprint":prefix,"key_type":input.key_type,"token_mode":match input.token_mode { ApiKeyTokenMode::Generated => "generated", ApiKeyTokenMode::ImportExisting => "import_existing" }})).await?;
     transaction.commit().await?;
-    let view = ScopedApiKeyView::find_by_statement(statement("SELECT id,name,key_prefix,scopes,budget_micros,enabled,created_at,project_id,user_id,profile_id,key_type,expires_at,allowed_ips_json,denied_ips_json FROM api_keys WHERE id=?", vec![id.into()])).one(db).await?.ok_or(AccessError::NotFound)?;
+    let view = ScopedApiKeyView::find_by_statement(statement("SELECT id,name,key_prefix,scopes,budget_micros,spent_micros,enabled,created_at,project_id,user_id,profile_id,key_type,expires_at,last_used_at,allowed_ips_json,denied_ips_json,lifecycle,archived_at FROM api_keys WHERE id=?", vec![id.into()])).one(db).await?.ok_or(AccessError::NotFound)?;
     Ok((view, token))
 }
 
@@ -1384,7 +1529,7 @@ pub async fn list_scoped_api_keys(
     project_id: &str,
 ) -> Result<Vec<ScopedApiKeyView>, AccessError> {
     authorize(db, actor, Some(project_id), "api_key:manage").await?;
-    Ok(ScopedApiKeyView::find_by_statement(statement("SELECT id,name,key_prefix,scopes,budget_micros,enabled,created_at,project_id,user_id,profile_id,key_type,expires_at,allowed_ips_json,denied_ips_json FROM api_keys WHERE project_id=? ORDER BY created_at DESC,id", vec![project_id.into()])).all(db).await?)
+    Ok(ScopedApiKeyView::find_by_statement(statement("SELECT id,name,key_prefix,scopes,budget_micros,spent_micros,enabled,created_at,project_id,user_id,profile_id,key_type,expires_at,last_used_at,allowed_ips_json,denied_ips_json,lifecycle,archived_at FROM api_keys WHERE project_id=? ORDER BY created_at DESC,id", vec![project_id.into()])).all(db).await?)
 }
 
 pub async fn update_scoped_api_key(
@@ -1400,23 +1545,20 @@ pub async fn update_scoped_api_key(
             "expiration must be in the future".into(),
         ));
     }
-    let current = ScopedApiKeyView::find_by_statement(statement("SELECT id,name,key_prefix,scopes,budget_micros,enabled,created_at,project_id,user_id,profile_id,key_type,expires_at,allowed_ips_json,denied_ips_json FROM api_keys WHERE id=? AND project_id=?", vec![key_id.into(), project_id.into()])).one(db).await?.ok_or(AccessError::NotFound)?;
-    if input.enabled == Some(true) && matches!(current.key_type.as_str(), "user" | "personal") {
-        let Some(owner_id) = current.user_id.as_deref() else {
-            return Err(AccessError::Invalid("owned API key has no owner".into()));
-        };
-        let owner_active = PermissionRow::find_by_statement(statement(
-            "SELECT 'active' AS slug FROM users user JOIN project_memberships membership ON membership.user_id=user.id AND membership.project_id=? AND membership.status='active' WHERE user.id=? AND user.enabled=1",
-            vec![project_id.into(), owner_id.into()],
-        ))
-        .one(db)
-        .await?
-        .is_some();
-        if !owner_active {
-            return Err(AccessError::Invalid(
-                "cannot enable a user/personal key without an active owner membership".into(),
-            ));
-        }
+    let current = ScopedApiKeyView::find_by_statement(statement("SELECT id,name,key_prefix,scopes,budget_micros,spent_micros,enabled,created_at,project_id,user_id,profile_id,key_type,expires_at,last_used_at,allowed_ips_json,denied_ips_json,lifecycle,archived_at FROM api_keys WHERE id=? AND project_id=?", vec![key_id.into(), project_id.into()])).one(db).await?.ok_or(AccessError::NotFound)?;
+    if current.lifecycle == "archived" {
+        return Err(AccessError::Conflict(
+            "archived API keys cannot be modified".into(),
+        ));
+    }
+    if input.enabled == Some(true) {
+        ensure_owner_can_hold_enabled_key(
+            db,
+            project_id,
+            &current.key_type,
+            current.user_id.as_deref(),
+        )
+        .await?;
     }
     let scopes = if let Some(scopes) = &input.scopes {
         let scopes = scopes
@@ -1515,7 +1657,230 @@ pub async fn update_scoped_api_key(
     )
     .await?;
     transaction.commit().await?;
-    ScopedApiKeyView::find_by_statement(statement("SELECT id,name,key_prefix,scopes,budget_micros,enabled,created_at,project_id,user_id,profile_id,key_type,expires_at,allowed_ips_json,denied_ips_json FROM api_keys WHERE id=? AND project_id=?", vec![key_id.into(), project_id.into()])).one(db).await?.ok_or(AccessError::NotFound)
+    ScopedApiKeyView::find_by_statement(statement("SELECT id,name,key_prefix,scopes,budget_micros,spent_micros,enabled,created_at,project_id,user_id,profile_id,key_type,expires_at,last_used_at,allowed_ips_json,denied_ips_json,lifecycle,archived_at FROM api_keys WHERE id=? AND project_id=?", vec![key_id.into(), project_id.into()])).one(db).await?.ok_or(AccessError::NotFound)
+}
+
+pub async fn rotate_scoped_api_key(
+    db: &DatabaseConnection,
+    actor: &Principal,
+    project_id: &str,
+    key_id: &str,
+) -> Result<(ScopedApiKeyView, String), AccessError> {
+    authorize(db, actor, Some(project_id), "api_key:manage").await?;
+    // Argon2id is intentionally outside the SQLite business transaction. A refused
+    // rotate may waste one hash, but never holds the writer while doing expensive CPU.
+    let token = crypto::opaque_token("pg_");
+    let lookup_digest = crypto::token_hash(&token);
+    let prefix = lookup_digest[..8].to_owned();
+    let key_hash = crypto::hash_password(&token).map_err(AccessError::Internal)?;
+    let transaction = db.begin().await?;
+    let current = ApiKeyOwnerRow::find_by_statement(statement(
+        "SELECT key_type,user_id,lifecycle FROM api_keys WHERE id=? AND project_id=?",
+        vec![key_id.into(), project_id.into()],
+    ))
+    .one(&transaction)
+    .await?
+    .ok_or(AccessError::NotFound)?;
+    if current.lifecycle == "archived" {
+        return Err(AccessError::Conflict(
+            "archived API keys cannot be rotated".into(),
+        ));
+    }
+    ensure_owner_can_hold_enabled_key(
+        &transaction,
+        project_id,
+        &current.key_type,
+        current.user_id.as_deref(),
+    )
+    .await?;
+    let changed = transaction
+        .execute(statement(
+            "UPDATE api_keys SET key_prefix=?,key_hash=?,lookup_digest=? WHERE id=? AND project_id=? AND lifecycle='active'",
+            vec![prefix.clone().into(), key_hash.into(), lookup_digest.into(), key_id.into(), project_id.into()],
+        ))
+        .await?;
+    if changed.rows_affected() != 1 {
+        return Err(AccessError::NotFound);
+    }
+    audit(
+        &transaction,
+        actor,
+        "rotate",
+        "api_key",
+        key_id,
+        json!({"project_id":project_id,"fingerprint":prefix}),
+    )
+    .await?;
+    transaction.commit().await?;
+    let view = ScopedApiKeyView::find_by_statement(statement(
+        "SELECT id,name,key_prefix,scopes,budget_micros,spent_micros,enabled,created_at,project_id,user_id,profile_id,key_type,expires_at,last_used_at,allowed_ips_json,denied_ips_json,lifecycle,archived_at FROM api_keys WHERE id=? AND project_id=?",
+        vec![key_id.into(), project_id.into()],
+    ))
+    .one(db)
+    .await?
+    .ok_or(AccessError::NotFound)?;
+    Ok((view, token))
+}
+
+pub async fn archive_scoped_api_key(
+    db: &DatabaseConnection,
+    actor: &Principal,
+    project_id: &str,
+    key_id: &str,
+) -> Result<ScopedApiKeyView, AccessError> {
+    authorize(db, actor, Some(project_id), "api_key:manage").await?;
+    let transaction = db.begin().await?;
+    let current = ApiKeyOwnerRow::find_by_statement(statement(
+        "SELECT key_type,user_id,lifecycle FROM api_keys WHERE id=? AND project_id=?",
+        vec![key_id.into(), project_id.into()],
+    ))
+    .one(&transaction)
+    .await?
+    .ok_or(AccessError::NotFound)?;
+    if current.lifecycle == "archived" {
+        return Err(AccessError::Conflict("API key is already archived".into()));
+    }
+    let archived_at = db::now();
+    transaction
+        .execute(statement(
+            "UPDATE api_keys SET lifecycle='archived',archived_at=?,enabled=0 WHERE id=? AND project_id=? AND lifecycle='active'",
+            vec![archived_at.into(), key_id.into(), project_id.into()],
+        ))
+        .await?;
+    audit(
+        &transaction,
+        actor,
+        "archive",
+        "api_key",
+        key_id,
+        json!({"project_id":project_id,"archived_at":archived_at}),
+    )
+    .await?;
+    transaction.commit().await?;
+    ScopedApiKeyView::find_by_statement(statement(
+        "SELECT id,name,key_prefix,scopes,budget_micros,spent_micros,enabled,created_at,project_id,user_id,profile_id,key_type,expires_at,last_used_at,allowed_ips_json,denied_ips_json,lifecycle,archived_at FROM api_keys WHERE id=? AND project_id=?",
+        vec![key_id.into(), project_id.into()],
+    ))
+    .one(db)
+    .await?
+    .ok_or(AccessError::NotFound)
+}
+
+pub async fn archive_scoped_api_keys(
+    db: &DatabaseConnection,
+    actor: &Principal,
+    project_id: &str,
+    key_ids: &[String],
+) -> Result<BulkApiKeyArchiveResult, AccessError> {
+    authorize(db, actor, Some(project_id), "api_key:manage").await?;
+    let transaction = db.begin().await?;
+    let mut archived_ids = Vec::new();
+    for key_id in key_ids.iter().collect::<BTreeSet<_>>() {
+        let Some(current) = ApiKeyOwnerRow::find_by_statement(statement(
+            "SELECT key_type,user_id,lifecycle FROM api_keys WHERE id=? AND project_id=?",
+            vec![key_id.as_str().into(), project_id.into()],
+        ))
+        .one(&transaction)
+        .await?
+        else {
+            continue;
+        };
+        if current.lifecycle == "archived" {
+            continue;
+        }
+        archived_ids.push((*key_id).clone());
+    }
+    let archived_at = db::now();
+    for key_id in &archived_ids {
+        transaction
+            .execute(statement(
+                "UPDATE api_keys SET lifecycle='archived',archived_at=?,enabled=0 WHERE id=? AND project_id=? AND lifecycle='active'",
+                vec![archived_at.into(), key_id.clone().into(), project_id.into()],
+            ))
+            .await?;
+    }
+    let archived_count = archived_ids.len();
+    audit(
+        &transaction,
+        actor,
+        "archive_bulk",
+        "api_key",
+        project_id,
+        json!({"project_id":project_id,"archived_ids":archived_ids,"archived_count":archived_count,"archived_at":archived_at}),
+    )
+    .await?;
+    transaction.commit().await?;
+    Ok(BulkApiKeyArchiveResult {
+        archived_ids,
+        archived_count,
+    })
+}
+
+/// Bulk enable/disable for the keys one project owns. This is the same lifecycle as
+/// [`update_scoped_api_key`] — the same effective `api_key:manage` authorization and
+/// the same owner-membership rule for `user`/`personal` keys — because the generic
+/// table toggle in the operations API could express neither.
+///
+/// One transaction covers the whole batch: a key that cannot be enabled leaves every
+/// key in the batch exactly as it was. An id this project does not own is skipped, as
+/// it is for every other bulk resource, so the batch cannot write to another
+/// project's keys; the count returned is the number of keys this project changed, and
+/// a caller allowed to run this can already list this project's keys, so the count
+/// discloses nothing about another project. Every applied change is audited in the
+/// same transaction.
+pub async fn set_scoped_api_keys_enabled(
+    db: &DatabaseConnection,
+    actor: &Principal,
+    project_id: &str,
+    key_ids: &[String],
+    enabled: bool,
+) -> Result<usize, AccessError> {
+    authorize(db, actor, Some(project_id), "api_key:manage").await?;
+    let transaction = db.begin().await?;
+    let mut updated = 0usize;
+    for key_id in key_ids {
+        let Some(current) = ApiKeyOwnerRow::find_by_statement(statement(
+            "SELECT key_type,user_id,lifecycle FROM api_keys WHERE id=? AND project_id=?",
+            vec![key_id.clone().into(), project_id.into()],
+        ))
+        .one(&transaction)
+        .await?
+        else {
+            continue;
+        };
+        if current.lifecycle == "archived" {
+            return Err(AccessError::Conflict(
+                "archived API keys cannot be modified".into(),
+            ));
+        }
+        if enabled {
+            ensure_owner_can_hold_enabled_key(
+                &transaction,
+                project_id,
+                &current.key_type,
+                current.user_id.as_deref(),
+            )
+            .await?;
+        }
+        transaction
+            .execute(statement(
+                "UPDATE api_keys SET enabled=? WHERE id=? AND project_id=?",
+                vec![enabled.into(), key_id.clone().into(), project_id.into()],
+            ))
+            .await?;
+        audit(
+            &transaction,
+            actor,
+            "update",
+            "api_key",
+            key_id,
+            json!({"project_id":project_id,"enabled":enabled,"bulk":true}),
+        )
+        .await?;
+        updated += 1;
+    }
+    transaction.commit().await?;
+    Ok(updated)
 }
 
 pub async fn delete_scoped_api_key(
@@ -1555,6 +1920,25 @@ pub async fn list_role_bindings(
 ) -> Result<Vec<RoleBindingView>, AccessError> {
     authorize(db, actor, None, "user:manage").await?;
     Ok(RoleBindingView::find_by_statement(statement("SELECT id,user_id,role_id,project_id,created_at FROM user_role_bindings WHERE user_id=? ORDER BY project_id,created_at,id", vec![user_id.into()])).all(db).await?)
+}
+
+/// Bindings a user holds **within one project**. Creating a binding needs
+/// `role:manage` on that project, so reading them needs the same permission:
+/// listing only through the instance-level route left a project manager able to
+/// grant a role but unable to see or revoke it.
+pub async fn list_project_role_bindings(
+    db: &DatabaseConnection,
+    actor: &Principal,
+    project_id: &str,
+    user_id: &str,
+) -> Result<Vec<RoleBindingView>, AccessError> {
+    authorize(db, actor, Some(project_id), "role:manage").await?;
+    Ok(RoleBindingView::find_by_statement(statement(
+        "SELECT id,user_id,role_id,project_id,created_at FROM user_role_bindings WHERE user_id=? AND project_id=? ORDER BY created_at",
+        vec![user_id.into(), project_id.into()],
+    ))
+    .all(db)
+    .await?)
 }
 
 pub async fn create_role_binding(
@@ -1663,6 +2047,338 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn permission_catalog_and_role_writes_share_delegation_boundaries() {
+        let (database, owner) = owner_database().await;
+        let owner_catalog = permission_catalog(&database, &owner, db::DEFAULT_PROJECT_ID)
+            .await
+            .unwrap();
+        assert_eq!(owner_catalog.len(), 5);
+        assert!(
+            owner_catalog
+                .iter()
+                .any(|permission| permission.slug == "gateway:use"),
+            "a wildcard system session receives the full applicable project catalog"
+        );
+        let manager = create_user(
+            &database,
+            &owner,
+            &UserInput {
+                email: "permission-manager@example.com".into(),
+                password: "another secure password".into(),
+                display_name: None,
+                language: None,
+                enabled: true,
+            },
+        )
+        .await
+        .unwrap();
+        let manager_role = create_role(
+            &database,
+            &owner,
+            db::DEFAULT_PROJECT_ID,
+            &RoleInput {
+                name: "permission manager".into(),
+                permissions: vec!["project:manage".into()],
+            },
+        )
+        .await
+        .unwrap();
+        upsert_membership(
+            &database,
+            &owner,
+            db::DEFAULT_PROJECT_ID,
+            &MembershipInput {
+                user_id: manager.id.clone(),
+                role_id: manager_role.id,
+                status: "active".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let actor = Principal::session(manager.id);
+
+        let catalog = permission_catalog(&database, &actor, db::DEFAULT_PROJECT_ID)
+            .await
+            .unwrap();
+        let slugs = catalog
+            .iter()
+            .map(|permission| permission.slug.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            slugs,
+            BTreeSet::from([
+                "api_key:manage",
+                "project:manage",
+                "project:read",
+                "role:manage",
+            ]),
+            "project:manage must keep its documented implications without granting gateway use"
+        );
+        assert!(
+            catalog
+                .iter()
+                .all(|permission| permission.level == "project")
+        );
+        assert!(
+            catalog
+                .iter()
+                .all(|permission| !permission.description.trim().is_empty())
+        );
+
+        let delegated = create_role(
+            &database,
+            &actor,
+            db::DEFAULT_PROJECT_ID,
+            &RoleInput {
+                name: "delegated manager".into(),
+                permissions: vec!["project:read".into(), "api_key:manage".into()],
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            create_role(
+                &database,
+                &actor,
+                db::DEFAULT_PROJECT_ID,
+                &RoleInput {
+                    name: "escalated creator".into(),
+                    permissions: vec!["gateway:use".into()],
+                },
+            )
+            .await,
+            Err(AccessError::Forbidden)
+        ));
+        assert!(matches!(
+            update_role(
+                &database,
+                &actor,
+                db::DEFAULT_PROJECT_ID,
+                &delegated.id,
+                &RoleInput {
+                    name: "escalated editor".into(),
+                    permissions: vec!["project:read".into(), "gateway:use".into()],
+                },
+            )
+            .await,
+            Err(AccessError::Forbidden)
+        ));
+        let unchanged = list_roles(&database, &actor, db::DEFAULT_PROJECT_ID)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|role| role.id == delegated.id)
+            .unwrap();
+        assert_eq!(unchanged.name, "delegated manager");
+        assert_eq!(
+            unchanged.permissions,
+            "[\"project:read\",\"api_key:manage\"]"
+        );
+    }
+
+    /// A roster of opaque user ids cannot be read by the project manager who is
+    /// allowed to see it, and that manager is refused the user list, so the
+    /// identity has to travel with the membership.
+    #[tokio::test]
+    async fn the_member_roster_carries_the_member_identity() {
+        let (database, owner) = owner_database().await;
+        let project = create_project(
+            &database,
+            &owner,
+            &ProjectInput {
+                name: "Roster".into(),
+                slug: "roster".into(),
+                owner_user_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        let user = create_user(
+            &database,
+            &owner,
+            &UserInput {
+                email: "roster-member@example.com".into(),
+                password: "another secure password".into(),
+                display_name: Some("Roster Member".into()),
+                language: None,
+                enabled: true,
+            },
+        )
+        .await
+        .unwrap();
+        let reader = create_role(
+            &database,
+            &owner,
+            &project.id,
+            &RoleInput {
+                name: "reader".into(),
+                permissions: vec!["project:read".into()],
+            },
+        )
+        .await
+        .unwrap();
+        let created = upsert_membership(
+            &database,
+            &owner,
+            &project.id,
+            &MembershipInput {
+                user_id: user.id.clone(),
+                role_id: reader.id.clone(),
+                status: "active".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            created.email.as_deref(),
+            Some("roster-member@example.com"),
+            "the add response must identify the member too"
+        );
+
+        let roster = list_memberships(&database, &owner, &project.id)
+            .await
+            .unwrap();
+        let member = roster
+            .iter()
+            .find(|row| row.user_id == user.id)
+            .expect("the member must be in the roster");
+        assert_eq!(
+            member.email.as_deref(),
+            Some("roster-member@example.com"),
+            "the roster must say who the member is"
+        );
+        assert_eq!(member.display_name.as_deref(), Some("Roster Member"));
+    }
+
+    /// The console offered an `enabled` switch on the create-user form and the
+    /// backend ignored it, always inserting an enabled account.
+    #[tokio::test]
+    async fn creating_a_user_honours_the_enabled_switch() {
+        let (database, owner) = owner_database().await;
+        let created = create_user(
+            &database,
+            &owner,
+            &UserInput {
+                email: "disabled@example.com".into(),
+                password: "another secure password".into(),
+                display_name: None,
+                language: None,
+                enabled: false,
+            },
+        )
+        .await
+        .unwrap();
+        let row = UserView::find_by_statement(statement(
+            "SELECT id,email,display_name,role,language,theme,avatar_url,enabled,created_at,updated_at FROM users WHERE id=?",
+            vec![created.id.clone().into()],
+        ))
+        .one(&database)
+        .await
+        .unwrap()
+        .expect("the user must exist");
+        assert!(
+            !row.enabled,
+            "a user created with the switch off must not be enabled"
+        );
+    }
+
+    /// A key that has run out of budget or expired must be distinguishable from a
+    /// working one. The scoped view the console reads carried the budget but not
+    /// the spend, so a key that could no longer be used still read as healthy.
+    #[tokio::test]
+    async fn the_key_view_carries_expiry_and_spend() {
+        let (database, owner) = owner_database().await;
+        database
+            .execute(statement(
+                "INSERT INTO api_keys(id,name,key_prefix,key_hash,lookup_digest,scopes,budget_micros,spent_micros,enabled,created_at,project_id,expires_at) VALUES('key-spent','spent','spent-prefix','hash','digest','[\"gateway\"]',1000,1000,1,0,?,?)",
+                vec![
+                    db::DEFAULT_PROJECT_ID.into(),
+                    (db::now() - 60).into(),
+                ],
+            ))
+            .await
+            .unwrap();
+
+        let rows = list_scoped_api_keys(&database, &owner, db::DEFAULT_PROJECT_ID)
+            .await
+            .unwrap();
+        let row = rows
+            .iter()
+            .find(|row| row.id == "key-spent")
+            .expect("the key must be listed");
+        assert!(
+            row.expires_at.is_some_and(|at| at < db::now()),
+            "an expired key must be recognisable as expired"
+        );
+        assert_eq!(
+            row.spent_micros, 1000,
+            "the spend must travel with the budget, or a key out of budget reads as healthy"
+        );
+        assert!(
+            row.last_used_at.is_none(),
+            "an unused key must be distinguishable from one in active use"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_key_view_serializes_scopes_as_an_array() {
+        let (database, owner) = owner_database().await;
+        let (key, _) = create_scoped_api_key(
+            &database,
+            &owner,
+            &ScopedApiKeyInput {
+                name: "scope shape".into(),
+                project_id: db::DEFAULT_PROJECT_ID.into(),
+                key_type: "service".into(),
+                scopes: vec!["gateway:use".into(), "project:read".into()],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            serde_json::to_value(key).unwrap()["scopes"],
+            json!(["gateway:use", "project:read"]),
+            "the HTTP view must expose project scopes as an array, not a JSON string"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_api_key_cannot_delegate_a_scope_it_does_not_hold() {
+        let (database, _owner) = owner_database().await;
+        let actor = Principal::api_key(
+            "parent-key",
+            db::DEFAULT_PROJECT_ID,
+            None,
+            vec!["api_key:manage".into()],
+        );
+
+        assert!(matches!(
+            create_scoped_api_key(
+                &database,
+                &actor,
+                &ScopedApiKeyInput {
+                    name: "escalated child".into(),
+                    project_id: db::DEFAULT_PROJECT_ID.into(),
+                    key_type: "service".into(),
+                    scopes: vec!["api_key:manage".into(), "gateway:use".into()],
+                    ..Default::default()
+                },
+            )
+            .await,
+            Err(AccessError::Forbidden)
+        ));
+        assert!(
+            list_scoped_api_keys(&database, &actor, db::DEFAULT_PROJECT_ID)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a refused delegation must not leave a child key behind"
+        );
+    }
+
+    #[tokio::test]
     async fn denies_cross_project_access_and_resolves_project_roles() {
         let (database, owner) = owner_database().await;
         let user = create_user(
@@ -1673,6 +2389,7 @@ mod tests {
                 password: "another secure password".into(),
                 display_name: None,
                 language: None,
+                enabled: true,
             },
         )
         .await
@@ -1740,6 +2457,7 @@ mod tests {
                 password: "another secure password".into(),
                 display_name: None,
                 language: None,
+                enabled: true,
             },
         )
         .await
@@ -1871,6 +2589,689 @@ mod tests {
         ));
         assert!(matches!(
             authorize(&database, &principal, None, "user:manage").await,
+            Err(AccessError::Forbidden)
+        ));
+    }
+
+    /// Creates a member of the default project and an owned key for them, so the
+    /// bulk lifecycle tests can move that owner's membership around.
+    async fn owned_key(
+        database: &DatabaseConnection,
+        owner: &Principal,
+        key_type: &str,
+        status: &str,
+    ) -> (String, String) {
+        let member = create_user(
+            database,
+            owner,
+            &UserInput {
+                email: format!("{key_type}-owner@example.com"),
+                password: "another secure password".into(),
+                display_name: None,
+                language: None,
+                enabled: true,
+            },
+        )
+        .await
+        .unwrap();
+        upsert_membership(
+            database,
+            owner,
+            db::DEFAULT_PROJECT_ID,
+            &MembershipInput {
+                user_id: member.id.clone(),
+                role_id: SYSTEM_MEMBER_ROLE_ID.into(),
+                status: status.into(),
+            },
+        )
+        .await
+        .unwrap();
+        let (key, _) = create_scoped_api_key(
+            database,
+            owner,
+            &ScopedApiKeyInput {
+                name: format!("{key_type} key"),
+                project_id: db::DEFAULT_PROJECT_ID.into(),
+                user_id: Some(member.id.clone()),
+                profile_id: None,
+                key_type: key_type.into(),
+                scopes: vec!["gateway:use".into()],
+                budget_micros: None,
+                expires_at: None,
+                allowed_ips: vec![],
+                denied_ips: vec![],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        (member.id, key.id)
+    }
+
+    /// Enables one key through the bulk lifecycle, which is the path under test.
+    async fn enable_key(
+        database: &DatabaseConnection,
+        owner: &Principal,
+        key_id: &str,
+    ) -> Result<usize, AccessError> {
+        set_scoped_api_keys_enabled(
+            database,
+            owner,
+            db::DEFAULT_PROJECT_ID,
+            &[key_id.to_owned()],
+            true,
+        )
+        .await
+    }
+
+    async fn enabled_state(database: &DatabaseConnection, key_id: &str) -> bool {
+        PermissionRow::find_by_statement(statement(
+            "SELECT CAST(enabled AS TEXT) AS slug FROM api_keys WHERE id=?",
+            vec![key_id.into()],
+        ))
+        .one(database)
+        .await
+        .unwrap()
+        .unwrap()
+        .slug
+            == "1"
+    }
+
+    /// Creates a key owned by nobody, for the project this caller owns.
+    async fn service_key(
+        database: &DatabaseConnection,
+        owner: &Principal,
+        project_id: &str,
+        name: &str,
+    ) -> String {
+        create_scoped_api_key(
+            database,
+            owner,
+            &ScopedApiKeyInput {
+                name: name.into(),
+                project_id: project_id.into(),
+                user_id: None,
+                profile_id: None,
+                key_type: "service".into(),
+                scopes: vec!["gateway:use".into()],
+                budget_micros: None,
+                expires_at: None,
+                allowed_ips: vec![],
+                denied_ips: vec![],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .0
+        .id
+    }
+
+    /// A member of the default project holding only the system member role.
+    async fn member(database: &DatabaseConnection, owner: &Principal, email: &str) -> Principal {
+        let user = create_user(
+            database,
+            owner,
+            &UserInput {
+                email: email.into(),
+                password: "another secure password".into(),
+                display_name: None,
+                language: None,
+                enabled: true,
+            },
+        )
+        .await
+        .unwrap();
+        upsert_membership(
+            database,
+            owner,
+            db::DEFAULT_PROJECT_ID,
+            &MembershipInput {
+                user_id: user.id.clone(),
+                role_id: SYSTEM_MEMBER_ROLE_ID.into(),
+                status: "active".into(),
+            },
+        )
+        .await
+        .unwrap();
+        Principal::session(user.id)
+    }
+
+    /// The bulk lifecycle and the single-key update are one rule. A `user`/`personal`
+    /// key acts as its owner, so enabling it while that owner is suspended, disabled,
+    /// gone or no longer a member must be refused — and refused with the same stated
+    /// reason, because a second copy of that query is exactly what drifts.
+    #[tokio::test]
+    async fn bulk_key_state_applies_the_single_key_owner_rule() {
+        let (database, owner) = owner_database().await;
+        let (owner_id, key) = owned_key(&database, &owner, "personal", "active").await;
+        assert!(
+            set_scoped_api_keys_enabled(
+                &database,
+                &owner,
+                db::DEFAULT_PROJECT_ID,
+                std::slice::from_ref(&key),
+                false
+            )
+            .await
+            .is_ok()
+        );
+        assert!(!enabled_state(&database, &key).await);
+
+        // Suspended owner: the bulk path must state the same rule as the single-key
+        // update, word for word.
+        upsert_membership(
+            &database,
+            &owner,
+            db::DEFAULT_PROJECT_ID,
+            &MembershipInput {
+                user_id: owner_id.clone(),
+                role_id: SYSTEM_MEMBER_ROLE_ID.into(),
+                status: "suspended".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let bulk = enable_key(&database, &owner, &key).await;
+        let one = update_scoped_api_key(
+            &database,
+            &owner,
+            db::DEFAULT_PROJECT_ID,
+            &key,
+            &ScopedApiKeyUpdate {
+                enabled: Some(true),
+                ..Default::default()
+            },
+        )
+        .await;
+        match (bulk, one) {
+            (Err(AccessError::Invalid(bulk)), Err(AccessError::Invalid(one))) => {
+                assert_eq!(bulk, one, "both paths must state the same rule")
+            }
+            (bulk, one) => panic!("both paths must refuse a suspended owner: {bulk:?} {one:?}"),
+        }
+        assert!(
+            !enabled_state(&database, &key).await,
+            "a refused bulk enable must change nothing"
+        );
+
+        // A disabled account, even with an active membership.
+        database
+            .execute(statement(
+                "UPDATE users SET enabled=0 WHERE id=?",
+                vec![owner_id.clone().into()],
+            ))
+            .await
+            .unwrap();
+        upsert_membership(
+            &database,
+            &owner,
+            db::DEFAULT_PROJECT_ID,
+            &MembershipInput {
+                user_id: owner_id.clone(),
+                role_id: SYSTEM_MEMBER_ROLE_ID.into(),
+                status: "active".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            enable_key(&database, &owner, &key).await,
+            Err(AccessError::Invalid(_))
+        ));
+
+        // No membership at all.
+        database
+            .execute(statement(
+                "DELETE FROM project_memberships WHERE user_id=?",
+                vec![owner_id.clone().into()],
+            ))
+            .await
+            .unwrap();
+        database
+            .execute(statement(
+                "UPDATE users SET enabled=1 WHERE id=?",
+                vec![owner_id.clone().into()],
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(
+            enable_key(&database, &owner, &key).await,
+            Err(AccessError::Invalid(_))
+        ));
+
+        // "Owner missing" cannot be reached through the record system: the key's
+        // `user_id` is `ON DELETE CASCADE` and the table rejects a `user`/`personal`
+        // row with no owner, so the ownerless branch of the rule is defence in depth
+        // rather than a state the database can hold. Deleting the owner removes the
+        // key, which is why the rule is stated as a refusal instead.
+        assert_eq!(
+            PermissionRow::find_by_statement(statement(
+                "SELECT CAST(COUNT(*) AS TEXT) AS slug FROM api_keys WHERE id=?",
+                vec![key.clone().into()],
+            ))
+            .one(&database)
+            .await
+            .unwrap()
+            .unwrap()
+            .slug,
+            "1",
+            "the owned key must still exist for the remaining assertions"
+        );
+
+        // The owner is active again, and the key is still disabled: the lifecycle is
+        // restored, not bypassed.
+        upsert_membership(
+            &database,
+            &owner,
+            db::DEFAULT_PROJECT_ID,
+            &MembershipInput {
+                user_id: owner_id.clone(),
+                role_id: SYSTEM_MEMBER_ROLE_ID.into(),
+                status: "active".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            !enabled_state(&database, &key).await,
+            "no failed enable may leave the key on"
+        );
+
+        // An active owner restores the lifecycle.
+        assert_eq!(enable_key(&database, &owner, &key).await.unwrap(), 1);
+        assert!(enabled_state(&database, &key).await);
+    }
+
+    /// Bulk key state is a key-lifecycle mutation, so it carries that lifecycle's
+    /// authorization, stays inside the project, and fails closed on an id the project
+    /// does not own — with no partial application.
+    #[tokio::test]
+    async fn bulk_key_state_requires_key_authority_and_stays_in_the_project() {
+        let (database, owner) = owner_database().await;
+        let reader = member(&database, &owner, "reader@example.com").await;
+        let service = service_key(&database, &owner, db::DEFAULT_PROJECT_ID, "service").await;
+        let project = create_project(
+            &database,
+            &owner,
+            &ProjectInput {
+                name: "Elsewhere".into(),
+                slug: "elsewhere".into(),
+                owner_user_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        let foreign = service_key(&database, &owner, &project.id, "foreign").await;
+
+        // The system member role holds `project:read`, which is not the key contract.
+        assert!(matches!(
+            set_scoped_api_keys_enabled(
+                &database,
+                &reader,
+                db::DEFAULT_PROJECT_ID,
+                std::slice::from_ref(&service),
+                false
+            )
+            .await,
+            Err(AccessError::Forbidden)
+        ));
+        assert!(
+            enabled_state(&database, &service).await,
+            "a refused bulk change must leave the key alone"
+        );
+
+        // Another project's key is skipped exactly like an id that does not exist, so
+        // the batch stays inside this project and neither id is written.
+        for id in [foreign.clone(), "no-such-key".to_string()] {
+            assert_eq!(
+                set_scoped_api_keys_enabled(
+                    &database,
+                    &owner,
+                    db::DEFAULT_PROJECT_ID,
+                    &[id],
+                    false
+                )
+                .await
+                .unwrap(),
+                0,
+                "an id this project does not own is not a change"
+            );
+        }
+        assert!(
+            enabled_state(&database, &foreign).await,
+            "another project's key must not be toggled"
+        );
+
+        // One unowned id in the batch does not make the owned ones change partially:
+        // the batch applies what this project owns and leaves the rest alone.
+        assert_eq!(
+            set_scoped_api_keys_enabled(
+                &database,
+                &owner,
+                db::DEFAULT_PROJECT_ID,
+                &[service.clone(), foreign.clone()],
+                false
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        assert!(
+            !enabled_state(&database, &service).await,
+            "the key this project owns is the one that changed"
+        );
+        assert!(
+            enabled_state(&database, &foreign).await,
+            "the foreign key is untouched"
+        );
+
+        // An owned key that cannot be enabled rolls the whole batch back, including
+        // the keys that would have succeeded on their own.
+        let (member_id, owned) = owned_key(&database, &owner, "personal", "active").await;
+        upsert_membership(
+            &database,
+            &owner,
+            db::DEFAULT_PROJECT_ID,
+            &MembershipInput {
+                user_id: member_id.clone(),
+                role_id: SYSTEM_MEMBER_ROLE_ID.into(),
+                status: "suspended".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            set_scoped_api_keys_enabled(
+                &database,
+                &owner,
+                db::DEFAULT_PROJECT_ID,
+                &[service.clone(), owned.clone()],
+                true
+            )
+            .await,
+            Err(AccessError::Invalid(_))
+        ));
+        assert!(
+            !enabled_state(&database, &service).await,
+            "a refused batch must not be applied partially"
+        );
+        assert!(!enabled_state(&database, &owned).await);
+
+        // With an active owner the same batch applies, and each key it touched is
+        // audited.
+        upsert_membership(
+            &database,
+            &owner,
+            db::DEFAULT_PROJECT_ID,
+            &MembershipInput {
+                user_id: member_id,
+                role_id: SYSTEM_MEMBER_ROLE_ID.into(),
+                status: "active".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            set_scoped_api_keys_enabled(
+                &database,
+                &owner,
+                db::DEFAULT_PROJECT_ID,
+                &[service.clone(), owned.clone()],
+                true
+            )
+            .await
+            .unwrap(),
+            2
+        );
+        assert!(enabled_state(&database, &service).await);
+        assert!(enabled_state(&database, &owned).await);
+        assert_eq!(
+            PermissionRow::find_by_statement(statement(
+                "SELECT CAST(COUNT(*) AS TEXT) AS slug FROM audit_events WHERE resource_type='api_key' AND resource_id IN (?,?) AND action='update'",
+                vec![service.clone().into(), owned.clone().into()],
+            ))
+            .one(&database)
+            .await
+            .unwrap()
+            .unwrap()
+            .slug,
+            "3",
+            "the committed rows are the service key's initial disable and the final batch's two enables; the refused batch's row rolled back with it"
+        );
+    }
+
+    #[tokio::test]
+    async fn rotating_a_key_replaces_the_secret_once_and_audits_the_change() {
+        let (database, owner) = owner_database().await;
+        let (key, old_token) = create_scoped_api_key(
+            &database,
+            &owner,
+            &ScopedApiKeyInput {
+                name: "rotated".into(),
+                project_id: db::DEFAULT_PROJECT_ID.into(),
+                key_type: "service".into(),
+                scopes: vec!["gateway:use".into()],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let (view, new_token) =
+            rotate_scoped_api_key(&database, &owner, db::DEFAULT_PROJECT_ID, &key.id)
+                .await
+                .unwrap();
+        assert_ne!(old_token, new_token);
+        assert!(
+            db::authenticate_api_key(&database, &old_token, None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db::authenticate_api_key(&database, &new_token, None)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(!serde_json::to_string(&view).unwrap().contains(&new_token));
+        assert_eq!(
+            PermissionRow::find_by_statement(statement(
+                "SELECT CAST(COUNT(*) AS TEXT) AS slug FROM audit_events WHERE resource_type='api_key' AND resource_id=? AND action='rotate'",
+                vec![key.id.into()],
+            ))
+            .one(&database)
+            .await
+            .unwrap()
+            .unwrap()
+            .slug,
+            "1"
+        );
+    }
+
+    #[tokio::test]
+    async fn rotation_rolls_back_when_the_audit_write_fails() {
+        let (database, owner) = owner_database().await;
+        let (key, old_token) = create_scoped_api_key(
+            &database,
+            &owner,
+            &ScopedApiKeyInput {
+                name: "rollback".into(),
+                project_id: db::DEFAULT_PROJECT_ID.into(),
+                key_type: "service".into(),
+                scopes: vec!["gateway:use".into()],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        database
+            .execute_unprepared("CREATE TRIGGER fail_rotate_audit BEFORE INSERT ON audit_events WHEN NEW.action='rotate' BEGIN SELECT RAISE(ABORT,'audit refused'); END;")
+            .await
+            .unwrap();
+
+        assert!(
+            rotate_scoped_api_key(&database, &owner, db::DEFAULT_PROJECT_ID, &key.id)
+                .await
+                .is_err()
+        );
+        assert!(
+            db::authenticate_api_key(&database, &old_token, None)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn archived_keys_refuse_authentication_and_every_mutable_path() {
+        let (database, owner) = owner_database().await;
+        let (key, token) = create_scoped_api_key(
+            &database,
+            &owner,
+            &ScopedApiKeyInput {
+                name: "archive me".into(),
+                project_id: db::DEFAULT_PROJECT_ID.into(),
+                key_type: "service".into(),
+                scopes: vec!["gateway:use".into()],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let archived = archive_scoped_api_key(&database, &owner, db::DEFAULT_PROJECT_ID, &key.id)
+            .await
+            .unwrap();
+        assert_eq!(archived.lifecycle, "archived");
+        assert!(archived.archived_at.is_some());
+        assert_eq!(
+            PermissionRow::find_by_statement(statement(
+                "SELECT CAST(COUNT(*) AS TEXT) AS slug FROM audit_events WHERE action='archive' AND resource_type='api_key' AND resource_id=?",
+                vec![key.id.clone().into()],
+            )).one(&database).await.unwrap().unwrap().slug,
+            "1"
+        );
+        assert!(
+            db::authenticate_api_key(&database, &token, None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            update_scoped_api_key(
+                &database,
+                &owner,
+                db::DEFAULT_PROJECT_ID,
+                &key.id,
+                &ScopedApiKeyUpdate {
+                    enabled: Some(true),
+                    ..Default::default()
+                }
+            )
+            .await,
+            Err(AccessError::Conflict(_))
+        ));
+        assert!(matches!(
+            rotate_scoped_api_key(&database, &owner, db::DEFAULT_PROJECT_ID, &key.id).await,
+            Err(AccessError::Conflict(_))
+        ));
+        assert!(matches!(
+            set_scoped_api_keys_enabled(&database, &owner, db::DEFAULT_PROJECT_ID, &[key.id], true)
+                .await,
+            Err(AccessError::Conflict(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn bulk_archive_deduplicates_skips_foreign_ids_and_records_actual_facts() {
+        let (database, owner) = owner_database().await;
+        let local = service_key(&database, &owner, db::DEFAULT_PROJECT_ID, "local").await;
+        let project = create_project(
+            &database,
+            &owner,
+            &ProjectInput {
+                name: "Foreign".into(),
+                slug: "foreign-archive".into(),
+                owner_user_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        let foreign = service_key(&database, &owner, &project.id, "foreign").await;
+
+        let result = archive_scoped_api_keys(
+            &database,
+            &owner,
+            db::DEFAULT_PROJECT_ID,
+            &[
+                local.clone(),
+                local.clone(),
+                foreign.clone(),
+                "missing".into(),
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.archived_ids, vec![local.clone()]);
+        assert_eq!(result.archived_count, 1);
+        let audit = PermissionRow::find_by_statement(statement(
+            "SELECT details AS slug FROM audit_events WHERE action='archive_bulk' AND resource_type='api_key' ORDER BY created_at DESC LIMIT 1",
+            vec![],
+        )).one(&database).await.unwrap().unwrap().slug;
+        let audit: Value = serde_json::from_str(&audit).unwrap();
+        assert_eq!(audit["archived_ids"], json!([local]));
+        assert_eq!(audit["archived_count"], 1);
+        assert_eq!(
+            PermissionRow::find_by_statement(statement(
+                "SELECT lifecycle AS slug FROM api_keys WHERE id=?",
+                vec![foreign.into()],
+            ))
+            .one(&database)
+            .await
+            .unwrap()
+            .unwrap()
+            .slug,
+            "active"
+        );
+    }
+
+    #[tokio::test]
+    async fn archive_can_revoke_suspended_owner_keys_while_rotate_refuses_them() {
+        let (database, owner) = owner_database().await;
+        let (owner_id, first) = owned_key(&database, &owner, "personal", "active").await;
+        let (second_owner_id, second) = owned_key(&database, &owner, "user", "active").await;
+        database.execute(statement(
+            "UPDATE project_memberships SET status='suspended' WHERE project_id=? AND user_id IN (?,?)",
+            vec![db::DEFAULT_PROJECT_ID.into(), owner_id.into(), second_owner_id.into()],
+        )).await.unwrap();
+
+        assert!(matches!(
+            rotate_scoped_api_key(&database, &owner, db::DEFAULT_PROJECT_ID, &first).await,
+            Err(AccessError::Invalid(_))
+        ));
+        assert!(
+            archive_scoped_api_key(&database, &owner, db::DEFAULT_PROJECT_ID, &first)
+                .await
+                .is_ok()
+        );
+        let bulk = archive_scoped_api_keys(&database, &owner, db::DEFAULT_PROJECT_ID, &[second])
+            .await
+            .unwrap();
+        assert_eq!(bulk.archived_count, 1);
+    }
+
+    #[tokio::test]
+    async fn single_and_bulk_archive_require_api_key_manage() {
+        let (database, owner) = owner_database().await;
+        let key = service_key(&database, &owner, db::DEFAULT_PROJECT_ID, "protected").await;
+        let member = member(&database, &owner, "archive-member@example.com").await;
+        assert!(matches!(
+            archive_scoped_api_key(&database, &member, db::DEFAULT_PROJECT_ID, &key).await,
+            Err(AccessError::Forbidden)
+        ));
+        assert!(matches!(
+            archive_scoped_api_keys(&database, &member, db::DEFAULT_PROJECT_ID, &[key]).await,
             Err(AccessError::Forbidden)
         ));
     }

@@ -35,12 +35,16 @@ describe('application routing', () => {
       if (path.endsWith('/projects')) return response([{id:'project-a',name:'Project A',slug:'project-a',owner_user_id:'owner',is_default:true,enabled:true}])
       if (path.includes('/permissions')) return response(['project:read','project:manage','api_key:manage','catalog:manage'])
       if (path.includes('summary')) return response({ requests:0, errors:0, error_rate:null, p95_latency_ms:null, input_tokens:0, output_tokens:0, cost_micros:0, series:[] })
+      // The empty state asserted below is a *measured* zero, which the console
+      // only claims when it can read the logging policy: a body that is not a
+      // policy at all is unknown, so this fixture returns a real one.
+      if (path.includes('settings/request-logging')) return response({ enabled:true, default_level:'metadata', key_override_enabled:false, key_disable_allowed:false })
       return response([])
     }))
     renderApp('/login')
     expect(await screen.findByRole('heading', { name: 'Overview' })).toBeInTheDocument()
     expect(screen.getByRole('navigation', { name: 'Primary navigation' })).toBeInTheDocument()
-    expect(await screen.findByText('No requests in the last 24 hours')).toBeInTheDocument()
+    expect(await screen.findByText('Last 24 hours: no requests recorded')).toBeInTheDocument()
     expect(screen.getAllByText('—').length).toBeGreaterThanOrEqual(2)
     await waitFor(() => expect(screen.queryByRole('heading', { name: 'Sign in to Pangolin' })).not.toBeInTheDocument())
   })

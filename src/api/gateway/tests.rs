@@ -1,6 +1,7 @@
 use super::*;
 
 mod auth_audit;
+mod authoritative_observation;
 mod catalog;
 mod control_plane_audit;
 mod instance_backup;
@@ -115,6 +116,327 @@ async fn fixture(mock: Router) -> Fixture {
         server,
         _directory: directory,
     }
+}
+
+/// The playground always calls the Responses API, so its model discovery must
+/// be able to ask the key's authoritative list for that endpoint only. A model
+/// that is reachable through Anthropic Messages is still visible in the
+/// unfiltered compatibility list, but must not be offered for `/v1/responses`.
+#[tokio::test]
+async fn model_discovery_can_be_filtered_to_the_responses_endpoint() {
+    let f = fixture(Router::new()).await;
+    sql(
+        &f,
+        "UPDATE models SET capabilities='[\"responses\"]'",
+        vec![],
+    )
+    .await;
+    let provider = db::create_provider(
+        &f.state.db,
+        &ProviderInput {
+            name: "messages-only".into(),
+            kind: "anthropic".into(),
+            base_url: "https://example.invalid".into(),
+            api_key: String::new(),
+        },
+        f.state.secrets.encrypt("messages-secret").unwrap(),
+    )
+    .await
+    .unwrap();
+    db::create_model(
+        &f.state.db,
+        &ModelInput {
+            provider_id: provider.id,
+            public_name: "messages-only".into(),
+            upstream_name: "claude-test".into(),
+            capabilities: Some(vec!["chat".into()]),
+            input_price_micros: None,
+            output_price_micros: None,
+            priority: None,
+        },
+        db::DEFAULT_PROJECT_ID,
+    )
+    .await
+    .unwrap();
+
+    let response = router(f.state.clone())
+        .oneshot(
+            Request::get("/v1/models?endpoint=%2Fv1%2Fresponses")
+                .header("authorization", format!("Bearer {}", f.token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+            .unwrap();
+    let ids = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|model| model["id"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, vec!["public"]);
+}
+
+#[tokio::test]
+async fn model_discovery_default_shape_remains_byte_compatible() {
+    let f = fixture(Router::new()).await;
+    sql(&f, "UPDATE models SET created_at=42", vec![]).await;
+
+    let response = router(f.state.clone())
+        .oneshot(
+            Request::get("/v1/models")
+                .header("authorization", format!("Bearer {}", f.token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+
+    assert_eq!(
+        body.as_ref(),
+        br#"{"object":"list","data":[{"id":"public","object":"model","created":42,"owned_by":"pangolin"}]}"#
+    );
+}
+
+#[tokio::test]
+async fn model_discovery_include_all_projects_only_typed_catalog_card_metadata() {
+    let f = fixture(Router::new()).await;
+    let stored = json!({
+        "catalog_version": "test-v1",
+        "logo_key": "lobehub:OpenAI",
+        "provider_secret": "must-not-leak",
+        "card": {
+            "developer": "openai",
+            "type": "chat",
+            "limits": { "context": 128_000, "output": 16_384 },
+            "cost_defaults": {
+                "input": 2.5,
+                "output": 10.0,
+                "currency": "USD",
+                "unit": "per_million_tokens"
+            },
+            "extensions": { "internal": "must-not-leak" }
+        }
+    });
+    sql(
+        &f,
+        "UPDATE models SET created_at=42,catalog_metadata_json=?",
+        vec![stored.to_string().into()],
+    )
+    .await;
+
+    let response = router(f.state.clone())
+        .oneshot(
+            Request::get("/v1/models?include=all")
+                .header("authorization", format!("Bearer {}", f.token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+            .unwrap();
+
+    assert_eq!(
+        body,
+        json!({
+            "object": "list",
+            "data": [{
+                "id": "public",
+                "object": "model",
+                "created": 42,
+                "owned_by": "pangolin",
+                "metadata": {
+                    "developer": "openai",
+                    "type": "chat",
+                    "logo_key": "lobehub:OpenAI",
+                    "limits": { "context": 128_000, "output": 16_384 },
+                    "cost_defaults": {
+                        "input": 2.5,
+                        "output": 10.0,
+                        "currency": "USD",
+                        "unit": "per_million_tokens"
+                    }
+                }
+            }]
+        })
+    );
+}
+
+#[tokio::test]
+async fn model_discovery_include_all_omits_absent_and_malformed_cards() {
+    let f = fixture(Router::new()).await;
+    sql(&f, "UPDATE models SET created_at=42", vec![]).await;
+
+    for metadata in ["{}", "{not-json"] {
+        sql(
+            &f,
+            "UPDATE models SET catalog_metadata_json=?",
+            vec![metadata.into()],
+        )
+        .await;
+        let response = router(f.state.clone())
+            .oneshot(
+                Request::get("/v1/models?include=all")
+                    .header("authorization", format!("Bearer {}", f.token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            body,
+            json!({
+                "object": "list",
+                "data": [{
+                    "id": "public",
+                    "object": "model",
+                    "created": 42,
+                    "owned_by": "pangolin"
+                }]
+            }),
+            "stored metadata {metadata:?} must not widen the response"
+        );
+    }
+}
+
+#[tokio::test]
+async fn model_discovery_unknown_include_preserves_default_shape() {
+    let f = fixture(Router::new()).await;
+    sql(
+        &f,
+        "UPDATE models SET created_at=42,catalog_metadata_json=?",
+        vec![
+            json!({"logo_key":"lobehub:OpenAI","card":{"developer":"openai","type":"chat"}})
+                .to_string()
+                .into(),
+        ],
+    )
+    .await;
+
+    let response = router(f.state.clone())
+        .oneshot(
+            Request::get("/v1/models?include=everything")
+                .header("authorization", format!("Bearer {}", f.token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    assert_eq!(
+        body.as_ref(),
+        br#"{"object":"list","data":[{"id":"public","object":"model","created":42,"owned_by":"pangolin"}]}"#
+    );
+}
+
+#[tokio::test]
+async fn model_discovery_include_all_keeps_mapping_and_visibility_policy_authoritative() {
+    let f = fixture(Router::new()).await;
+    let stored = json!({
+        "logo_key": "lobehub:OpenAI",
+        "card": {
+            "developer": "openai",
+            "type": "chat",
+            "limits": { "context": 8_192 },
+            "cost_defaults": { "currency": "USD", "unit": "per_million_tokens" }
+        }
+    });
+    sql(
+        &f,
+        "UPDATE models SET catalog_metadata_json=?",
+        vec![stored.to_string().into()],
+    )
+    .await;
+    let hidden = db::create_model(
+        &f.state.db,
+        &ModelInput {
+            provider_id: f.providers[0].clone(),
+            public_name: "disabled-hidden".into(),
+            upstream_name: "disabled-hidden".into(),
+            capabilities: Some(vec!["chat".into()]),
+            input_price_micros: None,
+            output_price_micros: None,
+            priority: None,
+        },
+        db::DEFAULT_PROJECT_ID,
+    )
+    .await
+    .unwrap();
+    sql(
+        &f,
+        "UPDATE models SET enabled=0 WHERE id=?",
+        vec![hidden.id.into()],
+    )
+    .await;
+    sql(
+        &f,
+        "INSERT INTO api_key_profiles(id,project_id,name,routing_policy_json,created_at,updated_at) VALUES('model-list-profile',?,'model list','{\"version\":1}',0,0)",
+        vec![db::DEFAULT_PROJECT_ID.into()],
+    )
+    .await;
+    sql(
+        &f,
+        "UPDATE api_keys SET profile_id='model-list-profile'",
+        vec![],
+    )
+    .await;
+    sql(
+        &f,
+        "INSERT INTO api_key_profile_model_mappings(id,profile_id,source_model,target_model) VALUES('model-list-mapping','model-list-profile','client-alias','public')",
+        vec![],
+    )
+    .await;
+    sql(
+        &f,
+        "INSERT INTO api_key_profile_allowed_models(profile_id,model_pattern,match_type) VALUES('model-list-profile','client-alias','exact')",
+        vec![],
+    )
+    .await;
+
+    let response = router(f.state.clone())
+        .oneshot(
+            Request::get("/v1/models?include=all")
+                .header("authorization", format!("Bearer {}", f.token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+            .unwrap();
+    assert_eq!(body["data"].as_array().unwrap().len(), 1);
+    assert_eq!(body["data"][0]["id"], "client-alias");
+    assert_eq!(
+        body["data"][0]["metadata"],
+        json!({
+            "developer": "openai",
+            "type": "chat",
+            "logo_key": "lobehub:OpenAI",
+            "limits": { "context": 8_192, "output": null },
+            "cost_defaults": {
+                "input": null,
+                "output": null,
+                "currency": "USD",
+                "unit": "per_million_tokens"
+            }
+        })
+    );
 }
 
 async fn request(f: &Fixture, endpoint: &str, payload: Value) -> Response {
@@ -256,7 +578,15 @@ async fn no_retry_after_first_event_and_eof_emits_a_terminal_error() {
     assert!(String::from_utf8_lossy(&terminal).contains("upstream request failed"));
     assert_eq!(calls.load(Ordering::Relaxed), 1);
     f.state.observations.flush().await;
-    assert_eq!(f.state.observations.summary().await.unwrap().errors, 1);
+    assert_eq!(
+        f.state
+            .observations
+            .summary(SummaryFilter::default())
+            .await
+            .unwrap()
+            .errors,
+        1
+    );
 }
 
 #[tokio::test]

@@ -17,11 +17,19 @@ const renderPage = (page: React.ReactElement) => {
   return render(<QueryClientProvider client={client}><MemoryRouter><ProjectProvider>{page}</ProjectProvider></MemoryRouter></QueryClientProvider>)
 }
 const base = (path: string) => path.endsWith('/projects') ? json([project]) : path.includes('/permissions') ? json(['*']) : null
-const requestRow = { request_id: 'r1', started_at: 1, endpoint: '/v1/chat/completions', provider: 'openai', requested_model: 'demo', resolved_model: 'demo', status_code: 200, latency_ms: 12, input_tokens: 1, output_tokens: 1, cost_micros: 0 }
-// One request is listed until a status-code filter narrows it away.
+const requestRow = { internal_id: 'internal-r1', request_id: 'r1', started_at: 1, endpoint: '/v1/chat/completions', provider: 'openai', requested_model: 'demo', resolved_model: 'demo', status_code: 200, latency_ms: 12, input_tokens: 1, output_tokens: 1, cost_micros: 0 }
+// A failed row is what makes 500 an *observed* status code: the facet is built
+// from codes the projection actually emitted, so it cannot offer one it never
+// did. Selecting 500 then narrows the list to nothing.
+const failedRow = { ...requestRow, internal_id: 'internal-r2', request_id: 'r2', status_code: 500 }
 const requestsMock = () => vi.fn((input: RequestInfo | URL) => base(String(input)) ?? json(String(input).includes('status_code=500')
   ? { data: [], total: 0, offset: 0, limit: 25 }
-  : { data: [requestRow], total: 1, offset: 0, limit: 25 }))
+  : { data: [requestRow, failedRow], total: 2, offset: 0, limit: 25 }))
+/** Pick an option from a Mantine Select by its accessible combobox name. */
+const pickOption = async (name: string, option: string) => {
+  await userEvent.click(screen.getByRole('combobox', { name }))
+  await userEvent.click(await screen.findByRole('option', { name: option }))
+}
 
 describe('empty states drop controls that cannot do anything', () => {
   beforeEach(() => { void i18n.changeLanguage('en') })
@@ -56,17 +64,19 @@ describe('empty states drop controls that cannot do anything', () => {
     vi.stubGlobal('fetch', requestsMock())
     renderPage(<OperationsPage />)
     expect(await screen.findByRole('button', { name: 'Pause' })).toBeInTheDocument()
-    await userEvent.type(screen.getByLabelText('Status code'), '500')
+    await pickOption('Status code', '500')
     expect(await screen.findByRole('button', { name: 'Clear filters' })).toBeInTheDocument()
-    expect(screen.getByLabelText('Status code')).toHaveValue('500')
+    expect(screen.getByRole('combobox', { name: 'Status code' })).toHaveValue('500')
     await userEvent.click(screen.getByRole('button', { name: 'Clear filters' }))
-    expect(screen.getByLabelText('Status code')).toHaveValue('')
+    expect(screen.getByRole('combobox', { name: 'Status code' })).toHaveValue('')
   })
 
   it('localizes the clear-filters action', async () => {
     vi.stubGlobal('fetch', requestsMock())
     renderPage(<OperationsPage />)
-    await userEvent.type(await screen.findByLabelText('Status code'), '500')
+    expect(await screen.findByRole('button', { name: 'Pause' })).toBeInTheDocument()
+    await pickOption('Status code', '500')
+    await screen.findByRole('button', { name: 'Clear filters' })
     await i18n.changeLanguage('zh-CN')
     expect(await screen.findByRole('button', { name: '清除筛选条件' })).toBeInTheDocument()
     await i18n.changeLanguage('en')

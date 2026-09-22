@@ -218,6 +218,8 @@ pub fn validate_conditions(condition: &Value) -> Result<()> {
         "body": {},
         "headers": {},
         "endpoint": "/v1/chat/completions",
+        "project_id": "",
+        "api_key_id": "",
     });
     matches(condition, &context).map(|_| ())
 }
@@ -325,8 +327,21 @@ pub fn sensitive_header(name: &str) -> bool {
         || name == "x-pangolin-trusted-client-ip"
 }
 
-pub fn context(body: &Value, headers: &HeaderMap, endpoint: &str) -> Value {
-    json!({"body":body,"headers":safe_headers(headers),"endpoint":endpoint})
+pub fn context(
+    body: &Value,
+    headers: &HeaderMap,
+    endpoint: &str,
+    principal: Option<(&str, &str)>,
+) -> Value {
+    let mut context = json!({"body":body,"headers":safe_headers(headers),"endpoint":endpoint});
+    if let Some((project_id, api_key_id)) = principal {
+        // A condition may be scoped to the calling key. It has to be a field
+        // rather than a header because credentials are stripped from the context,
+        // so a header could never express it.
+        context["project_id"] = json!(project_id);
+        context["api_key_id"] = json!(api_key_id);
+    }
+    context
 }
 
 /// Merge and RFC 6902 patch operations are applied to a fresh clone for every attempt.

@@ -1,19 +1,29 @@
-import { Button, Card, Group, Paper, Select, SimpleGrid, Stack, Tabs, Text, TextInput, Title } from '@mantine/core'
+import { Badge, Button, Card, Group, Modal, Paper, SimpleGrid, Skeleton, Stack, Tabs, Text, Title, Tooltip } from '@mantine/core'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Plus } from 'lucide-react'
-import { useState, type FormEvent } from 'react'
+import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 import { api, type Document, type Paged } from '../api'
-import { EnabledPill, SelectField, SkeletonRows } from '../components'
+import { EnabledPill, InlineQueryError, SelectField, SkeletonRows } from '../components'
+import { UNMEASURED, useErrorCodeLabel } from '../observability'
 import { ProviderIcon } from '../ProviderIcon'
+import { CHANNEL_PROVIDERS } from '../providers'
 import { projectOperationPath, useProject } from '../project'
-import { PageHeader, QueryError, ResourcePage } from './shared'
+import { BulkToggle, PageHeader, QueryError, ResourcePage, displayValue, formatDate } from './shared'
 
 const CHANNEL_TABS = ['channels', 'credentials', 'channelPolicies', 'probes', 'quotas', 'presets'] as const
 
+/**
+ * One row of `channel_health_state` or `credential_health_state`, exactly as the
+ * operations projection returns it. Every field is optional here because the
+ * console must render what was recorded and nothing else.
+ */
+type HealthRow = { id: string; provider_id?: string; credential_id?: string; consecutive_failures?: number; disabled_until?: number | null; backoff_until?: number | null; reason?: string | null; updated_at?: number }
+
 export default function ChannelsPage() {
   const { t } = useTranslation()
+  const kindLabel = useProviderKindLabel()
   return (
     <Tabs keepMounted={false} defaultValue="channels">
       <Tabs.List mb="lg">
@@ -22,14 +32,14 @@ export default function ChannelsPage() {
         ))}
       </Tabs.List>
       <Tabs.Panel value="channels">
-        <ResourcePage resource="channels" title={t('channels')} description={t('channelsDescription')} empty={t('channelEmpty')} createLabel={t('addChannel')} columns={[{ key: 'name', label: t('name'), render: (value, row) => <span className="provider-cell"><ProviderIcon logoKey={String((row.settings as Record<string, unknown>)?.logo_key || '')} name={String(value)} /><strong>{String(value)}</strong></span> }, { key: 'kind', label: t('providerType') }, { key: 'base_url', label: t('baseUrl'), mono: true }, { key: 'enabled', label: t('status'), render: (value) => <EnabledPill enabled={value} /> }]} fields={[{ key: 'name', label: t('name'), required: true }, { key: 'kind', label: t('providerType'), kind: 'select', required: true, options: providerKinds() }, { key: 'base_url', label: t('baseUrl'), required: true, defaultValue: 'https://api.openai.com' }, { key: 'settings', label: t('advancedSettings'), kind: 'json', defaultValue: { version: 1, tags: [], limits: {}, circuit: { failures: 5, window_ms: 60000, recovery_ms: 30000 } } }, { key: 'enabled', label: t('status'), kind: 'checkbox' }]} />
+        <ResourcePage resource="channels" title={t('channels')} description={t('channelsDescription')} empty={t('channelEmpty')} createLabel={t('addChannel')} selectable="channels" notice={<HealthNotice kind="channel" />} columns={[{ key: 'name', label: t('name'), render: (value, row) => <span className="provider-cell"><ProviderIcon logoKey={String((row.settings as Record<string, unknown>)?.logo_key || '')} name={String(value)} /><strong>{String(value)}</strong></span> }, { key: 'kind', label: t('providerType'), render: (value) => kindLabel(value) }, { key: 'base_url', label: t('baseUrl'), mono: true }, { key: 'health', label: t('channelHealth'), render: (_value, row) => <HealthCell kind="channel" id={String(row.id)} /> }, { key: 'enabled', label: t('status'), render: (value) => <EnabledPill enabled={value} /> }]} rowActions={(row) => <ProbeRowAction id={String(row.id)} name={displayValue(row.name || row.id)} />} fields={[{ key: 'name', label: t('name'), required: true }, { key: 'kind', label: t('providerType'), kind: 'provider', required: true, baseUrlKey: 'base_url', options: providerOptions(t) }, { key: 'base_url', label: t('baseUrl'), required: true, defaultValue: CHANNEL_PROVIDERS[0].defaultBaseUrl ?? '' }, { key: 'settings', label: t('advancedSettings'), kind: 'json', defaultValue: { version: 1, tags: [], limits: {}, circuit: { failures: 5, window_ms: 60000, recovery_ms: 30000 } } }, { key: 'enabled', label: t('status'), kind: 'checkbox' }]} />
         <BulkToggle />
       </Tabs.Panel>
       <Tabs.Panel value="credentials"><CredentialsPanel /></Tabs.Panel>
       <Tabs.Panel value="channelPolicies"><ChannelSettingsPanel /></Tabs.Panel>
       <Tabs.Panel value="probes">
         <Diagnostics />
-        <ResourcePage resource="probes" title={t('probes')} description={t('probesDescription')} empty={t('probeEmpty')} immutable columns={[{ key: 'provider_id', label: t('channel'), mono: true }, { key: 'success', label: t('status') }, { key: 'status_code', label: t('statusCode') }, { key: 'latency_ms', label: t('latency') }, { key: 'probed_at', label: t('time') }]} />
+        <ProbesPanel />
       </Tabs.Panel>
       <Tabs.Panel value="quotas">
         <Diagnostics quota />
@@ -40,8 +50,50 @@ export default function ChannelsPage() {
   )
 }
 
-function providerKinds() {
-  return ['openai', 'openai_compatible', 'anthropic', 'gemini', 'azure', 'bedrock', 'vertex', 'gcp', 'openrouter', 'deepseek', 'moonshot', 'zhipu', 'doubao', 'xai', 'groq', 'ollama', 'nanogpt', 'jina'].map((value) => ({ value, label: value.replaceAll('_', ' ') }))
+/** The picker's options: the adapter kind is the submitted value, the visible
+ *  name is localized and the icon comes from the bundled catalog icon map. */
+function providerOptions(label: (key: string) => string) {
+  return CHANNEL_PROVIDERS.map((provider) => ({ value: provider.kind, label: label(provider.labelKey), logoKey: provider.logoKey, defaultBaseUrl: provider.defaultBaseUrl }))
+}
+
+/**
+ * The adapter kind a channel stores, as the name the picker offered. The record
+ * system keeps the enum (`openai_compatible`) and the console keeps the copy, so
+ * a table of Chinese labels no longer carries one English enum in it. A kind this
+ * build does not know — a channel from a newer backend — is shown verbatim.
+ */
+function useProviderKindLabel() {
+  const { t } = useTranslation()
+  return (kind: unknown) => {
+    const provider = CHANNEL_PROVIDERS.find((entry) => entry.kind === kind)
+    return provider ? t(provider.labelKey) : displayValue(kind)
+  }
+}
+
+/** Credential types as the record system stores them; anything else is data. */
+const CREDENTIAL_TYPE_KEYS: Record<string, string> = { api_key: 'credentialTypeApiKey' }
+
+function useCredentialTypeLabel() {
+  const { t } = useTranslation()
+  return (type: unknown) => {
+    const key = CREDENTIAL_TYPE_KEYS[String(type)]
+    return key ? t(key) : displayValue(type)
+  }
+}
+
+/**
+ * The recorded probe attempts. The projection sends a channel id, an integer
+ * outcome, epoch seconds and `0` for a probe that never reached the upstream; none
+ * of those is a name or a measurement, so each is resolved before it is shown.
+ */
+function ProbesPanel() {
+  const { t } = useTranslation()
+  const errorLabel = useErrorCodeLabel()
+  const { options: channelOptions } = useChannelOptions()
+  const channelName = (value: unknown) => channelOptions.find((option) => option.value === String(value))?.label ?? displayValue(value)
+  const measured = (value: unknown) => typeof value === 'number' && value > 0 ? String(value) : '—'
+  const outcome = (value: unknown) => value === 1 || value === true
+  return <ResourcePage resource="probes" title={t('probes')} description={t('probesDescription')} empty={t('probeEmpty')} immutable columns={[{ key: 'provider_id', label: t('channel'), render: (value) => channelName(value) }, { key: 'success', label: t('status'), render: (value) => <Badge variant="light" color={outcome(value) ? 'green' : 'red'}>{t(outcome(value) ? 'statusSucceeded' : 'statusFailed')}</Badge> }, { key: 'status_code', label: t('statusCode'), render: (value) => measured(value) }, { key: 'latency_ms', label: t('latency'), render: (value) => measured(value) }, { key: 'probed_at', label: t('time'), render: formatDate }, { key: 'error', label: t('probeError'), render: (value) => value ? errorLabel(String(value)) : '—' }]} />
 }
 
 function useChannelOptions() {
@@ -50,27 +102,80 @@ function useChannelOptions() {
   return { query, options: (query.data?.data || []).map((row) => ({ value: String(row.id), label: String(row.name) })) }
 }
 
-/** Row count for a resource-backed tab. The key reuses the
- *  `['resource', projectId, resource]` prefix that ResourcePage invalidates
- *  after every create and delete, so the count cannot go stale. */
-function useResourceTotal(resource: 'channels' | 'credentials') {
+/**
+ * The recorded health of every channel and credential in the project. The
+ * gateway serves both projections already; without them the console could only
+ * say "disabled" and an operator had to guess why. A failed read is reported as
+ * a failure — never as healthy, and never as an invented zero.
+ *
+ * The read is subscribed by each cell (and by the notice) rather than by the
+ * page: the projection lands after the table's own rows, and a page-level
+ * subscription would re-render — and so remount — every row's controls each time
+ * it settled. Cells sharing this key still cost one request.
+ */
+const healthQuery = (project: string, kind: 'channel' | 'credential') => ({
+  queryKey: [kind === 'channel' ? 'channel-health' : 'credential-health', project],
+  queryFn: () => api<Paged<HealthRow>>(projectOperationPath(project, kind === 'channel' ? 'health' : 'credential-health') + '?limit=500'),
+})
+const healthKey = (kind: 'channel' | 'credential') => kind === 'channel' ? 'provider_id' : 'credential_id'
+
+/** One row's health, from the projection's own record of that channel or credential. */
+function HealthCell({ kind, id }: { kind: 'channel' | 'credential'; id: string }) {
   const { project } = useProject()
-  const query = useQuery({ queryKey: ['resource', project.id, resource], queryFn: () => api<Paged<Document>>(`${projectOperationPath(project.id, resource)}?limit=1`) })
-  // `null` means the count is unknown (still loading, or the request failed), and
-  // an unknown count must not be treated as empty: that would drop the bulk
-  // controls from a populated page whenever this auxiliary request failed.
-  // TanStack Query keeps the last `data` through a failed refetch, so a stale
-  // zero after an error would read as "no rows" — the error state comes first.
-  if (query.isError) return null
-  return query.data ? (query.data.total ?? query.data.data?.length ?? 0) : null
+  const query = useQuery(healthQuery(project.id, kind))
+  // Loading is its own state: `—` while the read is in flight would read as "no
+  // record" before the record arrives.
+  if (query.isLoading) return <Skeleton height={18} width={72} radius="sm" />
+  // The projection names a channel's key `provider_id` and a credential's
+  // `credential_id`; older responses of the credential relation only carried `id`,
+  // which left the column blank for every credential.
+  const row = (query.data?.data || []).find((item) => String(item[healthKey(kind)] ?? item.id) === id)
+  return <HealthPill health={row} kind={kind} />
+}
+
+/** The banner a page shows when the health projection itself cannot be read. */
+function HealthNotice({ kind }: { kind: 'channel' | 'credential' }) {
+  const { t } = useTranslation()
+  const { project } = useProject()
+  const query = useQuery(healthQuery(project.id, kind))
+  if (!query.isError) return null
+  return <div className="resource-notice"><InlineQueryError message={kind === 'channel' ? t('channelHealthUnavailable') : t('credentialHealthUnavailable')} onRetry={() => void query.refetch()} /></div>
+}
+
+/**
+ * What the gateway recorded about one channel or credential: an auto-disable
+ * window, a short backoff, a run of consecutive failures, or nothing at all.
+ * `—` when the projection has no row — an absent record is unknown, not healthy.
+ */
+function HealthPill({ health, kind = 'channel' }: { health?: HealthRow; kind?: 'channel' | 'credential' }) {
+  const { t } = useTranslation()
+  if (!health) return <>—</>
+  const now = Math.floor(Date.now() / 1000)
+  const disabledUntil = typeof health.disabled_until === 'number' && health.disabled_until > now ? health.disabled_until : null
+  const backoffUntil = kind === 'channel' && typeof health.backoff_until === 'number' && health.backoff_until > now ? health.backoff_until : null
+  const failures = typeof health.consecutive_failures === 'number' ? health.consecutive_failures : null
+  if (!disabledUntil && !backoffUntil && failures == null) return <>—</>
+  const label = disabledUntil ? t('healthDisabledUntil', { time: formatDate(disabledUntil) })
+    : backoffUntil ? t('healthBackoffUntil', { time: formatDate(backoffUntil) })
+      : failures ? t('healthFailures', { count: failures })
+        : t('healthHealthy')
+  const color = disabledUntil ? 'red' : backoffUntil || failures ? 'yellow' : 'teal'
+  const pill = <Badge variant="light" color={color} radius="sm">{label}</Badge>
+  // The recorded reason is the gateway's own error code: data, shown verbatim.
+  return health.reason ? <Tooltip label={t('healthLastError', { reason: health.reason })}>{pill}</Tooltip> : pill
 }
 
 function CredentialsPanel() {
   const { t } = useTranslation()
-  const { options } = useChannelOptions()
+  const credentialType = useCredentialTypeLabel()
+  const { options, query } = useChannelOptions()
+  // A picker fed by a failed lookup offers an empty choice that reads as a real
+  // one, so the field carries the failure and its retry instead.
+  const optionsError = query.isError ? t('optionsUnavailable') : undefined
+  const retryOptions = () => void query.refetch()
   return (
     <>
-      <ResourcePage resource="credentials" title={t('credentials')} description={t('credentialsDescription')} empty={t('credentialEmpty')} createLabel={t('addCredential')} columns={[{ key: 'provider_name', label: t('channel') }, { key: 'suffix', label: t('suffix'), mono: true }, { key: 'credential_type', label: t('credentialType') }, { key: 'priority', label: t('priority') }, { key: 'enabled', label: t('status'), render: (value) => <EnabledPill enabled={value} /> }]} fields={[{ key: 'provider_id', label: t('channel'), kind: 'select', required: true, options }, { key: 'credential_type', label: t('credentialType'), defaultValue: 'api_key', required: true }, { key: 'secret', label: t('secret'), kind: 'secret', hint: t('secretUpdateHint'), omitWhenBlank: true }, { key: 'priority', label: t('priority'), kind: 'number', defaultValue: 100 }, { key: 'enabled', label: t('status'), kind: 'checkbox' }, { key: 'settings', label: t('advancedSettings'), kind: 'json', defaultValue: { version: 1 } }]} />
+      <ResourcePage resource="credentials" title={t('credentials')} description={t('credentialsDescription')} empty={t('credentialEmpty')} selectable="credentials" createLabel={t('addCredential')} notice={<HealthNotice kind="credential" />} columns={[{ key: 'provider_name', label: t('channel') }, { key: 'suffix', label: t('suffix'), mono: true }, { key: 'credential_type', label: t('credentialType'), render: (value) => credentialType(value) }, { key: 'priority', label: t('priority') }, { key: 'health', label: t('credentialHealth'), render: (_value, row) => <HealthCell kind="credential" id={String(row.id)} /> }, { key: 'enabled', label: t('status'), render: (value) => <EnabledPill enabled={value} /> }]} fields={[{ key: 'provider_id', label: t('channel'), kind: 'select', required: true, options, error: optionsError, onRetry: retryOptions }, { key: 'credential_type', label: t('credentialType'), defaultValue: 'api_key', required: true }, { key: 'secret', label: t('secret'), kind: 'secret', hint: t('secretUpdateHint'), omitWhenBlank: true }, { key: 'priority', label: t('priority'), kind: 'number', defaultValue: 100 }, { key: 'enabled', label: t('status'), kind: 'checkbox' }, { key: 'settings', label: t('advancedSettings'), kind: 'json', defaultValue: { version: 1 } }]} />
       <BulkToggle resource="credentials" />
     </>
   )
@@ -78,44 +183,78 @@ function CredentialsPanel() {
 
 function ChannelSettingsPanel() {
   const { t } = useTranslation()
-  const { options } = useChannelOptions()
+  const { options, query } = useChannelOptions()
   return (
-    <ResourcePage resource="channel-settings" title={t('channelPolicies')} description={t('channelPoliciesHint')} empty={t('channelPoliciesEmpty')} canDelete={false} columns={[{ key: 'provider_id', label: t('channel'), render: (value) => options.find((option) => option.value === value)?.label || String(value) }, { key: 'retry_statuses', label: t('retryStatuses') }, { key: 'auto_disable_policy', label: t('autoDisable') }]} fields={[{ key: 'provider_id', label: t('channel'), kind: 'select', required: true, options }, { key: 'endpoint_mappings', label: t('endpointMappings'), kind: 'json', defaultValue: { version: 1 } }, { key: 'model_rules', label: t('modelRules'), kind: 'json', defaultValue: { version: 1 } }, { key: 'parameter_overrides', label: t('parameterOverrides'), kind: 'json', defaultValue: { version: 1 } }, { key: 'retry_statuses', label: t('retryStatuses'), kind: 'json', defaultValue: { version: 1, statuses: [408, 409, 429, 500, 502, 503, 504] } }, { key: 'auto_disable_policy', label: t('autoDisable'), kind: 'json', defaultValue: { version: 1, enabled: false } }]} />
+    <ResourcePage resource="channel-settings" title={t('channelPolicies')} description={t('channelPoliciesHint')} empty={t('channelPoliciesEmpty')} canDelete={false} columns={[{ key: 'provider_id', label: t('channel'), render: (value) => options.find((option) => option.value === value)?.label || String(value) }, { key: 'retry_statuses', label: t('retryStatuses') }, { key: 'auto_disable_policy', label: t('autoDisable') }]} fields={[{ key: 'provider_id', label: t('channel'), kind: 'select', required: true, options, error: query.isError ? t('optionsUnavailable') : undefined, onRetry: () => void query.refetch() }, { key: 'endpoint_mappings', label: t('endpointMappings'), kind: 'json', defaultValue: { version: 1 } }, { key: 'model_rules', label: t('modelRules'), kind: 'json', defaultValue: { version: 1 } }, { key: 'parameter_overrides', label: t('parameterOverrides'), kind: 'json', defaultValue: { version: 1 } }, { key: 'retry_statuses', label: t('retryStatuses'), kind: 'json', defaultValue: { version: 1, statuses: [408, 409, 429, 500, 502, 503, 504] } }, { key: 'auto_disable_policy', label: t('autoDisable'), kind: 'json', defaultValue: { version: 1, enabled: false } }]} />
   )
 }
 
-function BulkToggle({ resource = 'channels' }: { resource?: 'channels' | 'credentials' }) {
+type ProbeRow = { id?: string; provider_id?: string; model?: string | null; success?: number | null; status_code?: number | null; latency_ms?: number | null; probed_at?: number | null; error?: string | null }
+
+/**
+ * Probe one channel from its own row. The job is the same durable one the Probes
+ * tab enqueues, but the outcome is reported where the operator asked for it: a
+ * dialog that watches the probe records and shows the first one newer than the
+ * moment the job was queued, with the model the backend chose — the console does
+ * not pick it, and saying otherwise would be an invention.
+ */
+function ProbeRowAction({ id, name }: { id: string; name: string }) {
   const { t } = useTranslation()
   const { project } = useProject()
-  const client = useQueryClient()
-  const total = useResourceTotal(resource)
-  const mutate = useMutation({ mutationFn: (body: unknown) => api(projectOperationPath(project.id, 'bulk-toggle'), { method: 'POST', body: JSON.stringify(body) }), onSuccess: () => { toast.success(t('saved')); void client.invalidateQueries({ queryKey: ['resource', project.id, resource] }) }, onError: (error: Error) => toast.error(error.message) })
-  const submit = (event: FormEvent<HTMLFormElement>) => { event.preventDefault(); const data = new FormData(event.currentTarget); mutate.mutate({ resource, ids: String(data.get('ids')).split(',').map((id) => id.trim()).filter(Boolean), enabled: data.get('enabled') === 'true' }) }
-  // With no rows to act on the bulk form is dead weight next to the empty
-  // state's single call to action, so it only appears once a row exists. An
-  // unknown count (`null`) keeps it: the failure belongs to the count query, and
-  // silently dropping a working control is worse than showing it unnecessarily.
-  if (total === 0) return null
-  return (
-    <Paper withBorder p="md" mt="md">
-      <Title order={3} mb="md">{t('bulkActions')}</Title>
-      <form onSubmit={submit}>
-        <Group gap="md" align="end" wrap="wrap">
-          <TextInput name="ids" label={t('resourceIds')} placeholder="id-1, id-2" required style={{ minWidth: 260 }} />
-          <Select name="enabled" label={t('action')} defaultValue="true" data={[{ value: 'true', label: t('enable') }, { value: 'false', label: t('disable') }]} />
-          {/* The page's primary action is creating a resource, so the bulk
-              panel submits through a secondary button. */}
-          <Button type="submit" variant="default">{t('apply')}</Button>
+  const [open, setOpen] = useState(false)
+  const [baseline, setBaseline] = useState<number | null>(null)
+  const [queued, setQueued] = useState(false)
+  const query = useQuery({
+    queryKey: ['probe-row', project.id, id],
+    queryFn: () => api<Paged<ProbeRow>>(projectOperationPath(project.id, 'probes') + '?limit=50'),
+    enabled: open,
+    // A queued job is expected to land shortly; polling stops once it has.
+    refetchInterval: open && queued ? 2000 : false,
+  })
+  const rows = query.data?.data || []
+  const newest = rows.reduce((value, row) => Math.max(value, Number(row.probed_at ?? 0)), 0)
+  const run = useMutation({
+    mutationFn: () => api(projectOperationPath(project.id, 'probe'), { method: 'POST', body: JSON.stringify({ provider_id: id }) }),
+    // The baseline is the newest record *before* this run, so the result shown is
+    // this probe's and not an older one; the read is repeated straight away because
+    // a fast job would otherwise wait for the polling interval.
+    onSuccess: () => { setBaseline(newest); setQueued(true); void query.refetch() },
+    onError: (error: Error) => toast.error(error.message),
+  })
+  const result = rows
+    .filter((row) => String(row.provider_id) === id && (baseline == null || Number(row.probed_at ?? 0) > baseline))
+    .sort((left, right) => Number(right.probed_at ?? 0) - Number(left.probed_at ?? 0))[0]
+  const outcome = result ? result.success === 1 : null
+  const openDialog = () => { setOpen(true); setBaseline(null); setQueued(false) }
+  const closeDialog = () => setOpen(false)
+  return <>
+    <Button variant="subtle" size="compact-sm" aria-label={`${t('test')} ${name}`} onClick={openDialog}>{t('test')}</Button>
+    <Modal opened={open} onClose={closeDialog} title={`${t('test')} ${name}`} closeButtonProps={{ 'aria-label': t('close') }}>
+      <Stack gap="md">
+        <Group gap="sm" align="end" wrap="wrap">
+          <Button onClick={() => run.mutate()} loading={run.isPending}>{t('runProbe')}</Button>
+          <Text size="xs" c="dimmed">{t('probeChoosesModel')}</Text>
         </Group>
-      </form>
-    </Paper>
-  )
+        {run.isError && <InlineQueryError message={run.error.message} onRetry={() => run.mutate()} />}
+        {query.isError ? <InlineQueryError message={t('probeResultsUnavailable')} onRetry={() => void query.refetch()} />
+          : !queued ? null
+            : !result ? <Text size="sm" c="dimmed">{t('probeWaiting')}</Text>
+              : <Stack gap={4}>
+                <Badge variant="light" color={outcome ? 'green' : 'red'}>{t(outcome ? 'statusSucceeded' : 'statusFailed')}</Badge>
+                <Text size="sm">{`${t('model')}: ${result.model || UNMEASURED}`}</Text>
+                <Text size="sm">{`${t('latency')}: ${result.latency_ms == null || result.latency_ms <= 0 ? UNMEASURED : `${result.latency_ms} ms`}`}</Text>
+                <Text size="sm">{`${t('statusCode')}: ${result.status_code == null || result.status_code <= 0 ? UNMEASURED : result.status_code}`}</Text>
+                {result.error && <Text size="sm" className="error-text">{`${t('probeError')}: ${result.error}`}</Text>}
+              </Stack>}
+      </Stack>
+    </Modal>
+  </>
 }
 
 function Diagnostics({ quota = false }: { quota?: boolean }) {
   const { t } = useTranslation()
   const { project } = useProject()
-  const { options } = useChannelOptions()
+  const { options, query } = useChannelOptions()
   const [selected, setSelected] = useState('')
   const run = useMutation({ mutationFn: (provider_id: string) => api(projectOperationPath(project.id, quota ? 'quota' : 'probe'), { method: 'POST', body: JSON.stringify({ provider_id }) }), onSuccess: () => toast.success(t('jobQueued')), onError: (error: Error) => toast.error(error.message) })
   const current = selected || options[0]?.value || ''
@@ -123,8 +262,12 @@ function Diagnostics({ quota = false }: { quota?: boolean }) {
     <Paper withBorder p="md" mb="md">
       <form onSubmit={(event) => { event.preventDefault(); run.mutate(current) }}>
         <Group gap="md" align="end" wrap="wrap">
-          <SelectField label={t('channel')} value={current} onValueChange={setSelected} options={options} />
-          <Button type="submit" disabled={!current}>{quota ? t('collectQuota') : t('runProbe')}</Button>
+          {/* The probe targets a channel, so a channel list that could not be read
+              is reported here rather than as an empty picker. */}
+          {query.isError
+            ? <InlineQueryError message={t('optionsUnavailable')} onRetry={() => void query.refetch()} />
+            : <SelectField label={t('channel')} value={current} onValueChange={setSelected} options={options} />}
+          <Button type="submit" disabled={!current || query.isError}>{quota ? t('collectQuota') : t('runProbe')}</Button>
         </Group>
       </form>
     </Paper>

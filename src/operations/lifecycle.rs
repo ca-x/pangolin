@@ -16,12 +16,21 @@ use sea_orm::{ConnectionTrait, TransactionTrait};
 use serde_json::{Value, json};
 use std::{sync::Arc, time::Instant};
 
+const MAX_STORED_STREAM_BYTES: usize = 1024 * 1024;
+/// Keep enough of the 1 MiB payload budget for the small protocol terminal
+/// envelope. Without this reserve a long, otherwise valid stream filled the body
+/// with deltas and discarded the only fact that says it completed.
+const STREAM_TERMINAL_RESERVE_BYTES: usize = 256;
+
 struct Context {
     state: AppState,
     id: String,
     trace_id: String,
     external_request: String,
     external_trace: String,
+    /// The server-observed direct peer, resolved once at admission and reused by
+    /// both the authoritative row and every derived event.
+    source_ip: Option<String>,
     key: ApiKeyCredential,
     profile_id: Option<String>,
     level: Level,
@@ -30,6 +39,10 @@ struct Context {
     ratio: i64,
     started_at: i64,
     request_json: Option<String>,
+    /// The stream decision taken when this request was admitted. Kept in memory so
+    /// the terminal event carries the same answer that was persisted, instead of
+    /// inferring one from the response.
+    stream: Option<bool>,
     affinity: Option<crate::orchestration::affinity::Binding>,
     observation_generation: u64,
 }
@@ -55,6 +68,15 @@ pub struct Request {
     context: Arc<Context>,
 }
 impl Request {
+    /// Pangolin's own request UUID, the projection's identity.
+    pub fn internal_id(&self) -> String {
+        self.context.id.clone()
+    }
+
+    pub fn source_ip(&self) -> Option<String> {
+        self.context.source_ip.clone()
+    }
+
     pub fn record_event(&self, event: RequestEvent) {
         if self.logs_enabled() {
             self.context
@@ -109,6 +131,7 @@ impl Request {
             .try_get::<Option<String>>("", "profile_id")?;
         let request = id();
         let now = db::now();
+        let source_ip = crate::api::trusted_client_ip(headers).map(|value| value.to_string());
         let group=state.db.query_one(sql("SELECT g.ratio_millionths,g.enabled FROM service_group_keys k JOIN service_groups g ON g.id=k.group_id WHERE k.api_key_id=? AND k.project_id=?",vec![key.id.clone().into(),key.project_id.clone().into()])).await?;
         let ratio = if let Some(row) = group {
             if !row.try_get::<bool>("", "enabled")? {
@@ -119,6 +142,11 @@ impl Request {
             1_000_000
         };
         let trace = scope_id(&key.project_id, &key.id, trace_id);
+        // The protocol's own stream decision, taken once here — the one place that
+        // knows both the endpoint shape and the admitted payload. It is written to
+        // the authoritative request metadata so a projection rebuild reads it back
+        // rather than guessing from a response or a captured payload.
+        let stream = crate::providers::streamed(endpoint, payload);
         let transaction = state.db.begin().await?;
         transaction.execute(sql("INSERT INTO request_facts(id,project_id,api_key_id,profile_id,user_id,log_level,started_at,ratio_millionths) VALUES(?,?,?,?,?,?,?,?)",vec![request.clone().into(),key.project_id.clone().into(),key.id.clone().into(),profile_id.clone().into(),key.user_id.clone().into(),level.name().into(),now.into(),ratio.into()])).await?;
         let request_json = level.body(payload);
@@ -132,7 +160,12 @@ impl Request {
                 transaction.execute(sql("INSERT INTO threads(id,project_id,api_key_id,user_id,external_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET updated_at=excluded.updated_at",vec![thread.clone().into(),key.project_id.clone().into(),key.id.clone().into(),key.user_id.clone().into(),external_thread.into(),now.into(),now.into()])).await?;
             }
             transaction.execute(sql("INSERT INTO traces(id,thread_id,project_id,api_key_id,user_id,external_id,started_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET status='running',finished_at=NULL",vec![trace.clone().into(),thread.into(),key.project_id.clone().into(),key.id.clone().into(),key.user_id.clone().into(),trace_id.into(),now.into()])).await?;
-            transaction.execute(sql("INSERT INTO requests(id,trace_id,protocol,endpoint,requested_model,source_ip,status,request_metadata_json,started_at) VALUES(?,?,?,?,?,?,'running',?,?)",vec![request.clone().into(),trace.clone().into(),crate::providers::capability(endpoint).into(),endpoint.into(),model.into(),crate::api::trusted_client_ip(headers).map(|v|v.to_string()).into(),json!({"version":1,"external_id":request_id,"log_level":level.name()}).to_string().into(),now.into()])).await?;
+            let mut metadata =
+                json!({"version":1,"external_id":request_id,"log_level":level.name()});
+            if let Some(stream) = stream {
+                metadata["stream"] = json!(stream);
+            }
+            transaction.execute(sql("INSERT INTO requests(id,trace_id,protocol,endpoint,requested_model,source_ip,status,request_metadata_json,started_at) VALUES(?,?,?,?,?,?,'running',?,?)",vec![request.clone().into(),trace.clone().into(),crate::providers::capability(endpoint).into(),endpoint.into(),model.into(),source_ip.clone().into(),metadata.to_string().into(),now.into()])).await?;
             transaction
                 .execute(sql(
                     "INSERT INTO request_contents(request_id,request_json) VALUES(?,?)",
@@ -148,6 +181,7 @@ impl Request {
                 trace_id: trace,
                 external_request: request_id.into(),
                 external_trace: trace_id.into(),
+                source_ip,
                 key: key.clone(),
                 profile_id,
                 level,
@@ -156,6 +190,7 @@ impl Request {
                 ratio,
                 started_at: now,
                 request_json,
+                stream,
                 affinity,
                 observation_generation: state.observations.generation(),
             }),
@@ -217,7 +252,7 @@ impl Request {
                 .await?;
         }
         if ctx.level != Level::Off {
-            transaction.execute(sql("INSERT INTO request_executions(id,request_id,provider_id,credential_id,attempt,model,status,credential_suffix,started_at) SELECT ?,?,?,?,?,?,'running',suffix,? FROM channel_credentials WHERE id=?",vec![execution.clone().into(),ctx.id.clone().into(),candidate.provider_id.clone().into(),candidate.credential_id.clone().into(),(number as i64).into(),candidate.target.upstream_name.clone().into(),db::now().into(),candidate.credential_id.clone().into()])).await?;
+            transaction.execute(sql("INSERT INTO request_executions(id,request_id,provider_id,provider_name,credential_id,attempt,model,status,credential_suffix,started_at) SELECT ?,?,?,?,?,?,?,'running',suffix,? FROM channel_credentials WHERE id=?",vec![execution.clone().into(),ctx.id.clone().into(),candidate.provider_id.clone().into(),candidate.target.provider_name.clone().into(),candidate.credential_id.clone().into(),(number as i64).into(),candidate.target.upstream_name.clone().into(),db::now().into(),candidate.credential_id.clone().into()])).await?;
         }
         transaction.commit().await?;
         Ok(Attempt {
@@ -273,8 +308,14 @@ pub struct Attempt {
     response_id: Option<String>,
 }
 impl Attempt {
-    pub async fn rejection(&mut self, status: u16) -> Result<(), ApiError> {
+    /// Records the upstream status this attempt actually saw. A rejection also
+    /// releases the reservation; an accepted response does not, so a `2xx` that is
+    /// not `200` is recorded here without changing how it settles.
+    pub fn observed_status(&mut self, status: u16) {
         self.http_status = Some(status);
+    }
+    pub async fn rejection(&mut self, status: u16) -> Result<(), ApiError> {
+        self.observed_status(status);
         self.price.components.clear();
         self.reserved = 0;
         self.usage.reported = true;
@@ -324,63 +365,164 @@ impl Attempt {
         }
         self.final_usage |= self.usage.reported;
     }
-    pub fn stream_event(&mut self, value: &Value, terminal: bool) {
-        self.capture_response_id(value);
-        let parsed = Usage::parse_for(value, self.context.endpoint == "/v1/messages");
+    pub fn stream_event(&mut self, event_name: &str, data: &str, terminal: bool) {
+        let value = serde_json::from_str::<Value>(data).ok();
+        if let Some(value) = value.as_ref() {
+            self.capture_response_id(value);
+        }
+        let parsed = value
+            .as_ref()
+            .map(|value| Usage::parse_for(value, self.context.endpoint == "/v1/messages"))
+            .unwrap_or_default();
         // A valid cumulative/initial report is not proof that generation has ended.
         // Anthropic's final delta and OpenAI's aggregate chunk precede their stop
         // events; Responses/Gemini carry final usage on a protocol terminal event.
-        let final_report = match self.context.endpoint.as_str() {
-            "/v1/messages" => {
-                value["type"] == "message_delta"
-                    && value
-                        .pointer("/delta/stop_reason")
-                        .is_some_and(Value::is_string)
-                    && value
-                        .pointer("/usage/output_tokens")
-                        .and_then(Value::as_i64)
-                        .is_some_and(|n| n >= 0)
-            }
-            "/v1/chat/completions" | "/v1/completions" => {
-                value["choices"].as_array().is_some_and(Vec::is_empty)
-                    && value
-                        .pointer("/usage/completion_tokens")
-                        .and_then(Value::as_i64)
-                        .is_some_and(|n| n >= 0)
-            }
-            "/v1/responses" => {
-                terminal
-                    && value
-                        .pointer("/response/usage/output_tokens")
-                        .and_then(Value::as_i64)
-                        .is_some_and(|n| n >= 0)
-            }
-            "/v1beta/models:streamGenerateContent" => {
-                terminal
-                    && value.get("error").is_none()
-                    && [
-                        "/usageMetadata/totalTokenCount",
-                        "/usageMetadata/candidatesTokenCount",
-                    ]
-                    .iter()
-                    .any(|pointer| {
-                        value
-                            .pointer(pointer)
+        // Only the shape that ends a choice or the stream may set final usage, so a
+        // reservation is never released from a partial report.
+        let final_report =
+            value
+                .as_ref()
+                .is_some_and(|value| match self.context.endpoint.as_str() {
+                    "/v1/messages" => {
+                        value["type"] == "message_delta"
+                            && value
+                                .pointer("/delta/stop_reason")
+                                .is_some_and(Value::is_string)
+                            && value
+                                .pointer("/usage/output_tokens")
+                                .and_then(Value::as_i64)
+                                .is_some_and(|n| n >= 0)
+                    }
+                    "/v1/chat/completions" | "/v1/completions" => {
+                        let completion_tokens = value
+                            .pointer("/usage/completion_tokens")
                             .and_then(Value::as_i64)
-                            .is_some_and(|n| n >= 0)
-                    })
-            }
-            _ => false,
-        };
+                            .is_some_and(|n| n >= 0);
+                        let choices = value["choices"].as_array();
+                        // The conventional aggregate: usage arrives with no choices at all.
+                        let aggregate = choices.is_some_and(Vec::is_empty);
+                        // Compatible upstreams may instead attach the same cumulative usage to
+                        // the chunk that closes every choice. That chunk is this protocol's
+                        // in-band terminal — every choice carries a non-null `finish_reason` —
+                        // so its report is complete even though `[DONE]` is still to come. A
+                        // content delta, which has no `finish_reason`, is never final.
+                        let finished = choices.is_some_and(|choices| {
+                            !choices.is_empty()
+                                && choices.iter().all(|choice| {
+                                    choice
+                                        .get("finish_reason")
+                                        .and_then(Value::as_str)
+                                        .is_some_and(|reason| !reason.is_empty())
+                                })
+                        });
+                        completion_tokens && (aggregate || finished)
+                    }
+                    "/v1/responses" => {
+                        terminal
+                            && value
+                                .pointer("/response/usage/output_tokens")
+                                .and_then(Value::as_i64)
+                                .is_some_and(|n| n >= 0)
+                    }
+                    "/v1beta/models:streamGenerateContent" => {
+                        terminal
+                            && value.get("error").is_none()
+                            && [
+                                "/usageMetadata/totalTokenCount",
+                                "/usageMetadata/candidatesTokenCount",
+                            ]
+                            .iter()
+                            .any(|pointer| {
+                                value
+                                    .pointer(pointer)
+                                    .and_then(Value::as_i64)
+                                    .is_some_and(|n| n >= 0)
+                            })
+                    }
+                    _ => false,
+                });
         self.final_usage |= parsed.reported && final_report;
-        self.usage
-            .merge_event(value, self.context.endpoint == "/v1/messages");
-        if let Some(event) = self.context.level.body(value) {
-            let body = self.body.get_or_insert_default();
-            if body.len() + event.len() < 1024 * 1024 {
-                body.push_str(&event);
-                body.push('\n');
+        if let Some(value) = value.as_ref() {
+            self.usage
+                .merge_event(value, self.context.endpoint == "/v1/messages");
+        }
+        self.capture_stream_envelope(event_name, data, value.as_ref(), terminal);
+    }
+    fn capture_stream_envelope(
+        &mut self,
+        event_name: &str,
+        raw_data: &str,
+        value: Option<&Value>,
+        terminal: bool,
+    ) {
+        let data = if let Some(value) = value {
+            let Some(sanitized) = self.context.level.body(value) else {
+                return;
+            };
+            // `Level::body` serialized a `serde_json::Value`, so this cannot fail;
+            // refusing the event is still safer than retaining the unsanitized input.
+            let Ok(sanitized) = serde_json::from_str::<Value>(&sanitized) else {
+                return;
+            };
+            sanitized
+        } else if raw_data.trim() == "[DONE]"
+            && matches!(self.context.level, Level::FullBody | Level::RedactedBody)
+        {
+            Value::String("[DONE]".into())
+        } else {
+            // Arbitrary non-JSON SSE data cannot pass the structured credential and
+            // media sanitizer. The fixed protocol sentinel above contains no user data.
+            return;
+        };
+        let lower_event = event_name.to_ascii_lowercase().replace('-', "_");
+        let safe_event_name = !event_name.is_empty()
+            && event_name.len() <= 128
+            && event_name.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':')
+            })
+            && ![
+                "authorization",
+                "cookie",
+                "secret",
+                "password",
+                "credential",
+                "api_key",
+                "apikey",
+                "token",
+                "bearer",
+            ]
+            .iter()
+            .any(|needle| lower_event.contains(needle));
+        let event = json!({
+            "version": 1,
+            "event": if safe_event_name { event_name } else { "message" },
+            "data": data,
+            "terminal": terminal,
+        })
+        .to_string();
+        let limit = if terminal {
+            MAX_STORED_STREAM_BYTES
+        } else {
+            MAX_STORED_STREAM_BYTES - STREAM_TERMINAL_RESERVE_BYTES
+        };
+        let body = self.body.get_or_insert_default();
+        let required = event.len().saturating_add(1);
+        if terminal && required <= MAX_STORED_STREAM_BYTES {
+            // Prefer the protocol terminal to the newest deltas. Remove complete
+            // envelopes from the tail until the retained prefix and terminal fit;
+            // never cut a JSON line into invalid storage.
+            while body.len().saturating_add(required) > MAX_STORED_STREAM_BYTES {
+                let without_final_newline = body.strip_suffix('\n').unwrap_or(body);
+                if let Some(previous_newline) = without_final_newline.rfind('\n') {
+                    body.truncate(previous_newline + 1);
+                } else {
+                    body.clear();
+                }
             }
+        }
+        if body.len().saturating_add(required) <= limit {
+            body.push_str(&event);
+            body.push('\n');
         }
     }
     pub fn first_byte(&mut self) {
@@ -444,6 +586,20 @@ impl Attempt {
         }
         health
     }
+    /// The terminal classification of this attempt, derived from facts that are all
+    /// in memory: a success that reported its usage has none; a success whose usage
+    /// never arrived is `usage_unavailable`; anything else is its own terminal
+    /// status. The same value is persisted and emitted.
+    fn error_kind(&self, status: &str) -> Option<String> {
+        if status == "succeeded" && self.final_usage {
+            return None;
+        }
+        Some(if self.final_usage {
+            status.to_owned()
+        } else {
+            "usage_unavailable".to_owned()
+        })
+    }
     async fn settle(&mut self, status: &str) -> Result<(), ApiError> {
         if self.settled {
             return Ok(());
@@ -480,6 +636,11 @@ impl Attempt {
             self.settled = true;
             return Ok(());
         }
+        // One classification, computed once and written to both the authoritative
+        // execution row and the live event: a console that shows two different
+        // reasons for one request is worse than one that shows none.
+        let error_kind = self.error_kind(status);
+        let http_status = self.http_status.map(i32::from);
         let usage_id = id();
         let mut kind = if self.final_usage {
             "reported"
@@ -545,7 +706,7 @@ impl Attempt {
         .await?;
         let latency = self.started.elapsed().as_millis() as i64;
         if ctx.level != Level::Off {
-            txn.execute(sql("UPDATE request_executions SET status=?,finished_at=?,latency_ms=?,first_token_at=?,retry_reason=? WHERE id=?",vec![status.into(),db::now().into(),latency.into(),self.ttft.map(|ms|ctx.started_at*1000+ms).into(),(status!="succeeded").then_some(status.to_owned()).into(),self.id.clone().into()])).await?;
+            txn.execute(sql("UPDATE request_executions SET status=?,finished_at=?,latency_ms=?,first_token_at=?,retry_reason=?,http_status=?,error_kind=? WHERE id=?",vec![status.into(),db::now().into(),latency.into(),self.ttft.map(|ms|ctx.started_at*1000+ms).into(),(status!="succeeded").then_some(status.to_owned()).into(),http_status.into(),error_kind.clone().into(),self.id.clone().into()])).await?;
             txn.execute(sql(
                 "UPDATE requests SET status=?,finished_at=? WHERE id=?",
                 vec![status.into(), db::now().into(), ctx.id.clone().into()],
@@ -563,9 +724,11 @@ impl Attempt {
         if ctx.level != Level::Off {
             ctx.state.observations.record_at(
                 RequestEvent {
+                    id: ctx.id.clone(),
                     project_id: ctx.key.project_id.clone(),
                     request_id: ctx.external_request.clone(),
                     trace_id: ctx.external_trace.clone(),
+                    source_ip: ctx.source_ip.clone(),
                     started_at: ctx.started_at,
                     finished_at: db::now(),
                     endpoint: ctx.endpoint.clone(),
@@ -573,19 +736,23 @@ impl Attempt {
                     provider: Some(self.provider.clone()),
                     requested_model: Some(ctx.model.clone()),
                     resolved_model: Some(self.model.clone()),
-                    status_code: if status == "succeeded" { 200 } else { 502 },
-                    error_kind: (status != "succeeded" || !self.final_usage).then(|| {
-                        if !self.final_usage {
-                            "usage_unavailable".into()
-                        } else {
-                            status.into()
-                        }
-                    }),
+                    // The real upstream status when the attempt observed one. A local
+                    // failure before any response has none, and NULL says exactly
+                    // that: the old synthesized 502 was the gateway's own answer, so
+                    // a rate limit, a bad key and an outage were indistinguishable.
+                    status_code: http_status,
+                    error_kind: error_kind.clone(),
                     latency_ms: latency,
                     ttft_ms: self.ttft,
                     input_tokens: self.usage.input,
                     output_tokens: self.usage.output,
                     cached_tokens: self.usage.cache_read,
+                    // The settled usage facts, from the same in-memory report that
+                    // was just written to `usage_logs` — not the cost components a
+                    // price happened to charge for.
+                    cache_write_tokens: self.usage.cache_write,
+                    reasoning_tokens: self.usage.reasoning,
+                    stream: ctx.stream,
                     cost_micros: cost,
                     payload_captured: ctx.request_json.is_some(),
                     request_json: ctx.request_json.clone(),

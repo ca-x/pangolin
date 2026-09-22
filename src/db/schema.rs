@@ -401,7 +401,7 @@ CREATE TABLE prompts (
     role TEXT NOT NULL,
     content TEXT NOT NULL,
     activation_json TEXT NOT NULL DEFAULT '{"version":1}',
-    enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0,1)),
+    enabled INTEGER NOT NULL DEFAULT 0 CHECK(enabled IN (0,1)),
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
     UNIQUE(project_id,name)
@@ -762,6 +762,110 @@ INSERT INTO permissions(id,slug,level,description,created_at) VALUES('00000000-0
 INSERT INTO role_permissions(role_id,permission_id,created_at) VALUES('00000000-0000-0000-0000-000000000011','00000000-0000-0000-0000-000000000028',unixepoch());
 "#;
 
+/// The durable outcome snapshot of an upstream attempt. The live observation event
+/// always knew the exact status, the channel's display name and the terminal
+/// classification; without these columns the projection could only be rebuilt by
+/// inventing `200`, `502` and a provider UUID. Existing rows stay NULL: a status
+/// nobody recorded is not a status.
+const V9_EXECUTION_OUTCOME_SNAPSHOT: &str = r#"
+ALTER TABLE request_executions ADD COLUMN provider_name TEXT;
+ALTER TABLE request_executions ADD COLUMN http_status INTEGER;
+ALTER TABLE request_executions ADD COLUMN error_kind TEXT;
+"#;
+
+/// The trace lifecycle is a durable, constrained value of its own.
+///
+/// `traces.status` is the execution outcome — what the run did — and it stays
+/// authoritative; overloading it with archive/pin state would have made
+/// "succeeded and archived" unrepresentable. Every row that predates this column
+/// is active, which is what it already was, and the index serves the list's own
+/// default predicate (`lifecycle!='archived'`) under the project scope.
+const V10_TRACE_LIFECYCLE: &str = r#"
+ALTER TABLE traces ADD COLUMN lifecycle TEXT NOT NULL DEFAULT 'active' CHECK(lifecycle IN ('active','archived','retained'));
+CREATE INDEX idx_traces_project_lifecycle ON traces(project_id,lifecycle);
+"#;
+
+/// Prompt placement is logically additive and backwards compatible. SQLite
+/// cannot alter a column default in place, so the transaction copies the table:
+/// existing prompts keep their enabled bit and acquire the behaviour Pangolin
+/// previously hard-coded (order zero and prepend), while every upgraded database
+/// also receives the safe disabled default for future inserts.
+const V11_PROMPT_PLACEMENT: &str = r#"
+ALTER TABLE prompts RENAME TO prompts_v10;
+CREATE TABLE prompts (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    role TEXT NOT NULL,
+    content TEXT NOT NULL,
+    activation_json TEXT NOT NULL DEFAULT '{"version":1}',
+    enabled INTEGER NOT NULL DEFAULT 0 CHECK(enabled IN (0,1)),
+    "order" INTEGER NOT NULL DEFAULT 0,
+    action TEXT NOT NULL DEFAULT 'prepend' CHECK(action IN ('prepend','append')),
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    UNIQUE(project_id,name)
+);
+INSERT INTO prompts(id,project_id,name,role,content,activation_json,enabled,"order",action,created_at,updated_at)
+SELECT id,project_id,name,role,content,activation_json,enabled,0,'prepend',created_at,updated_at FROM prompts_v10;
+DROP TABLE prompts_v10;
+"#;
+
+/// Human-readable context and archive state are independent of the existing
+/// enable switch. Every rule predating this migration was enforceable when
+/// enabled, so the additive default preserves it as active.
+const V12_PROTECTION_METADATA: &str = r#"
+ALTER TABLE prompt_protection_rules ADD COLUMN description TEXT NOT NULL DEFAULT '';
+ALTER TABLE prompt_protection_rules ADD COLUMN state TEXT NOT NULL DEFAULT 'active' CHECK(state IN ('active','archived'));
+"#;
+
+/// A self-service link callback must use the user captured when the flow
+/// started. Keeping both the intent and user on the one-time state prevents a
+/// callback from accepting either value from the browser or a later session.
+const V13_OIDC_LINK_STATE: &str = r#"
+ALTER TABLE oidc_auth_states ADD COLUMN intent TEXT NOT NULL DEFAULT 'login' CHECK(intent IN ('login','link'));
+ALTER TABLE oidc_auth_states ADD COLUMN link_user_id TEXT REFERENCES users(id) ON DELETE CASCADE;
+"#;
+
+/// API-key archival is durable lifecycle state, distinct from the reversible
+/// enable switch. The default keeps every pre-existing key active.
+const V14_API_KEY_LIFECYCLE: &str = r#"
+ALTER TABLE api_keys ADD COLUMN lifecycle TEXT NOT NULL DEFAULT 'active' CHECK(lifecycle IN ('active','archived'));
+ALTER TABLE api_keys ADD COLUMN archived_at INTEGER;
+CREATE INDEX idx_api_keys_project_lifecycle ON api_keys(project_id,lifecycle);
+"#;
+
+/// Model lifecycle is independent from enablement. Existing rows remain active;
+/// archive is an explicit control-plane operation rather than another spelling
+/// of disabled.
+const V15_MODEL_LIFECYCLE: &str = r#"
+ALTER TABLE models ADD COLUMN lifecycle TEXT NOT NULL DEFAULT 'active' CHECK(lifecycle IN ('active','archived'));
+CREATE INDEX idx_models_project_lifecycle ON models(provider_id,lifecycle,enabled);
+"#;
+
+/// AxonHub calls its branding field `icon_url`. Pangolin deliberately stores a
+/// bundled catalog key instead: login discovery must never turn an operator
+/// value into a browser-side remote image request.
+const V16_OIDC_LOGIN_POLICY: &str = r#"
+ALTER TABLE oidc_providers ADD COLUMN login_only INTEGER NOT NULL DEFAULT 0 CHECK(login_only IN (0,1));
+ALTER TABLE oidc_providers ADD COLUMN display_name TEXT NOT NULL DEFAULT '';
+ALTER TABLE oidc_providers ADD COLUMN button_color TEXT CHECK(button_color IS NULL OR (length(button_color)=7 AND substr(button_color,1,1)='#' AND substr(button_color,2) NOT GLOB '*[^0-9A-Fa-f]*'));
+ALTER TABLE oidc_providers ADD COLUMN logo_key TEXT;
+"#;
+
+const V17_API_KEY_PROFILE_TEMPLATES: &str = r#"
+CREATE TABLE api_key_profile_templates (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    name TEXT NOT NULL COLLATE NOCASE CHECK(length(name) BETWEEN 1 AND 128),
+    document_json TEXT NOT NULL CHECK(length(document_json) <= 65536 AND json_valid(document_json)),
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    UNIQUE(project_id,name)
+);
+CREATE INDEX idx_api_key_profile_templates_project ON api_key_profile_templates(project_id,updated_at);
+"#;
+
 #[derive(FromQueryResult)]
 struct Count {
     count: i64,
@@ -926,6 +1030,177 @@ pub async fn migrate(db: &DatabaseConnection) -> Result<()> {
             .await?;
         transaction.commit().await?;
     }
+    let snapshot_applied = Count::find_by_statement(statement(
+        "SELECT COUNT(*) AS count FROM schema_migrations WHERE version=9",
+    ))
+    .one(db)
+    .await?
+    .is_some_and(|row| row.count > 0);
+    if !snapshot_applied {
+        let transaction = db.begin().await?;
+        transaction
+            .execute_unprepared(V9_EXECUTION_OUTCOME_SNAPSHOT)
+            .await
+            .context("failed to add the execution outcome snapshot columns")?;
+        transaction
+            .execute(statement(
+                "INSERT INTO schema_migrations(version,applied_at) VALUES(9,unixepoch())",
+            ))
+            .await?;
+        transaction.commit().await?;
+    }
+    let lifecycle_applied = Count::find_by_statement(statement(
+        "SELECT COUNT(*) AS count FROM schema_migrations WHERE version=10",
+    ))
+    .one(db)
+    .await?
+    .is_some_and(|row| row.count > 0);
+    if !lifecycle_applied {
+        let transaction = db.begin().await?;
+        transaction
+            .execute_unprepared(V10_TRACE_LIFECYCLE)
+            .await
+            .context("failed to add the trace lifecycle state")?;
+        transaction
+            .execute(statement(
+                "INSERT INTO schema_migrations(version,applied_at) VALUES(10,unixepoch())",
+            ))
+            .await?;
+        transaction.commit().await?;
+    }
+    let prompt_placement_applied = Count::find_by_statement(statement(
+        "SELECT COUNT(*) AS count FROM schema_migrations WHERE version=11",
+    ))
+    .one(db)
+    .await?
+    .is_some_and(|row| row.count > 0);
+    if !prompt_placement_applied {
+        let transaction = db.begin().await?;
+        transaction
+            .execute_unprepared(V11_PROMPT_PLACEMENT)
+            .await
+            .context("failed to add prompt placement policy")?;
+        transaction
+            .execute(statement(
+                "INSERT INTO schema_migrations(version,applied_at) VALUES(11,unixepoch())",
+            ))
+            .await?;
+        transaction.commit().await?;
+    }
+    let protection_metadata_applied = Count::find_by_statement(statement(
+        "SELECT COUNT(*) AS count FROM schema_migrations WHERE version=12",
+    ))
+    .one(db)
+    .await?
+    .is_some_and(|row| row.count > 0);
+    if !protection_metadata_applied {
+        let transaction = db.begin().await?;
+        transaction
+            .execute_unprepared(V12_PROTECTION_METADATA)
+            .await
+            .context("failed to add protection rule metadata")?;
+        transaction
+            .execute(statement(
+                "INSERT INTO schema_migrations(version,applied_at) VALUES(12,unixepoch())",
+            ))
+            .await?;
+        transaction.commit().await?;
+    }
+    let oidc_link_state_applied = Count::find_by_statement(statement(
+        "SELECT COUNT(*) AS count FROM schema_migrations WHERE version=13",
+    ))
+    .one(db)
+    .await?
+    .is_some_and(|row| row.count > 0);
+    if !oidc_link_state_applied {
+        let transaction = db.begin().await?;
+        transaction
+            .execute_unprepared(V13_OIDC_LINK_STATE)
+            .await
+            .context("failed to add captured OIDC link intent")?;
+        transaction
+            .execute(statement(
+                "INSERT INTO schema_migrations(version,applied_at) VALUES(13,unixepoch())",
+            ))
+            .await?;
+        transaction.commit().await?;
+    }
+    let api_key_lifecycle_applied = Count::find_by_statement(statement(
+        "SELECT COUNT(*) AS count FROM schema_migrations WHERE version=14",
+    ))
+    .one(db)
+    .await?
+    .is_some_and(|row| row.count > 0);
+    if !api_key_lifecycle_applied {
+        let transaction = db.begin().await?;
+        transaction
+            .execute_unprepared(V14_API_KEY_LIFECYCLE)
+            .await
+            .context("failed to add the API-key lifecycle state")?;
+        transaction
+            .execute(statement(
+                "INSERT INTO schema_migrations(version,applied_at) VALUES(14,unixepoch())",
+            ))
+            .await?;
+        transaction.commit().await?;
+    }
+    let model_lifecycle_applied = Count::find_by_statement(statement(
+        "SELECT COUNT(*) AS count FROM schema_migrations WHERE version=15",
+    ))
+    .one(db)
+    .await?
+    .is_some_and(|row| row.count > 0);
+    if !model_lifecycle_applied {
+        let transaction = db.begin().await?;
+        transaction
+            .execute_unprepared(V15_MODEL_LIFECYCLE)
+            .await
+            .context("failed to add model lifecycle state")?;
+        transaction
+            .execute(statement(
+                "INSERT INTO schema_migrations(version,applied_at) VALUES(15,unixepoch())",
+            ))
+            .await?;
+        transaction.commit().await?;
+    }
+    let oidc_login_policy_applied = Count::find_by_statement(statement(
+        "SELECT COUNT(*) AS count FROM schema_migrations WHERE version=16",
+    ))
+    .one(db)
+    .await?
+    .is_some_and(|row| row.count > 0);
+    if !oidc_login_policy_applied {
+        let transaction = db.begin().await?;
+        transaction
+            .execute_unprepared(V16_OIDC_LOGIN_POLICY)
+            .await
+            .context("failed to add OIDC login policy and safe branding")?;
+        transaction
+            .execute(statement(
+                "INSERT INTO schema_migrations(version,applied_at) VALUES(16,unixepoch())",
+            ))
+            .await?;
+        transaction.commit().await?;
+    }
+    let profile_templates_applied = Count::find_by_statement(statement(
+        "SELECT COUNT(*) AS count FROM schema_migrations WHERE version=17",
+    ))
+    .one(db)
+    .await?
+    .is_some_and(|row| row.count > 0);
+    if !profile_templates_applied {
+        let transaction = db.begin().await?;
+        transaction
+            .execute_unprepared(V17_API_KEY_PROFILE_TEMPLATES)
+            .await
+            .context("failed to add API-key profile templates")?;
+        transaction
+            .execute(statement(
+                "INSERT INTO schema_migrations(version,applied_at) VALUES(17,unixepoch())",
+            ))
+            .await?;
+        transaction.commit().await?;
+    }
     Ok(())
 }
 
@@ -963,7 +1238,15 @@ mod tests {
 
         assert_eq!(
             scalar(&db, "SELECT MAX(version) AS count FROM schema_migrations").await,
-            8
+            17
+        );
+        assert_eq!(
+            scalar(
+                &db,
+                "SELECT COUNT(*) AS count FROM pragma_table_info('models') WHERE name='lifecycle' AND dflt_value=\"'active'\""
+            )
+            .await,
+            1
         );
         for table in [
             "projects",
@@ -976,6 +1259,7 @@ mod tests {
             "oidc_identities",
             "oidc_auth_states",
             "api_key_profiles",
+            "api_key_profile_templates",
             "response_sessions",
             "protocol_tasks",
             "catalog_sources",
@@ -1101,6 +1385,86 @@ mod tests {
         );
     }
 
+    /// The outcome snapshot is additive and nullable: an existing instance gains the
+    /// columns on startup without losing a row, and nothing is backfilled with a
+    /// status or a name that was never recorded.
+    #[tokio::test]
+    async fn the_execution_outcome_snapshot_is_additive_and_nullable() {
+        let db = memory_database().await;
+        migrate(&db).await.unwrap();
+        for column in ["provider_name", "http_status", "error_kind"] {
+            assert_eq!(
+                scalar(
+                    &db,
+                    &format!(
+                        "SELECT COUNT(*) AS count FROM pragma_table_info('request_executions') WHERE name='{column}' AND \"notnull\"=0"
+                    )
+                )
+                .await,
+                1,
+                "request_executions.{column} must exist and be nullable"
+            );
+        }
+        // A second initialization adds nothing and keeps the ledger at one row per
+        // applied version.
+        migrate(&db).await.unwrap();
+        assert_eq!(
+            scalar(
+                &db,
+                "SELECT COUNT(*) AS count FROM pragma_table_info('request_executions') WHERE name='http_status'"
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            scalar(
+                &db,
+                "SELECT COUNT(*) AS count FROM schema_migrations WHERE version=9"
+            )
+            .await,
+            1
+        );
+
+        // An instance initialized before this migration: a row already exists, the
+        // columns do not, and the ledger has no version 9. Re-initializing must add
+        // the columns and leave the row unmeasured rather than guessing a status.
+        db.execute_unprepared(
+            "PRAGMA foreign_keys=OFF;
+             INSERT INTO request_executions(id,request_id,attempt,model,status,started_at) VALUES('legacy','legacy-request',1,'m','succeeded',0);
+             ALTER TABLE request_executions DROP COLUMN provider_name;
+             ALTER TABLE request_executions DROP COLUMN http_status;
+             ALTER TABLE request_executions DROP COLUMN error_kind;
+             DELETE FROM schema_migrations WHERE version=9;
+             PRAGMA foreign_keys=ON;",
+        )
+        .await
+        .unwrap();
+        migrate(&db).await.unwrap();
+        let legacy = one(
+            &db,
+            "SELECT http_status,provider_name,error_kind FROM request_executions WHERE id='legacy'",
+        )
+        .await;
+        assert!(
+            legacy
+                .try_get::<Option<i64>>("", "http_status")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            legacy
+                .try_get::<Option<String>>("", "provider_name")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            legacy
+                .try_get::<Option<String>>("", "error_kind")
+                .unwrap()
+                .is_none()
+        );
+    }
+
     #[tokio::test]
     async fn migration_is_idempotent() {
         let db = memory_database().await;
@@ -1120,7 +1484,7 @@ mod tests {
 
         assert_eq!(
             scalar(&db, "SELECT COUNT(*) AS count FROM schema_migrations").await,
-            7
+            16
         );
         assert_eq!(
             scalar(
@@ -1425,6 +1789,436 @@ mod tests {
             .await
             .is_err(),
             "global retention policies must be unique per resource"
+        );
+    }
+
+    /// The trace lifecycle is its own durable, constrained value: the execution
+    /// outcome in `traces.status` stays authoritative and is never overloaded with
+    /// archive/pin state, a database that predates the column gains it with every
+    /// existing row active, and a second initialization records version 10 exactly
+    /// once instead of re-running the `ALTER TABLE`.
+    #[tokio::test]
+    async fn the_trace_lifecycle_state_is_additive_constrained_and_recorded_once() {
+        let db = memory_database().await;
+        migrate(&db).await.unwrap();
+
+        assert_eq!(
+            scalar(
+                &db,
+                "SELECT COUNT(*) AS count FROM pragma_table_info('traces') WHERE name='lifecycle' AND \"notnull\"=1"
+            )
+            .await,
+            1,
+            "traces.lifecycle must exist and be NOT NULL"
+        );
+        assert_eq!(
+            scalar(
+                &db,
+                "SELECT COUNT(*) AS count FROM pragma_table_info('traces') WHERE name='lifecycle' AND dflt_value='''active'''"
+            )
+            .await,
+            1,
+            "existing rows must become active, so the default has to be 'active'"
+        );
+        assert_eq!(
+            scalar(
+                &db,
+                "SELECT COUNT(*) AS count FROM schema_migrations WHERE version=10"
+            )
+            .await,
+            1
+        );
+
+        db.execute_unprepared(
+            "INSERT INTO traces(id,project_id,status,started_at) VALUES('fresh-trace','00000000-0000-0000-0000-000000000001','succeeded',1)",
+        )
+        .await
+        .unwrap();
+        let fresh = one(
+            &db,
+            "SELECT lifecycle,status FROM traces WHERE id='fresh-trace'",
+        )
+        .await;
+        assert_eq!(
+            fresh.try_get::<String>("", "lifecycle").unwrap(),
+            "active",
+            "a new trace starts active"
+        );
+        assert_eq!(
+            fresh.try_get::<String>("", "status").unwrap(),
+            "succeeded",
+            "the execution outcome is a different fact and must be untouched"
+        );
+        for invalid in ["'deleted'", "'ACTIVE'", "''", "NULL"] {
+            assert!(
+                db.execute_unprepared(&format!(
+                    "UPDATE traces SET lifecycle={invalid} WHERE id='fresh-trace'"
+                ))
+                .await
+                .is_err(),
+                "the lifecycle constraint must reject {invalid}"
+            );
+        }
+
+        // A database initialized before this migration: the column and the index
+        // do not exist, the ledger has no version 10, and a row is already there.
+        db.execute_unprepared(
+            "PRAGMA foreign_keys=OFF;
+             INSERT INTO traces(id,project_id,status,started_at) VALUES('legacy-trace','00000000-0000-0000-0000-000000000001','failed',1);
+             DROP INDEX IF EXISTS idx_traces_project_lifecycle;
+             ALTER TABLE traces DROP COLUMN lifecycle;
+             DELETE FROM schema_migrations WHERE version=10;
+             PRAGMA foreign_keys=ON;",
+        )
+        .await
+        .unwrap();
+        migrate(&db).await.unwrap();
+        let legacy = one(
+            &db,
+            "SELECT lifecycle,status FROM traces WHERE id='legacy-trace'",
+        )
+        .await;
+        assert_eq!(
+            legacy.try_get::<String>("", "lifecycle").unwrap(),
+            "active",
+            "a pre-v10 row becomes active rather than guessing a lifecycle"
+        );
+        assert_eq!(
+            legacy.try_get::<String>("", "status").unwrap(),
+            "failed",
+            "the migration must not rewrite the execution outcome"
+        );
+        assert_eq!(
+            scalar(
+                &db,
+                "SELECT COUNT(*) AS count FROM schema_migrations WHERE version=10"
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            scalar(
+                &db,
+                "SELECT COUNT(*) AS count FROM pragma_table_info('traces') WHERE name='lifecycle'"
+            )
+            .await,
+            1,
+            "a repeat migration must not add the column twice"
+        );
+        assert_eq!(
+            scalar(
+                &db,
+                "SELECT COUNT(*) AS count FROM sqlite_master WHERE type='index' AND name='idx_traces_project_lifecycle'"
+            )
+            .await,
+            1
+        );
+    }
+
+    /// Prompt placement is durable policy, not a console-only hint. A fresh
+    /// database defaults to a safe disabled/prepend/order-zero record, while an
+    /// upgrade adds only the new placement columns and keeps every existing
+    /// prompt's enabled state and prepend behaviour intact.
+    #[tokio::test]
+    async fn prompt_placement_migration_is_additive_safe_and_idempotent() {
+        let db = memory_database().await;
+        migrate(&db).await.unwrap();
+
+        assert_eq!(
+            scalar(&db, "SELECT MAX(version) AS count FROM schema_migrations").await,
+            17
+        );
+        assert_eq!(
+            scalar(
+                &db,
+                "SELECT COUNT(*) AS count FROM pragma_table_info('prompts') WHERE name='order' AND \"notnull\"=1 AND dflt_value='0'"
+            )
+            .await,
+            1,
+            "prompts.order must be non-null with its compatibility default"
+        );
+        assert_eq!(
+            scalar(
+                &db,
+                "SELECT COUNT(*) AS count FROM pragma_table_info('prompts') WHERE name='action' AND \"notnull\"=1 AND dflt_value='''prepend'''"
+            )
+            .await,
+            1,
+            "prompts.action must be non-null with its compatibility default"
+        );
+
+        db.execute_unprepared(
+            "INSERT INTO prompts(id,project_id,name,role,content,created_at,updated_at)
+             VALUES('fresh-prompt','00000000-0000-0000-0000-000000000001','Fresh','system','x',1,1)",
+        )
+        .await
+        .unwrap();
+        let fresh = one(
+            &db,
+            "SELECT enabled,\"order\",action FROM prompts WHERE id='fresh-prompt'",
+        )
+        .await;
+        assert_eq!(fresh.try_get::<i64>("", "enabled").unwrap(), 0);
+        assert_eq!(fresh.try_get::<i64>("", "order").unwrap(), 0);
+        assert_eq!(fresh.try_get::<String>("", "action").unwrap(), "prepend");
+        assert!(
+            db.execute_unprepared("UPDATE prompts SET action='around' WHERE id='fresh-prompt'")
+                .await
+                .is_err(),
+            "the database must reject an unknown placement action"
+        );
+
+        db.execute_unprepared(
+            "INSERT INTO prompts(id,project_id,name,role,content,enabled,created_at,updated_at)
+             VALUES('legacy-prompt','00000000-0000-0000-0000-000000000001','Legacy','system','legacy',1,2,2);
+             ALTER TABLE prompts RENAME TO prompts_current;
+             CREATE TABLE prompts (
+                 id TEXT PRIMARY KEY,
+                 project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                 name TEXT NOT NULL,
+                 role TEXT NOT NULL,
+                 content TEXT NOT NULL,
+                 activation_json TEXT NOT NULL DEFAULT '{\"version\":1}',
+                 enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0,1)),
+                 created_at INTEGER NOT NULL,
+                 updated_at INTEGER NOT NULL,
+                 UNIQUE(project_id,name)
+             );
+             INSERT INTO prompts(id,project_id,name,role,content,activation_json,enabled,created_at,updated_at)
+             SELECT id,project_id,name,role,content,activation_json,enabled,created_at,updated_at FROM prompts_current;
+             DROP TABLE prompts_current;
+             DELETE FROM schema_migrations WHERE version=11;",
+        )
+        .await
+        .unwrap();
+        migrate(&db).await.unwrap();
+        let legacy = one(
+            &db,
+            "SELECT enabled,\"order\",action FROM prompts WHERE id='legacy-prompt'",
+        )
+        .await;
+        assert_eq!(legacy.try_get::<i64>("", "enabled").unwrap(), 1);
+        assert_eq!(legacy.try_get::<i64>("", "order").unwrap(), 0);
+        assert_eq!(legacy.try_get::<String>("", "action").unwrap(), "prepend");
+        db.execute_unprepared(
+            "INSERT INTO prompts(id,project_id,name,role,content,created_at,updated_at)
+             VALUES('upgraded-default','00000000-0000-0000-0000-000000000001','Upgraded default','system','x',3,3)",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            scalar(
+                &db,
+                "SELECT COUNT(*) AS count FROM prompts WHERE id='upgraded-default' AND enabled=0"
+            )
+            .await,
+            1,
+            "an upgraded database must have the same disabled default as a fresh one"
+        );
+
+        migrate(&db).await.unwrap();
+        assert_eq!(
+            scalar(
+                &db,
+                "SELECT COUNT(*) AS count FROM schema_migrations WHERE version=11"
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            scalar(
+                &db,
+                "SELECT COUNT(*) AS count FROM pragma_table_info('prompts') WHERE name IN ('order','action')"
+            )
+            .await,
+            2
+        );
+    }
+
+    /// Protection metadata is additive policy state. Existing rules were all
+    /// enforceable, so an upgrade must classify them as active; future rows get
+    /// the same default, and SQLite itself rejects states the orchestrator does
+    /// not understand.
+    #[tokio::test]
+    async fn protection_metadata_migration_is_additive_constrained_and_idempotent() {
+        let db = memory_database().await;
+        migrate(&db).await.unwrap();
+
+        assert_eq!(
+            scalar(&db, "SELECT MAX(version) AS count FROM schema_migrations").await,
+            17
+        );
+        assert_eq!(
+            scalar(
+                &db,
+                "SELECT COUNT(*) AS count FROM pragma_table_info('prompt_protection_rules') WHERE name IN ('description','state') AND \"notnull\"=1"
+            )
+            .await,
+            2
+        );
+        db.execute_unprepared(
+            "INSERT INTO prompt_protection_rules(id,project_id,name,content_pattern,action,created_at,updated_at)
+             VALUES('fresh-rule','00000000-0000-0000-0000-000000000001','Fresh','secret','deny',1,1)",
+        )
+        .await
+        .unwrap();
+        let fresh = one(
+            &db,
+            "SELECT description,state FROM prompt_protection_rules WHERE id='fresh-rule'",
+        )
+        .await;
+        assert_eq!(fresh.try_get::<String>("", "description").unwrap(), "");
+        assert_eq!(fresh.try_get::<String>("", "state").unwrap(), "active");
+        assert!(
+            db.execute_unprepared(
+                "UPDATE prompt_protection_rules SET state='deleted' WHERE id='fresh-rule'"
+            )
+            .await
+            .is_err(),
+            "the database must reject an unknown rule state"
+        );
+
+        db.execute_unprepared(
+            "ALTER TABLE prompt_protection_rules RENAME TO prompt_protection_rules_current;
+             CREATE TABLE prompt_protection_rules (
+                 id TEXT PRIMARY KEY,
+                 project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                 name TEXT NOT NULL,
+                 role_pattern TEXT,
+                 content_pattern TEXT NOT NULL,
+                 action TEXT NOT NULL CHECK(action IN ('deny','redact')),
+                 replacement TEXT,
+                 scopes_json TEXT NOT NULL DEFAULT '{\"version\":1}',
+                 test_mode INTEGER NOT NULL DEFAULT 0 CHECK(test_mode IN (0,1)),
+                 enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0,1)),
+                 created_at INTEGER NOT NULL,
+                 updated_at INTEGER NOT NULL
+             );
+             INSERT INTO prompt_protection_rules(id,project_id,name,role_pattern,content_pattern,action,replacement,scopes_json,test_mode,enabled,created_at,updated_at)
+             SELECT id,project_id,name,role_pattern,content_pattern,action,replacement,scopes_json,test_mode,enabled,created_at,updated_at FROM prompt_protection_rules_current;
+             DROP TABLE prompt_protection_rules_current;
+             DELETE FROM schema_migrations WHERE version=12;",
+        )
+        .await
+        .unwrap();
+
+        migrate(&db).await.unwrap();
+        let legacy = one(
+            &db,
+            "SELECT description,state FROM prompt_protection_rules WHERE id='fresh-rule'",
+        )
+        .await;
+        assert_eq!(legacy.try_get::<String>("", "description").unwrap(), "");
+        assert_eq!(legacy.try_get::<String>("", "state").unwrap(), "active");
+
+        migrate(&db).await.unwrap();
+        assert_eq!(
+            scalar(
+                &db,
+                "SELECT COUNT(*) AS count FROM schema_migrations WHERE version=12"
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            scalar(
+                &db,
+                "SELECT COUNT(*) AS count FROM pragma_table_info('prompt_protection_rules') WHERE name IN ('description','state')"
+            )
+            .await,
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn api_key_lifecycle_migration_keeps_existing_keys_active() {
+        let db = memory_database().await;
+        migrate(&db).await.unwrap();
+        db.execute_unprepared(
+            "DROP INDEX idx_api_keys_project_lifecycle;
+             ALTER TABLE api_keys DROP COLUMN archived_at;
+             ALTER TABLE api_keys DROP COLUMN lifecycle;
+             DELETE FROM schema_migrations WHERE version=14;
+             INSERT INTO api_keys(id,name,key_prefix,key_hash,lookup_digest,created_at,project_id) VALUES('legacy-key','legacy','legacy-prefix','hash','legacy-digest',1,'00000000-0000-0000-0000-000000000001');",
+        )
+        .await
+        .unwrap();
+
+        migrate(&db).await.unwrap();
+        let legacy = one(
+            &db,
+            "SELECT lifecycle,archived_at FROM api_keys WHERE id='legacy-key'",
+        )
+        .await;
+        assert_eq!(legacy.try_get::<String>("", "lifecycle").unwrap(), "active");
+        assert_eq!(
+            legacy.try_get::<Option<i64>>("", "archived_at").unwrap(),
+            None
+        );
+        assert_eq!(
+            scalar(
+                &db,
+                "SELECT COUNT(*) AS count FROM schema_migrations WHERE version=14"
+            )
+            .await,
+            1
+        );
+        migrate(&db).await.unwrap();
+        assert_eq!(
+            scalar(
+                &db,
+                "SELECT COUNT(*) AS count FROM schema_migrations WHERE version=14"
+            )
+            .await,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn oidc_login_policy_migration_has_safe_defaults_and_is_idempotent() {
+        let db = memory_database().await;
+        migrate(&db).await.unwrap();
+
+        assert_eq!(
+            scalar(
+                &db,
+                "SELECT COUNT(*) AS count FROM pragma_table_info('oidc_providers') WHERE name IN ('login_only','display_name','button_color','logo_key')"
+            )
+            .await,
+            4
+        );
+        db.execute_unprepared(
+            "INSERT INTO oidc_providers(id,name,issuer_url,client_id,client_secret_envelope,created_at,updated_at)
+             VALUES('legacy-oidc','Legacy SSO','https://id.example.test','client','encrypted',1,1);",
+        )
+        .await
+        .unwrap();
+        let legacy = one(
+            &db,
+            "SELECT login_only,display_name,button_color,logo_key FROM oidc_providers WHERE id='legacy-oidc'",
+        )
+        .await;
+        assert!(!legacy.try_get::<bool>("", "login_only").unwrap());
+        assert_eq!(legacy.try_get::<String>("", "display_name").unwrap(), "");
+        assert_eq!(
+            legacy
+                .try_get::<Option<String>>("", "button_color")
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            legacy.try_get::<Option<String>>("", "logo_key").unwrap(),
+            None
+        );
+
+        migrate(&db).await.unwrap();
+        assert_eq!(
+            scalar(
+                &db,
+                "SELECT COUNT(*) AS count FROM schema_migrations WHERE version=16"
+            )
+            .await,
+            1
         );
     }
 }

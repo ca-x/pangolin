@@ -152,6 +152,83 @@ pub struct Costs {
     pub extensions: Extensions,
 }
 
+/// The bounded public projection of an immutable card stored on a project model.
+///
+/// Historical rows may contain partial card objects. Such rows retain an object
+/// projection with nullable facts, while a missing/non-object card has no
+/// projection at all. Callers never need to expose the raw stored document.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ModelCardProjection {
+    pub developer: Option<String>,
+    #[serde(rename = "type")]
+    pub model_type: Option<String>,
+    pub logo_key: Option<String>,
+    pub limits: ModelCardLimitsProjection,
+    pub cost_defaults: ModelCardCostsProjection,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ModelCardLimitsProjection {
+    pub context: Option<u64>,
+    pub output: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ModelCardCostsProjection {
+    pub input: Option<f64>,
+    pub output: Option<f64>,
+    pub currency: Option<String>,
+    pub unit: Option<String>,
+}
+
+/// One successfully parsed stored catalog metadata document. `raw` exists only
+/// for the legacy admin-list compatibility field; public gateway responses use
+/// `card`, which contains a fixed set of typed facts.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StoredModelMetadata {
+    pub raw: Value,
+    pub card: Option<ModelCardProjection>,
+}
+
+impl StoredModelMetadata {
+    pub fn parse(raw: &str) -> Option<Self> {
+        let raw = serde_json::from_str::<Value>(raw).ok()?;
+        let object = raw.as_object()?;
+        let card = object
+            .get("card")
+            .filter(|card| card.is_object())
+            .map(|card| {
+                let bounded_text = |value: Option<&Value>| {
+                    value
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.trim().is_empty() && value.len() <= 256)
+                        .map(str::to_owned)
+                };
+                let nonnegative_cost = |value: Option<&Value>| {
+                    value
+                        .and_then(Value::as_f64)
+                        .filter(|value| value.is_finite() && *value >= 0.0)
+                };
+                ModelCardProjection {
+                    developer: bounded_text(card.get("developer")),
+                    model_type: bounded_text(card.get("type")),
+                    logo_key: bounded_text(object.get("logo_key")),
+                    limits: ModelCardLimitsProjection {
+                        context: card.pointer("/limits/context").and_then(Value::as_u64),
+                        output: card.pointer("/limits/output").and_then(Value::as_u64),
+                    },
+                    cost_defaults: ModelCardCostsProjection {
+                        input: nonnegative_cost(card.pointer("/cost_defaults/input")),
+                        output: nonnegative_cost(card.pointer("/cost_defaults/output")),
+                        currency: bounded_text(card.pointer("/cost_defaults/currency")),
+                        unit: bounded_text(card.pointer("/cost_defaults/unit")),
+                    },
+                }
+            });
+        Some(Self { raw, card })
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Model {

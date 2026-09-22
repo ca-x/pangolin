@@ -78,7 +78,12 @@ async fn compact(
     {
         return Err(ApiError::Forbidden);
     }
-    let context = super::policy::context(body, headers, "/v1/responses");
+    let context = super::policy::context(
+        body,
+        headers,
+        "/v1/responses",
+        Some((&key.project_id, &key.id)),
+    );
     let protection = super::protection::load(&state.db, &key.project_id).await?;
     let mut protected = body.clone();
     super::protection::apply(&protection, &mut protected, &context, &mut vec![])?;

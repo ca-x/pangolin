@@ -140,7 +140,7 @@ pub async fn candidates(
           AND NOT EXISTS(SELECT 1 FROM provider_quota_snapshots cq WHERE cq.id=(SELECT latest.id FROM provider_quota_snapshots latest WHERE latest.provider_id=p.id AND latest.credential_id=c.id ORDER BY latest.sequence DESC,latest.collected_at DESC,latest.id LIMIT 1)
             AND cq.remaining_micros<=0 AND (cq.period_end IS NULL OR cq.period_end>unixepoch()))
         LEFT JOIN channel_settings s ON s.provider_id=p.id LEFT JOIN channel_health_state h ON h.provider_id=p.id
-        WHERE p.project_id=? AND NOT EXISTS(
+        WHERE p.project_id=? AND m.lifecycle='active' AND NOT EXISTS(
           SELECT 1 FROM service_group_keys gk JOIN service_groups g ON g.id=gk.group_id
           WHERE gk.api_key_id=? AND (g.enabled=0 OR EXISTS(SELECT 1 FROM service_group_channels gc WHERE gc.group_id=g.id)
           AND NOT EXISTS(SELECT 1 FROM service_group_channels gc WHERE gc.group_id=g.id AND gc.provider_id=p.id)))

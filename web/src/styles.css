@@ -213,7 +213,10 @@ code { overflow-wrap: anywhere; }
 .chart-wrap { min-height: 268px; font-size: 12px; color: var(--muted); }
 .trend-chart { display: block; width: 100%; height: 240px; }
 .chart-empty-line { height: 220px; border-bottom: 1px solid var(--border-subtle); }
-.chart-table { margin-top: 16px; color: var(--muted); font-size: 12px; }
+.chart-table { margin-top: 16px; color: var(--muted); font-size: 14px; overflow-x: auto; }
+/* The disclosure table is wider than a 375px card in English (352px of table in
+   a 305px <details>), and the card that holds it clips — which cut the third
+   header to "ERROR". It scrolls in place instead, as every other table does. */
 .chart-plot { position: relative; margin-top: 10px; }
 .chart-canvas { position: relative; margin-left: 46px; }
 .chart-y-labels { position: absolute; left: 0; top: 0; width: 42px; height: 240px; }
@@ -233,11 +236,20 @@ code { overflow-wrap: anywhere; }
 .chart-tooltip {
   position: absolute; z-index: 5; display: grid; gap: 3px; min-width: 132px; padding: 10px 12px;
   border: 1px solid var(--border); border-radius: 11px; background: var(--elevated); box-shadow: var(--shadow-overlay);
-  color: var(--ink); font-size: 12px; pointer-events: none; transform: translate(-50%, -112%);
+  color: var(--ink); font-size: 14px; pointer-events: none; transform: translate(-50%, -112%);
 }
-.chart-tooltip span { color: var(--muted); font-size: 11.5px; }
+.chart-tooltip span { color: var(--muted); font-size: 14px; }
 .chart-tooltip strong { font-size: 15px; font-weight: 620; font-variant-numeric: tabular-nums; }
 .chart-tooltip div { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+/* Tokens and cost are their own small multiples under the count plot, sharing its
+   event-time x positions and carrying their own labelled scale. */
+.chart-spark { margin: 12px 0 0 46px; }
+.chart-spark-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 4px; }
+.chart-spark-label { color: var(--muted); font-size: 12.5px; font-weight: 540; }
+.chart-spark-scale { color: var(--faint); font-size: 11px; font-variant-numeric: tabular-nums; }
+.trend-spark { display: block; width: 100%; height: 56px; }
+.chart-spark-line { fill: none; stroke: var(--accent); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+.chart-spark-dot { fill: var(--surface); stroke: var(--accent); stroke-width: 2; }
 
 /* ---------------------------------------------------------- resources ---- */
 
@@ -253,13 +265,18 @@ table { width: 100%; border-collapse: separate; border-spacing: 0; font-size: 14
 thead th {
   position: sticky; top: 0; z-index: 2; height: 42px; padding: 0 16px; border-bottom: 1px solid var(--border);
   background: color-mix(in srgb, var(--surface-muted) 94%, transparent); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); /* deslop-ignore 19 — rows scroll beneath this header */
-  color: var(--faint); font-size: 10.5px; font-weight: 660; text-align: left; text-transform: uppercase; letter-spacing: .075em; white-space: nowrap; /* deslop-ignore 10 — column headers are the one place the uppercase label earns its keep */
+  color: var(--muted); font-size: 12px; font-weight: 660; text-align: left; text-transform: uppercase; letter-spacing: .075em; white-space: nowrap; /* deslop-ignore 10 — column headers are the one place the uppercase label earns its keep */
 }
 td { height: 54px; padding: 8px 16px; border-bottom: 1px solid var(--border-subtle); color: var(--muted); white-space: nowrap; }
 tr:last-child td { border-bottom: 0; }
 td strong { color: var(--ink); font-weight: 560; }
-td code { color: var(--ink); font-size: 13.5px; }
-.mono-cell, .mono-cell code { font-family: 'Geist Mono Variable', monospace; font-size: 13.5px; font-variant-numeric: tabular-nums; } /* deslop-ignore 33 34 — machine identifiers, mono disambiguates 0/O and 1/l */
+td code { color: var(--ink); font-size: 14px; }
+.mono-cell, .mono-cell code { font-family: 'Geist Mono Variable', monospace; font-size: 14px; font-variant-numeric: tabular-nums; } /* deslop-ignore 33 34 — machine identifiers, mono disambiguates 0/O and 1/l */
+/* A request's status code is the point of the cell it sits in. Mantine's badge is
+   `width: fit-content` with `overflow: hidden`, so a squeezed table column
+   collapsed its label to zero width below ~1150px and only the ✓/⚠ icon was left;
+   the badge keeps its intrinsic width and the table scrolls instead. */
+.status-badge { min-width: max-content; }
 .cell-action { width: 52px; padding: 4px; text-align: right; }
 .status {
   display: inline-flex; align-items: center; gap: 6px; padding: 3px 9px 3px 5px; border-radius: 999px;
@@ -305,6 +322,16 @@ input:not([type='checkbox']):not([type='radio']):not(.mantine-Input-input), text
 input:not([type='checkbox']):not([type='radio']):not(.mantine-Input-input)::placeholder, textarea:not(.mantine-Input-input)::placeholder { color: var(--faint); }
 textarea { min-height: 104px; padding-block: 10px; line-height: 1.55; resize: vertical; }
 input:not([type='checkbox']):not([type='radio']):not(.mantine-Input-input):focus, textarea:not(.mantine-Input-input):focus, select:not([aria-hidden='true']):not(.mantine-Input-input):focus { border-color: var(--focus); outline: 0; box-shadow: 0 0 0 3px color-mix(in srgb, var(--focus) 18%, transparent); }
+.permission-picker { min-width: 0; margin: 0; padding: 0; border: 0; }
+.permission-picker legend { margin-bottom: 4px; padding: 0; color: var(--ink); font-size: 14px; font-weight: 500; }
+.permission-options { min-width: 0; margin-top: 8px; }
+.permission-option { min-width: 0; padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--radius-control); background: var(--surface-muted); }
+.permission-option .mantine-Checkbox-body, .permission-option .mantine-Checkbox-labelWrapper { min-width: 0; width: 100%; }
+.permission-copy { display: grid; min-width: 0; gap: 2px; font-size: 14px; line-height: 1.45; }
+.permission-copy code { color: var(--ink); font-size: 14px; overflow-wrap: anywhere; }
+.permission-copy > span { color: var(--muted); overflow-wrap: anywhere; }
+.permission-option-unknown { border-style: dashed; }
+.permission-option-unknown .mantine-Checkbox-root { width: 100%; }
 .select-content { z-index: 100; min-width: var(--radix-select-trigger-width); padding: 5px; border: 1px solid var(--border); border-radius: 12px; background: var(--elevated); box-shadow: var(--shadow-overlay); transform-origin: var(--radix-select-content-transform-origin); }
 .select-content[data-state='open'] { animation: popover-in 180ms var(--ease-out); }
 .select-content[data-state='closed'] { animation: popover-out 140ms var(--ease-out); }
@@ -319,16 +346,39 @@ input:not([type='checkbox']):not([type='radio']):not(.mantine-Input-input):focus
 
 .empty-state { display: grid; min-height: 264px; place-items: center; align-content: center; padding: 30px; border: 1px dashed var(--border); border-radius: var(--radius-panel); text-align: center; }
 .query-error { display: flex; min-height: 116px; align-items: center; justify-content: space-between; gap: 16px; padding: 20px; border: 1px solid color-mix(in srgb, var(--danger) 34%, transparent); border-radius: var(--radius-panel); background: var(--danger-soft); color: var(--danger); }
+/* Failure copy under a control or beside a failed action: the semantic danger ink
+   rather than a Mantine ramp colour. Mantine's red-6 `#fa5252` measured 2.86:1 on
+   the light canvas, and the palette guard holds `--danger` at 4.5:1 on the canvas
+   in both modes. */
+.error-text { color: var(--danger); }
+/* A banner for an auxiliary query (health, a name lookup) that the page needs
+   but that is not the page's own data. */
+.resource-notice { margin-bottom: 16px; }
+.inline-query-error { margin-top: 4px; }
+.model-row-action { display: inline-flex; min-height: 36px; align-items: center; gap: 6px; border: 0; border-radius: var(--radius-control); padding: 0 8px; background: transparent; color: var(--muted); font: inherit; cursor: pointer; }
+.model-row-action:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.model-row-action.danger { color: var(--danger); }
+@media (hover: hover) and (pointer: fine) { .model-row-action:hover { background: var(--surface-muted); color: var(--ink); } }
+@media (pointer: coarse) { .model-row-action { min-height: 44px; } }
 .empty-icon { display: grid; width: 54px; height: 54px; place-items: center; margin-bottom: 16px; border-radius: 16px; color: var(--accent); background: var(--accent-soft); }
 .empty-state h3 { margin-bottom: 7px; font-size: 16px; font-weight: 620; }
 .empty-state p { max-width: 420px; margin-bottom: 18px; }
 .skeleton-stack { display: grid; gap: 10px; }
+/* The sweep is a transform on the element's own layer: `background-position`
+   repainted the whole block on every frame. The 1.6s linear sweep is the one
+   animation the design system keeps past the 300ms budget (MASTER.md: skeletons
+   sweep a muted gradient), and it is switched off under reduced motion. */
 .skeleton {
-  height: 58px; border-radius: 11px;
-  background: linear-gradient(90deg, var(--surface-muted) 0%, color-mix(in srgb, var(--border) 60%, var(--surface-muted)) 50%, var(--surface-muted) 100%);
-  background-size: 220% 100%; animation: skeleton-sweep 1.6s linear infinite;
+  position: relative; height: 58px; overflow: hidden; border-radius: 11px;
+  background: var(--surface-muted);
 }
-@keyframes skeleton-sweep { from { background-position: 120% 0; } to { background-position: -120% 0; } }
+.skeleton::after {
+  position: absolute; inset: 0; content: ''; border-radius: inherit;
+  background: linear-gradient(90deg, transparent 0%, color-mix(in srgb, var(--border) 60%, var(--surface-muted)) 50%, transparent 100%);
+  transform: translateX(-100%);
+  animation: skeleton-sweep 1.6s linear infinite;
+}
+@keyframes skeleton-sweep { from { transform: translateX(-100%); } to { transform: translateX(100%); } }
 
 /* ------------------------------------------------------------ details ---- */
 .detail-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1px; margin: 0; overflow: hidden; border: 1px solid var(--border); border-radius: 12px; background: var(--border-subtle); }
@@ -359,12 +409,23 @@ input:not([type='checkbox']):not([type='radio']):not(.mantine-Input-input):focus
 .compact-list a:last-child { border-bottom: 0; }
 .compact-list small { color: var(--muted); font-variant-numeric: tabular-nums; }
 .routing-preview { display: grid; gap: 18px; margin-top: 24px; padding: 20px; border: 1px solid var(--border); border-radius: var(--radius-panel); background: var(--surface); }
+.protection-preview-result { margin: 0; max-height: 180px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; border-radius: var(--radius-control); background: var(--surface-muted); padding: 12px; font-family: var(--font-mono); font-size: 0.875rem; line-height: 1.55; }
+
+@media (max-width: 48em) {
+  .protection-preview-dialog { margin: 8px; max-height: calc(100dvh - 16px); }
+}
 .mobile-resource-list { display:none; }
 .pagination { display:flex; align-items:center; justify-content:flex-end; gap:8px; margin-top:14px; color: var(--muted); font-size:13.5px; }
 .pagination select { width:auto; }
 .onboarding-banner { display:flex; align-items:center; justify-content:space-between; gap:16px; margin-bottom:20px; padding:14px 18px; border:1px solid color-mix(in srgb, var(--accent) 30%, transparent); border-radius:var(--radius-panel); background:var(--accent-soft); }
 .onboarding-banner div { display:grid; gap:3px; }
 .onboarding-banner span { color:var(--muted); font-size:14px; }
+/* The banner's action must never be the item that gives way: Mantine's button is
+   `overflow: hidden`, so a squeezed flex line clipped its own label and at 375px
+   "配置渠道" rendered as "配置渠". The hint takes the flexible column and wraps
+   inside it; the action keeps its intrinsic width at every viewport. */
+.pm-onboarding-row > :first-child { flex: 1 1 200px; min-width: 0; }
+.pm-onboarding-row > :last-child { flex: 0 0 auto; }
 
 /* ------------------------------------------- tooltips, toasts, scrollbars ---- */
 
@@ -415,6 +476,16 @@ input:not([type='checkbox']):not([type='radio']):not(.mantine-Input-input):focus
 
 /* --------------------------------------------------------- responsive ---- */
 
+/* The banner is a two-column row on desktop. Below 40em there is no room for two
+   columns: the row is `nowrap` so the action keeps its intrinsic width, which at
+   375px squeezed the explanation into a ~150px column that broke almost word by
+   word (evidence: probes-en-light-375.png). The copy takes the full line and the
+   one action plus the dismiss control follow it as one compact block. */
+@media (max-width: 40em) {
+  .pm-onboarding .pm-onboarding-row { flex-wrap: wrap; }
+  .pm-onboarding .pm-onboarding-row > :first-child { flex-basis: 100%; }
+}
+
 @media (max-width: 1100px) {
   .overview-grid { grid-template-columns: 1fr; }
 }
@@ -448,6 +519,7 @@ input:not([type='checkbox']):not([type='radio']):not(.mantine-Input-input):focus
 
 @media (max-width: 390px) {
   .stat { min-width: 0; }
+  .permission-option { padding: 10px; }
 }
 
 /* Touch devices get a full-size hit target even though desktop controls are denser. */
@@ -471,4 +543,6 @@ input:not([type='checkbox']):not([type='radio']):not(.mantine-Input-input):focus
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
   .button:active { transform: none; }
   .sidebar, .request-drawer, .select-content { transform: none; }
+  /* The skeleton stays as a static placeholder rather than sweeping. */
+  .skeleton::after { animation: none; }
 }

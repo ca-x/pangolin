@@ -347,11 +347,157 @@ async fn database_profile_mapping_allowed_models_limits_and_budget_are_binding()
     ));
 }
 
+/// AxonHub scopes a prompt to an API key. Pangolin could not: the condition
+/// context held only body, headers and endpoint, and credentials are stripped
+/// from the headers, so no condition could ever name the calling key.
+#[tokio::test]
+async fn a_prompt_can_be_scoped_to_the_calling_api_key() {
+    let f = database_fixture().await;
+    add_model(&f, "a", "public", "actual").await;
+    let mine = json!({
+        "version": 1,
+        "field": "/api_key_id",
+        "op": "eq",
+        "value": f.key.id,
+    })
+    .to_string();
+    let other = json!({
+        "version": 1,
+        "field": "/api_key_id",
+        "op": "eq",
+        "value": "some-other-key",
+    })
+    .to_string();
+    sql(
+        &f,
+        "INSERT INTO prompts(id,project_id,name,role,content,activation_json,enabled,created_at,updated_at) VALUES('mine',?,'Mine','system','mine',?,1,0,0),('other',?,'Other','system','other',?,1,0,0)",
+        vec![
+            f.key.project_id.clone().into(),
+            mine.into(),
+            f.key.project_id.clone().into(),
+            other.into(),
+        ],
+    )
+    .await;
+
+    let body = json!({"model":"public","messages":[{"role":"user","content":"hi"}]});
+    let result = plan(&f, body).await.unwrap();
+    let messages = result.payload["messages"].as_array().unwrap();
+    let injected: Vec<&str> = messages
+        .iter()
+        .filter_map(|message| message["content"].as_str())
+        .filter(|content| *content == "mine" || *content == "other")
+        .collect();
+    assert_eq!(
+        injected,
+        vec!["mine"],
+        "only the prompt scoped to this key may be injected"
+    );
+}
+
+#[tokio::test]
+async fn prompts_inject_by_order_then_created_at() {
+    let f = database_fixture().await;
+    sql(
+        &f,
+        "INSERT INTO prompts(id,project_id,name,role,content,activation_json,enabled,\"order\",action,created_at,updated_at) VALUES
+         ('late-order',?,'Late order','system','late-order','{\"version\":1}',1,20,'prepend',1,1),
+         ('tie-late',?,'Tie late','system','tie-late','{\"version\":1}',1,10,'prepend',3,3),
+         ('first',?,'First','system','first','{\"version\":1}',1,-10,'prepend',4,4),
+         ('tie-early',?,'Tie early','system','tie-early','{\"version\":1}',1,10,'prepend',2,2)",
+        vec![
+            f.key.project_id.clone().into(),
+            f.key.project_id.clone().into(),
+            f.key.project_id.clone().into(),
+            f.key.project_id.clone().into(),
+        ],
+    )
+    .await;
+    let mut body = json!({"messages":[{"role":"user","content":"conversation"}]});
+    protection::inject(
+        &f.db,
+        &f.key.project_id,
+        &mut body,
+        &json!({}),
+        "/v1/chat/completions",
+        &mut vec![],
+    )
+    .await
+    .unwrap();
+    let contents = body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|message| message["content"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        contents,
+        [
+            "first",
+            "tie-early",
+            "tie-late",
+            "late-order",
+            "conversation"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn append_places_a_prompt_after_each_protocol_conversation() {
+    let f = database_fixture().await;
+    sql(
+        &f,
+        "INSERT INTO prompts(id,project_id,name,role,content,activation_json,enabled,\"order\",action,created_at,updated_at)
+         VALUES('tail',?,'Tail','user','tail','{\"version\":1}',1,0,'append',1,1)",
+        vec![f.key.project_id.clone().into()],
+    )
+    .await;
+    let cases = [
+        (
+            "/v1/chat/completions",
+            json!({"messages":[{"role":"user","content":"chat"}]}),
+            "/messages/1/content",
+        ),
+        (
+            "/v1/messages",
+            json!({"messages":[{"role":"user","content":"messages"}]}),
+            "/messages/1/content",
+        ),
+        (
+            "/v1beta/models:generateContent",
+            json!({"contents":[{"role":"user","parts":[{"text":"gemini"}]}]}),
+            "/contents/1/parts/0/text",
+        ),
+        (
+            "/v1/responses",
+            json!({"input":[{"type":"message","role":"user","content":"responses"}]}),
+            "/input/1/content",
+        ),
+    ];
+    for (endpoint, mut body, tail) in cases {
+        protection::inject(
+            &f.db,
+            &f.key.project_id,
+            &mut body,
+            &json!({}),
+            endpoint,
+            &mut vec![],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            body.pointer(tail),
+            Some(&json!("tail")),
+            "{endpoint} must place append after its existing conversation: {body}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn prompt_protection_injection_preview_and_tools_do_not_reorder_history() {
     let f = database_fixture().await;
     let (provider, _) = add_model(&f, "a", "public", "actual").await;
-    sql(&f,"INSERT INTO prompts(id,project_id,name,role,content,created_at,updated_at) VALUES('prompt',?,'System','system','injected',0,0)",vec![f.key.project_id.clone().into()]).await;
+    sql(&f,"INSERT INTO prompts(id,project_id,name,role,content,enabled,created_at,updated_at) VALUES('prompt',?,'System','system','injected',1,0,0)",vec![f.key.project_id.clone().into()]).await;
     sql(&f,"INSERT INTO prompt_protection_rules(id,project_id,name,role_pattern,content_pattern,action,replacement,created_at,updated_at) VALUES('redact',?,'Redact','^user$','secret-[0-9]+','redact','[MASKED]',0,0)",vec![f.key.project_id.clone().into()]).await;
     sql(&f,"INSERT INTO prompt_protection_rules(id,project_id,name,content_pattern,action,test_mode,created_at,updated_at) VALUES('test',?,'Preview','preview','deny',1,0,0)",vec![f.key.project_id.clone().into()]).await;
     sql(
@@ -699,6 +845,7 @@ fn nested_conditions_fail_closed_and_use_sanitized_headers() {
         &json!({"model":"gpt","temperature":0.5}),
         &headers,
         "/v1/chat/completions",
+        None,
     );
     assert!(context["headers"].get("authorization").is_none());
     assert!(policy::matches(&json!({"all":[{"field":"/body/model","op":"regex","value":"^gpt$"},{"any":[{"field":"/headers/x-region","op":"eq","value":"eu"},{"field":"/body/temperature","op":"gt","value":1}]}]}),&context).unwrap());
@@ -733,7 +880,7 @@ fn mappings_enforce_public_model_access_before_rewrite() {
 #[test]
 fn override_merge_patch_template_and_protected_fields() {
     let original = json!({"model":"a","stream":false,"temperature":1,"metadata":{"old":"x"}});
-    let context = policy::context(&original, &HeaderMap::new(), "/v1/chat/completions");
+    let context = policy::context(&original, &HeaderMap::new(), "/v1/chat/completions", None);
     let policy=json!({"version":1,"operations":[{"merge":{"temperature":0.3,"metadata":{"old":null,"model":{"$request":"/body/model"}}}},{"patch":[{"op":"add","path":"/seed","value":42}],"headers":{"x-model":{"$request":"/body/model"}}}]}).to_string();
     let (result, headers) = policy::overrides(&original, &policy, &context).unwrap();
     assert_eq!(result["metadata"], json!({"model":"a"}));

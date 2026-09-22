@@ -210,53 +210,187 @@ async fn provider_presets_install_endpoint_mapping_and_keep_tpm_policy() {
 }
 
 #[tokio::test]
-async fn model_catalog_defaults_preserve_explicit_admin_prices_and_capabilities() {
+async fn console_model_creation_applies_the_selected_catalog_card_server_side() {
     let f = fixture(Router::new()).await;
-    let card = crate::catalog::builtin()
-        .models
-        .iter()
-        .find(|model| model.model_type == "embedding")
-        .unwrap();
-    let model = db::create_model(
-        &f.state.db,
-        &ModelInput {
-            provider_id: f.providers[0].clone(),
-            public_name: "catalog-embedding".into(),
-            upstream_name: card.upstream_id.clone(),
-            capabilities: None,
-            input_price_micros: Some(17),
-            output_price_micros: Some(0),
-            priority: None,
-        },
-        db::DEFAULT_PROJECT_ID,
+    let cookie = session(&f).await;
+    let path = format!(
+        "/api/admin/v1/projects/{}/operations/models",
+        db::DEFAULT_PROJECT_ID
+    );
+    let response = admin(
+        &f,
+        &cookie,
+        http::Method::POST,
+        &path,
+        json!({
+            "provider_id": f.providers[0],
+            "public_name": "catalog-chat",
+            "upstream_name": "deepseek-v4-flash-0731",
+            "catalog_model_id": "alibaba/deepseek-v4-flash-0731",
+            // Catalog-backed fields are server owned. These forged values must
+            // not replace the selected card's contract.
+            "capabilities": ["rerank"],
+            "input_price_micros": 17,
+            "output_price_micros": 19,
+            "catalog_metadata": {"card":{"id":"forged"}}
+        }),
     )
-    .await
-    .unwrap();
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let created_id = json_body(response).await["id"].as_str().unwrap().to_owned();
+    let model = db::list_models(&f.state.db, db::DEFAULT_PROJECT_ID)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|model| model.id == created_id)
+        .unwrap();
     assert_eq!(
         serde_json::from_str::<Value>(&model.capabilities).unwrap(),
-        json!(["embeddings"])
+        json!(["chat", "responses", "messages", "gemini"])
     );
-    assert_eq!(model.input_price_micros, 17);
-    assert_eq!(model.output_price_micros, 0);
+    assert_eq!(model.input_price_micros, 200_000);
+    assert_eq!(model.output_price_micros, 400_000);
     let metadata: Value = serde_json::from_str(&model.catalog_metadata_json).unwrap();
-    assert_eq!(metadata["card"]["id"], card.id);
-    let explicit = db::create_model(
-        &f.state.db,
-        &ModelInput {
-            provider_id: f.providers[0].clone(),
-            public_name: "explicit".into(),
-            upstream_name: card.upstream_id.clone(),
-            capabilities: Some(vec!["rerank".into()]),
-            input_price_micros: Some(0),
-            output_price_micros: Some(0),
-            priority: None,
-        },
-        db::DEFAULT_PROJECT_ID,
+    assert!(
+        metadata["catalog_version"]
+            .as_str()
+            .is_some_and(|version| !version.is_empty())
+    );
+    assert_eq!(metadata["card"]["id"], "alibaba/deepseek-v4-flash-0731");
+    assert_eq!(metadata["logo_key"], "lobehub:Qwen");
+
+    let stale = admin(
+        &f,
+        &cookie,
+        http::Method::POST,
+        &path,
+        json!({
+            "provider_id": f.providers[0],
+            "public_name": "stale-card",
+            "upstream_name": "stale-card",
+            "catalog_model_id": "missing/catalog-card"
+        }),
     )
-    .await
-    .unwrap();
-    assert_eq!(explicit.capabilities, "[\"rerank\"]");
-    assert_eq!(explicit.input_price_micros, 0);
+    .await;
+    assert_eq!(stale.status(), StatusCode::BAD_REQUEST);
+
+    // Editing does not re-resolve a card, even if a stale picker value is sent.
+    let edited = admin(
+        &f,
+        &cookie,
+        http::Method::POST,
+        &path,
+        json!({
+            "id": created_id,
+            "provider_id": f.providers[0],
+            "public_name": "catalog-chat-edited",
+            "upstream_name": "deepseek-v4-flash-0731",
+            "catalog_model_id": "missing/catalog-card",
+            "capabilities": ["chat"],
+            "input_price_micros": 300_000,
+            "output_price_micros": 500_000
+        }),
+    )
+    .await;
+    assert_eq!(edited.status(), StatusCode::OK);
+    let edited_model = db::list_models(&f.state.db, db::DEFAULT_PROJECT_ID)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|model| model.id == created_id)
+        .unwrap();
+    assert_eq!(edited_model.input_price_micros, 300_000);
+    assert_eq!(
+        serde_json::from_str::<Value>(&edited_model.catalog_metadata_json).unwrap()["card"]["id"],
+        "alibaba/deepseek-v4-flash-0731"
+    );
+}
+
+#[tokio::test]
+async fn model_card_projection_is_typed_and_malformed_metadata_is_unmeasured() {
+    let f = fixture(Router::new()).await;
+    let cookie = session(&f).await;
+    let metadata = json!({
+        "catalog_version": "test-v1",
+        "logo_key": "lobehub:OpenAI",
+        "card": {
+            "developer": "openai",
+            "type": "chat",
+            "limits": { "context": 128_000, "output": 16_384 },
+            "cost_defaults": {
+                "input": 2.5,
+                "output": 10.0,
+                "currency": "USD",
+                "unit": "per_million_tokens"
+            }
+        }
+    });
+    sql(
+        &f,
+        "INSERT INTO models(id,provider_id,public_name,upstream_name,capabilities,input_price_micros,output_price_micros,priority,enabled,created_at,catalog_metadata_json) VALUES('card-full',?,'card-full','card-full','[\"chat\"]',0,0,1,1,0,?),('card-malformed',?,'card-malformed','card-malformed','[\"chat\"]',0,0,1,1,0,'{not-json'),('card-legacy',?,'card-legacy','card-legacy','[\"chat\"]',0,0,1,1,0,'{}')",
+        vec![
+            f.providers[0].clone().into(),
+            metadata.to_string().into(),
+            f.providers[0].clone().into(),
+            f.providers[0].clone().into(),
+        ],
+    )
+    .await;
+
+    let path = format!(
+        "/api/admin/v1/projects/{}/operations/models?limit=500",
+        db::DEFAULT_PROJECT_ID
+    );
+    let response = admin(&f, &cookie, http::Method::GET, &path, Value::Null).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let document = json_body(response).await;
+    let rows = document["data"].as_array().unwrap();
+    let row = |id: &str| rows.iter().find(|row| row["id"] == id).unwrap();
+
+    assert_eq!(
+        row("card-full"),
+        &json!({
+            "id": "card-full",
+            "provider_id": f.providers[0],
+            "provider_name": "a",
+            "public_name": "card-full",
+            "upstream_name": "card-full",
+            "capabilities": ["chat"],
+            "input_price_micros": 0,
+            "output_price_micros": 0,
+            "priority": 1,
+            "enabled": 1,
+            "catalog_metadata": metadata,
+            "catalog_developer": "openai",
+            "catalog_model_type": "chat",
+            "catalog_logo_key": "lobehub:OpenAI",
+            "catalog_context_limit_tokens": 128_000,
+            "catalog_output_limit_tokens": 16_384,
+            "catalog_input_cost": 2.5,
+            "catalog_output_cost": 10.0,
+            "catalog_cost_currency": "USD",
+            "catalog_cost_unit": "per_million_tokens",
+            "created_at": 0
+        })
+    );
+    for id in ["card-malformed", "card-legacy"] {
+        let row = row(id);
+        for field in [
+            "catalog_developer",
+            "catalog_model_type",
+            "catalog_logo_key",
+            "catalog_context_limit_tokens",
+            "catalog_output_limit_tokens",
+            "catalog_input_cost",
+            "catalog_output_cost",
+            "catalog_cost_currency",
+            "catalog_cost_unit",
+        ] {
+            assert_eq!(row[field], Value::Null, "{id}.{field} must be unmeasured");
+        }
+    }
+    assert_eq!(row("card-malformed")["catalog_metadata"], Value::Null);
+    assert_eq!(row("card-legacy")["catalog_metadata"], json!({}));
 }
 #[tokio::test]
 async fn refresh_state_changes_commit_only_together_with_their_audit_row() {

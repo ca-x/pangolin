@@ -168,8 +168,23 @@ export function buildTheme(skinId: string, paletteId: string, mode: Mode): Manti
       Menu: { defaultProps: { shadow: elevatedShadow, classNames: { dropdown: surfaceClass } } },
       Popover: { defaultProps: { shadow: elevatedShadow, classNames: { dropdown: surfaceClass } } },
       Table: { defaultProps: { highlightOnHover: true, verticalSpacing: compact ? 'xs' : 'sm', horizontalSpacing: 'md', className: surfaceClass } },
-      Pagination: { defaultProps: { radius: 'md', size: 'sm' } },
-      Checkbox: { defaultProps: { radius: 'sm' } },
+      Pagination: {
+        defaultProps: { radius: 'md', size: 'sm' },
+        // The active page number is painted on the accent fill, and Mantine
+        // resolves that label from `--mantine-color-white`: measured 2.61:1 on
+        // the dark bronze accent. It takes the ink every other accent-filled
+        // control in this console uses.
+        vars: () => ({ root: { '--pagination-active-color': 'var(--accent-contrast)' } }),
+      },
+      Checkbox: {
+        defaultProps: { radius: 'sm' },
+        // Same convention for the tick a checked box draws on the accent fill;
+        // white on the dark accent is 2.61:1, below the 3:1 a control glyph needs.
+        vars: (_theme: unknown, props: { variant?: string }) =>
+          (props.variant ?? 'filled') === 'filled'
+            ? { root: { '--checkbox-icon-color': 'var(--accent-contrast)' } }
+            : {},
+      },
       Switch: { defaultProps: { radius: 'xl' } },
       Alert: { defaultProps: { radius: 'lg', className: surfaceClass } },
       Tabs: { defaultProps: { radius: 'md' } },
@@ -198,6 +213,16 @@ export function buildTheme(skinId: string, paletteId: string, mode: Mode): Manti
 export function buildResolver(paletteId: string, highContrast = false): CSSVariablesResolver {
   const light = applyHighContrast(resolvePalette(paletteId, 'light'), highContrast)
   const dark = applyHighContrast(resolvePalette(paletteId, 'dark'), highContrast)
+  /**
+   * A named Mantine colour family resolved from one palette fill/ink pair. The
+   * `light` variant paints its fill from `-light` behind its label in
+   * `-light-color`, and hovers to `-light-hover`.
+   */
+  const statusFamily = (name: string, fill: string, ink: string) => ({
+    [`--mantine-color-${name}-light`]: fill,
+    [`--mantine-color-${name}-light-hover`]: `color-mix(in srgb, ${fill} 88%, ${ink})`,
+    [`--mantine-color-${name}-light-color`]: ink,
+  })
   const scheme = (tokens: PaletteTokens) => ({
     '--mantine-color-bright': tokens.ink,
     '--mantine-color-text': tokens.ink,
@@ -215,6 +240,30 @@ export function buildResolver(paletteId: string, highContrast = false): CSSVaria
     // the accent into the soft fill.
     '--mantine-color-pangolin-light-hover': `color-mix(in srgb, ${tokens.accentSoft} 88%, ${tokens.accent})`,
     '--mantine-color-pangolin-light-color': tokens.accentStrong,
+    // Status families are named colours too, and only `pangolin` was mapped, so
+    // `variant="light"` status pills kept Mantine's own ramp: axe measured the
+    // `ENABLED` badge at 4.32:1 (teal-9 `#087f5b` on teal-1 `#c3fae8`), the probe
+    // table's success badge at 3.81:1 and the health pill's warning branch at
+    // 2.69:1. The palette's own status pairs are guarded at 4.5:1, so the badge,
+    // the health pill, the probe outcome and every status alert take them.
+    ...statusFamily('teal', tokens.successSoft, tokens.success),
+    ...statusFamily('green', tokens.successSoft, tokens.success),
+    ...statusFamily('yellow', tokens.warningSoft, tokens.warning),
+    ...statusFamily('red', tokens.dangerSoft, tokens.danger),
+    // The `outline` variant reads both its label and its border from `-outline`,
+    // and its hover fill from `-outline-hover`. `InlineQueryError` puts that button
+    // on its own `--danger-soft` alert, where Mantine's red-6 label measured
+    // ~3.0:1. The hover fill mixes the danger tint toward the surface, which moves
+    // it away from the ink in both modes (lighter in light, darker in dark), so the
+    // label gains contrast on hover instead of losing it — the naive "soft + 12%
+    // danger" step dropped it to 4.15:1 on that alert. `filled` is untouched, so
+    // destructive confirm buttons keep their own treatment.
+    '--mantine-color-red-outline': tokens.danger,
+    '--mantine-color-red-outline-hover': `color-mix(in srgb, ${tokens.dangerSoft} 55%, ${tokens.surface})`,
+    // The family's text alias. Nothing this console renders consumes it (Mantine's
+    // variant resolver reads `-light-color`/`-outline` instead), so this is a
+    // consistency guard rather than a fix: the alias cannot fall back to the ramp.
+    '--mantine-color-red-text': tokens.danger,
     '--mantine-color-pangolin-outline': tokens.accent,
     '--mantine-color-pangolin-outline-hover': `color-mix(in srgb, ${tokens.accent} 12%, transparent)`,
     '--mantine-color-pangolin-text': tokens.accentStrong,

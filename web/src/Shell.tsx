@@ -1,11 +1,12 @@
-import { AppShell, Avatar, Burger, Button, Group, Menu, NavLink as MantineNavLink, Select, Stack, Text, Alert, UnstyledButton } from '@mantine/core'
+import { AppShell, ActionIcon, Avatar, Burger, Button, Group, Menu, NavLink as MantineNavLink, Select, Stack, Text, Alert, Tooltip, UnstyledButton } from '@mantine/core'
 import { useDisclosure, useMediaQuery } from '@mantine/hooks'
-import { Activity, Boxes, FlaskConical, Gauge, KeyRound, LogOut, MessageSquareText, Settings, Unplug } from 'lucide-react'
+import { Activity, Boxes, FlaskConical, Gauge, KeyRound, LogOut, MessageSquareText, Settings, Unplug, UserRound, X } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
-import { useEffect } from 'react'
+import { useEffect, useState } from 'react'
 import { Link as RouterLink, Outlet, useLocation, useNavigate } from 'react-router'
 import { api } from './api'
 import type { Branding, User } from './api'
+import { ONBOARDING_CHANGED_EVENT, dismissOnboarding, isOnboardingDismissed } from './onboarding'
 import { ProjectProvider, useProject } from './project'
 
 export default function Shell({ user, branding }: { user: User; branding: Branding }) {
@@ -31,11 +32,20 @@ function ShellContent({ user, branding }: { user: User; branding: Branding }) {
     return () => window.removeEventListener('keydown', onKeyDown)
   }, [mobile, mobileOpen, closeMobile])
   const can = (permission: string) => permissions.has('*') || permissions.has(permission)
-  const canAccess = ['project:manage', 'api_key:manage', 'role:manage', 'user:manage', 'oidc:manage'].some(can)
+  // The guidance is dismissed per instance and remembered in this browser, so
+  // hiding it is not the same decision as declaring onboarding finished for the
+  // whole instance. It stays restorable from the appearance settings.
+  const [onboardingDismissed, setOnboardingDismissed] = useState(() => isOnboardingDismissed(branding.instance_name))
+  useEffect(() => {
+    const sync = () => setOnboardingDismissed(isOnboardingDismissed(branding.instance_name))
+    window.addEventListener(ONBOARDING_CHANGED_EVENT, sync)
+    return () => window.removeEventListener(ONBOARDING_CHANGED_EVENT, sync)
+  }, [branding.instance_name])
+  const canAccess = ['project:manage', 'api_key:manage', 'role:manage', 'user:manage', 'oidc:manage', 'project:read'].some(can)
   const groups = [
-    { label: t('workspace'), links: [{ to: '/', label: t('overview'), icon: Gauge, end: true }, ...(can('project:manage') ? [{ to: '/channels', label: t('channels'), icon: Unplug }, { to: '/models', label: t('models'), icon: Boxes }, { to: '/prompts', label: t('prompts'), icon: MessageSquareText }] : []), { to: '/playground', label: t('playground'), icon: FlaskConical }] },
+    { label: t('workspace'), links: [{ to: '/', label: t('overview'), icon: Gauge, end: true }, ...(can('project:manage') ? [{ to: '/channels', label: t('channels'), icon: Unplug }, { to: '/prompts', label: t('prompts'), icon: MessageSquareText }] : []), ...((can('project:manage') || can('catalog:manage')) ? [{ to: '/models', label: t('models'), icon: Boxes }] : []), { to: '/playground', label: t('playground'), icon: FlaskConical }] },
     { label: t('observe'), links: [{ to: '/operations', label: t('operations'), icon: Activity }] },
-    ...((canAccess || can('catalog:manage')) ? [{ label: t('administration'), links: [...(canAccess ? [{ to: '/access', label: t('access'), icon: KeyRound }] : []), ...(can('catalog:manage') ? [{ to: '/system', label: t('systemSettings'), icon: Settings }] : [])] }] : []),
+    ...((canAccess || can('catalog:manage') || can('project:manage')) ? [{ label: t('administration'), links: [...(canAccess ? [{ to: '/access', label: t('access'), icon: KeyRound }] : []), ...((can('catalog:manage') || can('project:manage')) ? [{ to: '/system', label: t('systemSettings'), icon: Settings }] : [])] }] : []),
   ]
 
   const signOut = async () => { await api('/api/v1/auth/logout', { method: 'POST' }); navigate('/login'); location.reload() }
@@ -127,6 +137,9 @@ function ShellContent({ user, branding }: { user: User; branding: Branding }) {
               </UnstyledButton>
             </Menu.Target>
             <Menu.Dropdown>
+              <Menu.Item component={RouterLink} to="/account" leftSection={<UserRound size={16} />}>
+                {t('account')}
+              </Menu.Item>
               <Menu.Item leftSection={<LogOut size={16} />} onClick={signOut}>
                 {t('signOut')}
               </Menu.Item>
@@ -145,19 +158,33 @@ function ShellContent({ user, branding }: { user: User; branding: Branding }) {
             screen, so it only takes the full width on the overview. Elsewhere it
             drops its title and demotes its action to a text button, which keeps
             one solid primary per resource page. */}
-        {!branding.onboarding_complete && (
+        {!branding.onboarding_complete && !onboardingDismissed && (
           <Alert variant="light" color="pangolin" mb="lg" radius="md" className="pm-onboarding" title={isOverview ? t('onboardingTitle') : undefined}>
-            <Group justify="space-between" align="center" gap="md" wrap="nowrap">
+            <Group justify="space-between" align="center" gap="md" wrap="nowrap" className="pm-onboarding-row">
               <Text size="sm">{t('onboardingHint')}</Text>
-              {isOverview ? (
-                <Button component={RouterLink} to="/channels" variant="light" size="sm">
-                  {t('configureChannel')}
-                </Button>
-              ) : (
-                <Button component={RouterLink} to="/channels" variant="subtle" size="compact-sm">
-                  {t('configureChannel')}
-                </Button>
-              )}
+              <Group gap="xs" wrap="nowrap">
+                {isOverview ? (
+                  <Button component={RouterLink} to="/channels" variant="light" size="sm">
+                    {t('configureChannel')}
+                  </Button>
+                ) : (
+                  <Button component={RouterLink} to="/channels" variant="subtle" size="compact-sm">
+                    {t('configureChannel')}
+                  </Button>
+                )}
+                {/* Dismissing hides the guidance here only; the branding switch
+                    still records that onboarding is finished instance-wide. */}
+                <Tooltip label={t('dismissOnboarding')}>
+                  <ActionIcon
+                    variant="subtle"
+                    color="gray"
+                    aria-label={t('dismissOnboarding')}
+                    onClick={() => { dismissOnboarding(branding.instance_name); setOnboardingDismissed(true) }}
+                  >
+                    <X size={17} />
+                  </ActionIcon>
+                </Tooltip>
+              </Group>
             </Group>
           </Alert>
         )}

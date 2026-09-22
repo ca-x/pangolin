@@ -312,15 +312,13 @@ fn settle_interrupted(connection: &mut Connection) -> anyhow::Result<()> {
     tx.execute("UPDATE api_keys SET spent_micros=spent_micros+COALESCE((SELECT SUM(e.reserved_micros) FROM execution_facts e JOIN request_facts r ON r.id=e.request_id WHERE r.api_key_id=api_keys.id AND e.status='running' AND e.contacted=1 AND NOT EXISTS(SELECT 1 FROM usage_logs u WHERE u.execution_id=e.id)),0)",[])?;
     tx.execute("INSERT INTO usage_logs(id,execution_id,model_id,price_id,total_cost_micros,created_at,settlement_kind) SELECT lower(hex(randomblob(16))),e.id,e.model_id,json_extract(e.price_json,'$.id'),CASE WHEN e.contacted=1 THEN e.reserved_micros ELSE 0 END,unixepoch(),'interrupted' FROM execution_facts e WHERE e.status='running' AND NOT EXISTS(SELECT 1 FROM usage_logs u WHERE u.execution_id=e.id)",[])?;
     tx.execute("INSERT INTO usage_cost_items(id,usage_log_id,quantity,subtotal_micros) SELECT lower(hex(randomblob(16))),u.id,1,u.total_cost_micros FROM usage_logs u JOIN execution_facts e ON e.id=u.execution_id WHERE e.status='running' AND u.total_cost_micros>0 AND NOT EXISTS(SELECT 1 FROM usage_cost_items c WHERE c.usage_log_id=u.id)",[])?;
-    for table in [
-        "execution_facts",
-        "request_facts",
-        "request_executions",
-        "requests",
-        "traces",
-    ] {
+    for table in ["execution_facts", "request_facts", "requests", "traces"] {
         tx.execute(&format!("UPDATE {table} SET status='interrupted',finished_at=unixepoch() WHERE status='running'"),[])?;
     }
+    // The execution row is what the observation projection is rebuilt from, so it
+    // records the classification that belongs to the status it just received: an
+    // interrupted request is a failure, and a NULL here would report it as neither.
+    tx.execute("UPDATE request_executions SET status='interrupted',error_kind='interrupted',finished_at=unixepoch() WHERE status='running'",[])?;
     tx.commit()?;
     Ok(())
 }
@@ -430,6 +428,118 @@ pub async fn restore(
   Ok(result)
  }).await.map_err(internal)?
 }
+/// Re-derive the retained window of the observation projection from the
+/// authoritative SQLite record system. This is the recovery path for a cleared
+/// or restored projection, so it must read only durable records.
+pub(crate) async fn rebuild_projection(state: &AppState) -> Result<usize, ApiError> {
+    let cutoff = db::now() - state.config.observation_retention_days as i64 * 86400;
+    let rows = state
+        .db
+        .query_all(super::sql(
+            r#"SELECT f.id AS id, f.project_id AS project_id, f.api_key_id AS api_key_id,
+                      f.started_at AS started_at, f.finished_at AS finished_at,
+                      COALESCE(json_extract(r.request_metadata_json,'$.external_id'), f.id) AS external_request,
+                      COALESCE(t.external_id, r.trace_id, '') AS external_trace,
+                      COALESCE(r.endpoint, '') AS endpoint,
+                      r.source_ip AS source_ip,
+                      r.requested_model AS requested_model,
+                      e.model AS resolved_model,
+                      e.provider_name AS provider_name,
+                      e.http_status AS http_status,
+                      e.error_kind AS error_kind,
+                      COALESCE(e.latency_ms, 0) AS latency_ms,
+                      -- `first_token_at` is milliseconds since the epoch, built as
+                      -- `started_at * 1000 + elapsed`. Subtracting the second-based
+                      -- `started_at` and multiplying the difference by 1000 — as
+                      -- this read used to — reported a first byte a thousand
+                      -- centuries away. The analytics breakdown has always used
+                      -- this form.
+                      CASE WHEN e.first_token_at IS NULL THEN NULL
+                           ELSE e.first_token_at - e.started_at * 1000 END AS ttft_ms,
+                      COALESCE(u.input_tokens, 0) AS input_tokens,
+                      COALESCE(u.output_tokens, 0) AS output_tokens,
+                      COALESCE(u.cache_read_tokens, 0) AS cached_tokens,
+                      -- Cache-write and reasoning tokens are the settled usage
+                      -- counts. A cost component is what a price charged for, not
+                      -- what the provider reported, so none is read here.
+                      COALESCE(u.cache_write_tokens, 0) AS cache_write_tokens,
+                      COALESCE(u.reasoning_tokens, 0) AS reasoning_tokens,
+                      -- The stream decision as recorded at admission. The stored
+                      -- JSON type is what separates a decision from its absence: a
+                      -- missing or non-boolean value stays NULL rather than turning
+                      -- into a guessed false.
+                      CASE json_type(r.request_metadata_json, '$.stream')
+                           WHEN 'true' THEN 1 WHEN 'false' THEN 0 END AS streamed,
+                      COALESCE(u.total_cost_micros, 0) AS cost_micros,
+                      c.request_json AS request_json, c.response_json AS response_json
+               FROM request_facts f
+               LEFT JOIN requests r ON r.id = f.id
+               LEFT JOIN traces t ON t.id = r.trace_id
+               LEFT JOIN request_executions e
+                      ON e.request_id = f.id
+                     AND e.attempt = (SELECT MAX(x.attempt) FROM request_executions x WHERE x.request_id = f.id)
+               LEFT JOIN execution_facts ef ON ef.id = e.id
+               LEFT JOIN usage_logs u ON u.execution_id = ef.id
+               LEFT JOIN request_contents c ON c.request_id = f.id
+               WHERE f.started_at >= ? AND f.log_level <> 'off'
+               ORDER BY f.started_at"#,
+            vec![cutoff.into()],
+        ))
+        .await?;
+    let mut events = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let payload = row
+            .try_get::<Option<String>>("", "request_json")
+            .ok()
+            .flatten();
+        events.push(crate::observability::RequestEvent {
+            id: row.try_get("", "id").unwrap_or_default(),
+            project_id: row.try_get("", "project_id").unwrap_or_default(),
+            request_id: row.try_get("", "external_request").unwrap_or_default(),
+            trace_id: row.try_get("", "external_trace").unwrap_or_default(),
+            started_at: row.try_get("", "started_at").unwrap_or_default(),
+            finished_at: row
+                .try_get::<Option<i64>>("", "finished_at")
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| row.try_get("", "started_at").unwrap_or_default()),
+            endpoint: row.try_get("", "endpoint").unwrap_or_default(),
+            source_ip: row.try_get("", "source_ip").ok().flatten(),
+            api_key_id: row.try_get("", "api_key_id").ok().flatten(),
+            // Every one of these is read from the execution snapshot, verbatim. The
+            // rebuild used to synthesize `200`/`502` from the execution status, and to
+            // label a row with the provider's UUID because that was all it had. A row
+            // that recorded none of it stays unmeasured: inventing a plausible answer
+            // here is what made the console contradict the request that actually ran.
+            provider: row.try_get("", "provider_name").ok().flatten(),
+            requested_model: row.try_get("", "requested_model").ok().flatten(),
+            resolved_model: row.try_get("", "resolved_model").ok().flatten(),
+            status_code: row.try_get("", "http_status").ok().flatten(),
+            error_kind: row.try_get("", "error_kind").ok().flatten(),
+            latency_ms: row.try_get("", "latency_ms").unwrap_or_default(),
+            ttft_ms: row.try_get("", "ttft_ms").ok().flatten(),
+            input_tokens: row.try_get("", "input_tokens").unwrap_or_default(),
+            output_tokens: row.try_get("", "output_tokens").unwrap_or_default(),
+            cached_tokens: row.try_get("", "cached_tokens").unwrap_or_default(),
+            cache_write_tokens: row.try_get("", "cache_write_tokens").unwrap_or_default(),
+            reasoning_tokens: row.try_get("", "reasoning_tokens").unwrap_or_default(),
+            // Read back, never inferred. A row that recorded no stream decision —
+            // written before the fact existed, or an endpoint with no stream choice
+            // — stays unmeasured.
+            stream: row
+                .try_get::<Option<i64>>("", "streamed")
+                .ok()
+                .flatten()
+                .map(|value| value != 0),
+            cost_micros: row.try_get("", "cost_micros").unwrap_or_default(),
+            payload_captured: payload.is_some(),
+            request_json: payload,
+            response_json: row.try_get("", "response_json").ok().flatten(),
+        });
+    }
+    Ok(state.observations.rebuild(events).await)
+}
+
 pub async fn reset_projection(state: &AppState) -> Result<bool, ApiError> {
     let reset = state
         .db
@@ -453,6 +563,18 @@ pub async fn reset_projection(state: &AppState) -> Result<bool, ApiError> {
     .unwrap_or(false);
     if cleared {
         cleared = super::runtime::sync_retention(state).await?;
+    }
+    if cleared {
+        // A restore leaves the projection empty. Derived data has to be
+        // re-derived from the record system, or the console reports zero traffic
+        // for the entire retained window even though the requests are all there.
+        match rebuild_projection(state).await {
+            Ok(count) => tracing::info!(
+                count,
+                "rebuilt the observation projection from the record system"
+            ),
+            Err(error) => tracing::error!(%error, "could not rebuild the observation projection"),
+        }
     }
     if cleared {
         state

@@ -34,6 +34,82 @@ fn logging_policy_matrix_and_secrets() {
     }
     assert!(Off.body(&document).is_none());
 }
+
+/// The write contract and the stored/runtime contract are different by design:
+/// the same document is rejected at the boundary and tolerated in the record
+/// system. Both halves are asserted here so neither can be "fixed" into the
+/// other.
+#[test]
+fn the_request_logging_write_contract_is_strict_while_the_stored_policy_tolerates() {
+    use logging::{Level, Policy, PolicyInput};
+
+    // Accepted, and converted only after validation. An omitted field keeps the
+    // policy's documented default, so `enabled` stays true.
+    let parsed: Policy = PolicyInput::parse(json!({"default_level":"off"}))
+        .unwrap()
+        .into();
+    assert!(parsed.enabled);
+    assert_eq!(parsed.default_level, Level::Off);
+    assert!(!parsed.key_override_enabled);
+    assert!(!parsed.key_disable_allowed);
+    assert_eq!(parsed.resolve(Level::FullBody), Level::Off);
+
+    let full = json!({"enabled":false,"default_level":"redacted_body","key_override_enabled":true,"key_disable_allowed":true});
+    let parsed: Policy = PolicyInput::parse(full.clone()).unwrap().into();
+    assert_eq!(
+        serde_json::to_value(&parsed).unwrap(),
+        full,
+        "an accepted document round-trips unchanged"
+    );
+
+    // Rejected: the shapes an operator typo takes. `[]` matters because serde's
+    // derived struct visitor reads a positional sequence as a struct, so it used
+    // to install an all-default policy.
+    for rejected in [
+        json!({"enabledd": false}),
+        json!({"default_level":"verbose"}),
+        json!({"default_level":"Metadata"}),
+        json!({"default_level":3}),
+        json!({"enabled":"no"}),
+        json!({"key_disable_allowed":null}),
+        json!([]),
+        json!([true, "off"]),
+        json!("off"),
+        json!(null),
+    ] {
+        let error = PolicyInput::parse(rejected.clone()).unwrap_err();
+        let (status, kind, message) = error.public_parts();
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{rejected}");
+        assert_eq!(kind, "invalid_request_error", "{rejected}");
+        assert!(message.contains("request-logging"), "{rejected} {message}");
+        assert!(
+            !message.contains("unknown field") && !message.contains("line "),
+            "no serde cause may reach the client: {rejected} {message}"
+        );
+    }
+    let defaulted: Policy = PolicyInput::parse(json!({})).unwrap().into();
+    assert_eq!(
+        serde_json::to_value(&defaulted).unwrap(),
+        serde_json::to_value(Policy::default()).unwrap(),
+        "an empty document is the documented default policy, not an all-false one"
+    );
+
+    // The stored/runtime policy stays tolerant: an unknown field must not fail
+    // resolution on the admission path.
+    let stored: Policy = serde_json::from_value(json!({
+        "enabled": true,
+        "default_level": "full_body",
+        "key_override_enabled": true,
+        "key_disable_allowed": true,
+        "retained_from_an_older_build": true,
+    }))
+    .expect("a stored document with a forward-compatible field must still parse");
+    assert_eq!(
+        stored.resolve(Level::Inherit),
+        Level::FullBody,
+        "the known fields of a stored document still decide the effective level"
+    );
+}
 #[test]
 fn axonhub_cached_and_write_cached_tokens_are_not_double_charged() {
     use pricing::*;

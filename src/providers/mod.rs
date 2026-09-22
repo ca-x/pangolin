@@ -95,6 +95,41 @@ pub fn capability(endpoint: &str) -> &str {
     }
 }
 
+/// Whether this request asked for a streamed response, decided once when the
+/// request is admitted.
+///
+/// This is the protocol's own decision, not something to infer later from a
+/// response or from a captured payload: the endpoints that accept a `stream` field
+/// answer with it (an absent field means the same thing there as `false`, because
+/// that is how the gateway encodes the response), the Gemini streaming action
+/// answers by URL shape, and an endpoint with no stream choice has no answer to
+/// record — `None`, which the console prints as unmeasured rather than as a `false`
+/// nobody decided.
+pub fn streamed(endpoint: &str, payload: &Value) -> Option<bool> {
+    match endpoint {
+        "/v1beta/models:streamGenerateContent" => Some(true),
+        "/v1beta/models:generateContent" => Some(false),
+        _ => {
+            if !matches!(
+                capability(endpoint),
+                "chat" | "completions" | "responses" | "messages" | "gemini"
+            ) {
+                return None;
+            }
+            match payload.get("stream") {
+                // The gateway answers a missing flag the same way it answers
+                // `false`, so that is this request's decision too.
+                None => Some(false),
+                Some(Value::Bool(value)) => Some(*value),
+                // A value that is not a boolean is not a stream decision. The
+                // gateway refuses such a request before it is admitted, so this
+                // only ever keeps the record from claiming one.
+                Some(_) => None,
+            }
+        }
+    }
+}
+
 pub fn supports(kind: &str, capabilities: &[String], endpoint: &str, stream: bool) -> bool {
     let stream = stream || endpoint == "/v1beta/models:streamGenerateContent";
     let configured = capabilities.iter().any(|c| {

@@ -140,7 +140,7 @@ async fn review_responses_apply_only_current_prompt_once_across_turns() {
         let mut history=captured.lock().await;history.push(body.clone());let response=json!({"id":format!("r{}",history.len()),"status":"completed","output":[{"type":"message","role":"assistant","content":"answer"}]});
         if body["stream"]==true {([(header::CONTENT_TYPE,"text/event-stream")],format!("event: response.completed\ndata: {}\n\n",json!({"type":"response.completed","response":response}))).into_response()}else{Json(response).into_response()}
     }}))).await;
-    sql(&f,"INSERT INTO prompts(id,project_id,name,role,content,created_at,updated_at) VALUES('prompt',?,'Directive','system','first directive',0,0)",vec![db::DEFAULT_PROJECT_ID.into()]).await;
+    sql(&f,"INSERT INTO prompts(id,project_id,name,role,content,enabled,created_at,updated_at) VALUES('prompt',?,'Directive','system','first directive',1,0,0)",vec![db::DEFAULT_PROJECT_ID.into()]).await;
     for turn in 1..=4 {
         if turn == 3 {
             sql(&f, "UPDATE prompts SET content='new directive'", vec![]).await;

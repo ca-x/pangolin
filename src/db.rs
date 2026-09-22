@@ -314,7 +314,7 @@ pub async fn delete_provider_in<C: ConnectionTrait>(
 
 pub async fn list_models(db: &DatabaseConnection, project_id: &str) -> Result<Vec<Model>> {
     Ok(Model::find_by_statement(stmt(
-        "SELECT m.*, p.name AS provider_name FROM models m JOIN providers p ON p.id=m.provider_id WHERE p.project_id=? ORDER BY m.public_name,m.priority,p.name",
+        "SELECT m.*, p.name AS provider_name FROM models m JOIN providers p ON p.id=m.provider_id WHERE p.project_id=? AND m.lifecycle='active' ORDER BY m.public_name,m.priority,p.name",
         vec![project_id.into()],
     )).all(db).await?)
 }
@@ -325,40 +325,10 @@ pub async fn create_model(
     input: &ModelInput,
     project_id: &str,
 ) -> Result<Model> {
-    let catalog = crate::catalog::repository::effective(db).await?;
-    let defaults = catalog.models.iter().find(|model| {
-        model.upstream_id == input.upstream_name
-            || model.id == input.upstream_name
-            || model.aliases.contains(&input.upstream_name)
-    });
-    let default_capabilities = defaults
-        .map(|model| model.gateway_capabilities())
-        .unwrap_or_else(|| {
-            vec![
-                "chat".to_owned(),
-                "responses".to_owned(),
-                "messages".to_owned(),
-            ]
-        });
-    let price = |value: Option<f64>| {
-        value
-            .filter(|value| {
-                value.is_finite() && *value >= 0.0 && *value <= (i64::MAX as f64 / 1_000_000.0)
-            })
-            .map(|value| (value * 1_000_000.0).round() as i64)
-            .unwrap_or(0)
-    };
-    let default_prices = defaults.filter(|model| {
-        model.cost_defaults.currency.as_deref() == Some("USD")
-            && model.cost_defaults.unit.as_deref() == Some("per_million_tokens")
-    });
-    let resolved = ModelCatalogDefaults {
-        capabilities: default_capabilities,
-        input_price_micros: price(default_prices.and_then(|model| model.cost_defaults.input)),
-        output_price_micros: price(default_prices.and_then(|model| model.cost_defaults.output)),
-        metadata: serde_json::json!({"catalog_version":catalog.version,"card":defaults})
-            .to_string(),
-    };
+    // Internal callers create a manual model. Catalog application is opt-in by
+    // exact card id through `catalog_model_defaults`; an upstream name is not a
+    // stable identity and must never silently attach catalog metadata.
+    let resolved = ModelCatalogDefaults::manual();
     let tx = db.begin().await?;
     let model = create_model_in(&tx, input, project_id, &resolved).await?;
     tx.commit().await?;
@@ -370,6 +340,54 @@ pub struct ModelCatalogDefaults {
     pub input_price_micros: i64,
     pub output_price_micros: i64,
     pub metadata: String,
+}
+
+impl ModelCatalogDefaults {
+    pub fn manual() -> Self {
+        Self {
+            capabilities: vec!["chat".into(), "responses".into(), "messages".into()],
+            input_price_micros: 0,
+            output_price_micros: 0,
+            metadata: "{}".into(),
+        }
+    }
+}
+
+/// Resolve one immutable catalog card by its stable id. Callers distinguish an
+/// absent card from repository failure so a stale picker value becomes a typed
+/// client refusal rather than an internal error or a manual model.
+pub async fn catalog_model_defaults(
+    db: &DatabaseConnection,
+    card_id: &str,
+) -> Result<Option<ModelCatalogDefaults>> {
+    let catalog = crate::catalog::repository::effective(db).await?;
+    let Some(card) = catalog.models.iter().find(|model| model.id == card_id) else {
+        return Ok(None);
+    };
+    let price = |value: Option<f64>| {
+        value
+            .filter(|value| {
+                value.is_finite() && *value >= 0.0 && *value <= (i64::MAX as f64 / 1_000_000.0)
+            })
+            .map(|value| (value * 1_000_000.0).round() as i64)
+            .unwrap_or(0)
+    };
+    let priced = (card.cost_defaults.currency.as_deref() == Some("USD")
+        && card.cost_defaults.unit.as_deref() == Some("per_million_tokens"))
+    .then_some(card);
+    let logo_key = catalog
+        .providers
+        .iter()
+        .find(|provider| provider.id == card.developer)
+        .map(|provider| provider.logo_key.as_str());
+    Ok(Some(ModelCatalogDefaults {
+        capabilities: card.gateway_capabilities(),
+        input_price_micros: price(priced.and_then(|model| model.cost_defaults.input)),
+        output_price_micros: price(priced.and_then(|model| model.cost_defaults.output)),
+        metadata:
+            serde_json::json!({"catalog_version":catalog.version,"logo_key":logo_key,"card":card})
+                .to_string(),
+    }))
 }
 
 /// Insert a model on any connection — intended for callers that already hold a transaction.
@@ -413,7 +431,7 @@ pub async fn delete_model_in<C: ConnectionTrait>(
 ) -> Result<bool> {
     Ok(db
         .execute(stmt(
-            "DELETE FROM models WHERE id=? AND provider_id IN (SELECT id FROM providers WHERE project_id=?)",
+            "DELETE FROM models WHERE id=? AND lifecycle='archived' AND provider_id IN (SELECT id FROM providers WHERE project_id=?)",
             vec![id.into(), project_id.into()],
         ))
         .await?
@@ -422,7 +440,7 @@ pub async fn delete_model_in<C: ConnectionTrait>(
 }
 
 pub async fn list_api_keys(db: &DatabaseConnection) -> Result<Vec<ApiKey>> {
-    Ok(ApiKey::find_by_statement(stmt("SELECT id,name,key_prefix,scopes,budget_micros,spent_micros,enabled,last_used_at,created_at FROM api_keys WHERE project_id=? ORDER BY created_at DESC", vec![DEFAULT_PROJECT_ID.into()])).all(db).await?)
+    Ok(ApiKey::find_by_statement(stmt("SELECT id,name,key_prefix,scopes,budget_micros,spent_micros,enabled,last_used_at,expires_at,created_at FROM api_keys WHERE project_id=? ORDER BY created_at DESC", vec![DEFAULT_PROJECT_ID.into()])).all(db).await?)
 }
 
 #[allow(dead_code)]
@@ -510,7 +528,7 @@ pub async fn authenticate_api_key(
 ) -> Result<Option<ApiKeyCredential>> {
     let lookup_digest = crypto::token_hash(token);
     let credential = ApiKeyCredential::find_by_statement(stmt(
-        "SELECT k.id,k.project_id,k.user_id,k.key_hash,k.scopes,k.budget_micros,k.spent_micros,k.enabled,k.expires_at,k.allowed_ips_json,k.denied_ips_json FROM api_keys k LEFT JOIN users u ON u.id=k.user_id WHERE k.lookup_digest=? AND (k.key_type NOT IN ('user','personal') OR (u.enabled=1 AND EXISTS (SELECT 1 FROM project_memberships membership WHERE membership.project_id=k.project_id AND membership.user_id=k.user_id AND membership.status='active')))",
+        "SELECT k.id,k.project_id,k.user_id,k.key_hash,k.scopes,k.budget_micros,k.spent_micros,k.enabled,k.expires_at,k.allowed_ips_json,k.denied_ips_json FROM api_keys k LEFT JOIN users u ON u.id=k.user_id WHERE k.lookup_digest=? AND k.lifecycle='active' AND (k.key_type NOT IN ('user','personal') OR (u.enabled=1 AND EXISTS (SELECT 1 FROM project_memberships membership WHERE membership.project_id=k.project_id AND membership.user_id=k.user_id AND membership.status='active')))",
         vec![lookup_digest.into()],
     )).one(db).await?;
     let Some(credential) = credential else {
@@ -545,9 +563,42 @@ pub async fn api_key_credential_by_id(
     id: &str,
 ) -> Result<Option<ApiKeyCredential>> {
     Ok(ApiKeyCredential::find_by_statement(stmt(
-        "SELECT k.id,k.project_id,k.user_id,k.key_hash,k.scopes,k.budget_micros,k.spent_micros,k.enabled,k.expires_at,k.allowed_ips_json,k.denied_ips_json FROM api_keys k LEFT JOIN users u ON u.id=k.user_id WHERE k.id=? AND k.project_id=? AND k.enabled=1 AND (k.expires_at IS NULL OR k.expires_at>unixepoch()) AND (k.key_type NOT IN ('user','personal') OR (u.enabled=1 AND EXISTS (SELECT 1 FROM project_memberships membership WHERE membership.project_id=k.project_id AND membership.user_id=k.user_id AND membership.status='active')))",
+        "SELECT k.id,k.project_id,k.user_id,k.key_hash,k.scopes,k.budget_micros,k.spent_micros,k.enabled,k.expires_at,k.allowed_ips_json,k.denied_ips_json FROM api_keys k LEFT JOIN users u ON u.id=k.user_id WHERE k.id=? AND k.project_id=? AND k.enabled=1 AND k.lifecycle='active' AND (k.expires_at IS NULL OR k.expires_at>unixepoch()) AND (k.key_type NOT IN ('user','personal') OR (u.enabled=1 AND EXISTS (SELECT 1 FROM project_memberships membership WHERE membership.project_id=k.project_id AND membership.user_id=k.user_id AND membership.status='active')))",
         vec![id.into(), project_id.into()],
     )).one(db).await?)
+}
+
+/// Load an existing project key for a session-delegated gateway call without
+/// reconstructing or exposing its token. This is the same live-key contract as
+/// token authentication after lookup proof: owner membership, enabled/expiry,
+/// IP policy and exhausted hard budget all fail closed.
+pub async fn api_key_credential_for_use_by_id(
+    db: &DatabaseConnection,
+    project_id: &str,
+    id: &str,
+    client_ip: Option<IpAddr>,
+) -> Result<Option<ApiKeyCredential>> {
+    let credential = api_key_credential_by_id(db, project_id, id).await?;
+    let Some(credential) = credential else {
+        return Ok(None);
+    };
+    if !api_key_ip_allowed(&credential, client_ip)
+        || credential
+            .budget_micros
+            .is_some_and(|budget| credential.spent_micros >= budget)
+    {
+        return Ok(None);
+    }
+    db.execute(stmt(
+        "UPDATE api_keys SET last_used_at=? WHERE id=? AND project_id=?",
+        vec![
+            now().into(),
+            credential.id.clone().into(),
+            project_id.into(),
+        ],
+    ))
+    .await?;
+    Ok(Some(credential))
 }
 
 fn api_key_ip_allowed(credential: &ApiKeyCredential, client_ip: Option<IpAddr>) -> bool {

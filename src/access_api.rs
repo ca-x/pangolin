@@ -9,7 +9,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::{
-    access::{self, AccessError, Principal},
+    access::{self, AccessError, Principal, PrincipalKind},
     api::{self, ApiError, AppState},
     db, oidc,
 };
@@ -29,6 +29,10 @@ pub fn router() -> Router<AppState> {
         .route(
             "/api/admin/v1/projects/{project_id}/permissions",
             get(project_permissions),
+        )
+        .route(
+            "/api/admin/v1/projects/{project_id}/permission-catalog",
+            get(permission_catalog),
         )
         .route(
             "/api/admin/v1/projects/{project_id}/members",
@@ -59,8 +63,20 @@ pub fn router() -> Router<AppState> {
             get(list_api_keys).post(create_api_key),
         )
         .route(
+            "/api/admin/v1/projects/{project_id}/api-keys/bulk-archive",
+            post(bulk_archive_api_keys),
+        )
+        .route(
             "/api/admin/v1/projects/{project_id}/api-keys/{key_id}",
             patch(update_api_key).delete(delete_api_key),
+        )
+        .route(
+            "/api/admin/v1/projects/{project_id}/api-keys/{key_id}/rotate",
+            post(rotate_api_key),
+        )
+        .route(
+            "/api/admin/v1/projects/{project_id}/api-keys/{key_id}/archive",
+            post(archive_api_key),
         )
         .route("/api/admin/v1/users", get(list_users).post(create_user))
         .route(
@@ -70,6 +86,10 @@ pub fn router() -> Router<AppState> {
         .route(
             "/api/admin/v1/users/{user_id}/role-bindings",
             get(list_role_bindings).post(create_role_binding),
+        )
+        .route(
+            "/api/admin/v1/projects/{project_id}/users/{user_id}/role-bindings",
+            get(list_project_role_bindings),
         )
         .route(
             "/api/admin/v1/users/{user_id}/role-bindings/{binding_id}",
@@ -93,19 +113,17 @@ pub fn router() -> Router<AppState> {
         )
         .route("/api/v1/invitations/inspect", post(inspect_invitation))
         .route("/api/v1/invitations/accept", post(accept_invitation))
+        .route("/api/v1/auth/oidc/providers", get(public_oidc_providers))
         .route("/api/v1/auth/oidc/{provider_id}/start", get(oidc_start))
+        .route(
+            "/api/v1/auth/oidc/{provider_id}/link/start",
+            post(oidc_link_start),
+        )
         .route("/api/v1/auth/oidc/callback", get(oidc_callback))
 }
 
 fn map_access(error: AccessError) -> ApiError {
-    match error {
-        AccessError::Unauthorized => ApiError::Unauthorized,
-        AccessError::Forbidden => ApiError::Forbidden,
-        AccessError::NotFound => ApiError::NotFound,
-        AccessError::Invalid(message) => ApiError::BadRequest(message),
-        AccessError::Conflict(message) => ApiError::Conflict(message),
-        AccessError::Internal(error) => ApiError::Internal(error),
-    }
+    api::errors::access(error)
 }
 
 fn session_token(headers: &HeaderMap) -> Option<&str> {
@@ -206,6 +224,19 @@ async fn project_permissions(
             .map_err(map_access)?
             .into_iter()
             .collect(),
+    ))
+}
+
+async fn permission_catalog(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+) -> Result<Json<Vec<access::PermissionCatalogEntry>>, ApiError> {
+    let actor = principal(&state, &headers).await?;
+    Ok(Json(
+        access::permission_catalog(&state.db, &actor, &project_id)
+            .await
+            .map_err(map_access)?,
     ))
 }
 
@@ -313,6 +344,19 @@ async fn list_role_bindings(
     let actor = principal(&state, &headers).await?;
     Ok(Json(
         access::list_role_bindings(&state.db, &actor, &user_id)
+            .await
+            .map_err(map_access)?,
+    ))
+}
+
+async fn list_project_role_bindings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((project_id, user_id)): Path<(String, String)>,
+) -> Result<Json<Vec<access::RoleBindingView>>, ApiError> {
+    let actor = principal(&state, &headers).await?;
+    Ok(Json(
+        access::list_project_role_bindings(&state.db, &actor, &project_id, &user_id)
             .await
             .map_err(map_access)?,
     ))
@@ -568,6 +612,53 @@ async fn update_api_key(
     ))
 }
 
+async fn rotate_api_key(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((project_id, key_id)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let actor = principal(&state, &headers).await?;
+    let (key, token) = access::rotate_scoped_api_key(&state.db, &actor, &project_id, &key_id)
+        .await
+        .map_err(map_access)?;
+    Ok(Json(json!({"key":key,"token":token})))
+}
+
+async fn archive_api_key(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((project_id, key_id)): Path<(String, String)>,
+) -> Result<Json<access::ScopedApiKeyView>, ApiError> {
+    let actor = principal(&state, &headers).await?;
+    Ok(Json(
+        access::archive_scoped_api_key(&state.db, &actor, &project_id, &key_id)
+            .await
+            .map_err(map_access)?,
+    ))
+}
+
+#[derive(Deserialize)]
+struct BulkArchiveApiKeysInput {
+    ids: Vec<String>,
+}
+
+async fn bulk_archive_api_keys(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+    Json(input): Json<BulkArchiveApiKeysInput>,
+) -> Result<Json<access::BulkApiKeyArchiveResult>, ApiError> {
+    if input.ids.is_empty() || input.ids.len() > 100 {
+        return Err(ApiError::BadRequest("ids must contain 1–100 items".into()));
+    }
+    let actor = principal(&state, &headers).await?;
+    Ok(Json(
+        access::archive_scoped_api_keys(&state.db, &actor, &project_id, &input.ids)
+            .await
+            .map_err(map_access)?,
+    ))
+}
+
 async fn delete_api_key(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -578,6 +669,18 @@ async fn delete_api_key(
         .await
         .map_err(map_access)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Unauthenticated discovery for the sign-in page: which SSO providers a visitor
+/// may choose from.
+async fn public_oidc_providers(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<oidc::PublicOidcProvider>>, ApiError> {
+    Ok(Json(
+        oidc::list_enabled_providers(&state.db)
+            .await
+            .map_err(map_access)?,
+    ))
 }
 
 async fn list_oidc_providers(
@@ -702,17 +805,14 @@ async fn discovery(client: &reqwest::Client, issuer: &str) -> Result<Discovery, 
         .get(url)
         .send()
         .await
-        .map_err(|error| ApiError::Upstream(error.to_string()))?;
+        .map_err(|_| ApiError::Upstream("OIDC provider is unavailable".into()))?;
     if !response.status().is_success() {
-        return Err(ApiError::Upstream(format!(
-            "OIDC discovery returned {}",
-            response.status()
-        )));
+        return Err(ApiError::Upstream("OIDC provider is unavailable".into()));
     }
     let metadata: Discovery = response
         .json()
         .await
-        .map_err(|error| ApiError::Upstream(error.to_string()))?;
+        .map_err(|_| ApiError::Upstream("OIDC provider metadata is invalid".into()))?;
     if metadata.issuer.trim_end_matches('/') != issuer.trim_end_matches('/') {
         return Err(ApiError::Upstream(
             "OIDC discovery issuer does not match the configured issuer".into(),
@@ -760,14 +860,50 @@ async fn oidc_start(
     State(state): State<AppState>,
     Path(provider_id): Path<String>,
 ) -> Result<Response, ApiError> {
-    let provider = oidc::provider_secret(&state.db, &provider_id)
+    oidc_authorization_response(&state, &provider_id, None).await
+}
+
+async fn oidc_link_start(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(provider_id): Path<String>,
+) -> Result<Response, ApiError> {
+    let actor = principal(&state, &headers).await?;
+    if actor.kind != PrincipalKind::Session {
+        return Err(ApiError::Forbidden);
+    }
+    let user_id = actor.user_id.ok_or(ApiError::Forbidden)?;
+    oidc_authorization_response(&state, &provider_id, Some(&user_id)).await
+}
+
+async fn oidc_authorization_response(
+    state: &AppState,
+    provider_id: &str,
+    link_user_id: Option<&str>,
+) -> Result<Response, ApiError> {
+    let provider = oidc::provider_secret(&state.db, provider_id)
         .await
         .map_err(map_access)?;
     let metadata = discovery(&state.oidc_client, &provider.issuer_url).await?;
     let redirect_uri = oidc_redirect_uri(state.config.public_url.as_deref())?;
-    let pkce = oidc::create_pkce_state(&state.db, &state.secrets, &provider_id, &redirect_uri, 600)
-        .await
-        .map_err(map_access)?;
+    let pkce = match link_user_id {
+        Some(user_id) => {
+            oidc::create_link_pkce_state(
+                &state.db,
+                &state.secrets,
+                provider_id,
+                &redirect_uri,
+                user_id,
+                600,
+            )
+            .await
+        }
+        None => {
+            oidc::create_pkce_state(&state.db, &state.secrets, provider_id, &redirect_uri, 600)
+                .await
+        }
+    }
+    .map_err(map_access)?;
     let mut url = reqwest::Url::parse(&metadata.authorization_endpoint)
         .map_err(|_| ApiError::Upstream("OIDC authorization endpoint is invalid".into()))?;
     let scopes = serde_json::from_str::<Vec<String>>(&provider.scopes_json)
@@ -828,35 +964,42 @@ async fn oidc_callback(
         ])
         .send()
         .await
-        .map_err(|error| ApiError::Upstream(error.to_string()))?;
+        .map_err(|_| ApiError::Upstream("OIDC provider is unavailable".into()))?;
     if !token.status().is_success() {
         return Err(ApiError::Unauthorized);
     }
     let token: TokenResponse = token
         .json()
         .await
-        .map_err(|error| ApiError::Upstream(error.to_string()))?;
+        .map_err(|_| ApiError::Upstream("OIDC token response is invalid".into()))?;
     let claims = state
         .oidc_client
         .get(metadata.userinfo_endpoint)
         .bearer_auth(token.access_token)
         .send()
         .await
-        .map_err(|error| ApiError::Upstream(error.to_string()))?;
+        .map_err(|_| ApiError::Upstream("OIDC provider is unavailable".into()))?;
     if !claims.status().is_success() {
         return Err(ApiError::Unauthorized);
     }
     let claims: oidc::OidcClaims = claims
         .json()
         .await
-        .map_err(|error| ApiError::Upstream(error.to_string()))?;
-    let user = oidc::link_or_create_identity(&state.db, &provider.id, &claims)
-        .await
-        .map_err(map_access)?;
-    let local = db::find_user_by_email(&state.db, &user.email)
-        .await?
-        .ok_or(ApiError::NotFound)?;
-    let mut response = api::session_response(&state, &local).await?;
+        .map_err(|_| ApiError::Upstream("OIDC user information is invalid".into()))?;
+    let mut response = if let Some(user_id) = consumed.link_user_id.as_deref() {
+        oidc::link_identity_to_user(&state.db, &provider.id, user_id, &claims)
+            .await
+            .map_err(map_access)?;
+        axum::response::Redirect::to("/account").into_response()
+    } else {
+        let user = oidc::link_or_create_identity(&state.db, &provider.id, &claims)
+            .await
+            .map_err(map_access)?;
+        let local = db::find_user_by_email(&state.db, &user.email)
+            .await?
+            .ok_or(ApiError::NotFound)?;
+        api::session_response(&state, &local).await?
+    };
     let mut clear_cookie = "pangolin_oidc_correlation=; Path=/api/v1/auth/oidc/callback; HttpOnly; SameSite=Lax; Max-Age=0".to_owned();
     if state.config.session_secure || consumed.redirect_uri.starts_with("https://") {
         clear_cookie.push_str("; Secure");
@@ -958,6 +1101,136 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn permission_catalog_route_is_typed_authorized_and_project_scoped() {
+        let (app, database, _directory, owner) = test_app().await;
+        let manager = access::create_user(
+            &database,
+            &owner,
+            &UserInput {
+                email: "catalog-manager@example.com".into(),
+                password: "another secure password".into(),
+                display_name: None,
+                language: None,
+                enabled: true,
+            },
+        )
+        .await
+        .unwrap();
+        let foreign = access::create_project(
+            &database,
+            &owner,
+            &access::ProjectInput {
+                name: "Foreign".into(),
+                slug: "foreign".into(),
+                owner_user_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        let role = access::create_role(
+            &database,
+            &owner,
+            db::DEFAULT_PROJECT_ID,
+            &access::RoleInput {
+                name: "catalog manager".into(),
+                permissions: vec!["role:manage".into(), "project:read".into()],
+            },
+        )
+        .await
+        .unwrap();
+        access::upsert_membership(
+            &database,
+            &owner,
+            db::DEFAULT_PROJECT_ID,
+            &MembershipInput {
+                user_id: manager.id.clone(),
+                role_id: role.id,
+                status: "active".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let session = db::create_session(&database, &manager.id).await.unwrap();
+        let catalog_path = format!(
+            "/api/admin/v1/projects/{}/permission-catalog",
+            db::DEFAULT_PROJECT_ID
+        );
+
+        let unauthenticated = app
+            .clone()
+            .oneshot(Request::get(&catalog_path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+        let (_, reader_token) = access::create_scoped_api_key(
+            &database,
+            &owner,
+            &ScopedApiKeyInput {
+                name: "catalog reader".into(),
+                project_id: db::DEFAULT_PROJECT_ID.into(),
+                key_type: "service".into(),
+                scopes: vec!["project:read".into()],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let insufficient = app
+            .clone()
+            .oneshot(
+                Request::get(&catalog_path)
+                    .header(header::AUTHORIZATION, format!("Bearer {reader_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(insufficient.status(), StatusCode::FORBIDDEN);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get(&catalog_path)
+                    .header(header::COOKIE, format!("pangolin_session={session}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            body,
+            json!([{
+                "slug": "project:read",
+                "level": "project",
+                "description": "Read project resources"
+            }, {
+                "slug": "role:manage",
+                "level": "project",
+                "description": "Manage roles and assignments"
+            }])
+        );
+
+        let foreign_response = app
+            .oneshot(
+                Request::get(format!(
+                    "/api/admin/v1/projects/{}/permission-catalog",
+                    foreign.id
+                ))
+                .header(header::COOKIE, format!("pangolin_session={session}"))
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(foreign_response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
     async fn imported_api_keys_authenticate_by_digest_without_returning_plaintext() {
         let (app, database, _directory, owner) = test_app().await;
         let session = db::create_session(&database, &owner.subject_id)
@@ -992,6 +1265,82 @@ mod tests {
             app.oneshot(request()).await.unwrap().status(),
             StatusCode::CONFLICT
         );
+    }
+
+    #[tokio::test]
+    async fn rotate_route_returns_the_new_secret_once_and_later_reads_do_not() {
+        let (app, database, _directory, owner) = test_app().await;
+        let session = db::create_session(&database, &owner.subject_id)
+            .await
+            .unwrap();
+        let (key, old_token) = access::create_scoped_api_key(
+            &database,
+            &owner,
+            &ScopedApiKeyInput {
+                name: "http rotate".into(),
+                project_id: db::DEFAULT_PROJECT_ID.into(),
+                key_type: "service".into(),
+                scopes: vec!["gateway:use".into()],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let authenticated = |method: &str, uri: String| {
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(header::COOKIE, format!("pangolin_session={session}"))
+                .header("x-pangolin-csrf", "1")
+                .body(Body::empty())
+                .unwrap()
+        };
+        let response = app
+            .clone()
+            .oneshot(authenticated(
+                "POST",
+                format!(
+                    "/api/admin/v1/projects/{}/api-keys/{}/rotate",
+                    db::DEFAULT_PROJECT_ID,
+                    key.id
+                ),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+                .unwrap();
+        let new_token = body["token"].as_str().unwrap().to_owned();
+        assert!(
+            db::authenticate_api_key(&database, &old_token, None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db::authenticate_api_key(&database, &new_token, None)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        let list = app
+            .oneshot(authenticated(
+                "GET",
+                format!("/api/admin/v1/projects/{}/api-keys", db::DEFAULT_PROJECT_ID),
+            ))
+            .await
+            .unwrap();
+        let list = String::from_utf8(
+            to_bytes(list.into_body(), 1024 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(!list.contains(&new_token));
+        assert!(!list.contains(&old_token));
     }
 
     #[tokio::test]
@@ -1084,6 +1433,50 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn oidc_link_start_requires_session_and_csrf() {
+        let (app, database, _directory, owner) = test_app().await;
+        let session = db::create_session(&database, &owner.subject_id)
+            .await
+            .unwrap();
+        let missing_csrf = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/auth/oidc/provider/link/start")
+                    .header(header::COOKIE, format!("pangolin_session={session}"))
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing_csrf.status(), StatusCode::FORBIDDEN);
+
+        let (_, token) = access::create_scoped_api_key(
+            &database,
+            &owner,
+            &ScopedApiKeyInput {
+                name: "not a browser session".into(),
+                project_id: db::DEFAULT_PROJECT_ID.into(),
+                key_type: "service".into(),
+                scopes: vec!["gateway:use".into()],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let api_key = app
+            .oneshot(
+                Request::post("/api/v1/auth/oidc/provider/link/start")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header("x-pangolin-csrf", "1")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(api_key.status(), StatusCode::FORBIDDEN);
     }
 
     #[derive(Clone)]
@@ -1180,6 +1573,10 @@ mod tests {
             owner,
             &oidc::OidcProviderInput {
                 name: format!("mock-{}", uuid::Uuid::new_v4()),
+                display_name: None,
+                button_color: None,
+                logo_key: None,
+                login_only: false,
                 issuer_url: issuer.into(),
                 client_id: "mock-client".into(),
                 client_secret: crate::crypto::opaque_token("mock_"),
@@ -1270,6 +1667,7 @@ mod tests {
                 password: "another secure password".into(),
                 display_name: None,
                 language: None,
+                enabled: true,
             },
         )
         .await
@@ -1342,6 +1740,7 @@ mod tests {
                 password: "another secure password".into(),
                 display_name: None,
                 language: None,
+                enabled: true,
             },
         )
         .await
@@ -1457,6 +1856,7 @@ mod tests {
                 password: "another secure password".into(),
                 display_name: None,
                 language: None,
+                enabled: true,
             },
         )
         .await
@@ -1469,6 +1869,7 @@ mod tests {
                 password: "another secure password".into(),
                 display_name: None,
                 language: None,
+                enabled: true,
             },
         )
         .await
@@ -1565,6 +1966,7 @@ mod tests {
                 password: "another secure password".into(),
                 display_name: None,
                 language: None,
+                enabled: true,
             },
         )
         .await
@@ -1706,6 +2108,7 @@ mod tests {
                 password: "another secure password".into(),
                 display_name: None,
                 language: None,
+                enabled: true,
             },
         )
         .await
@@ -1832,6 +2235,7 @@ mod tests {
                 password: "another secure password".into(),
                 display_name: None,
                 language: None,
+                enabled: true,
             },
         )
         .await

@@ -18,6 +18,7 @@ use std::{collections::HashMap, fs, sync::Arc};
 
 use anyhow::{Context, Result, bail};
 use axum::Router;
+use sea_orm::ConnectionTrait;
 use tower_http::{catch_panic::CatchPanicLayer, compression::CompressionLayer, trace::TraceLayer};
 use tracing_subscriber::EnvFilter;
 
@@ -49,6 +50,16 @@ async fn main() -> Result<()> {
             ObservationStore::degraded(&config.observation_path, error)
         }
     };
+    if observations.needs_rebuild() {
+        // The projection's shape changed. Mark it so startup re-derives it from
+        // the record system instead of leaving the console reporting no traffic.
+        database
+            .execute(sea_orm::Statement::from_string(
+                sea_orm::DbBackend::Sqlite,
+                "INSERT INTO settings(key,value,updated_at) VALUES('_internal.observation_reset_required','true',unixepoch()) ON CONFLICT(key) DO UPDATE SET value='true'".to_owned(),
+            ))
+            .await?;
+    }
     let state = AppState {
         db: database,
         config: Arc::new(config.clone()),

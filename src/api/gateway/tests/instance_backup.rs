@@ -89,6 +89,7 @@ async fn fill(f: &mut Fixture, owner: &access::Principal) {
             password: "member-password-123456".into(),
             display_name: None,
             language: None,
+            enabled: true,
         },
     )
     .await
@@ -144,7 +145,7 @@ async fn fill(f: &mut Fixture, owner: &access::Principal) {
     let entry = &builtin["providers"][0];
     sql(f,"INSERT INTO catalog_overrides(kind,entry_id,entry_json,updated_at) VALUES('provider',?,?,0)",vec![entry["id"].as_str().unwrap().into(),entry.to_string().into()]).await;
     sql(f,"INSERT INTO api_key_profiles(id,project_id,name,created_at,updated_at) VALUES('profile',?,'profile',0,0)",vec![db::DEFAULT_PROJECT_ID.into()]).await;
-    sql(f,"INSERT INTO prompts(id,project_id,name,role,content,created_at,updated_at) VALUES('prompt',?,'prompt','system','retained prompt',0,0)",vec![db::DEFAULT_PROJECT_ID.into()]).await;
+    sql(f,"INSERT INTO prompts(id,project_id,name,role,content,enabled,created_at,updated_at) VALUES('prompt',?,'prompt','system','retained prompt',1,0,0)",vec![db::DEFAULT_PROJECT_ID.into()]).await;
     sql(f,"INSERT INTO prompt_protection_rules(id,project_id,name,content_pattern,action,created_at,updated_at) VALUES('rule',?,'rule','never-match','deny',0,0)",vec![db::DEFAULT_PROJECT_ID.into()]).await;
 }
 fn restore(artifact: full::Artifact, portable: bool, mode: full::Mode) -> full::Restore {
@@ -512,5 +513,70 @@ async fn full_instance_without_history_preserves_spend_dedup_and_survives_derive
     assert_eq!(
         row.try_get::<String>("", "settlement_kind").unwrap(),
         "duplicate"
+    );
+}
+
+/// An instance restored while an attempt was in flight settles it as interrupted.
+/// The execution row is what the observation projection is rebuilt from, so it has
+/// to carry the classification together with the status: a NULL there would report
+/// the request as neither a success nor a failure, and the frozen channel name has
+/// to survive the round trip too.
+#[tokio::test]
+async fn restore_settles_in_flight_executions_with_their_classification() {
+    let (mut source, owner, _) = disk_fixture("source").await;
+    fill(&mut source, &owner).await;
+    let now = db::now();
+    sql(&source, "INSERT INTO traces(id,project_id,status,started_at) VALUES('in-flight-trace',?,'running',?)", vec![db::DEFAULT_PROJECT_ID.into(), now.into()]).await;
+    sql(&source, "INSERT INTO requests(id,trace_id,protocol,endpoint,status,started_at) VALUES('in-flight','in-flight-trace','openai','/v1/chat/completions','running',?)", vec![now.into()]).await;
+    sql(&source, "INSERT INTO request_facts(id,project_id,log_level,status,started_at) VALUES('in-flight',?,'metadata','running',?)", vec![db::DEFAULT_PROJECT_ID.into(), now.into()]).await;
+    sql(&source, "INSERT INTO execution_facts(id,request_id,provider_id,attempt,price_json,reserved_micros,contacted,status,started_at) VALUES('in-flight-execution','in-flight',?,1,'{}',0,1,'running',?)", vec![source.providers[0].clone().into(), now.into()]).await;
+    sql(&source, "INSERT INTO request_executions(id,request_id,provider_id,provider_name,attempt,model,status,started_at) VALUES('in-flight-execution','in-flight',?,'full-provider',1,'upstream','running',?)", vec![source.providers[0].clone().into(), now.into()]).await;
+    let artifact = full::export(
+        &source.state,
+        &owner,
+        full::Export {
+            include_history: true,
+            passphrase: Some(PASSPHRASE.into()),
+        },
+    )
+    .await
+    .unwrap();
+    let (target, target_owner, _) = disk_fixture("destination").await;
+    full::restore(
+        &target.state,
+        &target_owner,
+        restore(artifact, true, full::Mode::Fail),
+    )
+    .await
+    .unwrap();
+    let row = target
+        .state
+        .db
+        .query_one(ops::sql(
+            "SELECT status,error_kind,http_status,provider_name FROM request_executions WHERE id='in-flight-execution'",
+            vec![],
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.try_get::<String>("", "status").unwrap(), "interrupted");
+    assert_eq!(
+        row.try_get::<Option<String>>("", "error_kind")
+            .unwrap()
+            .as_deref(),
+        Some("interrupted"),
+        "the settlement classification must be durable, not only the status"
+    );
+    assert_eq!(
+        row.try_get::<Option<i64>>("", "http_status").unwrap(),
+        None,
+        "the attempt never received an upstream response"
+    );
+    assert_eq!(
+        row.try_get::<Option<String>>("", "provider_name")
+            .unwrap()
+            .as_deref(),
+        Some("full-provider"),
+        "the frozen channel name must survive the restore"
     );
 }

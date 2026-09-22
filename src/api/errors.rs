@@ -77,6 +77,21 @@ pub(crate) fn response(error: ApiError, protocol: Protocol) -> Response {
     (status, Json(document(protocol, status, kind, &message))).into_response()
 }
 
+/// The one place the access layer's typed errors become protocol errors. Every
+/// caller maps them here so a new access error cannot be translated differently in
+/// one route than in another, and no internal cause reaches the client.
+pub(crate) fn access(error: crate::access::AccessError) -> ApiError {
+    use crate::access::AccessError;
+    match error {
+        AccessError::Unauthorized => ApiError::Unauthorized,
+        AccessError::Forbidden => ApiError::Forbidden,
+        AccessError::NotFound => ApiError::NotFound,
+        AccessError::Invalid(message) => ApiError::BadRequest(message),
+        AccessError::Conflict(message) => ApiError::Conflict(message),
+        AccessError::Internal(error) => ApiError::Internal(error),
+    }
+}
+
 /// An explicit upstream pass-through policy owns its raw body, including errors.
 #[derive(Clone)]
 pub(crate) struct PassThrough;
@@ -95,12 +110,28 @@ pub(super) async fn native_errors(request: axum::extract::Request, next: Next) -
     ]
     .iter()
     .any(|prefix| path.starts_with(prefix));
-    let protocol = protocol(path);
+    // Admin routes answer with the same envelope, but axum's own extractor
+    // rejections (a malformed body, an oversized one) bypass it and return plain
+    // text, so a client cannot parse every failure the same way.
+    let admin = path.starts_with("/api/admin/");
+    let protocol = if admin {
+        Protocol::OpenAi
+    } else {
+        protocol(path)
+    };
     let response = next.run(request).await;
     let status = response.status();
-    if !public
+    let already_json = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("application/json"));
+    if !(public || admin)
         || !(status.is_client_error() || status.is_server_error())
         || response.extensions().get::<PassThrough>().is_some()
+        // An admin handler that already produced the envelope keeps its own error
+        // kind; public paths are always normalised to the protocol document.
+        || (admin && already_json)
     {
         return response;
     }

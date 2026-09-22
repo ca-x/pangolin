@@ -30,7 +30,11 @@ describe('dialogs', () => {
     // only names it when the prop is passed. Our own wrapper passes it, so the
     // guard is over the places that reach for Mantine's Modal directly.
     const offenders = sources(join(process.cwd(), 'src')).flatMap((path) => {
-      const source = readFileSync(path, 'utf8')
+      // An arrow function inside a prop contains a `>`, which ends a naive
+      // `<Modal[^>]*>` match before it reaches `closeButtonProps`; the guard
+      // reported a correctly named dialog as an offender. Arrows cannot affect
+      // whether the prop is present, so they are neutralised before matching.
+      const source = readFileSync(path, 'utf8').replace(/=>/g, '=')
       const aliases = [...source.matchAll(/import\s*\{([^}]*)\}\s*from\s*'@mantine\/core'/g)]
         .flatMap((match) => match[1].split(',').map((part) => part.trim()))
         .filter((part) => /^Modal(\s+as\s+\w+)?$/.test(part))

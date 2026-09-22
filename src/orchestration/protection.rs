@@ -1,5 +1,6 @@
 use regex::Regex;
 use sea_orm::{DatabaseConnection, FromQueryResult};
+use serde::Serialize;
 use serde_json::{Value, json};
 
 use super::{Decision, Error, Result, policy, repository::statement};
@@ -14,21 +15,107 @@ pub struct Rule {
     test: bool,
 }
 
-pub async fn load(db: &DatabaseConnection, project: &str) -> Result<Vec<Rule>> {
-    #[derive(FromQueryResult)]
-    struct Row {
-        id: String,
-        role_pattern: Option<String>,
-        content_pattern: String,
-        action: String,
-        replacement: Option<String>,
-        scopes_json: String,
-        test_mode: bool,
+#[derive(FromQueryResult)]
+struct RuleRow {
+    id: String,
+    name: String,
+    description: String,
+    role_pattern: Option<String>,
+    content_pattern: String,
+    action: String,
+    replacement: Option<String>,
+    scopes_json: String,
+    test_mode: bool,
+    enabled: bool,
+    state: String,
+}
+
+impl RuleRow {
+    fn compile(&self) -> Result<Rule> {
+        Ok(Rule {
+            id: self.id.clone(),
+            roles: self
+                .role_pattern
+                .as_deref()
+                .map(policy::regex)
+                .transpose()?,
+            content: policy::regex(&self.content_pattern)?,
+            deny: self.action == "deny",
+            replacement: self
+                .replacement
+                .clone()
+                .unwrap_or_else(|| "[REDACTED]".into()),
+            scopes: policy::document(&self.scopes_json)?,
+            test: self.test_mode,
+        })
     }
-    Row::find_by_statement(statement("SELECT id,role_pattern,content_pattern,action,replacement,scopes_json,test_mode FROM prompt_protection_rules WHERE project_id=? AND enabled=1 ORDER BY created_at,id",vec![project.into()])).all(db).await?.into_iter().map(|r|{
-        Ok(Rule{id:r.id,roles:r.role_pattern.as_deref().map(policy::regex).transpose()?,content:policy::regex(&r.content_pattern)?,
-            deny:r.action=="deny",replacement:r.replacement.unwrap_or_else(||"[REDACTED]".into()),scopes:policy::document(&r.scopes_json)?,test:r.test_mode})
-    }).collect()
+}
+
+#[derive(Serialize)]
+pub struct Preview {
+    id: String,
+    name: String,
+    description: String,
+    action: String,
+    enabled: bool,
+    state: String,
+    matched: bool,
+    result: String,
+}
+
+const PREVIEW_RULE_LIMIT: usize = 500;
+
+pub async fn load(db: &DatabaseConnection, project: &str) -> Result<Vec<Rule>> {
+    RuleRow::find_by_statement(statement(
+        "SELECT id,name,description,role_pattern,content_pattern,action,replacement,scopes_json,test_mode,enabled,state FROM prompt_protection_rules WHERE project_id=? AND enabled=1 AND state='active' ORDER BY created_at,id",
+        vec![project.into()],
+    ))
+    .all(db)
+    .await?
+    .into_iter()
+    .map(|row| row.compile())
+    .collect()
+}
+
+/// Evaluate every rule in a project against an operator-provided sample without
+/// mutating request state. The same compiled content matcher and replacement
+/// semantics are used by live enforcement; deny rules report the unchanged text
+/// because their effect is refusal, not redaction.
+pub async fn preview(db: &DatabaseConnection, project: &str, text: &str) -> Result<Vec<Preview>> {
+    let rows = RuleRow::find_by_statement(statement(
+        "SELECT id,name,description,role_pattern,content_pattern,action,replacement,scopes_json,test_mode,enabled,state FROM prompt_protection_rules WHERE project_id=? ORDER BY created_at,id LIMIT 501",
+        vec![project.into()],
+    ))
+    .all(db)
+    .await?;
+    if rows.len() > PREVIEW_RULE_LIMIT {
+        return Err(Error::Invalid(
+            "protection preview supports at most 500 rules",
+        ));
+    }
+    rows.into_iter()
+        .map(|row| {
+            let rule = row.compile()?;
+            let matched = rule.content.is_match(text);
+            let result = if matched && !rule.deny {
+                rule.content
+                    .replace_all(text, regex::NoExpand(&rule.replacement))
+                    .into_owned()
+            } else {
+                text.to_owned()
+            };
+            Ok(Preview {
+                id: row.id,
+                name: row.name,
+                description: row.description,
+                action: row.action,
+                enabled: row.enabled,
+                state: row.state,
+                matched,
+                result,
+            })
+        })
+        .collect()
 }
 
 pub async fn inject(
@@ -37,39 +124,57 @@ pub async fn inject(
     body: &mut Value,
     context: &Value,
     endpoint: &str,
+    decisions: &mut Vec<super::Decision>,
 ) -> Result<()> {
     #[derive(FromQueryResult)]
     struct Prompt {
         role: String,
         content: String,
         activation_json: String,
+        action: String,
     }
-    let prompts=Prompt::find_by_statement(statement("SELECT role,content,activation_json FROM prompts WHERE project_id=? AND enabled=1 ORDER BY created_at,id",vec![project.into()])).all(db).await?;
+    let prompts=Prompt::find_by_statement(statement("SELECT role,content,activation_json,action FROM prompts WHERE project_id=? AND enabled=1 ORDER BY \"order\",created_at,id",vec![project.into()])).all(db).await?;
     let mut prefix = vec![];
+    let mut suffix = vec![];
     for p in prompts {
         if policy::matches(&policy::document(&p.activation_json)?, context)? {
-            prefix.push(json!({"role":p.role,"content":p.content}));
+            let prompt = json!({"role":p.role,"content":p.content});
+            match p.action.as_str() {
+                "prepend" => prefix.push(prompt),
+                "append" => suffix.push(prompt),
+                _ => return Err(Error::Configuration),
+            }
         }
     }
-    if prefix.is_empty() {
+    if prefix.is_empty() && suffix.is_empty() {
         return Ok(());
     }
     if endpoint.starts_with("/v1/responses") {
         prefix.extend(super::session::input(body)?);
+        prefix.append(&mut suffix);
         body["input"] = Value::Array(prefix);
     } else if endpoint == "/v1/messages" {
         // Native Anthropic system prompts live outside messages.
-        let mut system = vec![];
+        let mut system_before = vec![];
         prefix.retain(|p| {
             if p["role"] == "system" || p["role"] == "developer" {
-                system.push(p["content"].as_str().unwrap_or("").to_owned());
+                system_before.push(p["content"].as_str().unwrap_or("").to_owned());
                 false
             } else {
                 true
             }
         });
-        if !system.is_empty() {
-            let mut blocks = system
+        let mut system_after = vec![];
+        suffix.retain(|p| {
+            if p["role"] == "system" || p["role"] == "developer" {
+                system_after.push(p["content"].as_str().unwrap_or("").to_owned());
+                false
+            } else {
+                true
+            }
+        });
+        if !system_before.is_empty() || !system_after.is_empty() {
+            let mut blocks = system_before
                 .into_iter()
                 .map(|s| json!({"type":"text","text":s}))
                 .collect::<Vec<_>>();
@@ -80,6 +185,11 @@ pub async fn inject(
                     _ => return Err(Error::Invalid("invalid system prompt")),
                 }
             }
+            blocks.extend(
+                system_after
+                    .into_iter()
+                    .map(|s| json!({"type":"text","text":s})),
+            );
             body["system"] = Value::Array(blocks);
         }
         prefix.extend(
@@ -88,6 +198,7 @@ pub async fn inject(
                 .cloned()
                 .ok_or(Error::Invalid("messages must be an array"))?,
         );
+        prefix.append(&mut suffix);
         body["messages"] = Value::Array(prefix);
     } else if endpoint.starts_with("/v1beta/models:") {
         let mut contents = body
@@ -101,18 +212,33 @@ pub async fn inject(
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        let mut before = vec![];
+        let mut content_before = vec![];
+        let mut instruction_before = vec![];
         for prompt in prefix {
             if prompt["role"] == "system" || prompt["role"] == "developer" {
-                instructions.push(json!({"text":prompt["content"]}));
+                instruction_before.push(json!({"text":prompt["content"]}));
             } else {
-                before.push(json!({"role":if prompt["role"]=="assistant"{"model"}else{"user"},"parts":[{"text":prompt["content"]}]}));
+                content_before.push(json!({"role":if prompt["role"]=="assistant"{"model"}else{"user"},"parts":[{"text":prompt["content"]}]}));
             }
         }
-        before.append(&mut contents);
-        body["contents"] = Value::Array(before);
-        if !instructions.is_empty() {
-            body["systemInstruction"] = json!({"parts":instructions});
+        let mut content_after = vec![];
+        let mut instruction_after = vec![];
+        for prompt in suffix {
+            if prompt["role"] == "system" || prompt["role"] == "developer" {
+                instruction_after.push(json!({"text":prompt["content"]}));
+            } else {
+                content_after.push(json!({"role":if prompt["role"]=="assistant"{"model"}else{"user"},"parts":[{"text":prompt["content"]}]}));
+            }
+        }
+        content_before.append(&mut contents);
+        content_before.append(&mut content_after);
+        // Non-system prompts keep Gemini's native role/parts shape around the
+        // existing contents. System instructions use their native container.
+        body["contents"] = Value::Array(content_before);
+        instruction_before.append(&mut instructions);
+        instruction_before.append(&mut instruction_after);
+        if !instruction_before.is_empty() {
+            body["systemInstruction"] = json!({"parts":instruction_before});
         }
     } else if endpoint == "/v1/chat/completions" {
         prefix.extend(
@@ -121,11 +247,21 @@ pub async fn inject(
                 .cloned()
                 .ok_or(Error::Invalid("messages must be an array"))?,
         );
+        prefix.append(&mut suffix);
         body["messages"] = Value::Array(prefix);
     } else {
-        return Err(Error::Invalid(
-            "prompt injection is unsupported for this endpoint; scope prompts to a conversational endpoint",
-        ));
+        // This endpoint cannot carry injected messages. Skipping is what the
+        // reference product does; failing here meant one prompt with the default
+        // activation (which matches everything) answered 400 for the whole
+        // project on embeddings and every other non-conversational route. The
+        // decision is recorded so the skip is visible in the trace rather than
+        // silent.
+        decisions.push(super::Decision {
+            stage: "prompt",
+            candidate: None,
+            reason: "prompt_injection_skipped_unsupported_endpoint",
+        });
+        return Ok(());
     }
     Ok(())
 }
