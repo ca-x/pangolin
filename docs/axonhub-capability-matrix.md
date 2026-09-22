@@ -46,9 +46,9 @@ This inventory is the parity source of truth. It is cross-checked against AxonHu
 | Codex OAuth | start/exchange and auth JSON decode |
 | xAI OAuth/SSO | start/exchange/SSO decode |
 | Claude Code OAuth | start/exchange |
-| Antigravity OAuth | Explicitly unavailable until Code Assist project resolution and refresh-backed provider auth are implemented |
-| GitHub Copilot device OAuth | Explicitly unavailable until GitHub-to-Copilot token exchange and provider headers are implemented |
-| IP security | Global blocklist, per-key allowlist, request-log ban affordance |
+| Antigravity OAuth | PKCE/client-secret exchange, Code Assist project resolution, encrypted refresh-backed Gemini provider auth (contract-tested) |
+| GitHub Copilot device OAuth | Device pending/slow-down/expiry, GitHub-to-Copilot exchange/refresh and required provider headers (contract-tested) |
+| IP security | Deliberate divergence: per-key allow/deny CIDRs; no global blocklist or request-log ban action ([ADR 0004](adr/0004-api-key-scoped-ip-policy.md)) |
 | OpenAPI GraphQL auth | Intentional REST-only divergence D6; one authorization/error/audit surface ([ADR 0003](adr/0003-rest-only-control-plane.md)) |
 
 OIDC branding intentionally diverges from AxonHub's remote `icon_url` field.
@@ -148,7 +148,7 @@ sign-in page; no provider trademark asset is copied into Pangolin.
 | Favicon/static SPA | Embedded branded assets and deep links |
 | Playground/chat | Admin-selected channel/model request testing |
 | Request content policy | Store chunks/body/live preview toggles |
-| Provider OAuth credential helpers | Codex/xAI/Claude Code setup flows; Antigravity/Copilot fail closed pending complete provider adapters |
+| Provider OAuth credential helpers | Codex/xAI/Claude Code/Antigravity/GitHub Copilot setup flows with encrypted credentials and mock provider contracts |
 
 ## Console feature pages
 

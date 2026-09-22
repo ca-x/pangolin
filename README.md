@@ -39,6 +39,10 @@ Pangolin (Chinese name 鲮鲤) is a single-binary AI API aggregation gateway. It
 | --- | --- | --- |
 | ![Pangolin model routing](docs/screenshots/routing-desktop-dark-zh.png) | ![Pangolin request list](docs/screenshots/requests-desktop-light-en.png) | ![Pangolin request detail](docs/screenshots/request-detail-desktop-light-en.png) |
 
+| Analytics | Playground | Operations | Models |
+| --- | --- | --- | --- |
+| ![Pangolin analytics with confidence](docs/screenshots/analytics-desktop-dark-zh.png) | ![Pangolin playground](docs/screenshots/playground-desktop-dark-zh.png) | ![Pangolin operations](docs/screenshots/operations-desktop-dark-zh.png) | ![Pangolin model operations](docs/screenshots/models-desktop-dark-zh.png) |
+
 | Trace detail | Access control | System settings | About |
 | --- | --- | --- | --- |
 | ![Pangolin trace detail](docs/screenshots/trace-desktop-dark-en.png) | ![Pangolin access control](docs/screenshots/access-desktop-light-zh.png) | ![Pangolin system settings](docs/screenshots/system-desktop-dark-zh.png) | ![Pangolin build identity](docs/screenshots/about-desktop-dark-zh.png) |
@@ -60,6 +64,10 @@ Interface style (16) and colour palette (20) are independent axes layered on top
 | Overview | Channels | Credentials | Trace detail |
 | --- | --- | --- | --- |
 | ![Pangolin mobile overview](docs/screenshots/overview-mobile-dark-zh.png) | ![Pangolin mobile channels](docs/screenshots/channels-mobile-light-en.png) | ![Pangolin mobile credential management](docs/screenshots/credentials-mobile-dark-zh.png) | ![Pangolin mobile trace detail](docs/screenshots/trace-mobile-dark-zh.png) |
+
+| Analytics | Playground | Operations | Models |
+| --- | --- | --- | --- |
+| ![Pangolin mobile analytics](docs/screenshots/analytics-mobile-dark-zh.png) | ![Pangolin mobile playground](docs/screenshots/playground-mobile-dark-zh.png) | ![Pangolin mobile operations](docs/screenshots/operations-mobile-dark-zh.png) | ![Pangolin mobile model operations](docs/screenshots/models-mobile-dark-zh.png) |
 
 ## Quick start
 
@@ -122,6 +130,7 @@ pnpm --dir web dev
 - The current supported release targets single-node deployment. The SQLite and DuckDB files must not be shared for writing between multiple Pangolin processes.
 - A budgeted virtual key re-checks and settles its balance serially per key; streaming requests are not allowed for budget keys because streamed consumption cannot be settled reliably. A single non-streaming request can still overshoot a very small remaining balance — budgets are a cost guardrail, not a prepaid ledger.
 - Request events are retained for 30 days by default and can be adjusted with `PANGOLIN_OBSERVATION_RETENTION_DAYS`; when DuckDB is unavailable the gateway keeps proxying and reports `degraded` in health checks and metrics.
+- Gateway IP allow/deny policy is scoped to each API key. Pangolin intentionally has no instance-wide IP blocklist or request-log “ban IP” action; enforce a site-wide network boundary at the reverse proxy or host firewall. See [ADR 0004](docs/adr/0004-api-key-scoped-ip-policy.md).
 
 See [docs/architecture/database.md](docs/architecture/database.md) for the fuller database trade-offs.
 

@@ -10,24 +10,23 @@ against the working tree** rather than restated from a report.
 | Fact | Value |
 | --- | --- |
 | Evidence date | 2026-09-22 |
-| Branch / HEAD | `main` at `e666bef7f49b8cf8b1de933288fbbae36a338a97` |
-| `origin/main` | `ae052b4` (HEAD is three commits ahead, unpushed) |
-| Working tree | 52 modified tracked paths, 59 untracked files, nothing staged |
-| Tree fingerprint | the sorted `git status --porcelain` output, hashed with `sha1sum` → `45438b1939956ad9` |
+| Implementation baseline | `main` at `89f5160b927c987868e7d3d726fb4e6f4b63e4b9` |
+| Documentation delivery | this ledger/ADR/screenshot commit follows that implementation baseline |
+| Working tree | clean after the documentation delivery commit |
+| Release identity | annotated tag `v0.4.0` is the authoritative final tree fingerprint |
 | AxonHub reference | `/home/czyt/code/others/axonhub` at `cb29b65d9adfb06f89bb1b467418e0816988f36c` (2026-09-19), read only |
-| Rust gate (fresh) | `cargo test --locked` → **242 passed, 0 failed** |
-| Web gate (fresh) | `pnpm --dir web test` → **58 files / 1333 passed** in isolation |
+| Rust gate (baseline) | `cargo test --locked` at `51eb84a` → **418 passed, 0 failed** |
+| Final focused Rust gate | OAuth 11/11; confidence 2/2; login limiter 3/3; login/audit retention/migration/model retrieve 1/1 each; focused Clippy clean |
+| Web gate (baseline) | single-worker `vitest run` at `51eb84a` → **72 files / 1514 passed** |
+| Final focused Web gate | Analytics/onboarding/observability/trend **4 files / 55 passed**; TypeScript lint clean |
 
-The uncommitted tree *is* the subject of this audit: it carries the batches
-recorded in `.superpowers/sdd/parity-remaining-handover/` (Tasks A, B, C1, C2, D1,
-D2a, D2b). Line numbers below are from that tree and will drift.
+The release-candidate commit is the subject of this audit. Line numbers below
+are evidence pointers and may drift as the implementation evolves.
 
-**Suite stability, recorded because it is easy to misread:** a first web run
-started while `cargo test` was running reported `8 failed | 1325 passed (1333)`
-and the failing case names were not captured; the same suite run alone on the same
-tree reported 58/58 files and 1333/1333 tests passed. This is the load flakiness
-the ledger already documents, not a regression — but a red suite under parallel
-load is not evidence either way, so re-run the specific files before believing it.
+**Suite stability:** the release-candidate suite is intentionally serialized on
+this 48 GB development host. A concurrent run produced one timing failure; that
+case then passed five focused repetitions and the single-worker suite passed all
+72 files / 1514 tests. Remote CI remains the authoritative parallel-run gate.
 
 ## How to read a row
 
@@ -257,25 +256,26 @@ Report: [parity-ux-extras.md](parity-ux-extras.md).
 Each is a deliberate difference from AxonHub, kept because a Pangolin invariant or
 a stronger rule wins. Two of them are rows of the 133 above (`prompts 18`, D2 and
 `system 9`, D3); the rest are design-level or matrix-level and are listed here so
-they are not re-filed as gaps. D5 and D6 qualify a row that is otherwise counted as
-work (`access 13` is `feature-build`, the matrix row *OpenAPI GraphQL auth* is not
-one of the 133).
+they are not re-filed as gaps. D5 records the bounded invitation design completed
+by B27, while D6 dispositions the matrix-only *OpenAPI GraphQL auth* capability.
 
 | # | Divergence | Why | Evidence | ADR / status |
 | --- | --- | --- | --- | --- |
 | D1 | The sign-in page keeps Pangolin's compact house-branded card instead of AxonHub's split introduction/form layout | Pangolin's own visual identity; the reference's 375px sign-in has an unnamed icon button and two dangling `aria-describedby` targets, which Pangolin must not copy | `web/src/Auth.tsx`, `design-system/pangolin/MASTER.md` | recorded in the 2026-09-21 controller re-audit; no ADR needed for a visual choice |
 | D2 | Hard delete for prompts and protection rules (AxonHub soft-deletes and keeps an archived state) | Simpler record model; the delete is audited and project-scoped | `operations_api.rs` delete path; `orchestration/protection.rs:28` filters `enabled=1` | row `prompts 18`; ADR optional |
-| D3 | IP security is per API key (`allowed_ips`/`denied_ips`), not an instance-wide blocklist | Keeps the enforcement point at admission, where the key is already resolved | `db.rs` admission checks; `AccessPage.tsx:233-234` | row `system 9`; ADR recommended |
+| D3 | IP security is per API key (`allowed_ips`/`denied_ips`), not an instance-wide blocklist | Keeps the enforcement point at admission, where the key is already resolved | `db.rs` admission checks; `AccessPage.tsx:233-234` | Accepted: [ADR 0004](../adr/0004-api-key-scoped-ip-policy.md) |
 | D4 | Bulk API-key state requires `api_key:manage` (with `project:manage ⇒ api_key:manage` preserved) and applies the owner-membership rule | One authority for one lifecycle; the generic `project:manage` gate would have bypassed the key contract | `access.rs::set_scoped_api_keys_enabled`, `operations_api.rs:909`; `bulk_key_state_takes_the_key_permission_and_keeps_the_session_guard` | controller ruling, recorded in the SDD ledger |
 | D5 | Invitations remain email-bound, finitely reusable and bounded to 30 days | B27 deliberately keeps identity binding and finite expiry while adding an operator-selected 1–100 use limit; AxonHub's reusable links have no email binding and can be unlimited | `access.rs` invitation acceptance; SQLite v18 | superseded by the implemented B27 decision; no longer blocks access 13 |
 | D6 | No GraphQL endpoint; the admin surface is REST with a documented envelope | One control-plane protocol, one error contract, one authorization and transactional-audit path | `api/errors.rs`, `api/operations_api.rs` router | Accepted: [ADR 0003](../adr/0003-rest-only-control-plane.md) |
 
-## Decisions required
+## Historical decision queue (resolved or superseded)
 
-These rows cannot be closed by code alone; each needs an explicit product or
-architecture decision, and the decision itself is the deliverable. Eight decisions
-are queued here and in `tasks/parity-completion-plan.md`; six of them correspond to a
-row of the 133, two are matrix-level.
+> This queue predates B1–B65. It is retained to explain why the later batches
+> exist, not as a list of release work. Current dispositions are the reconciled
+> tables above and `docs/axonhub-capability-matrix.md`.
+
+These rows originally required a product or architecture decision. Their work was
+completed or superseded by the later batches and accepted ADRs.
 
 | Row | Decision | Options | Consequence of not deciding |
 | --- | --- | --- | --- |
@@ -288,11 +288,14 @@ row of the 133, two are matrix-level.
 | matrix (D6) | Scoped GraphQL endpoint | REST-only divergence D6 recorded in [ADR 0003](../adr/0003-rest-only-control-plane.md) | closed as an intentional divergence; no second authorization/mutation surface |
 | matrix | Semantic-memory provider | Opt-in project setting and bounded project/API-key-scoped provider interface implemented; optional reranker only scores already scoped candidates | closed at the provider-interface boundary; no provider is installed by default |
 
-## Deferred corrections carried forward
+## Historical deferred-correction snapshot (superseded)
 
-These were already identified as unfinished in the SDD ledger or the controller
-re-audit and are **still open** in the inspected tree. None of them is a new
-finding; each is named here so it cannot be lost.
+> The C1–C8 list below is point-in-time evidence from before the final batches.
+> Each correction was subsequently implemented and tested; it must not be read as
+> an open release list.
+
+These were identified as unfinished in the earlier SDD ledger or controller
+re-audit and are retained so the origin of the closing tests is not lost.
 
 | # | Correction | Current state in the tree | Required guard |
 | --- | --- | --- | --- |
@@ -378,7 +381,15 @@ is the code path plus the test that fails without it.
   the role-binding query key (C1) and the authoritative rebuild (D2b) are all
   fixed with tests.
 
-## Capability matrix disposition
+## Historical capability-matrix snapshot (superseded)
+
+> **Do not use the tables in this section as current release status.** They are
+> retained only as the point-in-time input that drove the B1–B65 completion
+> work. The authoritative current inventory is
+> [`docs/axonhub-capability-matrix.md`](../axonhub-capability-matrix.md), while
+> the reconciled 133-row finding totals are at the top of this ledger. In
+> particular, the `partial`, `open`, and `feature-build` labels below describe
+> the pre-completion snapshot and do not override the reconciled totals.
 
 Every capability of `docs/axonhub-capability-matrix.md` (112 table rows plus the
 console-page inventory paragraph, 113 items) is dispositioned here
@@ -386,7 +397,7 @@ so no row disappears silently. `implemented+tested` and `contract-tested` mean t
 capability exists and is covered by a Rust or web test; `partial`, `open` and
 `feature-build` name what is missing; `divergence` points at the table above.
 
-Disposition totals: **68 `implemented+tested`**, **28 `partial`**, **8
+Historical disposition totals: **68 `implemented+tested`**, **28 `partial`**, **8
 `feature-build`**, **6 `open`**, **2 `divergence`** (one flagged ADR-required) and
 **1 `upstream-todo`** — 113 items, none omitted. The `feature-build` set is the five
 per-provider OAuth rows plus their aggregate row in *Operations and system
@@ -549,11 +560,9 @@ retry/model/quota settings, and CORS/timeouts. Every one of them is scheduled in
 (TypeScript-first, with native libraries the project's own README lists for
 several other languages, including Rust). **Recommendation: add no dependency.**
 
-- No remaining row needs it. The 43 work rows are console surfaces, catalog and
-  pricing presentation, OAuth setup flows, an instance settings document, CORS,
-  proxying, and identity plumbing. Ax's value is authoring and optimizing
-  LLM programs (signatures, optimizers, RAG pipelines, agent loops), which is not
-  what any of those rows lack.
+- The completed parity work does not need it. Ax's value is authoring and
+  optimizing LLM programs (signatures, optimizers, RAG pipelines, agent loops),
+  which is not part of Pangolin's gateway and control-plane responsibilities.
 - Where Pangolin does have a prompt/agent-shaped gap — prompt `order` and
   `append` (prompts 6, 7), the protection preview (prompts 11), the admin chat
   surface (prompts 13) — the missing part is a record field, a placement rule or a
@@ -573,12 +582,7 @@ several other languages, including Rust). **Recommendation: add no dependency.**
 - Every status in the reconciled tables was decided from the code and the tests in
   the inspected tree, not from a report. Where a row's evidence is a report rather
   than a test, the row says so.
-- The Rust and web gates were run on the inspected tree. The Rust suite was green
-  (242/242); the web suite was green in isolation (1333/1333) and reported 8
-  failures in a run that overlapped `cargo test`, with the failing names not
-  captured — treated as load flakiness, and re-run before being believed.
-- No browser pass was run for this reconciliation. The two browser-only items
-  (C7 contrast, C8 375 px clipping) are marked reproduce-before-fix for exactly
-  that reason, and every contrast number quoted here comes from a bundle that is
-  now stale.
+- The current release gates and browser evidence are recorded above; the
+  historical capability snapshot retains its original implementation evidence
+  solely for traceability.
 - AxonHub was read, never executed, in this pass.

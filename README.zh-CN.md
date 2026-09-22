@@ -39,6 +39,10 @@ Pangolin（中文正式名称“鲮鲤”）是一款单二进制 AI API 聚合�
 | --- | --- | --- |
 | ![鲮鲤桌面端模型路由](docs/screenshots/routing-desktop-dark-zh.png) | ![鲮鲤桌面端请求记录](docs/screenshots/requests-desktop-light-en.png) | ![鲮鲤请求详情](docs/screenshots/request-detail-desktop-light-en.png) |
 
+| 分析 | 调试台 | 请求运维 | 模型管理 |
+| --- | --- | --- | --- |
+| ![鲮鲤分析与可信度](docs/screenshots/analytics-desktop-dark-zh.png) | ![鲮鲤调试台](docs/screenshots/playground-desktop-dark-zh.png) | ![鲮鲤请求运维](docs/screenshots/operations-desktop-dark-zh.png) | ![鲮鲤模型管理](docs/screenshots/models-desktop-dark-zh.png) |
+
 | 追踪详情 | 访问控制 | 系统设置 | 关于 |
 | --- | --- | --- | --- |
 | ![鲮鲤追踪详情](docs/screenshots/trace-desktop-dark-en.png) | ![鲮鲤访问控制](docs/screenshots/access-desktop-light-zh.png) | ![鲮鲤系统设置](docs/screenshots/system-desktop-dark-zh.png) | ![鲮鲤构建信息](docs/screenshots/about-desktop-dark-zh.png) |
@@ -60,6 +64,10 @@ Pangolin（中文正式名称“鲮鲤”）是一款单二进制 AI API 聚合�
 | 概览 | 渠道 | 多凭据 | 追踪详情 |
 | --- | --- | --- | --- |
 | ![鲮鲤移动端概览](docs/screenshots/overview-mobile-dark-zh.png) | ![鲮鲤移动端渠道](docs/screenshots/channels-mobile-light-en.png) | ![鲮鲤移动端多凭据管理](docs/screenshots/credentials-mobile-dark-zh.png) | ![鲮鲤移动端追踪详情](docs/screenshots/trace-mobile-dark-zh.png) |
+
+| 分析 | 调试台 | 请求运维 | 模型管理 |
+| --- | --- | --- | --- |
+| ![鲮鲤移动端分析](docs/screenshots/analytics-mobile-dark-zh.png) | ![鲮鲤移动端调试台](docs/screenshots/playground-mobile-dark-zh.png) | ![鲮鲤移动端请求运维](docs/screenshots/operations-mobile-dark-zh.png) | ![鲮鲤移动端模型管理](docs/screenshots/models-mobile-dark-zh.png) |
 
 ## 快速开始
 
@@ -122,6 +130,7 @@ pnpm --dir web dev
 - 当前支持版本面向单节点部署。SQLite/DuckDB 文件不能由多个 Pangolin 进程共享写入。
 - 带预算的虚拟 Key 会按 Key 串行执行余额复查与结算；为了避免无法可靠结算的流式消耗，预算 Key 不允许流式请求。单个非流式请求仍可能超过极小的剩余余额，预算用于成本护栏而非预付费硬账本。
 - 请求事件默认保留 30 天，可用 `PANGOLIN_OBSERVATION_RETENTION_DAYS` 调整；DuckDB 不可用时网关继续提供代理服务，并在健康检查与指标中报告 degraded。
+- 网关 IP 允许/拒绝策略按 API 密钥生效。Pangolin 有意不提供实例级 IP 黑名单或请求日志中的“封禁 IP”操作；站点级网络边界应在反向代理或主机防火墙实施。参见 [ADR 0004](docs/adr/0004-api-key-scoped-ip-policy.md)。
 
 更完整的数据库权衡见 [docs/architecture/database.md](docs/architecture/database.md)。
 
