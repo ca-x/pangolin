@@ -63,6 +63,9 @@ pub struct SemanticMemoryRuntime {
 }
 
 impl SemanticMemoryRuntime {
+    // Production adapters install this extension point at composition time;
+    // the default single-binary build intentionally ships without one.
+    #[allow(dead_code)]
     pub fn install_provider(&self, provider: Arc<dyn SemanticMemory>) {
         *self
             .provider

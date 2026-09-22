@@ -243,10 +243,7 @@ pub async fn startup_problem(
             vec![],
         ))
         .await?;
-    Ok(row.and_then(|row| match parse_stored_row(&row) {
-        Ok(_) => None,
-        Err(problem) => Some(problem),
-    }))
+    Ok(row.and_then(|row| parse_stored_row(&row).err()))
 }
 
 impl Policy {

@@ -1668,7 +1668,7 @@ mod tests {
         }
 
         for kind in ["gcs", "webdav"] {
-            db.execute(statement(&format!(
+            db.execute(statement(format!(
                 "INSERT INTO data_storage_configs(id,name,kind,created_at,updated_at) VALUES('{kind}','{kind}','{kind}',0,0)"
             )))
             .await

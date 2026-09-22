@@ -262,17 +262,13 @@ pub async fn export_as(
     tx.commit().await?;
     Ok(artifact)
 }
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Conflict {
+    #[default]
     Fail,
     Skip,
     Overwrite,
-}
-impl Default for Conflict {
-    fn default() -> Self {
-        Self::Fail
-    }
 }
 impl Conflict {
     fn as_str(self) -> &'static str {
@@ -322,15 +318,6 @@ pub async fn restore(
     artifact: &Artifact,
     strategy: Conflict,
 ) -> Result<usize, ApiError> {
-    restore_as(state, project, artifact, strategy, None).await
-}
-pub async fn restore_as(
-    state: &AppState,
-    project: &str,
-    artifact: &Artifact,
-    strategy: Conflict,
-    actor: Option<&crate::access::Principal>,
-) -> Result<usize, ApiError> {
     restore_with_strategies_as(
         state,
         project,
@@ -339,7 +326,7 @@ pub async fn restore_as(
             default: strategy,
             resources: BTreeMap::new(),
         },
-        actor,
+        None,
     )
     .await
 }

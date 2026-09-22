@@ -71,14 +71,13 @@ fn validate_model_rules(value: &Value) -> Result<(), ApiError> {
     }) {
         return Err(ApiError::BadRequest("invalid model rules".into()));
     }
-    if let Some(patterns) = &rules.exclude {
-        if patterns.len() > 64
+    if let Some(patterns) = &rules.exclude
+        && (patterns.len() > 64
             || patterns
                 .iter()
-                .any(|pattern| !valid_text(pattern) || regex::Regex::new(pattern).is_err())
-        {
-            return Err(ApiError::BadRequest("invalid model rules".into()));
-        }
+                .any(|pattern| !valid_text(pattern) || regex::Regex::new(pattern).is_err()))
+    {
+        return Err(ApiError::BadRequest("invalid model rules".into()));
     }
     if rules.reasoning_effort.as_ref().is_some_and(|mappings| {
         mappings.len() > 32

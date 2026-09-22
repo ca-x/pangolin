@@ -371,9 +371,7 @@ pub fn catalog_model_defaults_from(
     catalog: &crate::catalog::Catalog,
     card_id: &str,
 ) -> Option<ModelCatalogDefaults> {
-    let Some(card) = catalog.models.iter().find(|model| model.id == card_id) else {
-        return None;
-    };
+    let card = catalog.models.iter().find(|model| model.id == card_id)?;
     let price = |value: Option<f64>| {
         value
             .filter(|value| {

@@ -305,7 +305,7 @@ enum Command {
     /// Every read goes through the writer's connection. Opening the file a second
     /// time checkpoints and deletes the WAL the writer holds, which silently
     /// freezes the projection for the life of the process.
-    Read(Read, oneshot::Sender<Result<ReadOutcome>>),
+    Read(Box<Read>, oneshot::Sender<Result<ReadOutcome>>),
 }
 
 /// A read the writer thread performs on its own connection.
@@ -549,7 +549,7 @@ impl ObservationStore {
                         let _=done.send(applied);
                     }
                     Command::Read(read,done)=>{
-                        let outcome = match read {
+                        let outcome = match *read {
                             Read::Summary { project, filter } => {
                                 query_summary_for(&connection, project.as_deref(), filter)
                                     .map(|value| ReadOutcome::Summary(Box::new(value)))
@@ -754,7 +754,7 @@ impl ObservationStore {
             anyhow::bail!("observation projection is unavailable")
         };
         sender
-            .send(Command::Read(read, done))
+            .send(Command::Read(Box::new(read), done))
             .await
             .map_err(|_| anyhow::anyhow!("observation writer is unavailable"))?;
         result
