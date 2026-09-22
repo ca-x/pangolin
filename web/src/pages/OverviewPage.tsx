@@ -4,11 +4,12 @@ import { useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Link } from 'react-router'
 import { api, type AnalyticsRow, type Paged, type RequestItem, type Summary } from '../api'
+import { ANALYTICS_DIMENSIONS, ANALYTICS_DIMENSION_KEYS, type AnalyticsDimension, useAnalyticsDimensionNames } from '../analyticsDimensions'
 import { EmptyState, SkeletonRows, Status } from '../components'
 import i18n from '../i18n'
 import { ObservabilityNotice, UNMEASURED, formatCount, formatMicros, useObservability } from '../observability'
 import { PageHeader, QueryError, displayValue, formatDate } from './shared'
-import { projectOperationPath, useProject } from '../project'
+import { useProject } from '../project'
 import { Button, Card, Group, Select, SimpleGrid, Stack, Table, TableScrollContainer, Text, ThemeIcon, Title } from '@mantine/core'
 
 const formatNumber = (value: number) => new Intl.NumberFormat(i18n.language, { notation: value > 9999 ? 'compact' : 'standard', maximumFractionDigits: 1 }).format(value)
@@ -60,27 +61,6 @@ const niceStep = (value: number) => {
   const normalized = value / magnitude
   const step = [1, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10].find((candidate) => normalized <= candidate) ?? 10
   return step * magnitude
-}
-
-/**
- * The entity facets `/analytics` can group by. `day` is deliberately absent: the
- * trend chart above already plots time, so a day breakdown would repeat it.
- */
-const DIMENSIONS = ['provider', 'model', 'api_key', 'user', 'project'] as const
-type Dimension = typeof DIMENSIONS[number]
-const DIMENSION_KEYS: Record<Dimension, string> = { provider: 'provider', model: 'model', api_key: 'apiKey', user: 'user', project: 'project' }
-/**
- * A breakdown row names its dimension by opaque id. Where the console can read
- * the entity behind that id it shows the name, and where it cannot it shows the
- * id itself — which is real data — instead of hiding a row it cannot label. The
- * project facet needs no read: the project list is already loaded.
- */
-const DIMENSION_SOURCES: Record<Dimension, { path: (projectId: string) => string; label: (row: Record<string, unknown>) => string } | null> = {
-  provider: { path: (projectId) => `${projectOperationPath(projectId, 'channels')}?limit=500`, label: (row) => String(row.name ?? '') },
-  model: { path: (projectId) => `${projectOperationPath(projectId, 'models')}?limit=500`, label: (row) => String(row.public_name ?? '') },
-  api_key: { path: (projectId) => `/api/admin/v1/projects/${encodeURIComponent(projectId)}/api-keys`, label: (row) => String(row.name ?? '') },
-  user: { path: () => '/api/admin/v1/users', label: (row) => String(row.display_name || row.email || '') },
-  project: null,
 }
 
 export default function OverviewPage() {
@@ -309,9 +289,7 @@ function CompactRequests({ rows }: { rows: RequestItem[] }) {
  */
 function Breakdowns({ projectId, bounds, windowLabel }: { projectId: string; bounds: { from: number; until: number }; windowLabel: string }) {
   const { t } = useTranslation()
-  const { projects } = useProject()
-  const [dimension, setDimension] = useState<Dimension>('provider')
-  const source = DIMENSION_SOURCES[dimension]
+  const [dimension, setDimension] = useState<AnalyticsDimension>('provider')
   const query = useQuery({
     queryKey: ['analytics', projectId, dimension, bounds.from, bounds.until],
     // The cards above state a window, so the breakdown is read over the same
@@ -319,50 +297,23 @@ function Breakdowns({ projectId, bounds, windowLabel }: { projectId: string; bou
     // window of its own that would disagree with them.
     queryFn: () => api<{ data: AnalyticsRow[] }>(`/api/admin/v1/projects/${encodeURIComponent(projectId)}/analytics?dimension=${dimension}&from=${bounds.from}&until=${bounds.until}`),
   })
-  const names = useQuery({
-    queryKey: ['dimension-names', projectId, dimension],
-    queryFn: () => api<Array<Record<string, unknown>> | Paged<Record<string, unknown>>>(source!.path(projectId)),
-    enabled: Boolean(source),
-    retry: false,
-  })
-  const labels = useMemo(() => {
-    const payload = names.data
-    const rows = Array.isArray(payload) ? payload : payload?.data ?? []
-    const map = new Map<string, string>()
-    for (const row of rows) {
-      const id = String(row.id ?? '')
-      const label = source ? source.label(row) : ''
-      if (id && label) map.set(id, label)
-    }
-    return map
-  }, [names.data, source])
-  // A resolved name reads as text; an id the console could not resolve stays
-  // monospaced, because it is a machine identifier and not a label.
-  const label = (value: string | null) => {
-    if (!value) return { text: UNMEASURED, opaque: true }
-    if (dimension === 'project') {
-      const named = projects.find((item) => item.id === value)?.name
-      return { text: named ?? value, opaque: !named }
-    }
-    const named = labels.get(value)
-    return { text: named ?? value, opaque: !named }
-  }
+  const names = useAnalyticsDimensionNames(projectId, dimension)
   const rows = query.data?.data ?? []
   return <Card p="lg" mt="lg">
     <Group justify="space-between" align="flex-end" mb="sm" wrap="wrap">
       <Stack gap={2}><Title order={2}>{t('breakdowns')}</Title><Text size="sm" c="dimmed">{t('breakdownsHint', { window: windowLabel })}</Text></Stack>
-      <Select label={t('dimension')} data={DIMENSIONS.map((value) => ({ value, label: t(DIMENSION_KEYS[value]) }))} value={dimension} onChange={(value) => value && setDimension(value as Dimension)} w={{ base: '100%', xs: 220 }} />
+      <Select label={t('dimension')} data={ANALYTICS_DIMENSIONS.map((value) => ({ value, label: t(ANALYTICS_DIMENSION_KEYS[value]) }))} value={dimension} onChange={(value) => value && setDimension(value as AnalyticsDimension)} w={{ base: '100%', xs: 220 }} />
     </Group>
     {query.isError ? <QueryError retry={() => void query.refetch()} /> : query.isLoading ? <SkeletonRows count={3} /> : !rows.length ? <EmptyState icon={<Server />} title={t('breakdowns')} copy={t('breakdownsEmpty')} /> : <>
       {/* The breakdown is real data even when its labels are not readable, so a
           failed lookup degrades to the ids and offers the retry instead of
           hiding rows the operator asked for. */}
-      {names.isError && <Stack mb="sm"><QueryError retry={() => void names.refetch()} /></Stack>}
+      {names.query.isError && <Stack mb="sm"><QueryError retry={() => void names.query.refetch()} /></Stack>}
       <TableScrollContainer minWidth={860} role="region" aria-label={t('breakdowns')} tabIndex={0} style={{ maxHeight: 'min(60vh, 720px)' }}>
         <Table stickyHeader highlightOnHover>
           <Table.Thead><Table.Tr><Table.Th>{t('dimension')}</Table.Th><Table.Th>{t('requests')}</Table.Th><Table.Th>{t('errorsLabel')}</Table.Th><Table.Th>{t('inputTokens')}</Table.Th><Table.Th>{t('outputTokens')}</Table.Th><Table.Th>{t('cacheTokens')}</Table.Th><Table.Th>{t('cost')}</Table.Th><Table.Th>{t('latency')}</Table.Th></Table.Tr></Table.Thead>
           <Table.Tbody>{rows.map((row, index) => {
-            const cell = label(row.dimension)
+            const cell = names.resolve(row.dimension)
             return <Table.Tr key={`${row.dimension ?? 'unrecorded'}-${index}`}>
               <Table.Td className={cell.opaque ? 'mono-cell' : undefined}>{cell.text}</Table.Td>
               <Table.Td className="mono-cell">{formatCount(row.requests)}</Table.Td>

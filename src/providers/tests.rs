@@ -180,9 +180,74 @@ async fn oauth_credentials_use_only_their_completed_provider_auth_contract() {
         assert!(!request.headers.contains_key("x-goog-api-key"));
     }
 
+    let mut antigravity = target("gemini");
+    antigravity.credential_type = "oauth_antigravity".into();
+    let request = prepare(
+        &antigravity,
+        "/v1/chat/completions",
+        &body,
+        &json!({"access_token":"antigravity-access","project_id":"code-assist-project"})
+            .to_string(),
+        HeaderMap::new(),
+        &HeaderMap::new(),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        request.url,
+        "http://localhost:8080/v1internal:generateContent"
+    );
+    assert_eq!(
+        request.headers["authorization"],
+        "Bearer antigravity-access"
+    );
+    assert_eq!(
+        request.headers["x-goog-api-client"],
+        "google-cloud-sdk vscode_cloudshelleditor/0.1"
+    );
+    assert_eq!(request.payload["project"], "code-assist-project");
+    assert_eq!(request.payload["model"], "model");
+    assert_eq!(
+        request.payload["request"]["contents"][0]["parts"][0]["text"],
+        "hi"
+    );
+
+    let mut copilot = target("openai");
+    copilot.credential_type = "oauth_github_copilot".into();
+    let request = prepare(
+        &copilot,
+        "/v1/chat/completions",
+        &body,
+        "copilot-session-token",
+        HeaderMap::new(),
+        &HeaderMap::new(),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(request.url, "http://localhost:8080/chat/completions");
+    assert_eq!(
+        request.headers["authorization"],
+        "Bearer copilot-session-token"
+    );
+    assert_eq!(request.headers["editor-version"], "vscode/1.95.0");
+    assert_eq!(
+        request.headers["editor-plugin-version"],
+        "copilot-chat/0.26.7"
+    );
+    assert_eq!(request.headers["copilot-integration-id"], "vscode-chat");
+    assert_eq!(request.headers["openai-intent"], "conversation-edits");
+    assert_eq!(request.headers["x-github-api-version"], "2025-04-01");
+    assert_eq!(
+        request.headers["x-vscode-user-agent-library-version"],
+        "electron-fetch"
+    );
+    assert_eq!(request.headers["x-initiator"], "user");
+
     for (kind, credential_type) in [
-        ("gemini", "oauth_antigravity"),
-        ("openai", "oauth_github_copilot"),
+        ("openai", "oauth_antigravity"),
+        ("gemini", "oauth_github_copilot"),
         ("gemini", "oauth_codex"),
     ] {
         let mut target = target(kind);

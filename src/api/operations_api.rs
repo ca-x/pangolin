@@ -599,6 +599,7 @@ async fn set_system_settings(
 #[serde(deny_unknown_fields)]
 struct ProviderOauthStartInput {
     client_id: String,
+    client_secret: Option<String>,
     redirect_uri: Option<String>,
 }
 
@@ -613,6 +614,7 @@ struct ProviderOauthCompleteInput {
 struct ProviderOauthSecret {
     verifier: Option<String>,
     device_code: Option<String>,
+    client_secret: Option<String>,
 }
 
 fn oauth_state_digest(state: &str) -> String {
@@ -699,6 +701,23 @@ async fn start_provider_oauth(
             "OAuth flow is incompatible with this channel type".into(),
         ));
     }
+    match (flow, input.client_secret.as_deref()) {
+        (crate::oauth::Flow::Antigravity, Some(secret))
+            if !secret.is_empty()
+                && secret.len() <= 4096
+                && !secret.chars().any(char::is_control) => {}
+        (crate::oauth::Flow::Antigravity, _) => {
+            return Err(ApiError::BadRequest(
+                "Antigravity OAuth client secret is required".into(),
+            ));
+        }
+        (_, Some(_)) => {
+            return Err(ApiError::BadRequest(
+                "OAuth client secret is unsupported for this flow".into(),
+            ));
+        }
+        (_, None) => {}
+    }
     let spec = provider_oauth_spec(&state, &provider, flow).await?;
     let (response, secret, expires_in, interval) = if flow.is_device() {
         if input.redirect_uri.is_some() {
@@ -706,12 +725,13 @@ async fn start_provider_oauth(
                 "device OAuth does not accept a redirect URI".into(),
             ));
         }
-        let start = crate::oauth::start_device(&state.oidc_client, spec, &input.client_id)
+        let start = crate::oauth::start_device(&state.oauth_client, spec, &input.client_id)
             .await
             .map_err(provider_oauth_error)?;
         let secret = ProviderOauthSecret {
             verifier: None,
             device_code: Some(start.device_code.clone()),
+            client_secret: None,
         };
         let expires_in = start.expires_in;
         let interval = start.interval;
@@ -732,6 +752,7 @@ async fn start_provider_oauth(
         let secret = ProviderOauthSecret {
             verifier: Some(start.verifier.clone()),
             device_code: None,
+            client_secret: input.client_secret.clone(),
         };
         (
             serde_json::to_value(&start).unwrap(),
@@ -864,7 +885,7 @@ async fn complete_provider_oauth(
     let spec = provider_oauth_spec(&state, &provider, flow).await?;
     let token = if flow.is_device() {
         crate::oauth::poll_device(
-            &state.oidc_client,
+            &state.oauth_client,
             spec,
             &client_id,
             secret
@@ -875,30 +896,47 @@ async fn complete_provider_oauth(
         .await
     } else {
         crate::oauth::exchange_browser(
-            &state.oidc_client,
+            &state.oauth_client,
             spec,
-            &client_id,
-            redirect_uri
-                .as_deref()
-                .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("redirect URI missing")))?,
-            input
-                .code
-                .as_deref()
-                .filter(|code| !code.is_empty() && code.len() <= 4096)
-                .ok_or_else(|| ApiError::BadRequest("OAuth code is required".into()))?,
-            &input.state,
-            secret
-                .verifier
-                .as_deref()
-                .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("PKCE verifier missing")))?,
+            crate::oauth::BrowserExchange {
+                client_id: &client_id,
+                client_secret: secret.client_secret.as_deref(),
+                redirect_uri: redirect_uri
+                    .as_deref()
+                    .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("redirect URI missing")))?,
+                code: input
+                    .code
+                    .as_deref()
+                    .filter(|code| !code.is_empty() && code.len() <= 4096)
+                    .ok_or_else(|| ApiError::BadRequest("OAuth code is required".into()))?,
+                state: &input.state,
+                verifier: secret
+                    .verifier
+                    .as_deref()
+                    .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("PKCE verifier missing")))?,
+            },
         )
         .await
     };
     let token = match token {
-        Ok(token) => token.into_value(),
+        Ok(token) => token,
         Err(crate::oauth::Error::Pending) => {
             return Ok(Json(
                 json!({"status":"pending","retry_after":interval.max(5)}),
+            ));
+        }
+        Err(crate::oauth::Error::SlowDown) => {
+            let slowed_interval = (interval + 5).clamp(5, 60);
+            let tx = state.db.begin().await?;
+            tx.execute(sql(
+                "UPDATE provider_oauth_states SET interval_seconds=? WHERE state_digest=?",
+                vec![slowed_interval.into(), digest.clone().into()],
+            ))
+            .await?;
+            audit_in(&tx, &user, &project, "provider_oauth.slow_down", &provider).await?;
+            tx.commit().await?;
+            return Ok(Json(
+                json!({"status":"pending","retry_after":slowed_interval}),
             ));
         }
         Err(crate::oauth::Error::Expired | crate::oauth::Error::Declined) => {
@@ -916,6 +954,17 @@ async fn complete_provider_oauth(
         }
         Err(error) => return Err(provider_oauth_error(error)),
     };
+    let token = crate::oauth::finalize_credential(
+        &state.oauth_client,
+        spec,
+        &client_id,
+        secret.client_secret.as_deref(),
+        token,
+        now,
+    )
+    .await
+    .map_err(provider_oauth_error)?
+    .into_value();
     let credential = operations::id();
     let token_envelope = state.secrets.encrypt(&token.to_string())?;
     let tx = state.db.begin().await?;
@@ -957,6 +1006,9 @@ fn provider_oauth_error(error: crate::oauth::Error) -> ApiError {
             ApiError::BadRequest("invalid OAuth configuration".into())
         }
         crate::oauth::Error::Pending => ApiError::Conflict("OAuth authorization is pending".into()),
+        crate::oauth::Error::SlowDown => {
+            ApiError::Conflict("OAuth provider requested slower polling".into())
+        }
         crate::oauth::Error::Expired => ApiError::BadRequest("OAuth authorization expired".into()),
         crate::oauth::Error::Declined => {
             ApiError::BadRequest("OAuth authorization was declined".into())
@@ -964,10 +1016,13 @@ fn provider_oauth_error(error: crate::oauth::Error) -> ApiError {
         crate::oauth::Error::ProviderUnavailable => {
             ApiError::Upstream("OAuth provider is unavailable".into())
         }
+        crate::oauth::Error::InvalidCredential => {
+            ApiError::Upstream("OAuth provider returned an unusable credential".into())
+        }
     }
 }
 
-async fn provider_oauth_spec(
+pub(super) async fn provider_oauth_spec(
     state: &AppState,
     provider: &str,
     flow: crate::oauth::Flow,
@@ -993,20 +1048,30 @@ async fn provider_oauth_spec(
                         .pointer("/oauth_test/device_endpoint")
                         .and_then(Value::as_str)
                     {
-                        return Ok(crate::oauth::ProviderSpec::test_device(
+                        let spec = crate::oauth::ProviderSpec::test_device(
                             device.to_owned(),
                             token.to_owned(),
-                        ));
+                        );
+                        return Ok(settings
+                            .pointer("/oauth_test/provider_token_endpoint")
+                            .and_then(Value::as_str)
+                            .map(|endpoint| spec.test_provider_endpoint(endpoint.to_owned()))
+                            .unwrap_or(spec));
                     }
                 } else if let Some(authorization) = settings
                     .pointer("/oauth_test/authorization_endpoint")
                     .and_then(Value::as_str)
                 {
-                    return Ok(crate::oauth::ProviderSpec::test_browser(
+                    let spec = crate::oauth::ProviderSpec::test_browser(
                         flow,
                         authorization.to_owned(),
                         token.to_owned(),
-                    ));
+                    );
+                    return Ok(settings
+                        .pointer("/oauth_test/provider_token_endpoint")
+                        .and_then(Value::as_str)
+                        .map(|endpoint| spec.test_provider_endpoint(endpoint.to_owned()))
+                        .unwrap_or(spec));
                 }
             }
         }
@@ -2572,7 +2637,8 @@ async fn analytics(
     {
         return Err(ApiError::NotFound);
     }
-    let dimension = match filter.dimension.as_deref().unwrap_or("day") {
+    let dimension_name = filter.dimension.as_deref().unwrap_or("day");
+    let dimension = match dimension_name {
         "day" => "CAST(r.started_at/86400 AS TEXT)",
         "provider" => "e.provider_id",
         "model" => "e.model_id",
@@ -2581,10 +2647,62 @@ async fn analytics(
         "project" => "r.project_id",
         _ => return Err(ApiError::BadRequest("unknown analytics dimension".into())),
     };
-    let rows=state.db.query_all(sql(format!("SELECT json_object('dimension',{dimension},'requests',COUNT(DISTINCT r.id),'attempts',COUNT(e.id),'errors',SUM(e.status!='succeeded'),'usage_measured',CASE WHEN COUNT(u.id)>0 THEN json('true') ELSE json('false') END,'input_tokens',COALESCE(SUM(u.input_tokens),0),'output_tokens',COALESCE(SUM(u.output_tokens),0),'cache_hit_tokens',COALESCE(SUM(u.cache_read_tokens),0),'cache_savings_micros',COALESCE(SUM(u.cache_savings_micros),0),'cost_micros',COALESCE(SUM(u.total_cost_micros),0),'latency_ms',AVG(x.latency_ms),'ttft_ms',AVG(x.first_token_at-x.started_at*1000),'tokens_per_second',AVG(CASE WHEN u.id IS NOT NULL AND x.latency_ms>0 THEN CAST(u.output_tokens AS REAL)*1000.0/x.latency_ms END)) AS document FROM request_facts r JOIN execution_facts e ON e.request_id=r.id LEFT JOIN usage_logs u ON u.execution_id=e.id LEFT JOIN request_executions x ON x.id=e.id WHERE r.project_id=? AND r.started_at>=? AND r.started_at<? AND (? IS NULL OR e.model_id=?) AND (? IS NULL OR e.provider_id=?) AND (? IS NULL OR r.api_key_id=?) GROUP BY {dimension} ORDER BY {dimension} LIMIT 500"),vec![project.into(),filter.from.unwrap_or(db::now()-86400*30).into(),filter.until.unwrap_or(db::now()+1).into(),filter.model.clone().into(),filter.model.into(),filter.provider.clone().into(),filter.provider.into(),filter.api_key.clone().into(),filter.api_key.into()])).await?;
+    let rows=state.db.query_all(sql(format!("SELECT json_object('dimension',{dimension},'requests',COUNT(DISTINCT r.id),'attempts',COUNT(e.id),'errors',SUM(e.status!='succeeded'),'sample_count',COUNT(DISTINCT CASE WHEN e.status='succeeded' AND x.latency_ms>0 AND u.id IS NOT NULL THEN r.id END),'usage_measured',CASE WHEN COUNT(u.id)>0 THEN json('true') ELSE json('false') END,'input_tokens',COALESCE(SUM(u.input_tokens),0),'output_tokens',COALESCE(SUM(u.output_tokens),0),'cache_hit_tokens',COALESCE(SUM(u.cache_read_tokens),0),'cache_savings_micros',COALESCE(SUM(u.cache_savings_micros),0),'cost_micros',COALESCE(SUM(u.total_cost_micros),0),'latency_ms',AVG(x.latency_ms),'ttft_ms',AVG(x.first_token_at-x.started_at*1000),'tokens_per_second',AVG(CASE WHEN u.id IS NOT NULL AND x.latency_ms>0 THEN CAST(u.output_tokens AS REAL)*1000.0/x.latency_ms END)) AS document FROM request_facts r JOIN execution_facts e ON e.request_id=r.id LEFT JOIN usage_logs u ON u.execution_id=e.id LEFT JOIN request_executions x ON x.id=e.id WHERE r.project_id=? AND r.started_at>=? AND r.started_at<? AND (? IS NULL OR e.model_id=?) AND (? IS NULL OR e.provider_id=?) AND (? IS NULL OR r.api_key_id=?) GROUP BY {dimension} ORDER BY {dimension} LIMIT 500"),vec![project.into(),filter.from.unwrap_or(db::now()-86400*30).into(),filter.until.unwrap_or(db::now()+1).into(),filter.model.clone().into(),filter.model.into(),filter.provider.clone().into(),filter.provider.into(),filter.api_key.clone().into(),filter.api_key.into()])).await?;
+    let mut rows = documents(rows)?;
+    if matches!(dimension_name, "provider" | "model") {
+        add_performance_confidence(&mut rows);
+    } else {
+        for row in &mut rows {
+            if let Some(object) = row.as_object_mut() {
+                object.remove("sample_count");
+            }
+        }
+    }
     Ok(Json(
-        json!({"data":documents(rows)?,"source":"sqlite","derived_available":state.observations.is_available()}),
+        json!({"data":rows,"source":"sqlite","derived_available":state.observations.is_available()}),
     ))
+}
+
+/// Matches AxonHub's public throughput-confidence contract. The absolute floors
+/// prevent a tiny group from looking reliable just because every peer is tiny.
+pub(super) fn performance_confidence_level(sample_count: u64, median: f64) -> &'static str {
+    if median == 0.0 || sample_count < 100 {
+        return "low";
+    }
+    let ratio = sample_count as f64 / median;
+    if sample_count >= 500 && ratio >= 1.5 {
+        "high"
+    } else if ratio >= 0.5 {
+        "medium"
+    } else {
+        "low"
+    }
+}
+
+pub(super) fn add_performance_confidence(rows: &mut [Value]) {
+    let mut sample_counts = rows
+        .iter()
+        .filter_map(|row| row.get("sample_count").and_then(Value::as_u64))
+        // AxonHub's median is over throughput result rows, which necessarily
+        // have at least one measured request. Keep zero-sample analytics rows
+        // visible as low confidence without letting them lower that baseline.
+        .filter(|count| *count > 0)
+        .collect::<Vec<_>>();
+    sample_counts.sort_unstable();
+    let median = match sample_counts.len() {
+        0 => 0.0,
+        len if len % 2 == 1 => sample_counts[len / 2] as f64,
+        len => (sample_counts[len / 2 - 1] as f64 + sample_counts[len / 2] as f64) / 2.0,
+    };
+    for row in rows {
+        let sample_count = row.get("sample_count").and_then(Value::as_u64).unwrap_or(0);
+        if let Some(object) = row.as_object_mut() {
+            object.insert(
+                "confidence_level".into(),
+                json!(performance_confidence_level(sample_count, median)),
+            );
+        }
+    }
 }
 
 async fn live_requests(

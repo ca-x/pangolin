@@ -53,9 +53,11 @@ export type RequestItem = { internal_id: string; request_id: string; started_at:
 /**
  * One row of `/analytics`: the aggregate of a single value of the selected
  * dimension. `dimension` is an opaque id for every entity facet, and `latency_ms`
- * and `ttft_ms` are averages the projection may not be able to compute.
+ * and `ttft_ms` are averages the projection may not be able to compute. Provider
+ * and model rows also carry the measured throughput sample count and its
+ * reference-compatible confidence classification.
  */
-export type AnalyticsRow = { dimension: string | null; requests: number; attempts: number; errors: number; usage_measured?: boolean; input_tokens: number; output_tokens: number; cache_hit_tokens: number; cache_savings_micros: number; cost_micros: number; latency_ms: number | null; ttft_ms: number | null; tokens_per_second?: number | null }
+export type AnalyticsRow = { dimension: string | null; requests: number; attempts: number; errors: number; sample_count?: number; confidence_level?: 'low' | 'medium' | 'high'; usage_measured?: boolean; input_tokens: number; output_tokens: number; cache_hit_tokens: number; cache_savings_micros: number; cost_micros: number; latency_ms: number | null; ttft_ms: number | null; tokens_per_second?: number | null }
 export type LiveRequest = { model: string; channel_id: string; api_key_id: string; started_at: number }
 /**
  * The projection's detail document for one request: the same facts as a list row plus

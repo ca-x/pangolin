@@ -5,6 +5,7 @@ use serde_json::{Value, json};
 #[derive(Clone)]
 pub enum ResponseTransform {
     Identity,
+    Antigravity(Box<ResponseTransform>),
     GeminiChat(String),
     ChatGemini,
     ChatMessages(String),
@@ -16,6 +17,13 @@ impl ResponseTransform {
     pub fn apply(&self, body: Value) -> Result<Value, ApiError> {
         match self {
             Self::Identity => Ok(body),
+            Self::Antigravity(inner) => {
+                let response = body
+                    .get("response")
+                    .cloned()
+                    .ok_or_else(|| invalid("Antigravity response missing response"))?;
+                inner.apply(response)
+            }
             Self::Bedrock(model) => super::upstream::bedrock_response(model, body),
             Self::GeminiEmbedding => {
                 let items = body["embeddings"]

@@ -109,6 +109,7 @@ async fn fixture(mock: Router) -> Fixture {
                 .build()
                 .unwrap(),
             oidc_client: reqwest::Client::new(),
+            oauth_client: crate::oauth::HttpClient::new(Duration::from_secs(3)).unwrap(),
             budget_locks: Arc::new(Mutex::new(HashMap::new())),
             maintenance: Arc::new(tokio::sync::RwLock::new(())),
             orchestrator: Arc::new(orchestration::Runtime::default()),
@@ -271,6 +272,50 @@ async fn model_discovery_include_all_projects_only_typed_catalog_card_metadata()
             }]
         })
     );
+}
+
+#[tokio::test]
+async fn model_retrieve_projects_the_same_typed_catalog_metadata() {
+    let f = fixture(Router::new()).await;
+    let stored = json!({
+        "catalog_version": "test-v1",
+        "logo_key": "lobehub:OpenAI",
+        "provider_secret": "must-not-leak",
+        "card": {
+            "developer": "openai",
+            "type": "chat",
+            "limits": { "context": 128_000, "output": 16_384 },
+            "extensions": { "internal": "must-not-leak" }
+        }
+    });
+    sql(
+        &f,
+        "UPDATE models SET created_at=42,catalog_metadata_json=?",
+        vec![stored.to_string().into()],
+    )
+    .await;
+
+    let response = router(f.state.clone())
+        .oneshot(
+            Request::get("/v1/models/public")
+                .header("authorization", format!("Bearer {}", f.token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+            .unwrap();
+
+    assert_eq!(body["id"], "public");
+    assert_eq!(body["metadata"]["developer"], "openai");
+    assert_eq!(body["metadata"]["type"], "chat");
+    assert_eq!(body["metadata"]["logo_key"], "lobehub:OpenAI");
+    assert_eq!(body["metadata"]["limits"]["context"], 128_000);
+    assert!(body.to_string().find("provider_secret").is_none());
+    assert!(body.to_string().find("must-not-leak").is_none());
 }
 
 #[tokio::test]

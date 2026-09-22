@@ -10,6 +10,8 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+const AUTH_FAILURE_AUDIT_RETENTION_DAYS: i64 = 90;
+
 pub fn start(state: AppState) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let owner = id();
@@ -939,6 +941,14 @@ pub async fn gc(state: &AppState) -> Result<(), ApiError> {
     tx.execute(sql(
         "DELETE FROM response_sessions WHERE expires_at<=?",
         vec![now.into()],
+    ))
+    .await?;
+    // Anonymous password failures are valuable threat evidence, but retaining them forever makes
+    // the unauthenticated endpoint an unbounded record-system growth vector. Successful login and
+    // every authenticated/control-plane audit remain durable; only this narrow class expires.
+    tx.execute(sql(
+        "DELETE FROM audit_events WHERE actor_user_id IS NULL AND action='login_failed' AND resource_type='authentication' AND json_extract(details,'$.method')='password' AND created_at<?",
+        vec![(now - AUTH_FAILURE_AUDIT_RETENTION_DAYS * 86_400).into()],
     ))
     .await?;
     let policies = tx

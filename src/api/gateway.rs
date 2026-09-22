@@ -2,6 +2,66 @@ use super::*;
 use crate::orchestration::{self, AttemptGuard, AttemptOutcome, policy::ErrorMode, stream as sse};
 use futures_util::StreamExt;
 use std::time::Duration;
+use zeroize::Zeroizing;
+
+async fn resolve_candidate_credential(
+    state: &AppState,
+    candidate: &orchestration::Candidate,
+    project_id: &str,
+) -> Result<Zeroizing<String>, ApiError> {
+    let target = &candidate.target;
+    let decrypted = state.secrets.decrypt(&target.secret_envelope)?;
+    let Some(flow) = crate::oauth::Flow::for_credential_type(&target.credential_type) else {
+        return crate::oauth::credential_secret(&target.credential_type, decrypted)
+            .map_err(ApiError::Internal);
+    };
+    if !flow.supports_provider_kind(&target.provider_kind) {
+        return Err(ApiError::Upstream(
+            "channel credential could not be resolved".into(),
+        ));
+    }
+    let spec =
+        super::operations_api::provider_oauth_spec(state, &candidate.provider_id, flow).await?;
+    let resolved = crate::oauth::resolve_credential(
+        &state.oauth_client,
+        spec,
+        &target.credential_type,
+        decrypted,
+        db::now(),
+    )
+    .await
+    .map_err(|_| ApiError::Upstream("channel credential could not be resolved".into()))?;
+    let (secret, replacement) = resolved.into_parts();
+    if let Some(replacement) = replacement {
+        let envelope = state.secrets.encrypt(&replacement)?;
+        let tx = state.db.begin().await?;
+        let changed = tx
+            .execute(crate::operations::sql(
+                "UPDATE channel_credentials SET secret_envelope=?,updated_at=? WHERE id=? AND provider_id=? AND secret_envelope=?",
+                vec![
+                    envelope.into(),
+                    db::now().into(),
+                    candidate.credential_id.clone().into(),
+                    candidate.provider_id.clone().into(),
+                    target.secret_envelope.clone().into(),
+                ],
+            ))
+            .await?
+            .rows_affected();
+        if changed == 1 {
+            crate::operations::audit(
+                &tx,
+                None,
+                project_id,
+                "credentials.oauth.refresh",
+                &candidate.credential_id,
+            )
+            .await?;
+        }
+        tx.commit().await?;
+    }
+    Ok(secret)
+}
 
 #[derive(Clone)]
 enum KeySource {
@@ -353,10 +413,12 @@ async fn execute_inner(
                 tokio::time::sleep(Duration::from_millis(candidate.retry.delay_ms)).await;
             }
             let target = &candidate.target;
-            let secret = match state
-                .secrets
-                .decrypt(&target.secret_envelope)
-                .and_then(|secret| crate::oauth::credential_secret(&target.credential_type, secret))
+            let secret = match resolve_candidate_credential(
+                &state,
+                candidate,
+                &credential.project_id,
+            )
+            .await
             {
                 Ok(secret) => secret,
                 Err(error) => {

@@ -213,6 +213,7 @@ pub async fn load_profile(db: &DatabaseConnection, key: &ApiKeyCredential) -> Re
     repository::profile(db, key).await
 }
 
+#[cfg(test)]
 pub async fn visible_models(
     db: &DatabaseConnection,
     key: &ApiKeyCredential,

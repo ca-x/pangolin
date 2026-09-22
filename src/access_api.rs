@@ -1087,6 +1087,7 @@ mod tests {
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .unwrap(),
+            oauth_client: crate::oauth::HttpClient::new(Duration::from_secs(3)).unwrap(),
             budget_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             maintenance: Arc::new(tokio::sync::RwLock::new(())),
             orchestrator: Arc::new(crate::orchestration::Runtime::default()),

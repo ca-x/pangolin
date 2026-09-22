@@ -600,6 +600,84 @@ async fn count(f: &Fixture, query: &str) -> i64 {
 fn success() -> Router {
     Router::new().route("/v1/chat/completions",post(||async {Json(json!({"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":100,"completion_tokens":10,"prompt_tokens_details":{"cached_tokens":20}}}))}))
 }
+
+#[test]
+fn performance_confidence_matches_reference_boundaries() {
+    use crate::api::operations_api::{add_performance_confidence, performance_confidence_level};
+
+    for (samples, median, expected) in [
+        (0, 0.0, "low"),
+        (99, 1.0, "low"),
+        (100, 200.0, "medium"),
+        (100, 201.0, "low"),
+        (499, 300.0, "medium"),
+        (500, 333.33, "high"),
+    ] {
+        assert_eq!(
+            performance_confidence_level(samples, median),
+            expected,
+            "samples={samples}, median={median}"
+        );
+    }
+
+    let mut rows = vec![
+        json!({"sample_count": 100}),
+        json!({"sample_count": 2_000}),
+        json!({"sample_count": 500}),
+    ];
+    add_performance_confidence(&mut rows);
+    assert_eq!(rows[0]["confidence_level"], "low");
+    assert_eq!(rows[1]["confidence_level"], "high");
+    assert_eq!(rows[2]["confidence_level"], "medium");
+
+    let mut rows_with_unmeasured_group = vec![
+        json!({"sample_count": 0}),
+        json!({"sample_count": 760}),
+        json!({"sample_count": 500}),
+    ];
+    add_performance_confidence(&mut rows_with_unmeasured_group);
+    assert_eq!(rows_with_unmeasured_group[0]["confidence_level"], "low");
+    assert_eq!(
+        rows_with_unmeasured_group[1]["confidence_level"], "medium",
+        "a zero-sample row must not lower the measured-group median"
+    );
+}
+
+#[tokio::test]
+async fn provider_and_model_analytics_report_performance_sample_confidence() {
+    let f = fixture(success()).await;
+    assert_eq!(
+        request(&f, "/v1/chat/completions", chat()).await.status(),
+        StatusCode::OK
+    );
+    let cookie = owner(&f).await;
+
+    for dimension in ["provider", "model"] {
+        let body = json_body(
+            admin(
+                &f,
+                &cookie,
+                http::Method::GET,
+                &format!(
+                    "/api/admin/v1/projects/{}/analytics?dimension={dimension}",
+                    db::DEFAULT_PROJECT_ID
+                ),
+                Value::Null,
+                false,
+            )
+            .await,
+        )
+        .await;
+        let measured = body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["sample_count"] == 1)
+            .unwrap_or_else(|| panic!("missing measured {dimension} row: {body}"));
+        assert_eq!(measured["confidence_level"], "low", "{body}");
+    }
+}
+
 #[tokio::test]
 async fn stored_stream_envelopes_preserve_terminal_metadata_and_sanitize_json() {
     let f = fixture(Router::new().route(

@@ -174,3 +174,65 @@ async fn payload_retention_is_its_own_resource_and_the_projection_does_not_offer
         "expiring bodies must not delete the request itself"
     );
 }
+
+/// Anonymous password failures have a finite security-audit window. The cleanup is deliberately
+/// narrow: recent failures, successful authentication, and control-plane audit history survive.
+#[tokio::test]
+async fn gc_expires_only_old_anonymous_password_failure_audits() {
+    let f = fixture(success()).await;
+    db::create_initial_admin(
+        &f.state.db,
+        &SetupRequest {
+            email: "audit-owner@example.com".into(),
+            password: "correct horse battery staple".into(),
+            instance_name: None,
+            language: Some("en".into()),
+        },
+    )
+    .await
+    .unwrap();
+    let now = db::now();
+    let old = now - 400 * 86_400;
+    sql(
+        &f,
+        "INSERT INTO audit_events(id,action,resource_type,resource_id,details,created_at) VALUES \
+         ('old-failure','login_failed','authentication','','{\"method\":\"password\",\"reason\":\"invalid_credentials\"}',?), \
+         ('recent-failure','login_failed','authentication','','{\"method\":\"password\",\"reason\":\"invalid_credentials\"}',?)",
+        vec![old.into(), now.into()],
+    )
+    .await;
+    sql(
+        &f,
+        "INSERT INTO audit_events(id,actor_user_id,action,resource_type,resource_id,details,created_at) \
+         SELECT 'old-success',id,'login','user',id,'{}',? FROM users WHERE email='audit-owner@example.com'",
+        vec![old.into()],
+    )
+    .await;
+    sql(
+        &f,
+        "INSERT INTO audit_events(id,actor_user_id,action,resource_type,resource_id,details,created_at) \
+         SELECT 'old-control',id,'update','system','settings','{}',? FROM users WHERE email='audit-owner@example.com'",
+        vec![old.into()],
+    )
+    .await;
+
+    ops_runtime::gc(&f.state).await.unwrap();
+
+    assert_eq!(
+        count(
+            &f,
+            "SELECT COUNT(*) AS n FROM audit_events WHERE id='old-failure'"
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        count(
+            &f,
+            "SELECT COUNT(*) AS n FROM audit_events WHERE id IN ('recent-failure','old-success','old-control')"
+        )
+        .await,
+        3,
+        "retention must preserve recent threat evidence and durable success/control-plane history"
+    );
+}

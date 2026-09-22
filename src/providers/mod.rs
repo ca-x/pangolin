@@ -205,8 +205,105 @@ pub async fn prepare_routed(
     let mut payload = payload.clone();
     let mut path = route.path.to_owned();
     let mut response = ResponseTransform::Identity;
-    match target.provider_kind.as_str() {
-        "gemini" | "vertex" | "gcp" => {
+    match (
+        target.provider_kind.as_str(),
+        target.credential_type.as_str(),
+    ) {
+        ("gemini", "oauth_antigravity") => {
+            if endpoint == "/v1/chat/completions" {
+                payload = transforms::chat_to_gemini(&payload)?;
+                response = ResponseTransform::Antigravity(Box::new(ResponseTransform::GeminiChat(
+                    target.public_name.clone(),
+                )));
+            } else if matches!(
+                endpoint,
+                "/v1beta/models:generateContent" | "/v1beta/models:streamGenerateContent"
+            ) {
+                response = ResponseTransform::Antigravity(Box::new(ResponseTransform::Identity));
+            } else {
+                return Err(invalid("unsupported Antigravity operation"));
+            }
+            payload
+                .as_object_mut()
+                .ok_or_else(|| invalid("request must be an object"))?
+                .remove("model");
+            payload.as_object_mut().unwrap().remove("stream");
+            let project = cloud::antigravity_project(secret)?;
+            payload = serde_json::json!({
+                "project": project,
+                "model": target.upstream_name,
+                "request": payload,
+                "requestType": "agent",
+                "userAgent": "pangolin",
+                "requestId": format!("agent-{}", uuid::Uuid::new_v4()),
+            });
+            path = if endpoint == "/v1beta/models:streamGenerateContent" {
+                "/v1internal:streamGenerateContent?alt=sse".into()
+            } else {
+                "/v1internal:generateContent".into()
+            };
+            headers.insert(
+                header::USER_AGENT,
+                HeaderValue::from_static(concat!("pangolin/", env!("CARGO_PKG_VERSION"))),
+            );
+            headers.insert(
+                "x-goog-api-client",
+                HeaderValue::from_static("google-cloud-sdk vscode_cloudshelleditor/0.1"),
+            );
+            headers.insert(
+                "client-metadata",
+                HeaderValue::from_static(
+                    r#"{"ideType":"ANTIGRAVITY","platform":"PLATFORM_UNSPECIFIED","pluginType":"GEMINI"}"#,
+                ),
+            );
+        }
+        ("openai", "oauth_github_copilot") => {
+            if endpoint != "/v1/chat/completions" {
+                return Err(invalid("unsupported GitHub Copilot operation"));
+            }
+            path = "/chat/completions".into();
+            for (name, value) in [
+                ("editor-version", "vscode/1.95.0"),
+                ("editor-plugin-version", "copilot-chat/0.26.7"),
+                ("user-agent", "GitHubCopilotChat/0.26.7"),
+                ("openai-intent", "conversation-edits"),
+                ("copilot-integration-id", "vscode-chat"),
+                ("x-github-api-version", "2025-04-01"),
+                ("x-vscode-user-agent-library-version", "electron-fetch"),
+            ] {
+                headers.insert(
+                    http::header::HeaderName::from_static(name),
+                    HeaderValue::from_static(value),
+                );
+            }
+            if copilot_has_vision(&payload) {
+                headers.insert("copilot-vision-request", HeaderValue::from_static("true"));
+            }
+            let inferred = payload["messages"]
+                .as_array()
+                .and_then(|messages| messages.last())
+                .map(|message| {
+                    let tool_result = message["content"]
+                        .as_array()
+                        .and_then(|parts| parts.last())
+                        .and_then(|part| part["type"].as_str())
+                        == Some("tool_result");
+                    if message["role"] == "user" && !tool_result {
+                        "user"
+                    } else {
+                        "agent"
+                    }
+                })
+                .unwrap_or("user");
+            let initiator = inbound
+                .get("x-initiator")
+                .and_then(|value| value.to_str().ok())
+                .map(str::trim)
+                .filter(|value| matches!(*value, "user" | "agent"))
+                .unwrap_or(inferred);
+            headers.insert("x-initiator", HeaderValue::from_str(initiator).unwrap());
+        }
+        ("gemini" | "vertex" | "gcp", _) => {
             if endpoint == "/v1/chat/completions" {
                 payload = transforms::chat_to_gemini(&payload)?;
                 response = ResponseTransform::GeminiChat(target.public_name.clone());
@@ -241,22 +338,22 @@ pub async fn prepare_routed(
                 path.push_str("?alt=sse");
             }
         }
-        "bedrock" => {
+        ("bedrock", _) => {
             payload = upstream::bedrock_request(&target.upstream_name, &payload)?;
             response = ResponseTransform::Bedrock(target.public_name.clone());
             path = format!("/model/{}/converse", segment(&target.upstream_name));
         }
-        _ if endpoint.starts_with("/v1beta/models:") => {
+        (_, _) if endpoint.starts_with("/v1beta/models:") => {
             payload = transforms::gemini_to_chat(&payload)?;
             path = "/v1/chat/completions".into();
             response = ResponseTransform::ChatGemini;
         }
-        _ if endpoint == "/v1/messages" && target.provider_kind != "anthropic" => {
+        (_, _) if endpoint == "/v1/messages" && target.provider_kind != "anthropic" => {
             payload = transforms::messages_to_chat(&payload)?;
             path = "/v1/chat/completions".into();
             response = ResponseTransform::ChatMessages(target.public_name.clone());
         }
-        _ => {}
+        (_, _) => {}
     }
     if route.path != endpoint && !route.path.contains('{') {
         path = route.path.to_owned();
@@ -305,6 +402,24 @@ pub async fn prepare_routed(
         headers,
         payload,
         response,
+    })
+}
+
+fn copilot_has_vision(payload: &Value) -> bool {
+    payload["messages"].as_array().is_some_and(|messages| {
+        messages.iter().any(|message| {
+            message["content"].as_array().is_some_and(|parts| {
+                parts.iter().any(|part| {
+                    part["type"] == "image_url"
+                        || part.get("image_url").is_some_and(|value| !value.is_null())
+                        || part["text"]
+                            .as_str()
+                            .is_some_and(|text| text.starts_with("data:image/"))
+                })
+            }) || message["content"]
+                .as_str()
+                .is_some_and(|text| text.starts_with("data:image/"))
+        })
     })
 }
 

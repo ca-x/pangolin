@@ -1,7 +1,12 @@
-use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+use std::{
+    collections::HashMap,
+    net::{IpAddr, SocketAddr},
+    sync::{Arc, Mutex as StdMutex},
+    time::{Duration, Instant},
+};
 
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     body::Body,
     extract::{ConnectInfo, Path, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
@@ -11,7 +16,7 @@ use axum::{
 };
 use sea_orm::{ConnectionTrait, DatabaseConnection, TransactionTrait};
 use serde_json::{Map, Value, json};
-use tokio::sync::{Mutex, OwnedMutexGuard};
+use tokio::sync::{Mutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
 
 mod catalog_api;
@@ -38,9 +43,124 @@ pub struct AppState {
     pub observations: ObservationStore,
     pub client: reqwest::Client,
     pub oidc_client: reqwest::Client,
+    pub oauth_client: crate::oauth::HttpClient,
     pub budget_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     pub maintenance: Arc<tokio::sync::RwLock<()>>,
     pub orchestrator: Arc<crate::orchestration::Runtime>,
+}
+
+const DUMMY_PASSWORD_HASH: &str =
+    "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+#[derive(Clone, Copy)]
+struct LoginLimits {
+    window: Duration,
+    max_keys: usize,
+    attempts_per_peer: u16,
+    attempts_per_identity: u16,
+    attempts_global: u16,
+    concurrent: usize,
+}
+
+impl Default for LoginLimits {
+    fn default() -> Self {
+        Self {
+            window: Duration::from_secs(10 * 60),
+            max_keys: 4_096,
+            attempts_per_peer: 20,
+            attempts_per_identity: 5,
+            attempts_global: 100,
+            concurrent: 2,
+        }
+    }
+}
+
+struct LoginLimiterState {
+    window_started: Instant,
+    peers: HashMap<Option<IpAddr>, u16>,
+    identities: HashMap<(Option<IpAddr>, [u8; 32]), u16>,
+    global: u16,
+}
+
+impl LoginLimiterState {
+    fn new(now: Instant) -> Self {
+        Self {
+            window_started: now,
+            peers: HashMap::new(),
+            identities: HashMap::new(),
+            global: 0,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct LoginLimiter {
+    limits: LoginLimits,
+    state: Arc<StdMutex<LoginLimiterState>>,
+    concurrent: Arc<Semaphore>,
+}
+
+struct LoginAdmission {
+    _permit: OwnedSemaphorePermit,
+}
+
+impl Default for LoginLimiter {
+    fn default() -> Self {
+        Self::with_limits(LoginLimits::default())
+    }
+}
+
+impl LoginLimiter {
+    fn with_limits(limits: LoginLimits) -> Self {
+        Self {
+            limits,
+            state: Arc::new(StdMutex::new(LoginLimiterState::new(Instant::now()))),
+            concurrent: Arc::new(Semaphore::new(limits.concurrent)),
+        }
+    }
+
+    /// Admit before any SQLite lookup or Argon2 work. A saturated worker gate, a poisoned state
+    /// lock, or a full key table all reject closed; none falls through to expensive work.
+    fn admit(&self, identifier: &str, peer: Option<IpAddr>) -> Option<LoginAdmission> {
+        let permit = Arc::clone(&self.concurrent).try_acquire_owned().ok()?;
+        self.check_at(identifier, peer, Instant::now())
+            .then_some(LoginAdmission { _permit: permit })
+    }
+
+    fn check_at(&self, identifier: &str, peer: Option<IpAddr>, now: Instant) -> bool {
+        let identifier = identifier.trim().to_ascii_lowercase();
+        let digest = *blake3::hash(identifier.as_bytes()).as_bytes();
+        let identity = (peer, digest);
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        if now.saturating_duration_since(state.window_started) >= self.limits.window {
+            *state = LoginLimiterState::new(now);
+        }
+        let new_peer = !state.peers.contains_key(&peer);
+        let new_identity = !state.identities.contains_key(&identity);
+        if (new_peer && state.peers.len() >= self.limits.max_keys)
+            || (new_identity && state.identities.len() >= self.limits.max_keys)
+            || state.global >= self.limits.attempts_global
+            || state.peers.get(&peer).copied().unwrap_or(0) >= self.limits.attempts_per_peer
+            || state.identities.get(&identity).copied().unwrap_or(0)
+                >= self.limits.attempts_per_identity
+        {
+            return false;
+        }
+        state.global += 1;
+        *state.peers.entry(peer).or_default() += 1;
+        *state.identities.entry(identity).or_default() += 1;
+        true
+    }
+
+    #[cfg(test)]
+    fn tracked_keys(&self) -> (usize, usize) {
+        self.state
+            .lock()
+            .map(|state| (state.peers.len(), state.identities.len()))
+            .unwrap_or((0, 0))
+    }
 }
 
 impl AppState {
@@ -237,6 +357,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/chat/completions", post(gateway_chat))
         .route("/v1/responses", post(gateway_responses))
         .route("/v1/messages", post(gateway_messages))
+        .layer(Extension(LoginLimiter::default()))
         .layer(middleware::from_fn(browser_csrf))
         .layer(middleware::from_fn(errors::native_errors))
         .layer(middleware::from_fn(capture_trusted_client_ip))
@@ -433,9 +554,18 @@ async fn setup(
 }
 
 async fn login(
+    Extension(limiter): Extension<LoginLimiter>,
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(request): Json<LoginRequest>,
 ) -> Result<Response, ApiError> {
+    let normalized_email = request.email.trim().to_ascii_lowercase();
+    let Some(_admission) = limiter.admit(&normalized_email, trusted_client_ip(&headers)) else {
+        // Match every other invalid-credential response. Earlier admitted failures provide bounded
+        // durable evidence; refusing here avoids turning the audit trail itself into an
+        // unauthenticated SQLite write sink.
+        return Err(ApiError::Unauthorized);
+    };
     if !crate::oidc::password_login_allowed(&state.db)
         .await
         .map_err(errors::access)?
@@ -443,14 +573,20 @@ async fn login(
         record_login_failure(&state, "login_only_policy").await;
         return Err(ApiError::Unauthorized);
     }
-    let Some(user) = db::find_user_by_email(&state.db, &request.email).await? else {
-        record_login_failure(&state, "invalid_credentials").await;
-        return Err(ApiError::Unauthorized);
-    };
-    if !crypto::verify_password(&request.password, &user.password_hash) {
+    let user = db::find_user_by_email(&state.db, &normalized_email).await?;
+    let password_hash = user
+        .as_ref()
+        .map(|user| user.password_hash.as_str())
+        .unwrap_or(DUMMY_PASSWORD_HASH);
+    if !crypto::verify_password(&request.password, password_hash) {
         record_login_failure(&state, "invalid_credentials").await;
         return Err(ApiError::Unauthorized);
     }
+    let Some(user) = user else {
+        // The dummy hash can never authenticate, but keep this boundary fail closed if its constant
+        // is ever changed incorrectly.
+        return Err(ApiError::Unauthorized);
+    };
     db::record_audit_event(
         &state.db,
         &user.id,
@@ -1472,6 +1608,70 @@ mod tests {
     use axum::{body::to_bytes, http::Request};
     use tower::ServiceExt as _;
 
+    fn test_login_limits() -> LoginLimits {
+        LoginLimits {
+            window: Duration::from_secs(60),
+            max_keys: 2,
+            attempts_per_peer: 2,
+            attempts_per_identity: 1,
+            attempts_global: 10,
+            concurrent: 1,
+        }
+    }
+
+    #[test]
+    fn login_limiter_keys_normalized_identity_and_trusted_peer() {
+        let limiter = LoginLimiter::with_limits(test_login_limits());
+        let now = Instant::now();
+        let peer = Some("192.0.2.1".parse().unwrap());
+
+        assert!(limiter.check_at(" Owner@Example.com ", peer, now));
+        assert!(
+            !limiter.check_at("owner@example.com", peer, now),
+            "case and surrounding whitespace must not create a fresh identifier bucket"
+        );
+        assert!(limiter.check_at("other@example.com", peer, now));
+        assert!(
+            !limiter.check_at("third@example.com", peer, now),
+            "changing identifiers must not bypass the trusted-peer budget"
+        );
+    }
+
+    #[test]
+    fn login_limiter_capacity_is_bounded_and_rejects_new_keys_closed() {
+        let limiter = LoginLimiter::with_limits(test_login_limits());
+        let now = Instant::now();
+        assert!(limiter.check_at("one@example.com", Some("192.0.2.1".parse().unwrap()), now));
+        assert!(limiter.check_at("two@example.com", Some("192.0.2.2".parse().unwrap()), now));
+        assert!(!limiter.check_at("three@example.com", Some("192.0.2.3".parse().unwrap()), now));
+        assert_eq!(limiter.tracked_keys(), (2, 2));
+    }
+
+    #[test]
+    fn login_limiter_expires_all_key_state_after_its_window() {
+        let limits = test_login_limits();
+        let limiter = LoginLimiter::with_limits(limits);
+        let now = Instant::now();
+        let peer = Some("192.0.2.1".parse().unwrap());
+        assert!(limiter.check_at("owner@example.com", peer, now));
+        assert!(!limiter.check_at("owner@example.com", peer, now));
+        assert!(limiter.check_at(
+            "owner@example.com",
+            peer,
+            now + limits.window + Duration::from_millis(1)
+        ));
+        assert_eq!(limiter.tracked_keys(), (1, 1));
+    }
+
+    #[test]
+    fn dummy_password_hash_is_structurally_valid() {
+        assert!(argon2::PasswordHash::new(DUMMY_PASSWORD_HASH).is_ok());
+        assert!(!crypto::verify_password(
+            "any supplied password",
+            DUMMY_PASSWORD_HASH
+        ));
+    }
+
     #[tokio::test]
     async fn client_network_identity_comes_only_from_the_server_connection() {
         let app = Router::new()
@@ -1624,6 +1824,8 @@ mod tests {
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .unwrap(),
+            oauth_client: crate::oauth::HttpClient::new(std::time::Duration::from_secs(30))
+                .unwrap(),
             budget_locks: Arc::new(Mutex::new(HashMap::new())),
             maintenance: Arc::new(tokio::sync::RwLock::new(())),
             orchestrator: Arc::new(crate::orchestration::Runtime::default()),
@@ -1696,6 +1898,8 @@ mod tests {
             oidc_client: reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
+                .unwrap(),
+            oauth_client: crate::oauth::HttpClient::new(std::time::Duration::from_secs(30))
                 .unwrap(),
             budget_locks: Arc::new(Mutex::new(HashMap::new())),
             maintenance: Arc::new(tokio::sync::RwLock::new(())),
@@ -1835,6 +2039,8 @@ mod tests {
             oidc_client: reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
+                .unwrap(),
+            oauth_client: crate::oauth::HttpClient::new(std::time::Duration::from_secs(30))
                 .unwrap(),
             budget_locks: Arc::new(Mutex::new(HashMap::new())),
             maintenance: Arc::new(tokio::sync::RwLock::new(())),

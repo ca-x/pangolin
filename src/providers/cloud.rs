@@ -17,6 +17,15 @@ fn credential(secret: &str) -> Result<Map<String, Value>, ApiError> {
         .map_err(|_| invalid("cloud channel credential must be a JSON object"))
 }
 
+pub(super) fn antigravity_project(secret: &str) -> Result<String, ApiError> {
+    credential(secret)?
+        .get("project_id")
+        .and_then(Value::as_str)
+        .filter(|project| !project.is_empty() && project.len() <= 256)
+        .map(str::to_owned)
+        .ok_or_else(|| ApiError::Upstream("channel credential could not be resolved".into()))
+}
+
 pub async fn authenticate(
     target: &RouteTarget,
     secret: &str,
@@ -43,7 +52,8 @@ pub(super) async fn authenticate_at(
         ),
         "oauth_xai" => target.provider_kind == "xai",
         "oauth_claude_code" => target.provider_kind == "anthropic",
-        "oauth_antigravity" | "oauth_github_copilot" => false,
+        "oauth_antigravity" => target.provider_kind == "gemini",
+        "oauth_github_copilot" => target.provider_kind == "openai",
         kind if kind.starts_with("oauth_") => false,
         _ => true,
     };
@@ -61,7 +71,19 @@ pub(super) async fn authenticate_at(
             }
         }
         "gemini" => {
-            header(headers, "x-goog-api-key", secret)?;
+            if target.credential_type == "oauth_antigravity" {
+                let params = credential(secret)?;
+                let access_token = params
+                    .get("access_token")
+                    .and_then(Value::as_str)
+                    .filter(|token| !token.is_empty() && token.len() <= 16 * 1024)
+                    .ok_or_else(|| {
+                        ApiError::Upstream("channel credential could not be resolved".into())
+                    })?;
+                header(headers, "authorization", &format!("Bearer {access_token}"))?;
+            } else {
+                header(headers, "x-goog-api-key", secret)?;
+            }
         }
         "azure" => {
             let params = if secret.trim_start().starts_with('{') {

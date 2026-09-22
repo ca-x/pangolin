@@ -381,7 +381,16 @@ async fn model(
 ) -> Result<Response, ApiError> {
     let _maintenance = state.maintenance.clone().read_owned().await;
     let key = gateway_key(&state, &headers).await?;
-    let models = crate::orchestration::visible_models(&state.db, &key, &headers).await?;
+    // A single-model read is an explicit discovery request, so return the same
+    // bounded, typed card projection as `GET /v1/models?include=all`. Candidate
+    // generation still decides visibility before any catalog metadata is read.
+    let models = crate::orchestration::visible_models_with_metadata_for(
+        &state.db,
+        &key,
+        &headers,
+        crate::providers::ENDPOINTS,
+    )
+    .await?;
     let value = models
         .into_iter()
         .find(|v| v["id"] == model)

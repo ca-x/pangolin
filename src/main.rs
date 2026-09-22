@@ -74,6 +74,7 @@ async fn main() -> Result<()> {
             .connect_timeout(std::time::Duration::from_secs(10))
             .timeout(config.upstream_timeout)
             .build()?,
+        oauth_client: oauth::HttpClient::new(config.upstream_timeout)?,
         budget_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         maintenance: Arc::new(tokio::sync::RwLock::new(())),
         orchestrator: Arc::new(orchestration::Runtime::default()),

@@ -256,6 +256,7 @@ code { overflow-wrap: anywhere; }
 .analytics-bar-value { flex: 0 0 auto; font-variant-numeric: tabular-nums; }
 .analytics-bar-track { height: 8px; overflow: hidden; border-radius: 999px; background: var(--surface-muted); }
 .analytics-bar-track span { display: block; height: 100%; border-radius: inherit; background: var(--accent); }
+.analytics-bar-track span[data-confidence='low'] { opacity: .45; }
 
 /* ---------------------------------------------------------- resources ---- */
 

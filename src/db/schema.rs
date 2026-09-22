@@ -1033,6 +1033,14 @@ const V26_PROBE_OUTPUT_TOKENS: &str = r#"
 ALTER TABLE channel_probes ADD COLUMN output_tokens INTEGER CHECK(output_tokens IS NULL OR output_tokens >= 0);
 "#;
 
+/// The hourly authentication-audit retention pass must not scan every durable control-plane audit
+/// row. The partial predicate narrows the scan to anonymous authentication failures; GC applies
+/// the remaining password-method predicate before deleting anything.
+const V27_AUTH_FAILURE_AUDIT_RETENTION_INDEX: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_audit_auth_failure_created_at ON audit_events(created_at)
+WHERE actor_user_id IS NULL AND action='login_failed' AND resource_type='authentication';
+"#;
+
 #[derive(FromQueryResult)]
 struct Count {
     count: i64,
@@ -1501,6 +1509,25 @@ pub async fn migrate(db: &DatabaseConnection) -> Result<()> {
             .await?;
         transaction.commit().await?;
     }
+    let auth_audit_retention_index_applied = Count::find_by_statement(statement(
+        "SELECT COUNT(*) AS count FROM schema_migrations WHERE version=27",
+    ))
+    .one(db)
+    .await?
+    .is_some_and(|row| row.count > 0);
+    if !auth_audit_retention_index_applied {
+        let transaction = db.begin().await?;
+        transaction
+            .execute_unprepared(V27_AUTH_FAILURE_AUDIT_RETENTION_INDEX)
+            .await
+            .context("failed to index retained authentication audit failures")?;
+        transaction
+            .execute(statement(
+                "INSERT INTO schema_migrations(version,applied_at) VALUES(27,unixepoch())",
+            ))
+            .await?;
+        transaction.commit().await?;
+    }
     Ok(())
 }
 
@@ -1538,7 +1565,7 @@ mod tests {
 
         assert_eq!(
             scalar(&db, "SELECT MAX(version) AS count FROM schema_migrations").await,
-            26
+            27
         );
         assert_eq!(
             scalar(
@@ -1727,6 +1754,7 @@ mod tests {
             "idx_channel_probes_provider",
             "idx_webhook_deliveries_pending",
             "idx_data_retention_policies_global_resource",
+            "idx_audit_auth_failure_created_at",
             "idx_backup_runs_storage",
         ] {
             assert_eq!(
@@ -2305,7 +2333,7 @@ mod tests {
 
         assert_eq!(
             scalar(&db, "SELECT MAX(version) AS count FROM schema_migrations").await,
-            26
+            27
         );
         assert_eq!(
             scalar(
@@ -2425,7 +2453,7 @@ mod tests {
 
         assert_eq!(
             scalar(&db, "SELECT MAX(version) AS count FROM schema_migrations").await,
-            26
+            27
         );
         assert_eq!(
             scalar(
@@ -2759,6 +2787,38 @@ mod tests {
             scalar(
                 &db,
                 "SELECT COUNT(*) AS count FROM schema_migrations WHERE version=26"
+            )
+            .await,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_failure_audit_retention_index_migration_is_idempotent() {
+        let db = memory_database().await;
+        migrate(&db).await.unwrap();
+        db.execute_unprepared(
+            "DROP INDEX idx_audit_auth_failure_created_at;
+             DELETE FROM schema_migrations WHERE version=27;",
+        )
+        .await
+        .unwrap();
+
+        migrate(&db).await.unwrap();
+        migrate(&db).await.unwrap();
+
+        assert_eq!(
+            scalar(
+                &db,
+                "SELECT COUNT(*) AS count FROM sqlite_master WHERE type='index' AND name='idx_audit_auth_failure_created_at'"
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            scalar(
+                &db,
+                "SELECT COUNT(*) AS count FROM schema_migrations WHERE version=27"
             )
             .await,
             1

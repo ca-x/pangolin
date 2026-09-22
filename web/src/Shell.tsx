@@ -161,7 +161,7 @@ function ShellContent({ user, branding }: { user: User; branding: Branding }) {
         {!branding.onboarding_complete && !onboardingDismissed && (
           <Alert variant="light" color="pangolin" mb="lg" radius="md" className="pm-onboarding" title={isOverview ? t('onboardingTitle') : undefined}>
             <Group justify="space-between" align="center" gap="md" wrap="nowrap" className="pm-onboarding-row">
-              <Text size="sm">{t('onboardingHint')}</Text>
+              <Text size="sm">{t(isOverview ? 'onboardingHint' : 'onboardingProgressHint')}</Text>
               <Group gap="xs" wrap="nowrap">
                 {isOverview ? (
                   <Button component={RouterLink} to="/channels" variant="light" size="sm">
@@ -169,7 +169,7 @@ function ShellContent({ user, branding }: { user: User; branding: Branding }) {
                   </Button>
                 ) : (
                   <Button component={RouterLink} to="/channels" variant="subtle" size="compact-sm">
-                    {t('configureChannel')}
+                    {t('channels')}
                   </Button>
                 )}
                 {/* Dismissing hides the guidance here only; the branding switch
