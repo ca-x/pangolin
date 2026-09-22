@@ -360,6 +360,8 @@ async fn model_card_projection_is_typed_and_malformed_metadata_is_unmeasured() {
             "output_price_micros": 0,
             "priority": 1,
             "enabled": 1,
+            "lifecycle": "active",
+            "disable_developer_settings_inheritance": 0,
             "catalog_metadata": metadata,
             "catalog_developer": "openai",
             "catalog_model_type": "chat",

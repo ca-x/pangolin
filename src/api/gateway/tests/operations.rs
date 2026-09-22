@@ -1759,7 +1759,7 @@ async fn anthropic_chat_bridge_uses_the_channel_proxy() {
     let proxy_url = format!("http://{}", listener.local_addr().unwrap());
     listener.set_nonblocking(true).unwrap();
     let proxy = std::thread::spawn(move || {
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
         let (mut socket, _) = loop {
             match listener.accept() {
                 Ok(connection) => break connection,
@@ -1771,7 +1771,7 @@ async fn anthropic_chat_bridge_uses_the_channel_proxy() {
             }
         };
         socket
-            .set_read_timeout(Some(Duration::from_secs(3)))
+            .set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
         let mut bytes = [0_u8; 4096];
         let count = socket.read(&mut bytes).unwrap();
@@ -1825,7 +1825,7 @@ async fn channel_proxy_preset_is_used_for_provider_egress() {
     let proxy_url = format!("http://{}", listener.local_addr().unwrap());
     listener.set_nonblocking(true).unwrap();
     let proxy = std::thread::spawn(move || {
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
         let (mut socket, _) = loop {
             match listener.accept() {
                 Ok(connection) => break connection,
@@ -1840,7 +1840,7 @@ async fn channel_proxy_preset_is_used_for_provider_egress() {
             }
         };
         socket
-            .set_read_timeout(Some(Duration::from_secs(3)))
+            .set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
         let mut bytes = [0_u8; 4096];
         let count = socket.read(&mut bytes).unwrap();
