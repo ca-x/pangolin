@@ -16,9 +16,29 @@ On startup, interrupted attempts settle before the HTTP listener starts. DuckDB 
 {"enabled":true,"default_level":"metadata","key_override_enabled":false,"key_disable_allowed":false}
 ```
 
+The write document is strict: an unknown field, an unknown level or a field of the wrong type is a 400 that stores nothing and appends no `logging.update` audit row, so a typo cannot silently install a different policy. A field omitted from an accepted document keeps its documented default (`enabled` stays `true`). The stored document is read tolerantly — a field written by another build neither breaks admission nor breaks the settings form — and `GET` answers with the effective policy in the shape above.
+
 Keys select `inherit`, `off`, `metadata`, `redacted_body` or `full_body` through the project `key-logging` mutation. Site disable always wins. Key choices require site override permission; key disable additionally requires `key_disable_allowed`. Defaults store metadata only. `off` creates no browsable thread/trace/request/execution/content rows and sends no DuckDB event, while retaining minimal accounting and security audit records. Existing encrypted Responses history remains an operational session store.
 
 Both body levels remove authorization, cookie, password, credential and token fields recursively. Full-body logging also omits structured base64/data-URI media, including media inside JSON-encoded tool output, and removes URL credentials/query strings. Logging sanitization does not mutate the upstream request. Stored stream content is bounded to 1 MiB. gzip, deflate, Brotli and zstd upstream responses use reqwest decoding before the existing decoded-body/SSE limits and settlement; unsupported residual/stacked encodings fail explicitly. Incoming compressed requests and historical header-casing quirks are not enabled by this change.
+
+For browsable requests (`metadata`, `redacted_body` and `full_body`), Pangolin also
+stores the direct network peer IP supplied by the server connection metadata. It
+does not trust `Forwarded`, `X-Forwarded-For` or a client-supplied internal header,
+so deployments behind a reverse proxy normally record that proxy's address rather
+than claiming it is the end user's address. The IP is detail-only metadata:
+Pangolin does not persist User-Agent or request headers, and never adds the IP to
+payload downloads, curl previews, audit details, logs, list search or facets.
+`off` creates no browsable request row or observation event. Payload-only retention
+may remove captured bodies while keeping this metadata; request retention removes
+the whole request and its IP. Project request detail remains readable with
+`project:read`, and the system-only unscoped detail follows the same field shape.
+
+## Request identity in the console
+
+The projection stores two identities per request. `id` is Pangolin's own request UUID and is unique; `request_id` is the caller-supplied `x-request-id` and is not. Project-scoped reads expose both: `/api/admin/v1/projects/{project}/observability/requests` returns `internal_id` (the projection's `id`) alongside `request_id`, and the console keys rows, detail links and previous/next navigation by `internal_id`.
+
+`/api/admin/v1/projects/{project}/observability/requests/{id}` resolves either identity inside the requested project in one query: an exact internal match wins, otherwise the newest external match is chosen with `started_at DESC, id DESC` breaking ties. The project is part of that query, so a newer row in another project that reuses the external id cannot hide this project's row, and no foreign row is read to decide the answer. Existing external-id links and bookmarks keep working. A caller can send an `x-request-id` equal to another request's internal UUID; the exact internal match still wins.
 
 ## Project API
 

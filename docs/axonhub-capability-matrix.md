@@ -51,6 +51,12 @@ This inventory is the parity source of truth. It is cross-checked against AxonHu
 | IP security | Global blocklist, per-key allowlist, request-log ban affordance |
 | OpenAPI GraphQL auth | Scoped service GraphQL endpoint and playground |
 
+OIDC branding intentionally diverges from AxonHub's remote `icon_url` field.
+Pangolin stores `logo_key`, resolves it only through the bundled `ProviderIcon`
+catalog, and uses deterministic initials for unknown keys. This prevents an
+administrator-supplied value from causing a remote image fetch on the public
+sign-in page; no provider trademark asset is copied into Pangolin.
+
 ## Channels, credentials and models
 
 | Capability | Target behavior |

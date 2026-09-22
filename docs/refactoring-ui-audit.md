@@ -159,3 +159,53 @@ axe 将关闭按钮报为 `button-name` critical：按钮无可读文字、`aria
 - `model-catalog-375-dark-zh-closed-full-raw.png`
 - `system-375-dark-zh-full-raw.png`
 
+## 2026-09-22 复测（Batch B1）
+
+> 复测对象：重新构建的 release binary（`http://127.0.0.1:18120`，已填充渠道、凭据、模型、探针和一次成功 Responses 请求）。
+> 方法：浏览器 axe 4.12.1 与尺寸测量在控制端执行；本批把可复现的对比度与响应式缺陷改成源码级 red/green 测试，并只按测量结果修改颜色与布局。
+
+### 旧结论的关闭
+
+| 旧编号 | 旧结论 | 现状 |
+| --- | --- | --- |
+| P1-1 | 深色主按钮文字对比度不达标 | 已关闭：filled 按钮、分页激活项与勾选框统一消费 `--accent-contrast`（`web/src/mantine.ts` Button/Pagination/Checkbox 的 `vars`）。 |
+| P1-2 | 弹窗关闭按钮无可访问名称 | 已关闭：共享 Modal 与资源弹窗都传 `closeButtonProps={{ 'aria-label': t('close') }}`（`web/src/components.tsx:33`、`web/src/pages/shared.tsx:202`），axe 不再报 `button-name`。 |
+| P2-1 | 关闭态移动抽屉露出 6px 边框 | 已关闭：`.sidebar` 关闭态 `visibility: hidden` + `translateX(-100%)`，退出后不再留边（`web/src/styles.css:451`）。 |
+| P2-2 | 移动抽屉出现两套品牌头和两个关闭按钮 | 已关闭：抽屉内品牌头 `visibleFrom="md"`，移动端只保留顶栏的一套品牌与开关（`web/src/Shell.tsx:95`）。 |
+| P2-5 | 能力标签 9px 且被截断 | 已关闭：能力值改为 12.5px 参考文本、以 `·` 分隔且不截断（`web/src/styles.css:107`）。 |
+| P2-6 | 移动模型目录默认 25 条 | 已关闭：`CATALOG_MOBILE_PAGE_SIZE = 10`（`web/src/pages/ModelsPage.tsx:132`）。 |
+| P2-7 | 目录区块组外间距不足 | 已关闭：`CATALOG_GROUP_GAP = 24`，组内保持 ≤16px（`web/src/pages/ModelsPage.tsx:130`）。 |
+| P2-8 | “高级设置”原始 JSON 占据首屏、状态用勾选圆框 | 已关闭：JSON 字段改为 `Collapse` 渐进披露（`web/src/pages/shared.tsx:306`），状态字段改为设计系统 switch（`web/src/pages/shared.tsx:255`）。 |
+| 其他自动检查 | 375px “英文数据表被裁切” | **未复现**：375×812 英文、有数据的探针页确实切换为卡片，`scrollWidth == 375`，body/document 无横向滚动。jsdom 无法测量溢出，因此不新增该断言，也不再据此改动表格。 |
+
+仍未关闭：P2-3（首次引导与页面主操作竞争）已通过“仅概览页展示完整横幅、其他页面降级为可关闭提示”部分缓解，是否进一步收敛留待后续批次；P2-4（空状态仍展示无效过滤器/批量/暂停控件）本轮未复测。
+
+### 本批新测得的两处对比度缺陷（已修复）
+
+| 位置 | 复测值 | 根因 |
+| --- | --- | --- |
+| 模型与渠道页 `ENABLED` 徽章 | 4.32:1（`#087f5b` on `#c3fae8`，11px bold） | 只有 `pangolin` 家族映射到调色板，`variant="light"` 的 teal/green/yellow/red 仍取 Mantine 自带 ramp（teal-9 / teal-1） |
+| 失败探针弹窗错误文案 | 2.86:1（`#fa5252` on `#f2efe9`，12.5px normal） | `<Text c="red">` 解析到 Mantine red-6，未走语义 token |
+
+同一根因还影响健康列与探针表：`HealthPill` 的告警分支源码计算为 2.69:1（`#e67700` on `#fff3bf`）、探针表成功徽章为 3.81:1（`#2b8a3e` on `#d3f9d8`）；两者在本次有数据状态下没有出现在 axe 报告里，但同样低于 AA，随本次修复一并解决。有数据的 `FAILED` 徽章（`#c92a2a` on `#ffe3e3`，4.51:1）与失败探针行的 `HealthPill` 本身没有 axe violation，符合控制端结论。
+
+修复方式：
+
+- `web/src/mantine.ts` 的 resolver 为 teal/green/yellow/red 增加 `light` / `light-hover` / `light-color` 映射，分别指向 `--success(-soft)`、`--warning(-soft)`、`--danger(-soft)`；调色板 guard 已保证这些配对在两种模式下 ≥4.5:1，因此是共享 token 级修复而非逐个徽章改色。
+- 失败文案改用语义样式 `.error-text { color: var(--danger) }`（`web/src/styles.css`），`web/src/pages/ChannelsPage.tsx:247` 由 `c="red"` 改为该 class，错误语义不变。
+- 审查追加（fix round 1）：`Button variant="outline" color="red"`（`InlineQueryError` 的重试按钮，位于 `--danger-soft` 告警底上）此前仍取 Mantine red-6，普通文字约 3.0:1。resolver 现额外把 `-outline`、`-outline-hover`、`-text` 映射到 danger 家族：`-outline` 取 `--danger`，hover 填充取「danger-soft 55% + surface」，使其在两种模式下都远离文字色（悬停后 5.35:1 / 5.75:1；若沿用 accent 的「soft + 12% 主色」写法会掉到 4.15:1 / 4.30:1），`-text` 为当前无消费者的别名。`filled` 未改动，破坏性确认按钮的观感不变。
+
+### 375px 首次引导横幅（已修复）
+
+- 复现：横幅行是 `nowrap`，操作按钮保持自身宽度，375px 下说明文字被挤成约 150px 一列、几乎逐词换行（证据：`/tmp/pangolin-parity-ui/screenshots/probes-en-light-375.png`）。
+- 修复：`web/src/styles.css` 新增 `@media (max-width: 40em)`，横幅行允许换行、说明占满整行，唯一的操作与本地化命名的关闭控件在其下组成一个紧凑块；桌面两列布局不变。
+- 测试：`consoleFixes.test.tsx` 断言该响应式契约，`onboarding.test.tsx` 断言行内只有一个操作和一个可访问关闭控件。
+
+### 本批新增/更新的测试与证据
+
+- `web/src/consoleFixes.test.tsx`：`status pills paint palette ink instead of Mantine's default ramp`、`failure copy uses the semantic danger ink`、`the onboarding banner stacks below the mobile breakpoint`、`the inline query error retry reads at AA`（fix round 1；bronze/slate/jade × light/dark，比较原始比值，格式化只用于失败信息）。
+- `web/src/onboarding.test.tsx`：`keeps one action and one named dismiss control in the banner row`。
+- RED：`.superpowers/sdd/parity-remaining-handover/evidence/task-b1-red.txt`（9 项失败）、`task-b1-fix1-red.txt`（6 项失败）；GREEN：`task-b1-green-focused.txt`（2 文件 / 25 测试）、`task-b1-green-full.txt`（58 文件 / 1348 测试）、`task-b1-fix1-green-focused.txt`（2 文件 / 33 测试）、`task-b1-fix1-green-full.txt`（58 文件 / 1356 测试）、`task-b1-fix2-green-focused.txt`（1 文件 / 30 测试）、`task-b1-fix2-green-full.txt`（58 文件 / 1356 测试）。
+- fix round 2 为机械收尾：column-header 的两处对比度断言（原 `web/src/consoleFixes.test.tsx:102`、`:108`）同样改为直接比较原始比值（实测 5.41:1 / 6.29:1），断言结果不变，故无可演示的 RED；该文件内所有 `toFixed` 现仅用于失败信息。
+- 完整实现报告（含 fix round 1、2）：`.superpowers/sdd/parity-remaining-handover/task-b1-ui-measurement-report.md`。
+- 控制端重建 release binary 后复测：Models（light/en/1440）、Channels（light/en/1440，含 HEALTHY/ENABLED）、失败探针弹窗（light/en/1440）和 Channels（dark/en/1440）均为 axe 4.12.1 WCAG 2 AA 零 violation；375×812 稳定态 body/document/viewport 宽度均为 375px，引导文案与操作/关闭控件已分两行清晰呈现。截图保存在 `/tmp/pangolin-parity-ui/screenshots/*-b1-fixed*.png`。

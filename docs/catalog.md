@@ -10,6 +10,8 @@ Creating a provider with a catalog preset ID uses its adapter family, default ba
 
 Catalog JSON uses `schema_version: 1`, a nonempty `version`, `source`, `providers`, `models`, and an `extensions` object. Provider entries contain name/category/base/auth/adapter, typed endpoint descriptors, discovery/quota metadata, logo keys and provenance. Model entries contain developer/upstream ID/type, input/output modalities, protocols, optional capability booleans, limits, aliases, lifecycle/dates and optional cost defaults. Missing facts are `null`, not invented values. Unknown capability keys and explicit extension objects survive import/export.
 
+`GET /v1/models` keeps the standard OpenAI-compatible model object by default. An explicit `include=all` adds a fixed `metadata` projection containing only `developer`, `type`, `logo_key`, `limits.{context,output}` and `cost_defaults.{input,output,currency,unit}` from the immutable card stored with a routable project model. A stored card object with missing or wrongly typed facts returns `null` for those facts; an absent, non-object or malformed card omits `metadata`. Unknown `include` values retain the default shape. Raw catalog JSON, provider configuration and routing policy are never included.
+
 Entries merge by stable ID in this order:
 
 1. Built-in catalog.
