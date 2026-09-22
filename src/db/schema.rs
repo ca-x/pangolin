@@ -866,6 +866,34 @@ CREATE TABLE api_key_profile_templates (
 CREATE INDEX idx_api_key_profile_templates_project ON api_key_profile_templates(project_id,updated_at);
 "#;
 
+/// Associations gain a tag-regex selector and a versioned channel-exclusion
+/// document. Version 24 is reserved here because 18–23 belong to parallel
+/// parity migrations.
+const V24_ASSOCIATION_FILTERS: &str = r#"
+ALTER TABLE model_associations RENAME TO model_associations_v23;
+CREATE TABLE model_associations (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    model_id TEXT REFERENCES models(id) ON DELETE CASCADE,
+    provider_id TEXT REFERENCES providers(id) ON DELETE CASCADE,
+    match_type TEXT NOT NULL CHECK(match_type IN ('exact','regex','tag','channel_tags_regex')),
+    pattern TEXT NOT NULL,
+    conditions_json TEXT NOT NULL DEFAULT '{"version":1}',
+    exclusions_json TEXT NOT NULL DEFAULT '{"version":1}',
+    priority INTEGER NOT NULL DEFAULT 100,
+    weight INTEGER NOT NULL DEFAULT 1 CHECK(weight > 0),
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0,1)),
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+INSERT INTO model_associations(id,project_id,model_id,provider_id,match_type,pattern,conditions_json,exclusions_json,priority,weight,enabled,created_at,updated_at)
+SELECT id,project_id,model_id,provider_id,match_type,pattern,conditions_json,'{"version":1}',priority,weight,enabled,created_at,updated_at FROM model_associations_v23;
+DROP TABLE model_associations_v23;
+CREATE INDEX idx_model_associations_project ON model_associations(project_id,enabled,priority);
+CREATE INDEX idx_model_associations_model ON model_associations(model_id);
+CREATE INDEX idx_model_associations_provider ON model_associations(provider_id);
+"#;
+
 #[derive(FromQueryResult)]
 struct Count {
     count: i64,
@@ -1201,6 +1229,25 @@ pub async fn migrate(db: &DatabaseConnection) -> Result<()> {
             .await?;
         transaction.commit().await?;
     }
+    let association_filters_applied = Count::find_by_statement(statement(
+        "SELECT COUNT(*) AS count FROM schema_migrations WHERE version=24",
+    ))
+    .one(db)
+    .await?
+    .is_some_and(|row| row.count > 0);
+    if !association_filters_applied {
+        let transaction = db.begin().await?;
+        transaction
+            .execute_unprepared(V24_ASSOCIATION_FILTERS)
+            .await
+            .context("failed to add association tag regex and exclusions")?;
+        transaction
+            .execute(statement(
+                "INSERT INTO schema_migrations(version,applied_at) VALUES(24,unixepoch())",
+            ))
+            .await?;
+        transaction.commit().await?;
+    }
     Ok(())
 }
 
@@ -1238,7 +1285,23 @@ mod tests {
 
         assert_eq!(
             scalar(&db, "SELECT MAX(version) AS count FROM schema_migrations").await,
-            17
+            24
+        );
+        assert_eq!(
+            scalar(
+                &db,
+                "SELECT COUNT(*) AS count FROM pragma_table_info('model_associations') WHERE name='exclusions_json' AND dflt_value='''{\"version\":1}'''"
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            scalar(
+                &db,
+                "SELECT COUNT(*) AS count FROM sqlite_master WHERE type='table' AND name='model_associations' AND sql LIKE '%channel_tags_regex%'"
+            )
+            .await,
+            1
         );
         assert_eq!(
             scalar(
@@ -1484,7 +1547,7 @@ mod tests {
 
         assert_eq!(
             scalar(&db, "SELECT COUNT(*) AS count FROM schema_migrations").await,
-            16
+            17
         );
         assert_eq!(
             scalar(
@@ -1926,7 +1989,7 @@ mod tests {
 
         assert_eq!(
             scalar(&db, "SELECT MAX(version) AS count FROM schema_migrations").await,
-            17
+            24
         );
         assert_eq!(
             scalar(
@@ -2046,7 +2109,7 @@ mod tests {
 
         assert_eq!(
             scalar(&db, "SELECT MAX(version) AS count FROM schema_migrations").await,
-            17
+            24
         );
         assert_eq!(
             scalar(

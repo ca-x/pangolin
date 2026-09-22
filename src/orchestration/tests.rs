@@ -277,6 +277,81 @@ async fn database_candidates_exact_regex_tag_conditions_dedup_and_project_isolat
 }
 
 #[tokio::test]
+async fn channel_tag_regex_and_association_exclusions_filter_candidates() {
+    let f = database_fixture().await;
+    let (tag_provider, _) = add_model(&f, "tag route", "base", "tag-upstream").await;
+    sql(
+        &f,
+        "UPDATE providers SET settings_json=? WHERE id=?",
+        vec![
+            json!({"version":1,"tags":["region-eu","fast"]})
+                .to_string()
+                .into(),
+            tag_provider.clone().into(),
+        ],
+    )
+    .await;
+    sql(
+        &f,
+        "INSERT INTO model_associations(id,project_id,match_type,pattern,conditions_json,exclusions_json,priority,weight,created_at,updated_at) VALUES('tag-regex',?,'channel_tags_regex','^region-(eu|us)$','{\"version\":1}','{\"version\":1}',1,1,0,0)",
+        vec![f.key.project_id.clone().into()],
+    )
+    .await;
+    let tag_result = plan(&f, json!({"model":"requested"})).await.unwrap();
+    assert_eq!(tag_result.candidates.len(), 1);
+    assert_eq!(tag_result.candidates[0].provider_id, tag_provider);
+
+    sql(&f, "DELETE FROM model_associations", vec![]).await;
+    sql(&f, "DELETE FROM models", vec![]).await;
+    sql(&f, "DELETE FROM providers", vec![]).await;
+    let (name_provider, _) = add_model(&f, "blocked by name", "requested", "name").await;
+    let (id_provider, _) = add_model(&f, "blocked by id", "requested", "id").await;
+    let (tag_provider, _) = add_model(&f, "blocked by tag", "requested", "tag").await;
+    let (allowed_provider, _) = add_model(&f, "allowed", "requested", "allowed").await;
+    sql(
+        &f,
+        "UPDATE providers SET settings_json=? WHERE id=?",
+        vec![
+            json!({"version":1,"tags":["private"]}).to_string().into(),
+            tag_provider.into(),
+        ],
+    )
+    .await;
+    let exclusions = json!({
+        "version": 1,
+        "channel_name_patterns": ["^blocked by name$"],
+        "channel_ids": [id_provider],
+        "channel_tags": ["private"]
+    });
+    sql(
+        &f,
+        "INSERT INTO model_associations(id,project_id,match_type,pattern,conditions_json,exclusions_json,priority,weight,created_at,updated_at) VALUES('with-exclusions',?,'exact','requested','{\"version\":1}',?,1,1,0,0),('also-matches',?,'regex','^requested$','{\"version\":1}','{\"version\":1}',2,1,0,0)",
+        vec![
+            f.key.project_id.clone().into(),
+            exclusions.to_string().into(),
+            f.key.project_id.clone().into(),
+        ],
+    )
+    .await;
+    let result = plan(&f, json!({"model":"requested"})).await.unwrap();
+    let providers = result
+        .candidates
+        .iter()
+        .map(|candidate| candidate.provider_id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(providers, [allowed_provider.as_str()]);
+    assert!(!providers.contains(&name_provider.as_str()));
+    assert!(
+        result
+            .decisions
+            .iter()
+            .filter(|decision| decision.reason == "association_excluded")
+            .count()
+            >= 3
+    );
+}
+
+#[tokio::test]
 async fn quota_health_capability_and_disabled_credentials_are_filtered() {
     let f = database_fixture().await;
     let (provider, _) = add_model(&f, "a", "public", "actual").await;
@@ -849,9 +924,7 @@ fn nested_conditions_fail_closed_and_use_sanitized_headers() {
     );
     assert!(context["headers"].get("authorization").is_none());
     assert!(policy::matches(&json!({"all":[{"field":"/body/model","op":"regex","value":"^gpt$"},{"any":[{"field":"/headers/x-region","op":"eq","value":"eu"},{"field":"/body/temperature","op":"gt","value":1}]}]}),&context).unwrap());
-    assert!(
-        !policy::matches(&json!({"field":"/missing","op":"ne","value":"x"}), &context).unwrap()
-    );
+    assert!(policy::matches(&json!({"field":"/missing","op":"ne","value":"x"}), &context).is_err());
     assert!(
         policy::matches(
             &json!({"field":"/body/model","op":"typo","value":"gpt"}),
@@ -859,6 +932,118 @@ fn nested_conditions_fail_closed_and_use_sanitized_headers() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn association_domain_context_is_sanitized_bounded_and_evaluable() {
+    use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+
+    let now = OffsetDateTime::parse("2026-09-22T13:47:00Z", &Rfc3339).unwrap();
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        http::header::AUTHORIZATION,
+        http::HeaderValue::from_static("Bearer private"),
+    );
+    headers.insert(
+        http::HeaderName::from_static("x-region"),
+        http::HeaderValue::from_static("eu"),
+    );
+    headers.insert(
+        http::HeaderName::from_static("x-oversized"),
+        http::HeaderValue::from_str(&"x".repeat(2_000)).unwrap(),
+    );
+    let body = json!({
+        "model": "gpt",
+        "stream": true,
+        "api_key": "body-private",
+        "oversized": "x".repeat(5_000),
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": "https://example.invalid/a.png"}},
+                {"type": "input_video", "video_url": "https://example.invalid/a.mp4"},
+                {"type": "document", "source": {"media_type": "application/pdf", "data": "ignored"}},
+                {"type": "input_audio", "input_audio": {"data": "ignored", "format": "wav"}}
+            ]
+        }]
+    });
+    let context = policy::context_at(
+        &body,
+        &headers,
+        "/v1/chat/completions",
+        Some(("project", "key")),
+        now,
+    );
+
+    assert_eq!(context["daily_time"], 13 * 60 + 47);
+    assert_eq!(context["daily_time_timezone"], "UTC");
+    assert_eq!(context["daily_time_source"], "gateway_clock");
+    assert_eq!(context["request_format"], "openai_chat");
+    assert_eq!(context["stream"], true);
+    for field in ["has_image", "has_video", "has_document", "has_audio"] {
+        assert_eq!(
+            context[field], true,
+            "{field} should be derived from content"
+        );
+        assert!(
+            policy::matches(
+                &json!({"version":1,"field":format!("/{field}"),"op":"eq","value":true}),
+                &context,
+            )
+            .unwrap(),
+            "{field} should be usable by the condition evaluator"
+        );
+    }
+    assert!(
+        policy::matches(
+            &json!({"version":1,"field":"/daily_time","op":"gte","value":827}),
+            &context
+        )
+        .unwrap()
+    );
+    assert!(
+        policy::matches(
+            &json!({"version":1,"field":"/stream","op":"eq","value":true}),
+            &context
+        )
+        .unwrap()
+    );
+    assert!(
+        policy::matches(
+            &json!({"version":1,"field":"/request_format","op":"eq","value":"openai_chat"}),
+            &context
+        )
+        .unwrap()
+    );
+    assert_eq!(context["headers"]["x-region"], "eu");
+    assert!(context["headers"].get("authorization").is_none());
+    assert!(context["headers"].get("x-oversized").is_none());
+    assert!(context["body"].get("api_key").is_none());
+    assert!(context["body"].get("oversized").is_none());
+
+    let text_only = policy::context_at(
+        &json!({"messages":[{"role":"user","content":"image"}]}),
+        &HeaderMap::new(),
+        "/v1/chat/completions",
+        None,
+        now,
+    );
+    assert_eq!(text_only["has_image"], false);
+
+    let crowded = policy::context_at(
+        &json!({
+            "messages": vec![json!({"type":"text","text":"x"}); 600],
+            "model": "gpt",
+            "stream": true
+        }),
+        &HeaderMap::new(),
+        "/v1/chat/completions",
+        None,
+        now,
+    );
+    assert_eq!(crowded["body"]["model"], "gpt");
+    assert_eq!(crowded["body"]["stream"], true);
+    assert_eq!(crowded["stream"], true);
 }
 
 #[test]

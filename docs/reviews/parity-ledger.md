@@ -53,15 +53,15 @@ states plainly that no test guards it yet.
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | observability | 5 | 10 | 0 | 2 | 3 | 0 | 0 | 20 |
 | prompts & playground | 6 | 12 | 1 | 0 | 0 | 0 | 1 | 20 |
-| models, routing & pricing | 6 | 4 | 2 | 3 | 9 | 2 | 0 | 26 |
+| models, routing & pricing | 6 | 6 | 2 | 2 | 8 | 2 | 0 | 26 |
 | access control | 2 | 16 | 2 | 0 | 0 | 1 | 0 | 21 |
 | system settings & background work | 8 | 9 | 5 | 1 | 5 | 2 | 1 | 31 |
 | console-wide UX | 3 | 9 | 1 | 2 | 0 | 0 | 0 | 15 |
-| **total** | **30** | **60** | **11** | **8** | **17** | **5** | **2** | **133** |
+| **total** | **30** | **62** | **11** | **7** | **16** | **5** | **2** | **133** |
 
 Row count is unchanged at 133 — the six area reports' own findings. No row was
-dropped, merged or added. What changed is the status: **101 rows need no work**
-(30 already matched, 60 fixed, 11 refuted), **30 rows need work** (`partial` +
+dropped, merged or added. What changed is the status: **103 rows need no work**
+(30 already matched, 62 fixed, 11 refuted), **28 rows need work** (`partial` +
 `open` + `feature-build`), and **2 rows are recorded divergences** whose only
 remaining difference is deliberate.
 
@@ -151,8 +151,8 @@ Report: [parity-models-routing-pricing.md](parity-models-routing-pricing.md).
 | 11 | `/v1/models` returns no extended metadata | closed | fixed | Default response bytes remain unchanged. Exact `include=all` adds only the bounded typed B29 card projection after mapping/allowlist/endpoint/candidate visibility; absent/malformed cards omit metadata and unknown include values preserve the legacy shape. | `internal/server/api/openai.go:832,882` (`?include=all`) | six `model_discovery_*` contract tests, including exact bytes, mapped id, hidden model and malformed metadata |
 | 12 | No global model settings surface | open | — | Only instance name/branding/favicon/onboarding exist (`operations_api.rs:195-200`); list filtering is hard-coded (`orchestration/mod.rs:129,159-165`) | `models-settings-dialog.tsx:28-34` | a settings document + form test for blacklist/fallback/include-all |
 | 13 | Project default routing has no write path or UI | closed | fixed | `routing` is read, validated and written by the orchestration settings route (`operations_api.rs:611-655,697,721-722`); the console renders and submits it (`SystemPage.tsx:271-298`) | `models-settings-dialog.tsx` | the harness guard is still missing — see [Deferred corrections](#deferred-corrections) |
-| 14 | Association conditions: no builder, no domain fields | partial | — | Context carries `project_id`/`api_key_id` (`policy.rs:330-345`) but no `daily_time`, media presence, `stream` or `request_format`; the console field is a raw JSON box (`ModelsPage.tsx:62`) | `models-association-dialog.tsx:61-143` | a builder test plus context fields for `daily_time` and media presence |
-| 15 | No `channel_tags + regex` type, no association exclusions | open | — | `tag` requires the pattern to equal a tag and additionally a `model_id` or exact public name (`repository.rs:177-180`); the only exclusion is a channel-level upstream-name regex (`:240-254`) | `internal/objects/model.go:59-76,99-116` | a candidate test for `channel_tags_regex` and channel-name/id/tag exclusions |
+| 14 | Association conditions: no builder, no domain fields | closed | fixed | The bounded sanitized context includes UTC daily time, media presence, stream and request format; typed field/operator validation fails invalid configuration closed. The bilingual nested all/any editor round-trips exact documents and retains raw JSON as an advanced escape hatch. | `models-association-dialog.tsx:61-143` | domain-context/evaluator Rust test plus `ModelsPage.test.tsx` structured/raw editor cases |
+| 15 | No `channel_tags + regex` type, no association exclusions | closed | fixed | Migration v24 adds `channel_tags_regex` and versioned association exclusions for channel name regexes, IDs and tags. Write-time bounds/regex checks and read-time revalidation make exclusions veto candidates fail-closed. | `internal/objects/model.go:59-76,99-116` | candidate/exclusion Rust test plus ModelsPage payload case |
 | 16 | No auto-trim or hide-original/hide-mapped transformations | open | — | No `auto_trim`/`hide_original`/`hide_mapped` anywhere; `model_rules` is a raw JSON box (`ChannelsPage.tsx:184`) | `internal/objects/channel.go:163-180`, `channel_llm.go:1473,1490-1522` | a resolution test for auto-trim and both hide flags |
 | 17 | No volume (non-marginal) tier pricing mode | open | — | `calculate` is marginal-only (`operations/pricing.rs:310-322`); the pre-flight upper bound uses the maximum tier rate (`:371-378`) | `internal/objects/price.go:26-31` (`usage_volume`) | a pricing test for per-component volume mode |
 | 18 | Channel-scoped prices cannot be created | open | — | Schema supports `provider_id` (`db/schema.rs:372-386`) and the resolver prefers it (`pricing.rs:425`), but the write path inserts `NULL` (`operations_api.rs:1377-1382`) and the form has no channel field (`ModelsPage.tsx:68`) | `channel_model_price.go:27-41` | a price-creation test that stores and reads back a channel-scoped rate |
@@ -464,7 +464,7 @@ retry/model/quota settings, and CORS/timeouts. Every one of them is scheduled in
 | Model catalog defaults | implemented+tested | versioned snapshot with refresh/cache, aliases and operator override |
 | Extensible model capabilities | partial | typed capabilities with preserved unknown extensions (`catalog/types.rs:121-122`); discovery/quota stay `implemented=false` |
 | Model CRUD/bulk | partial | CRUD + enable/disable bulk; no archive lifecycle, no batch create (models 10, 22) |
-| Associations | partial | six core types; no `channel_tags+regex`, no association-level exclusions (models 15) |
+| Associations | implemented+tested | core types plus channel-tag regex, bounded conditions and association-level channel name/id/tag exclusions |
 | Conditions | partial | nested AND/OR with 10 operators; no `daily_time`/media-presence fields (models 14) |
 | Developer settings | open | no per-developer associations, inheritance control or reasoning-effort mapping document |
 | Pricing | partial | channel price entries unreachable, no read projection (models 18, 24) |

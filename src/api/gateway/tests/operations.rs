@@ -5091,11 +5091,83 @@ async fn a_malformed_routing_condition_is_rejected_at_write_time() {
         "/api/admin/v1/projects/{}/operations/associations",
         db::DEFAULT_PROJECT_ID
     );
+    for (index, conditions) in [
+        json!({"version":1,"field":"/daily_time","op":"gte","value":480}),
+        json!({"version":1,"field":"/has_image","op":"eq","value":true}),
+        json!({"version":1,"field":"/has_video","op":"eq","value":true}),
+        json!({"version":1,"field":"/has_document","op":"eq","value":true}),
+        json!({"version":1,"field":"/has_audio","op":"eq","value":true}),
+        json!({"version":1,"field":"/stream","op":"eq","value":true}),
+        json!({"version":1,"field":"/request_format","op":"in","value":["openai_chat","openai_responses"]}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let response = admin(
+            &f,
+            &cookie,
+            http::Method::POST,
+            &path,
+            json!({"id":format!("valid-{index}"),"match_type":"exact","pattern":format!("m-{index}"),"conditions":conditions}),
+            true,
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "domain conditions should be accepted on the form: {conditions}"
+        );
+    }
+
+    let response = admin(
+        &f,
+        &cookie,
+        http::Method::POST,
+        &path,
+        json!({
+            "id":"valid-exclusions",
+            "match_type":"channel_tags_regex",
+            "pattern":"^region-(eu|us)$",
+            "exclusions":{
+                "version":1,
+                "channel_name_patterns":["^deprecated-"],
+                "channel_ids":["provider-id"],
+                "channel_tags":["private"]
+            }
+        }),
+        true,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    for exclusions in [
+        json!({"version":2}),
+        json!({"version":1,"channel_name_patterns":["[unclosed"]}),
+        json!({"version":1,"channel_ids":"provider-id"}),
+        json!({"version":1,"channel_tags":[""]}),
+        json!({"version":1,"unknown":[]}),
+    ] {
+        let response = admin(
+            &f,
+            &cookie,
+            http::Method::POST,
+            &path,
+            json!({"match_type":"exact","pattern":"m","exclusions":exclusions}),
+            true,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{exclusions}");
+    }
+
     for conditions in [
         json!({"version":1,"field":"/body/model","op":"eq","value":"m","typo":true}),
         json!({"version":1,"field":"/body/model","op":"matches","value":"m"}),
         json!({"version":1,"field":"body/model","op":"eq","value":"m"}),
         json!({"version":1,"field":"/body/model","op":"regex","value":"[unclosed"}),
+        json!({"version":1,"field":"/unknown","op":"eq","value":"m"}),
+        json!({"version":1,"field":"/headers/authorization","op":"eq","value":"private"}),
+        json!({"version":1,"field":"/has_image","op":"regex","value":"true"}),
+        json!({"version":1,"field":"/daily_time","op":"gte","value":1440}),
         json!({"version":2}),
     ] {
         let response = admin(
@@ -5115,8 +5187,8 @@ async fn a_malformed_routing_condition_is_rejected_at_write_time() {
     }
     assert_eq!(
         count(&f, "SELECT COUNT(*) AS n FROM model_associations").await,
-        0,
-        "a rejected condition must not be stored"
+        8,
+        "only valid domain conditions should be stored"
     );
 
     // A well-formed condition still saves.
@@ -5132,7 +5204,7 @@ async fn a_malformed_routing_condition_is_rejected_at_write_time() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         count(&f, "SELECT COUNT(*) AS n FROM model_associations").await,
-        1
+        9
     );
 }
 

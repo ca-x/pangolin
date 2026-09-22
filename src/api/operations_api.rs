@@ -416,7 +416,7 @@ fn query(resource: &str) -> Result<(&'static str, &'static str, &'static str), A
         "associations" => (
             "model_associations",
             "project_id=?",
-            "json_object('id',id,'model_id',model_id,'model_name',(SELECT m.public_name FROM models m JOIN providers p ON p.id=m.provider_id WHERE m.id=model_associations.model_id AND p.project_id=model_associations.project_id),'provider_id',provider_id,'provider_name',(SELECT name FROM providers WHERE id=model_associations.provider_id AND project_id=model_associations.project_id),'match_type',match_type,'pattern',pattern,'conditions',json(conditions_json),'priority',priority,'weight',weight,'enabled',enabled,'created_at',created_at,'updated_at',updated_at)",
+            "json_object('id',id,'model_id',model_id,'model_name',(SELECT m.public_name FROM models m JOIN providers p ON p.id=m.provider_id WHERE m.id=model_associations.model_id AND p.project_id=model_associations.project_id),'provider_id',provider_id,'provider_name',(SELECT name FROM providers WHERE id=model_associations.provider_id AND project_id=model_associations.project_id),'match_type',match_type,'pattern',pattern,'conditions',json(conditions_json),'exclusions',json(exclusions_json),'priority',priority,'weight',weight,'enabled',enabled,'created_at',created_at,'updated_at',updated_at)",
         ),
         "key-profiles" => (
             "api_key_profiles",
@@ -2309,12 +2309,12 @@ async fn mutate(
         }
         "associations" => {
             let match_type = value["match_type"].as_str().unwrap_or("exact");
-            if !matches!(match_type, "exact" | "regex" | "tag") {
+            if !matches!(match_type, "exact" | "regex" | "tag" | "channel_tags_regex") {
                 return Err(ApiError::BadRequest(
                     "invalid association match type".into(),
                 ));
             }
-            if match_type == "regex" {
+            if matches!(match_type, "regex" | "channel_tags_regex") {
                 crate::orchestration::policy::regex(text(&value, "pattern")?)?;
             }
             // Validate the condition tree with the evaluator that will run it.
@@ -2330,6 +2330,17 @@ async fn mutate(
                     "invalid conditions: only version, all, any, field, op and value are allowed; field must be a JSON pointer; value must match the operator".into(),
                 )
             })?;
+            let exclusions = value
+                .get("exclusions")
+                .cloned()
+                .unwrap_or_else(|| json!({"version":1}));
+            crate::orchestration::policy::AssociationExclusions::parse(&exclusions).map_err(
+                |_| {
+                    ApiError::BadRequest(
+                        "invalid exclusions: use version 1 arrays for channel_name_patterns, channel_ids and channel_tags; name patterns must be valid regular expressions".into(),
+                    )
+                },
+            )?;
             let model = value
                 .get("model_id")
                 .and_then(Value::as_str)
@@ -2350,7 +2361,7 @@ async fn mutate(
             {
                 return Err(ApiError::NotFound);
             }
-            let changed = transaction.execute(sql("INSERT INTO model_associations(id,project_id,model_id,provider_id,match_type,pattern,conditions_json,priority,weight,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET model_id=excluded.model_id,provider_id=excluded.provider_id,match_type=excluded.match_type,pattern=excluded.pattern,conditions_json=excluded.conditions_json,priority=excluded.priority,weight=excluded.weight,enabled=excluded.enabled,updated_at=excluded.updated_at WHERE model_associations.project_id=excluded.project_id",vec![resource_id.clone().into(),project.clone().into(),model.into(),provider.into(),match_type.into(),text(&value,"pattern")?.into(),value.get("conditions").cloned().unwrap_or(json!({"version":1})).to_string().into(),value["priority"].as_i64().unwrap_or(100).into(),value["weight"].as_i64().unwrap_or(1).clamp(1,10000).into(),value["enabled"].as_bool().unwrap_or(true).into(),db::now().into(),db::now().into()])).await?.rows_affected();
+            let changed = transaction.execute(sql("INSERT INTO model_associations(id,project_id,model_id,provider_id,match_type,pattern,conditions_json,exclusions_json,priority,weight,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET model_id=excluded.model_id,provider_id=excluded.provider_id,match_type=excluded.match_type,pattern=excluded.pattern,conditions_json=excluded.conditions_json,exclusions_json=excluded.exclusions_json,priority=excluded.priority,weight=excluded.weight,enabled=excluded.enabled,updated_at=excluded.updated_at WHERE model_associations.project_id=excluded.project_id",vec![resource_id.clone().into(),project.clone().into(),model.into(),provider.into(),match_type.into(),text(&value,"pattern")?.into(),conditions.to_string().into(),exclusions.to_string().into(),value["priority"].as_i64().unwrap_or(100).into(),value["weight"].as_i64().unwrap_or(1).clamp(1,10000).into(),value["enabled"].as_bool().unwrap_or(true).into(),db::now().into(),db::now().into()])).await?.rows_affected();
             if changed != 1 {
                 return Err(ApiError::Forbidden);
             }

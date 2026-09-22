@@ -110,6 +110,7 @@ struct Association {
     match_type: String,
     pattern: String,
     conditions_json: String,
+    exclusions_json: String,
     priority: i32,
     weight: i32,
 }
@@ -146,7 +147,7 @@ pub async fn candidates(
           AND NOT EXISTS(SELECT 1 FROM service_group_channels gc WHERE gc.group_id=g.id AND gc.provider_id=p.id)))
         ORDER BY m.priority,p.id,m.id,c.priority,c.id
     "#,vec![key.project_id.clone().into(),key.id.clone().into()])).all(db).await?;
-    let associations = Association::find_by_statement(statement("SELECT id,model_id,provider_id,match_type,pattern,conditions_json,priority,weight FROM model_associations WHERE project_id=? AND enabled=1 ORDER BY priority,id",vec![key.project_id.clone().into()])).all(db).await?;
+    let associations = Association::find_by_statement(statement("SELECT id,model_id,provider_id,match_type,pattern,conditions_json,exclusions_json,priority,weight FROM model_associations WHERE project_id=? AND enabled=1 ORDER BY priority,id",vec![key.project_id.clone().into()])).all(db).await?;
     let mut result = vec![];
     for row in rows {
         let settings = policy::document(&row.settings_json)?;
@@ -156,6 +157,7 @@ pub async fn candidates(
         let mut rank = (row.priority, 1);
         let mut matched = row.public_name == model;
         let mut association_matched = false;
+        let mut association_excluded = false;
         for association in &associations {
             if association
                 .provider_id
@@ -178,11 +180,27 @@ pub async fn candidates(
                     tags.contains(&association.pattern)
                         && (association.model_id.is_some() || row.public_name == model)
                 }
+                "channel_tags_regex" => {
+                    let regex = policy::regex(&association.pattern)?;
+                    tags.iter().any(|tag| regex.is_match(tag))
+                }
                 _ => return Err(Error::Configuration),
             };
             if matches
                 && policy::matches(&policy::document(&association.conditions_json)?, context)?
             {
+                let exclusions = policy::AssociationExclusions::parse(&policy::document(
+                    &association.exclusions_json,
+                )?)?;
+                if exclusions.excludes(&row.provider_id, &row.provider_name, &tags)? {
+                    association_excluded = true;
+                    decisions.push(Decision {
+                        stage: "association",
+                        candidate: Some(association.id.clone()),
+                        reason: "association_excluded",
+                    });
+                    continue;
+                }
                 if !association_matched || association.priority < rank.0 {
                     rank = (association.priority, association.weight as u32);
                 }
@@ -194,6 +212,9 @@ pub async fn candidates(
                     reason: "matched",
                 });
             }
+        }
+        if association_excluded {
+            continue;
         }
         if !matched {
             continue;
@@ -227,7 +248,7 @@ pub async fn candidates(
             &row.provider_kind,
             &capabilities,
             endpoint,
-            context["body"]["stream"].as_bool().unwrap_or(false),
+            context["stream"].as_bool().unwrap_or(false),
         ) {
             decisions.push(Decision {
                 stage: "endpoint",
@@ -254,7 +275,7 @@ pub async fn candidates(
         }
         let upstream_name = resolve_model(&row.upstream_name, &model_rules)?;
         if model_rules.get("stream").and_then(Value::as_bool) == Some(false)
-            && context["body"]["stream"] == true
+            && context["stream"] == true
         {
             decisions.push(Decision {
                 stage: "endpoint",

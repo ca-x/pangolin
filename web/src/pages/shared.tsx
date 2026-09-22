@@ -65,6 +65,8 @@ export type FormField = {
    * field's default and silently overwrite the stored value.
    */
   fromRow?: (row: Document) => unknown
+  /** Resource-specific structured editor that still submits through this field's normal FormData contract. */
+  render?: (props: { name: string; label: string; value: unknown; setValid: (valid: boolean) => void }) => ReactNode
 }
 
 type ResourcePageProps = {
@@ -148,6 +150,7 @@ export function ResourcePage({ resource, title, description, empty, columns, fie
   const [filter, setFilter] = useState('')
   const [offset, setOffset] = useState(0)
   const [limit, setLimit] = useState(25)
+  const [invalidFields, setInvalidFields] = useState<Set<string>>(() => new Set())
   const lastTrigger = useRef<HTMLButtonElement | null>(null)
   const formRef = useRef<HTMLFormElement | null>(null)
   const path = typeof endpoint === 'function' ? endpoint(project.id) : endpoint || projectOperationPath(project.id, resource)
@@ -188,7 +191,7 @@ export function ResourcePage({ resource, title, description, empty, columns, fie
       cell: ({ row }) => <Checkbox aria-label={`${t('selectRow')} ${displayValue(row.original.name || row.original.public_name || row.original.id)}`} checked={selected.includes(String(row.original.id))} onChange={(event) => setSelected((current) => event.currentTarget.checked ? [...current, String(row.original.id)] : current.filter((id) => id !== String(row.original.id)))} />,
     })] : []),
     ...columns.map((column) => columnHelper.accessor((row) => row[column.key], { id: column.key, header: column.label, cell: (info) => <span className={column.mono ? 'mono-cell' : ''}>{column.render ? column.render(info.getValue(), info.row.original) : displayValue(info.getValue())}</span> })),
-    ...((!immutable && !appendOnly && fields.length) || rowActions ? [columnHelper.display({ id: 'actions', header: () => <span className="sr-only">{t('actions')}</span>, cell: ({ row }) => <Group gap={4} justify="flex-end" wrap="nowrap">{!immutable && !appendOnly && !forbids(editDisabled, row.original) && fields.length > 0 && <Button variant="subtle" size="compact-sm" onClick={(event) => { lastTrigger.current = event.currentTarget as HTMLButtonElement; setEditing(row.original); setOpen(true) }}>{t('edit')}</Button>}<Tooltip label={t('copyId')}><ActionIcon variant="subtle" color="gray" aria-label={`${t('copyId')} ${displayValue(row.original.name || row.original.id)}`} onClick={() => void navigator.clipboard?.writeText(String(row.original.id))}><Copy size={15} /></ActionIcon></Tooltip>{!immutable && !appendOnly && allows(canDelete, row.original) && <Tooltip label={t('delete')}><ActionIcon variant="subtle" color="red" aria-label={`${t('delete')} ${displayValue(row.original.name || row.original.id)}`} onClick={() => confirmRemove(row.original)}><Trash2 size={16} /></ActionIcon></Tooltip>}{rowActions?.(row.original)}</Group> })] : []),
+    ...((!immutable && !appendOnly && fields.length) || rowActions ? [columnHelper.display({ id: 'actions', header: () => <span className="sr-only">{t('actions')}</span>, cell: ({ row }) => <Group gap={4} justify="flex-end" wrap="nowrap">{!immutable && !appendOnly && !forbids(editDisabled, row.original) && fields.length > 0 && <Button variant="subtle" size="compact-sm" onClick={(event) => { lastTrigger.current = event.currentTarget as HTMLButtonElement; setInvalidFields(new Set()); setEditing(row.original); setOpen(true) }}>{t('edit')}</Button>}<Tooltip label={t('copyId')}><ActionIcon variant="subtle" color="gray" aria-label={`${t('copyId')} ${displayValue(row.original.name || row.original.id)}`} onClick={() => void navigator.clipboard?.writeText(String(row.original.id))}><Copy size={15} /></ActionIcon></Tooltip>{!immutable && !appendOnly && allows(canDelete, row.original) && <Tooltip label={t('delete')}><ActionIcon variant="subtle" color="red" aria-label={`${t('delete')} ${displayValue(row.original.name || row.original.id)}`} onClick={() => confirmRemove(row.original)}><Trash2 size={16} /></ActionIcon></Tooltip>}{rowActions?.(row.original)}</Group> })] : []),
   ], [appendOnly, canDelete, columns, editDisabled, fields.length, rowActions, rows, selectable, selected, t])
   const table = useReactTable({ data: rows, columns: tableColumns, getCoreRowModel: getCoreRowModel(), getFilteredRowModel: getFilteredRowModel() })
   const submit = (event: FormEvent<HTMLFormElement>) => {
@@ -203,7 +206,7 @@ export function ResourcePage({ resource, title, description, empty, columns, fie
       toast.error(error instanceof SyntaxError || !(error instanceof Error) ? t('invalidJson') : error.message || t('invalidJson'))
     }
   }
-  const beginCreate = (trigger: HTMLButtonElement) => { lastTrigger.current = trigger; setEditing(null); setOpen(true) }
+  const beginCreate = (trigger: HTMLButtonElement) => { lastTrigger.current = trigger; setInvalidFields(new Set()); setEditing(null); setOpen(true) }
   // Picking a provider is a create-time convenience: the default endpoint fills
   // the base URL input. An edit keeps whatever the operator saved, so the write
   // is limited to a new row.
@@ -228,14 +231,14 @@ export function ResourcePage({ resource, title, description, empty, columns, fie
       <Button size="compact-sm" variant="default" loading={bulk.isPending} onClick={() => bulk.mutate(false)}>{t('disable')}</Button>
       <Button size="compact-sm" variant="subtle" onClick={() => setSelected([])}>{t('cancel')}</Button>
     </Group>}
-    {query.isError ? <QueryError retry={() => void query.refetch()} /> : query.isLoading ? <SkeletonRows /> : rows.length === 0 ? <EmptyState icon={<Inbox />} title={title} copy={filter ? t('noSearchResults') : empty} action={!filter ? emptyAction ?? (!immutable && fields.length ? <Button onClick={(event) => beginCreate(event.currentTarget)}>{createLabel || t('add')}</Button> : undefined) : undefined} /> : <><TableScrollContainer minWidth={tableMinWidth} className="desktop-resource-table" style={{ maxHeight: 'min(74vh, 900px)' }} role="region" aria-label={title} tabIndex={0}><Table stickyHeader highlightOnHover><Table.Thead>{table.getHeaderGroups().map((group) => <Table.Tr key={group.id}>{group.headers.map((header) => <Table.Th key={header.id}>{flexRender(header.column.columnDef.header, header.getContext())}</Table.Th>)}</Table.Tr>)}</Table.Thead><Table.Tbody>{table.getRowModel().rows.map((row) => <Table.Tr key={row.id}>{row.getVisibleCells().map((cell) => <Table.Td key={cell.id}>{flexRender(cell.column.columnDef.cell, cell.getContext())}</Table.Td>)}</Table.Tr>)}</Table.Tbody></Table></TableScrollContainer><MobileResources rows={rows} columns={columns} rowActions={rowActions} mobileStatus={mobileStatus} onEdit={!immutable && !appendOnly && fields.length ? (row, trigger) => { lastTrigger.current = trigger; setEditing(row); setOpen(true) } : undefined} editDisabled={editDisabled} onDelete={!immutable && !appendOnly ? confirmRemove : undefined} canDelete={canDelete} primary={mobilePrimary} primaryKey={mobilePrimaryKey} hiddenKeys={mobileHiddenKeys} columnLimit={mobileColumnLimit} /></>}
+    {query.isError ? <QueryError retry={() => void query.refetch()} /> : query.isLoading ? <SkeletonRows /> : rows.length === 0 ? <EmptyState icon={<Inbox />} title={title} copy={filter ? t('noSearchResults') : empty} action={!filter ? emptyAction ?? (!immutable && fields.length ? <Button onClick={(event) => beginCreate(event.currentTarget)}>{createLabel || t('add')}</Button> : undefined) : undefined} /> : <><TableScrollContainer minWidth={tableMinWidth} className="desktop-resource-table" style={{ maxHeight: 'min(74vh, 900px)' }} role="region" aria-label={title} tabIndex={0}><Table stickyHeader highlightOnHover><Table.Thead>{table.getHeaderGroups().map((group) => <Table.Tr key={group.id}>{group.headers.map((header) => <Table.Th key={header.id}>{flexRender(header.column.columnDef.header, header.getContext())}</Table.Th>)}</Table.Tr>)}</Table.Thead><Table.Tbody>{table.getRowModel().rows.map((row) => <Table.Tr key={row.id}>{row.getVisibleCells().map((cell) => <Table.Td key={cell.id}>{flexRender(cell.column.columnDef.cell, cell.getContext())}</Table.Td>)}</Table.Tr>)}</Table.Tbody></Table></TableScrollContainer><MobileResources rows={rows} columns={columns} rowActions={rowActions} mobileStatus={mobileStatus} onEdit={!immutable && !appendOnly && fields.length ? (row, trigger) => { lastTrigger.current = trigger; setInvalidFields(new Set()); setEditing(row); setOpen(true) } : undefined} editDisabled={editDisabled} onDelete={!immutable && !appendOnly ? confirmRemove : undefined} canDelete={canDelete} primary={mobilePrimary} primaryKey={mobilePrimaryKey} hiddenKeys={mobileHiddenKeys} columnLimit={mobileColumnLimit} /></>}
     {total > limit && <Group justify="flex-end" gap="sm" mt="md" className="pagination"><Pagination total={totalPages} value={currentPage} onChange={(page) => setOffset((page - 1) * limit)} getControlProps={(control) => {
       if (control === 'previous') return { 'aria-label': t('previous') }
       if (control === 'next') return { 'aria-label': t('next') }
       return {}
     }} /><Text size="sm" c="dimmed">{offset + 1}–{Math.min(offset + limit, total)} / {total}</Text><Select aria-label={t('pageSize')} data={['10', '25', '50']} value={String(limit)} onChange={(value) => { value && setLimit(Number(value)); setOffset(0) }} size="sm" style={{ width: 80 }} /></Group>}
     <Modal opened={open} onClose={handleClose} title={editing ? `${t('edit')} ${title}` : createLabel || `${t('add')} ${title}`} closeButtonProps={{ 'aria-label': t('close') }}>
-      <form ref={formRef} onSubmit={submit}><Stack gap="md">{activeFields.map((field) => <ResourceField key={`${editing?.id ?? 'create'}:${field.key}`} field={field} value={fieldValue(field, editing)} editing={Boolean(editing)} onProviderChange={applyProviderDefault} />)}<Group justify="flex-end" gap="xs" pt="xs"><Button variant="default" type="button" onClick={handleClose}>{t('cancel')}</Button>{/* Required lookups fail closed. Optional provenance pickers retain their explicit manual fallback. */}<Button type="submit" loading={save.isPending} disabled={activeFields.some((field) => field.error && !field.allowManualOnError)}>{t('save')}</Button></Group></Stack></form>
+      <form ref={formRef} onSubmit={submit}><Stack gap="md">{activeFields.map((field) => <ResourceField key={`${editing?.id ?? 'create'}:${field.key}`} field={field} value={fieldValue(field, editing)} editing={Boolean(editing)} onProviderChange={applyProviderDefault} onValidityChange={(valid) => setInvalidFields((current) => { const alreadyValid = !current.has(field.key); if (valid === alreadyValid) return current; const next = new Set(current); if (valid) next.delete(field.key); else next.add(field.key); return next })} />)}<Group justify="flex-end" gap="xs" pt="xs"><Button variant="default" type="button" onClick={handleClose}>{t('cancel')}</Button>{/* Required lookups fail closed. Optional provenance pickers retain their explicit manual fallback. */}<Button type="submit" loading={save.isPending} disabled={invalidFields.size > 0 || activeFields.some((field) => field.error && !field.allowManualOnError)}>{t('save')}</Button></Group></Stack></form>
     </Modal>
   </>
 }
@@ -263,12 +266,13 @@ function permissionValues(value: unknown): string[] {
   }
 }
 
-function ResourceField({ field, value, editing, onProviderChange }: { field: FormField; value: unknown; editing: boolean; onProviderChange: (field: FormField, provider: string) => void }) {
+function ResourceField({ field, value, editing, onProviderChange, onValidityChange }: { field: FormField; value: unknown; editing: boolean; onProviderChange: (field: FormField, provider: string) => void; onValidityChange: (valid: boolean) => void }) {
   const { t } = useTranslation()
   const [advanced, setAdvanced] = useState(false)
   const [provider, setProvider] = useState(String(value ?? field.options?.[0]?.value ?? ''))
   const [selectedPermissions, setSelectedPermissions] = useState(() => permissionValues(value))
   const [validationError, setValidationError] = useState<string>()
+  if (field.render) return field.render({ name: field.key, label: field.label, value, setValid: onValidityChange })
   if (field.kind === 'permission-list') {
     const permissions = field.permissions ?? []
     const available = new Set(permissions.map((permission) => permission.slug))

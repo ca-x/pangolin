@@ -1,4 +1,4 @@
-import { ActionIcon, Alert, Badge, Button, Checkbox, Collapse, Group, Loader, NumberInput, Pagination, Paper, Select, Stack, Table, TableScrollContainer, Tabs, Text, Textarea, TextInput, Title, Tooltip, UnstyledButton } from '@mantine/core'
+import { ActionIcon, Alert, Badge, Button, Checkbox, Collapse, Group, Loader, NumberInput, Pagination, Paper, Select, SimpleGrid, Stack, Table, TableScrollContainer, Tabs, Text, Textarea, TextInput, Title, Tooltip, UnstyledButton } from '@mantine/core'
 import { useMediaQuery } from '@mantine/hooks'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Archive, Copy, Download, Inbox, Plus, RefreshCw, RotateCcw, Search, Trash2, Upload } from 'lucide-react'
@@ -167,12 +167,184 @@ function CatalogCosts({ row }: { row: Document }) {
   return <Stack gap={2}><Group gap={6} wrap="nowrap"><Text size="xs" c="dimmed">{t('catalogInputCost')}</Text><Text size="sm">{formattedCatalogCost(row.catalog_input_cost, row, i18n.language, t('millionTokens'))}</Text></Group><Group gap={6} wrap="nowrap"><Text size="xs" c="dimmed">{t('catalogOutputCost')}</Text><Text size="sm">{formattedCatalogCost(row.catalog_output_cost, row, i18n.language, t('millionTokens'))}</Text></Group></Stack>
 }
 
+type ConditionDocument = {
+  version?: number
+  all?: ConditionDocument[]
+  any?: ConditionDocument[]
+  field?: string
+  op?: string
+  value?: unknown
+}
+
+const conditionFields = [
+  ['/daily_time', 'conditionFieldDailyTime'],
+  ['/daily_time_timezone', 'conditionFieldDailyTimezone'],
+  ['/daily_time_source', 'conditionFieldDailySource'],
+  ['/has_image', 'conditionFieldHasImage'],
+  ['/has_video', 'conditionFieldHasVideo'],
+  ['/has_document', 'conditionFieldHasDocument'],
+  ['/has_audio', 'conditionFieldHasAudio'],
+  ['/stream', 'conditionFieldStream'],
+  ['/request_format', 'conditionFieldRequestFormat'],
+  ['/endpoint', 'conditionFieldEndpoint'],
+  ['/project_id', 'conditionFieldProject'],
+  ['/api_key_id', 'conditionFieldApiKey'],
+  ['/body/model', 'conditionFieldModel'],
+] as const
+
+const booleanConditionFields = new Set(['/has_image', '/has_video', '/has_document', '/has_audio', '/stream'])
+const numericConditionFields = new Set(['/daily_time'])
+const stringConditionFields = new Set(['/daily_time_timezone', '/daily_time_source', '/request_format', '/endpoint', '/project_id', '/api_key_id'])
+const conditionOperators = ['exists', 'eq', 'ne', 'in', 'contains', 'regex', 'gt', 'gte', 'lt', 'lte'] as const
+
+function validConditionField(field: string) {
+  if (conditionFields.some(([value]) => value === field)) return true
+  if (field !== '/body' && !field.startsWith('/body/') && !field.startsWith('/headers/')) return false
+  return !/(authorization|key|token|secret|password|credential|cookie)/i.test(field)
+}
+
+function validateCondition(document: unknown, depth = 0): string | null {
+  if (depth > 16 || !document || typeof document !== 'object' || Array.isArray(document)) return 'conditionInvalidStructure'
+  const node = document as ConditionDocument
+  if (node.version != null && node.version !== 1) return 'conditionInvalidVersion'
+  const keys = Object.keys(node)
+  if (keys.length === 0 || (keys.length === 1 && node.version === 1)) return null
+  const group = node.all ? 'all' : node.any ? 'any' : null
+  if (group) {
+    if (keys.some((key) => key !== group && key !== 'version') || !Array.isArray(node[group])) return 'conditionInvalidStructure'
+    for (const child of node[group]) {
+      const error = validateCondition(child, depth + 1)
+      if (error) return error
+    }
+    return null
+  }
+  if (keys.some((key) => !['version', 'field', 'op', 'value'].includes(key)) || typeof node.field !== 'string' || typeof node.op !== 'string' || !conditionOperators.includes(node.op as typeof conditionOperators[number])) return 'conditionInvalidStructure'
+  if (!validConditionField(node.field)) return 'conditionUnsupportedField'
+  if (node.op === 'exists') return typeof node.value === 'boolean' ? null : 'conditionInvalidValue'
+  if (booleanConditionFields.has(node.field)) {
+    if (!['eq', 'ne', 'in'].includes(node.op)) return 'conditionInvalidOperator'
+    const values = node.op === 'in' ? node.value : [node.value]
+    return Array.isArray(values) && values.every((value) => typeof value === 'boolean') ? null : 'conditionInvalidValue'
+  }
+  if (numericConditionFields.has(node.field)) {
+    if (!['eq', 'ne', 'in', 'gt', 'gte', 'lt', 'lte'].includes(node.op)) return 'conditionInvalidOperator'
+    const values = node.op === 'in' ? node.value : [node.value]
+    return Array.isArray(values) && values.every((value) => Number.isInteger(value) && Number(value) >= 0 && Number(value) < 1440) ? null : 'conditionInvalidValue'
+  }
+  if (stringConditionFields.has(node.field) || node.field.startsWith('/headers/')) {
+    if (!['eq', 'ne', 'in', 'contains', 'regex'].includes(node.op)) return 'conditionInvalidOperator'
+    const values = node.op === 'in' ? node.value : [node.value]
+    return Array.isArray(values) && values.every((value) => typeof value === 'string') ? null : 'conditionInvalidValue'
+  }
+  if (node.op === 'in') return Array.isArray(node.value) ? null : 'conditionInvalidValue'
+  if (['contains', 'regex'].includes(node.op) && typeof node.value !== 'string') return 'conditionInvalidValue'
+  return null
+}
+
+function conditionGroup(node: ConditionDocument): 'all' | 'any' | null {
+  if (Array.isArray(node.all)) return 'all'
+  if (Array.isArray(node.any)) return 'any'
+  return null
+}
+
+function updateCondition(document: ConditionDocument, path: number[], replacement: ConditionDocument | null): ConditionDocument {
+  if (path.length === 0) return replacement || { version: 1 }
+  const group = conditionGroup(document)
+  if (!group) return document
+  const [index, ...rest] = path
+  const children = [...(document[group] || [])]
+  if (rest.length === 0 && replacement == null) children.splice(index, 1)
+  else children[index] = updateCondition(children[index], rest, replacement)
+  return { ...document, [group]: children }
+}
+
+function ConditionValue({ node, onChange }: { node: ConditionDocument; onChange: (node: ConditionDocument) => void }) {
+  const { t } = useTranslation()
+  if (node.op === 'exists' || booleanConditionFields.has(node.field || '')) {
+    const value = node.op === 'in' && Array.isArray(node.value) ? node.value.join(',') : String(node.value ?? false)
+    return <Select label={t('conditionValue')} value={value} data={node.op === 'in' ? [{ value: 'true', label: t('yes') }, { value: 'false', label: t('no') }, { value: 'true,false', label: t('conditionEitherBoolean') }] : [{ value: 'true', label: t('yes') }, { value: 'false', label: t('no') }]} onChange={(next) => onChange({ ...node, value: node.op === 'in' ? String(next).split(',').map((item) => item === 'true') : next === 'true' })} />
+  }
+  if (numericConditionFields.has(node.field || '')) {
+    if (node.op === 'in') {
+      const value = Array.isArray(node.value) ? node.value.join(', ') : String(node.value ?? '')
+      return <TextInput label={t('conditionValue')} description={t('conditionDailyTimeHint')} value={value} onChange={(event) => onChange({ ...node, value: event.currentTarget.value.split(',').map((item) => Number(item.trim())).filter((item) => Number.isInteger(item)) })} />
+    }
+    return <NumberInput label={t('conditionValue')} description={t('conditionDailyTimeHint')} min={0} max={1439} value={typeof node.value === 'number' ? node.value : 0} onChange={(value) => onChange({ ...node, value: Number(value) })} hideControls />
+  }
+  if (node.field === '/request_format' && node.op !== 'in') {
+    return <Select label={t('conditionValue')} value={String(node.value ?? 'openai_chat')} data={['openai_chat', 'openai_responses', 'anthropic_messages'].map((value) => ({ value, label: t(`conditionFormat_${value}`) }))} onChange={(value) => onChange({ ...node, value })} />
+  }
+  const value = node.op === 'in' && Array.isArray(node.value) ? node.value.join(', ') : String(node.value ?? '')
+  return <TextInput label={t('conditionValue')} value={value} onChange={(event) => onChange({ ...node, value: node.op === 'in' ? event.currentTarget.value.split(',').map((item) => item.trim()).filter(Boolean) : event.currentTarget.value })} />
+}
+
+function ConditionNodeEditor({ node, path, root, onRootChange }: { node: ConditionDocument; path: number[]; root: ConditionDocument; onRootChange: (root: ConditionDocument) => void }) {
+  const { t } = useTranslation()
+  const group = conditionGroup(node)
+  const replace = (next: ConditionDocument | null) => onRootChange(updateCondition(root, path, next))
+  if (group) {
+    const children = node[group] || []
+    return <Paper withBorder p="sm" radius="md"><Stack gap="sm"><Group justify="space-between" wrap="nowrap"><Text fw={600} size="sm">{t(group === 'all' ? 'conditionAll' : 'conditionAny')}</Text>{path.length > 0 && <Button variant="subtle" color="red" size="compact-xs" onClick={() => replace(null)}>{t('remove')}</Button>}</Group>{children.map((child, index) => <ConditionNodeEditor key={`${path.join('.')}-${index}`} node={child} path={[...path, index]} root={root} onRootChange={onRootChange} />)}<Group gap="xs" wrap="wrap"><Button variant="default" size="compact-sm" onClick={() => replace({ ...node, [group]: [...children, { field: '/stream', op: 'eq', value: true }] })}>{t('conditionAddRule')}</Button><Button variant="subtle" size="compact-sm" onClick={() => replace({ ...node, [group]: [...children, { all: [] }] })}>{t('conditionAddGroup')}</Button></Group></Stack></Paper>
+  }
+  const options: Array<{ value: string; label: string }> = conditionFields.map(([value, label]) => ({ value, label: t(label) }))
+  if (node.field && !options.some((option) => option.value === node.field)) options.push({ value: node.field, label: node.field })
+  const operators = numericConditionFields.has(node.field || '') ? ['exists', 'eq', 'ne', 'in', 'gt', 'gte', 'lt', 'lte'] : booleanConditionFields.has(node.field || '') ? ['exists', 'eq', 'ne', 'in'] : ['exists', 'eq', 'ne', 'in', 'contains', 'regex']
+  const setField = (field: string | null) => {
+    if (!field) return
+    const value = booleanConditionFields.has(field) ? true : numericConditionFields.has(field) ? 0 : field === '/request_format' ? 'openai_chat' : ''
+    replace({ ...node, field, op: 'eq', value })
+  }
+  const setOperator = (op: string | null) => {
+    if (!op) return
+    let value = node.value
+    if (op === 'exists') value = true
+    else if (op === 'in' && !Array.isArray(value)) value = [value]
+    else if (op !== 'in' && Array.isArray(value)) value = value[0] ?? (booleanConditionFields.has(node.field || '') ? true : numericConditionFields.has(node.field || '') ? 0 : '')
+    replace({ ...node, op, value })
+  }
+  return <Paper withBorder p="sm" radius="md"><Stack gap="sm"><SimpleGrid cols={{ base: 1, sm: 3 }} spacing="sm"><Select label={t('conditionField')} value={node.field || '/stream'} data={options} onChange={setField} /><Select label={t('conditionOperator')} value={node.op || 'eq'} data={operators.map((value) => ({ value, label: t(`conditionOp_${value}`) }))} onChange={setOperator} /><ConditionValue node={node} onChange={(next) => replace(next)} /></SimpleGrid><Button variant="subtle" color="red" size="compact-xs" style={{ alignSelf: 'flex-end' }} onClick={() => replace(null)}>{t('remove')}</Button></Stack></Paper>
+}
+
+function ConditionEditor({ name, value, setValid }: { name: string; value: unknown; setValid: (valid: boolean) => void }) {
+  const { t } = useTranslation()
+  const initial = value && typeof value === 'object' ? value as ConditionDocument : { version: 1 }
+  const serializedInitial = JSON.stringify(initial)
+  const [document, setDocument] = useState<ConditionDocument>(initial)
+  const [raw, setRaw] = useState(() => JSON.stringify(initial, null, 2))
+  const [mode, setMode] = useState<'structured' | 'raw'>('structured')
+  const [error, setError] = useState<string | null>(() => validateCondition(initial))
+  useEffect(() => {
+    const next = JSON.parse(serializedInitial) as ConditionDocument
+    setDocument(next)
+    setRaw(JSON.stringify(next, null, 2))
+    setMode('structured')
+    setError(validateCondition(next))
+  }, [serializedInitial])
+  useEffect(() => { setValid(!error) }, [error, setValid])
+  const changeDocument = (next: ConditionDocument) => { setDocument(next); setRaw(JSON.stringify(next, null, 2)); setError(validateCondition(next)) }
+  const changeRaw = (next: string) => {
+    setRaw(next)
+    try {
+      const parsed = JSON.parse(next) as ConditionDocument
+      const validation = validateCondition(parsed)
+      setDocument(parsed)
+      setError(validation)
+    } catch {
+      setError('conditionInvalidJson')
+    }
+  }
+  const empty = Object.keys(document).every((key) => key === 'version')
+  return <Stack gap="sm"><Group justify="space-between" align="center" wrap="wrap"><Text fw={500}>{t('conditions')}</Text><Group gap={4}><Button variant={mode === 'structured' ? 'filled' : 'subtle'} size="compact-sm" onClick={() => setMode('structured')}>{t('conditionStructured')}</Button><Button variant={mode === 'raw' ? 'filled' : 'subtle'} size="compact-sm" onClick={() => setMode('raw')}>{t('conditionRaw')}</Button></Group></Group>{mode === 'raw' ? <Textarea aria-label={t('conditionJson')} value={raw} onChange={(event) => changeRaw(event.currentTarget.value)} rows={9} styles={{ input: { fontFamily: 'var(--font-mono)' } }} /> : empty ? <Paper withBorder p="sm" radius="md"><Stack gap="sm"><Text size="sm" c="dimmed">{t('conditionAlways')}</Text><Group gap="xs"><Button variant="default" size="compact-sm" onClick={() => changeDocument({ version: 1, all: [{ field: '/stream', op: 'eq', value: true }] })}>{t('conditionAddRule')}</Button><Button variant="subtle" size="compact-sm" onClick={() => changeDocument({ version: 1, all: [{ all: [] }] })}>{t('conditionAddGroup')}</Button></Group></Stack></Paper> : <ConditionNodeEditor node={document} path={[]} root={document} onRootChange={changeDocument} />}{error && <Alert color="red" variant="light" role="alert">{t(error)}</Alert>}<textarea name={name} value={raw} readOnly hidden /></Stack>
+}
+
+const commaList = (value: unknown) => String(value || '').split(',').map((item) => item.trim()).filter(Boolean)
+
 function RoutingEditor() {
   const { t } = useTranslation()
   const { channels, models, channelsError, modelsError, retryChannels, retryModels } = useModelRelations()
   const any = { value: '__any__', label: t('unrestricted') }
-  const matchTypes = [{ value: 'exact', label: t('matchExact') }, { value: 'regex', label: t('matchRegex') }, { value: 'tag', label: t('matchTag') }]
-  return <ResourcePage resource="associations" title={t('routing')} description={t('routingDescription')} empty={t('routingEmpty')} createLabel={t('addRoute')} columns={[{ key: 'pattern', label: t('pattern'), mono: true }, { key: 'match_type', label: t('matchType'), render: (value) => matchTypes.find((option) => option.value === value)?.label || displayValue(value) }, { key: 'model_name', label: t('model'), render: (value) => value ? String(value) : t('unrestricted') }, { key: 'provider_name', label: t('channel'), render: (value) => value ? String(value) : t('unrestricted') }, { key: 'priority', label: t('priority') }, { key: 'enabled', label: t('status'), render: (value) => <EnabledPill enabled={value} /> }]} fields={[{ key: 'model_id', label: t('model'), kind: 'select', defaultValue: '__any__', options: [any, ...models], error: modelsError ? t('optionsUnavailable') : undefined, onRetry: retryModels }, { key: 'provider_id', label: t('channel'), kind: 'select', defaultValue: '__any__', options: [any, ...channels], error: channelsError ? t('optionsUnavailable') : undefined, onRetry: retryChannels }, { key: 'match_type', label: t('matchType'), kind: 'select', options: matchTypes }, { key: 'pattern', label: t('pattern'), required: true }, { key: 'conditions', label: t('conditions'), kind: 'json', defaultValue: { version: 1 } }, { key: 'priority', label: t('priority'), kind: 'number', defaultValue: 100 }, { key: 'weight', label: t('weight'), kind: 'number', defaultValue: 1 }, { key: 'enabled', label: t('status'), kind: 'checkbox' }]} normalize={(values, editing) => ({ ...values, ...(editing ? { id: editing.id } : {}), model_id: values.model_id === '__any__' ? null : values.model_id, provider_id: values.provider_id === '__any__' ? null : values.provider_id })} />
+  const matchTypes = [{ value: 'exact', label: t('matchExact') }, { value: 'regex', label: t('matchRegex') }, { value: 'tag', label: t('matchTag') }, { value: 'channel_tags_regex', label: t('matchChannelTagsRegex') }]
+  return <ResourcePage resource="associations" title={t('routing')} description={t('routingDescription')} empty={t('routingEmpty')} createLabel={t('addRoute')} columns={[{ key: 'pattern', label: t('pattern'), mono: true }, { key: 'match_type', label: t('matchType'), render: (value) => matchTypes.find((option) => option.value === value)?.label || displayValue(value) }, { key: 'model_name', label: t('model'), render: (value) => value ? String(value) : t('unrestricted') }, { key: 'provider_name', label: t('channel'), render: (value) => value ? String(value) : t('unrestricted') }, { key: 'priority', label: t('priority') }, { key: 'enabled', label: t('status'), render: (value) => <EnabledPill enabled={value} /> }]} fields={[{ key: 'model_id', label: t('model'), kind: 'select', defaultValue: '__any__', options: [any, ...models], error: modelsError ? t('optionsUnavailable') : undefined, onRetry: retryModels }, { key: 'provider_id', label: t('channel'), kind: 'select', defaultValue: '__any__', options: [any, ...channels], error: channelsError ? t('optionsUnavailable') : undefined, onRetry: retryChannels }, { key: 'match_type', label: t('matchType'), kind: 'select', options: matchTypes }, { key: 'pattern', label: t('pattern'), required: true }, { key: 'conditions', label: t('conditions'), kind: 'json', defaultValue: { version: 1 }, render: ({ name, value, setValid }) => <ConditionEditor name={name} value={value} setValid={setValid} /> }, { key: 'exclude_name_patterns', label: t('excludeChannelNames'), kind: 'text', hint: t('excludeChannelNamesHint'), fromRow: (row) => ((row.exclusions as Document | undefined)?.channel_name_patterns as string[] | undefined)?.join(', ') || '' }, { key: 'exclude_channel_ids', label: t('excludeChannelIds'), kind: 'text', hint: t('commaSeparated'), fromRow: (row) => ((row.exclusions as Document | undefined)?.channel_ids as string[] | undefined)?.join(', ') || '' }, { key: 'exclude_channel_tags', label: t('excludeChannelTags'), kind: 'text', hint: t('commaSeparated'), fromRow: (row) => ((row.exclusions as Document | undefined)?.channel_tags as string[] | undefined)?.join(', ') || '' }, { key: 'priority', label: t('priority'), kind: 'number', defaultValue: 100 }, { key: 'weight', label: t('weight'), kind: 'number', defaultValue: 1 }, { key: 'enabled', label: t('status'), kind: 'checkbox' }]} normalize={(values, editing) => { const { exclude_name_patterns, exclude_channel_ids, exclude_channel_tags, ...payload } = values; return { ...payload, ...(editing ? { id: editing.id } : {}), model_id: values.model_id === '__any__' ? null : values.model_id, provider_id: values.provider_id === '__any__' ? null : values.provider_id, exclusions: { version: 1, channel_name_patterns: commaList(exclude_name_patterns), channel_ids: commaList(exclude_channel_ids), channel_tags: commaList(exclude_channel_tags) } } }} />
 }
 
 function PricesPanel() {
