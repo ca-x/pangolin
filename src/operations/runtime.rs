@@ -141,7 +141,7 @@ async fn model_sync(
 ) -> Result<(), ApiError> {
     let project = claim.project_id.as_deref().ok_or(ApiError::Forbidden)?;
     let provider = payload["provider_id"].as_str().ok_or(ApiError::NotFound)?;
-    let row=state.db.query_one(sql("SELECT p.name,p.kind,p.base_url,c.credential_type,c.secret_envelope,s.proxy_url,s.proxy_username,s.proxy_secret_envelope,COALESCE(s.proxy_reuse_connections,1) AS proxy_reuse_connections FROM providers p JOIN channel_credentials c ON c.provider_id=p.id AND c.enabled=1 LEFT JOIN channel_settings s ON s.provider_id=p.id WHERE p.id=? AND p.project_id=? AND p.enabled=1 ORDER BY c.priority,c.id LIMIT 1",vec![provider.into(),project.into()])).await?.ok_or(ApiError::NotFound)?;
+    let row=state.db.query_one(sql("SELECT p.name,p.kind,p.base_url,c.credential_type,c.secret_envelope,s.proxy_url,s.proxy_username,s.proxy_secret_envelope,COALESCE(s.proxy_reuse_connections,1) AS proxy_reuse_connections,s.proxy_preset_id FROM providers p JOIN channel_credentials c ON c.provider_id=p.id AND c.enabled=1 LEFT JOIN channel_settings s ON s.provider_id=p.id WHERE p.id=? AND p.project_id=? AND p.enabled=1 ORDER BY c.priority,c.id LIMIT 1",vec![provider.into(),project.into()])).await?.ok_or(ApiError::NotFound)?;
     let secret_envelope: String = row.try_get("", "secret_envelope")?;
     let target = crate::models::RouteTarget {
         public_name: String::new(),
@@ -155,6 +155,7 @@ async fn model_sync(
         proxy_username: row.try_get("", "proxy_username")?,
         proxy_secret_envelope: row.try_get("", "proxy_secret_envelope")?,
         proxy_reuse_connections: row.try_get("", "proxy_reuse_connections")?,
+        proxy_preset_id: row.try_get("", "proxy_preset_id")?,
         input_price_micros: 0,
         output_price_micros: 0,
     };
@@ -162,7 +163,7 @@ async fn model_sync(
         &target.credential_type,
         state.secrets.decrypt(&secret_envelope)?,
     )?;
-    let client = state.upstream_client(&target)?;
+    let client = state.upstream_client(&target).await?;
     let discovered = crate::providers::discovery::models(
         &client,
         &target.provider_kind,
@@ -370,12 +371,12 @@ async fn target(
 ) -> Result<(crate::models::RouteTarget, String, String), ApiError> {
     let (query, values) = if let Some(model_id) = model_id {
         (
-            "SELECT p.name,p.kind,p.base_url,c.id AS credential_id,c.credential_type,c.secret_envelope,m.public_name,m.upstream_name,s.proxy_url,s.proxy_username,s.proxy_secret_envelope,COALESCE(s.proxy_reuse_connections,1) AS proxy_reuse_connections FROM providers p JOIN channel_credentials c ON c.provider_id=p.id AND c.enabled=1 JOIN models m ON m.provider_id=p.id AND m.enabled=1 AND m.lifecycle='active' LEFT JOIN channel_settings s ON s.provider_id=p.id WHERE p.id=? AND p.project_id=? AND p.enabled=1 AND m.id=? ORDER BY c.priority LIMIT 1",
+            "SELECT p.name,p.kind,p.base_url,c.id AS credential_id,c.credential_type,c.secret_envelope,m.public_name,m.upstream_name,s.proxy_url,s.proxy_username,s.proxy_secret_envelope,COALESCE(s.proxy_reuse_connections,1) AS proxy_reuse_connections,s.proxy_preset_id FROM providers p JOIN channel_credentials c ON c.provider_id=p.id AND c.enabled=1 JOIN models m ON m.provider_id=p.id AND m.enabled=1 AND m.lifecycle='active' LEFT JOIN channel_settings s ON s.provider_id=p.id WHERE p.id=? AND p.project_id=? AND p.enabled=1 AND m.id=? ORDER BY c.priority LIMIT 1",
             vec![provider.into(), project.into(), model_id.into()],
         )
     } else {
         (
-            "SELECT p.name,p.kind,p.base_url,c.id AS credential_id,c.credential_type,c.secret_envelope,m.public_name,m.upstream_name,s.proxy_url,s.proxy_username,s.proxy_secret_envelope,COALESCE(s.proxy_reuse_connections,1) AS proxy_reuse_connections FROM providers p JOIN channel_credentials c ON c.provider_id=p.id AND c.enabled=1 JOIN models m ON m.provider_id=p.id AND m.enabled=1 AND m.lifecycle='active' LEFT JOIN channel_settings s ON s.provider_id=p.id WHERE p.id=? AND p.project_id=? AND p.enabled=1 ORDER BY c.priority,m.priority LIMIT 1",
+            "SELECT p.name,p.kind,p.base_url,c.id AS credential_id,c.credential_type,c.secret_envelope,m.public_name,m.upstream_name,s.proxy_url,s.proxy_username,s.proxy_secret_envelope,COALESCE(s.proxy_reuse_connections,1) AS proxy_reuse_connections,s.proxy_preset_id FROM providers p JOIN channel_credentials c ON c.provider_id=p.id AND c.enabled=1 JOIN models m ON m.provider_id=p.id AND m.enabled=1 AND m.lifecycle='active' LEFT JOIN channel_settings s ON s.provider_id=p.id WHERE p.id=? AND p.project_id=? AND p.enabled=1 ORDER BY c.priority,m.priority LIMIT 1",
             vec![provider.into(), project.into()],
         )
     };
@@ -399,6 +400,7 @@ async fn target(
             proxy_username: row.try_get("", "proxy_username")?,
             proxy_secret_envelope: row.try_get("", "proxy_secret_envelope")?,
             proxy_reuse_connections: row.try_get("", "proxy_reuse_connections")?,
+            proxy_preset_id: row.try_get("", "proxy_preset_id")?,
             input_price_micros: 0,
             output_price_micros: 0,
         },
@@ -443,7 +445,8 @@ async fn probe(state: &AppState, claim: &jobs::Claim, payload: &Value) -> Result
     .await?;
     let started = Instant::now();
     let response = state
-        .upstream_client(&target)?
+        .upstream_client(&target)
+        .await?
         .post(prepared.url)
         .headers(prepared.headers)
         .json(&prepared.payload)
@@ -620,7 +623,7 @@ async fn quota(state: &AppState, claim: &jobs::Claim, payload: &Value) -> Result
     {
         return Err(ApiError::BadRequest("quota collection requires a supported API-key credential and the configured provider origin".into()));
     }
-    let request = state.upstream_client(&target)?.get(url.clone());
+    let request = state.upstream_client(&target).await?.get(url.clone());
     let request = match target.provider_kind.as_str() {
         "anthropic" => request
             .header("x-api-key", &secret)

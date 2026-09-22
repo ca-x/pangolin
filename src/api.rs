@@ -56,10 +56,19 @@ impl AppState {
         lock.lock_owned().await
     }
 
-    pub(crate) fn upstream_client(
+    pub(crate) async fn upstream_client(
         &self,
         target: &crate::models::RouteTarget,
     ) -> Result<reqwest::Client, ApiError> {
+        if target.proxy_url.is_none()
+            && let Some(preset) = target.proxy_preset_id.as_deref()
+        {
+            let resolved = crate::operations::proxy::resolve(self, Some(preset)).await?;
+            return crate::operations::proxy::client(
+                resolved.as_ref(),
+                self.config.upstream_timeout,
+            );
+        }
         let password = target
             .proxy_secret_envelope
             .as_deref()
@@ -1904,6 +1913,7 @@ mod tests {
             proxy_username: None,
             proxy_secret_envelope: None,
             proxy_reuse_connections: true,
+            proxy_preset_id: None,
             input_price_micros: 0,
             output_price_micros: 0,
         };

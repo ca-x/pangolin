@@ -1820,6 +1820,67 @@ async fn anthropic_chat_bridge_uses_the_channel_proxy() {
 }
 
 #[tokio::test]
+async fn channel_proxy_preset_is_used_for_provider_egress() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let proxy_url = format!("http://{}", listener.local_addr().unwrap());
+    listener.set_nonblocking(true).unwrap();
+    let proxy = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let (mut socket, _) = loop {
+            match listener.accept() {
+                Ok(connection) => break connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "proxy preset was not used"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("proxy accept failed: {error}"),
+            }
+        };
+        socket
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut bytes = [0_u8; 4096];
+        let count = socket.read(&mut bytes).unwrap();
+        let request = String::from_utf8_lossy(&bytes[..count]).to_string();
+        let body = r#"{"choices":[{"message":{"content":"via preset"}}]}"#;
+        socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).unwrap();
+        request
+    });
+
+    let f = fixture(Router::new()).await;
+    sql(
+        &f,
+        "UPDATE providers SET base_url='http://preset-upstream.invalid' WHERE id=?",
+        vec![f.providers[0].clone().into()],
+    )
+    .await;
+    sql(
+        &f,
+        "UPDATE providers SET enabled=0 WHERE id<>?",
+        vec![f.providers[0].clone().into()],
+    )
+    .await;
+    sql(&f, "INSERT INTO proxy_presets(id,name,url,enabled,created_at,updated_at) VALUES('provider-preset','Provider preset',?,1,0,0)", vec![proxy_url.into()]).await;
+    sql(&f, "UPDATE channel_settings SET proxy_url=NULL,proxy_secret_envelope=NULL,proxy_preset_id='provider-preset' WHERE provider_id=?", vec![f.providers[0].clone().into()]).await;
+
+    let response = request(&f, "/v1/chat/completions", chat()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        json_body(response).await["choices"][0]["message"]["content"],
+        "via preset"
+    );
+    assert!(
+        proxy
+            .join()
+            .unwrap()
+            .starts_with("POST http://preset-upstream.invalid/v1/chat/completions HTTP/1.1")
+    );
+}
+
+#[tokio::test]
 async fn model_sync_is_bounded_idempotent_and_preserves_manual_models() {
     let f = fixture(Router::new().route(
         "/models",

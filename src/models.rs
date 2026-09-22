@@ -85,6 +85,7 @@ pub struct RouteTarget {
     pub proxy_username: Option<String>,
     pub proxy_secret_envelope: Option<String>,
     pub proxy_reuse_connections: bool,
+    pub proxy_preset_id: Option<String>,
     pub input_price_micros: i64,
     pub output_price_micros: i64,
 }

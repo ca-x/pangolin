@@ -387,7 +387,7 @@ async fn execute_inner(
                 }
             }
             contacted = true;
-            let upstream_client = state.upstream_client(target)?;
+            let upstream_client = state.upstream_client(target).await?;
             if endpoint == "/v1/chat/completions" && target.provider_kind == "anthropic" {
                 let mapped_endpoint = if candidate.endpoint == endpoint {
                     "/v1/messages"

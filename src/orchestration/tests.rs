@@ -103,6 +103,7 @@ pub(super) fn candidate(id: &str, weight: u32) -> Candidate {
             proxy_username: None,
             proxy_secret_envelope: None,
             proxy_reuse_connections: true,
+            proxy_preset_id: None,
             input_price_micros: 0,
             output_price_micros: 0,
         },
