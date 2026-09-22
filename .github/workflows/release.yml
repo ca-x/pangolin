@@ -3,13 +3,30 @@ name: Release binaries
 on:
   push:
     tags: ["v*"]
-  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
+  preflight:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Verify stable release tag
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REF" =~ ^refs/tags/v([0-9]+\.[0-9]+\.[0-9]+)$ ]]
+          version="${BASH_REMATCH[1]}"
+          test "$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)" = "$version"
+          test "$(node -p "require('./web/package.json').version")" = "$version"
+          git fetch --no-tags origin main
+          test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)"
+
   web-assets:
+    needs: preflight
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -90,6 +107,7 @@ jobs:
           set -euo pipefail
           cd dist
           find . -maxdepth 1 -type f -name 'pangolin-*' -printf '%f\0' | sort -z | xargs -0 sha256sum > SHA256SUMS
+          sha256sum -c SHA256SUMS
       - uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b # v2.5.0
         with:
           files: dist/*
