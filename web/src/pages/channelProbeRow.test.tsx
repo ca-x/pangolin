@@ -21,6 +21,7 @@ vi.mock('sonner', () => ({ toast: { success: vi.fn(), error: vi.fn(), info: vi.f
 const json = (value: unknown, status = 200) => Promise.resolve(new Response(JSON.stringify(value), { status, headers: { 'Content-Type': 'application/json' } }))
 const project = { id: 'p1', name: 'Project', slug: 'project', owner_user_id: 'u1', is_default: true, enabled: true }
 const channel = { id: 'c1', name: 'openai-prod', kind: 'openai', base_url: 'https://api.openai.com/v1', enabled: true }
+const model = { id: 'm1', provider_id: 'c1', public_name: 'fast', upstream_name: 'gpt-4o-mini', enabled: true, lifecycle: 'active' }
 
 const renderPage = (fetchMock: ReturnType<typeof vi.fn>) => {
   vi.stubGlobal('fetch', fetchMock)
@@ -42,8 +43,9 @@ const mockApi = () => {
     if (path.endsWith('/projects')) return json([project])
     if (path.includes('/permissions')) return json(['*'])
     if (path.includes('operations/probe') && init?.method === 'POST') { probed = true; return json({ job_id: 'j1' }) }
-    if (path.includes('operations/probes')) return json({ data: probed ? [{ id: 'pr1', provider_id: 'c1', model: 'gpt-4o-mini', success: 1, status_code: 200, latency_ms: 12, probed_at: 1_700_000_000, error: null }] : [], total: probed ? 1 : 0 })
+    if (path.includes('operations/probes')) return json({ data: probed ? [{ id: 'pr1', provider_id: 'c1', model: 'gpt-4o-mini', success: 1, status_code: 200, latency_ms: 110, ttft_ms: 10, output_tokens: 10, probed_at: 1_700_000_000, error: null }] : [], total: probed ? 1 : 0 })
     if (path.includes('operations/health') || path.includes('operations/credential-health')) return json({ data: [], total: 0 })
+    if (path.includes('operations/models')) return json({ data: [model], total: 1 })
     return json({ data: [channel], total: 1 })
   })
 }
@@ -66,14 +68,47 @@ describe('a channel can be probed from its own row', () => {
     await waitFor(() => {
       const call = fetchMock.mock.calls.find(([input, init]) => String(input).includes('operations/probe') && (init as RequestInit | undefined)?.method === 'POST')
       expect(call).toBeTruthy()
-      expect(JSON.parse(String((call![1] as RequestInit).body))).toEqual({ provider_id: 'c1' })
+      expect(JSON.parse(String((call![1] as RequestInit).body))).toEqual({ provider_id: 'c1', model_id: 'm1' })
     })
 
-    // The outcome lands where the decision was made, with the model the probe
-    // actually used — the console does not choose it, the backend does.
-    expect(await within(dialog).findByText('Succeeded')).toBeInTheDocument()
-    expect(within(dialog).getByText('Latency: 12 ms')).toBeInTheDocument()
+    // The outcome lands where the decision was made, with the model selected by
+    // the operator and validated by the backend.
+    expect((await within(dialog).findAllByText('Succeeded')).length).toBeGreaterThan(0)
+    expect(within(dialog).getByText('Latency: 110 ms')).toBeInTheDocument()
     expect(within(dialog).getByText('Model: gpt-4o-mini')).toBeInTheDocument()
     expect(within(dialog).getByText('Status code: 200')).toBeInTheDocument()
+    expect(within(dialog).getByText('Success rate')).toBeInTheDocument()
+    expect(within(dialog).getByText('100%')).toBeInTheDocument()
+    expect(within(dialog).getByText('Average TTFT')).toBeInTheDocument()
+    expect(within(dialog).getByText('10 ms')).toBeInTheDocument()
+    expect(within(dialog).getByText('Tokens/s')).toBeInTheDocument()
+    expect(within(dialog).getByText('100.0')).toBeInTheDocument()
+  })
+
+  it('runs all eligible channels with bounded concurrency and reports each channel', async () => {
+    const channels = Array.from({ length: 5 }, (_, index) => ({ ...channel, id: `c${index + 1}`, name: `Channel ${index + 1}` }))
+    const models = channels.map((item, index) => ({ ...model, id: `m${index + 1}`, provider_id: item.id, public_name: `model-${index + 1}` }))
+    let active = 0
+    let maximum = 0
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input)
+      if (path.endsWith('/projects')) return json([project])
+      if (path.includes('/permissions')) return json(['*'])
+      if (path.includes('operations/probe') && init?.method === 'POST') {
+        active += 1
+        maximum = Math.max(maximum, active)
+        return new Promise<Response>((resolve) => setTimeout(() => { active -= 1; resolve(new Response(JSON.stringify({ id: 'job' }), { status: 200, headers: { 'Content-Type': 'application/json' } })) }, 20))
+      }
+      if (path.includes('operations/probes') || path.includes('operations/health') || path.includes('operations/credential-health')) return json({ data: [], total: 0 })
+      if (path.includes('operations/models')) return json({ data: models, total: models.length })
+      if (path.includes('operations/channels')) return json({ data: channels, total: channels.length })
+      return json({ data: [], total: 0 })
+    })
+    renderPage(fetchMock)
+
+    await userEvent.click(await screen.findByRole('button', { name: 'Test all channels' }))
+    await waitFor(() => expect(fetchMock.mock.calls.filter(([input, init]) => String(input).includes('operations/probe') && (init as RequestInit | undefined)?.method === 'POST')).toHaveLength(5))
+    expect(maximum).toBeLessThanOrEqual(3)
+    for (const item of channels) expect(await screen.findByText(`${item.name}: Queued`)).toBeInTheDocument()
   })
 })

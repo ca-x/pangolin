@@ -476,6 +476,7 @@ pub mod parity {
         pub status_code: Option<i32>,
         pub latency_ms: Option<i64>,
         pub ttft_ms: Option<i64>,
+        pub output_tokens: Option<i64>,
         pub error_code: Option<String>,
         pub probed_at: i64,
     }

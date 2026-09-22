@@ -2,10 +2,10 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Activity, AlertTriangle, Archive, ChevronLeft, ChevronRight, Circle, Copy, Pause, Pin, Play, RotateCcw } from 'lucide-react'
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
-import { Link, useLocation, useNavigate, useParams } from 'react-router'
+import { Link, useLocation, useNavigate, useParams, useSearchParams } from 'react-router'
 import { toast } from 'sonner'
 import { api, type Document, type LiveRequest, type Paged, type RequestDetail, type RequestItem } from '../api'
-import { ActionIcon, Alert, Anchor, Badge, Button, Card, Code, Group, Pagination, Select, SimpleGrid, Stack, Table, TableScrollContainer, Tabs, Text, TextInput, Title, Tooltip } from '@mantine/core'
+import { ActionIcon, Alert, Anchor, Badge, Button, Card, Code, Group, MultiSelect, Pagination, Select, SimpleGrid, Stack, Table, TableScrollContainer, Tabs, Text, TextInput, Title, Tooltip } from '@mantine/core'
 import { EmptyState, SkeletonRows, Status, confirmAction } from '../components'
 import { ObservabilityNotice, UNMEASURED, formatCount, formatMicros, usageMeasured, useErrorKindLabel, useObservability } from '../observability'
 import { projectOperationPath, useProject } from '../project'
@@ -63,6 +63,13 @@ const mergeObserved = (current: Observed, rows: RequestItem[]): Observed => {
   // Keep the previous object when nothing changed, so the effect cannot loop.
   return next.codes.join() === current.codes.join() && next.providers.join() === current.providers.join() && next.models.join() === current.models.join() && next.keys.join() === current.keys.join() ? current : next
 }
+
+const FACET_LIMIT = 20
+const facetValues = (params: URLSearchParams, key: string) => params.getAll(key)
+  .map((value) => value.trim())
+  .filter((value, index, values) => value && values.indexOf(value) === index)
+  .slice(0, FACET_LIMIT)
+const facetData = (observed: string[], selected: string[]) => [...new Set([...selected, ...observed])]
 
 export default function OperationsPage() {
   const { t } = useTranslation()
@@ -218,25 +225,43 @@ function RequestList({ observability }: { observability: ReturnType<typeof useOb
   const { project } = useProject()
   const kindLabel = useErrorKindLabel()
   const [paused, setPaused] = useState(false)
-  const [offset, setOffset] = useState(0)
+  const [searchParams, setSearchParams] = useSearchParams()
   const limit = 25
-  const [filters, setFilters] = useState({ status: '', provider: '', model: '', key: '' })
-  const [period, setPeriod] = useState('')
-  const [custom, setCustom] = useState({ from: '', until: '' })
+  const filters = {
+    status: facetValues(searchParams, 'status'),
+    provider: facetValues(searchParams, 'provider'),
+    model: facetValues(searchParams, 'model'),
+    key: facetValues(searchParams, 'key'),
+  }
+  const period = searchParams.get('window') ?? ''
+  const custom = { from: searchParams.get('from') ?? '', until: searchParams.get('until') ?? '' }
+  const page = Math.max(1, Number.parseInt(searchParams.get('page') ?? '1', 10) || 1)
+  const offset = (page - 1) * limit
   const [observed, setObserved] = useState<Observed>(emptyObserved)
   const params = new URLSearchParams({ limit: String(limit), offset: String(offset) })
-  const statusCode = filters.status.trim()
-  if (statusCode && /^\d{3}$/.test(statusCode)) params.set('status_code', statusCode)
-  if (filters.provider) params.set('provider', filters.provider)
-  if (filters.model) params.set('model', filters.model)
-  // The projection has always carried the key id; the filter accepts it now.
-  if (filters.key.trim()) params.set('api_key_id', filters.key.trim())
+  const addFacet = (single: string, plural: string, values: string[]) => {
+    if (values.length === 1) params.set(single, values[0])
+    if (values.length > 1) params.set(plural, JSON.stringify(values))
+  }
+  addFacet('status_code', 'status_codes', filters.status.filter((value) => /^\d{3}$/.test(value)))
+  addFacet('provider', 'providers', filters.provider)
+  addFacet('model', 'models', filters.model)
+  addFacet('api_key_id', 'api_key_ids', filters.key)
   // The list and its total are read from the same windowed response, so the page
   // count can never describe a different set of rows than the page shows.
   const bounds = windowBounds(period, custom, Math.floor(Date.now() / 1000))
   if (bounds.from != null) params.set('from', String(bounds.from))
   if (bounds.until != null) params.set('until', String(bounds.until))
-  const update = (next: typeof filters) => { setFilters(next); setOffset(0) }
+  const updateParams = (changes: Record<string, string[] | string | null>, replace = false) => {
+    const next = new URLSearchParams(searchParams)
+    for (const [key, value] of Object.entries(changes)) {
+      next.delete(key)
+      if (Array.isArray(value)) value.slice(0, FACET_LIMIT).forEach((item) => next.append(key, item))
+      else if (value) next.set(key, value)
+    }
+    if (!Object.hasOwn(changes, 'page')) next.delete('page')
+    setSearchParams(next, { replace })
+  }
   const query = useQuery({
     queryKey: ['requests', project.id, filters, period, custom, offset],
     queryFn: () => api<Paged<RequestItem>>(`/api/admin/v1/projects/${encodeURIComponent(project.id)}/observability/requests?${params}`),
@@ -251,11 +276,11 @@ function RequestList({ observability }: { observability: ReturnType<typeof useOb
   const total = query.data?.total || 0
   const totalPages = Math.max(1, Math.ceil(total / limit))
   const currentPage = Math.floor(offset / limit) + 1
-  const filtered = Boolean(filters.status.trim() || filters.provider.trim() || filters.model.trim() || filters.key.trim() || period)
+  const filtered = Boolean(filters.status.length || filters.provider.length || filters.model.length || filters.key.length || period)
   const showFilters = observability.measured && (filtered || total > 0)
   // Never hide the control that undoes a pause, even once the list drains.
   const showPause = observability.measured && (paused || total > 0)
-  const clearFilters = () => { update({ status: '', provider: '', model: '', key: '' }); setPeriod(''); setCustom({ from: '', until: '' }) }
+  const clearFilters = () => updateParams({ status: [], provider: [], model: [], key: [], window: null, from: null, until: null })
   const measured = observability.measured
   const unavailable = observability.reason === 'unavailable'
   return <>
@@ -264,17 +289,17 @@ function RequestList({ observability }: { observability: ReturnType<typeof useOb
       <Group justify={showFilters ? 'space-between' : 'flex-end'} align="flex-end" gap="md" wrap="wrap">
         {showFilters && <Stack gap="sm" style={{ flex: '1 1 520px' }}>
           <SimpleGrid cols={{ base: 1, sm: 2, lg: 4 }}>
-            <Select label={t('statusCode')} data={observed.codes} value={filters.status || null} onChange={(value) => update({ ...filters, status: value ?? '' })} placeholder={t('anyStatus')} nothingFoundMessage={t('noObservedValues')} clearable />
-            <Select label={t('provider')} data={observed.providers} value={filters.provider || null} onChange={(value) => update({ ...filters, provider: value ?? '' })} placeholder={t('anyProvider')} nothingFoundMessage={t('noObservedValues')} searchable clearable />
-            <Select label={t('model')} data={observed.models} value={filters.model || null} onChange={(value) => update({ ...filters, model: value ?? '' })} placeholder={t('anyModel')} nothingFoundMessage={t('noObservedValues')} searchable clearable />
-            <Select label={t('keyId')} data={observed.keys} value={filters.key || null} onChange={(value) => update({ ...filters, key: value ?? '' })} clearable searchable />
-            <Select label={t('timeWindow')} data={WINDOW_KEYS.map(({ value, label }) => ({ value, label: t(label) }))} value={period || null} onChange={(value) => { setPeriod(value ?? ''); setOffset(0) }} placeholder={t('anyTime')} clearable />
+            <MultiSelect label={t('statusCode')} data={facetData(observed.codes, filters.status)} value={filters.status} onChange={(value) => updateParams({ status: value })} placeholder={t('anyStatus')} nothingFoundMessage={t('noObservedValues')} clearable maxValues={FACET_LIMIT} />
+            <MultiSelect label={t('provider')} data={facetData(observed.providers, filters.provider)} value={filters.provider} onChange={(value) => updateParams({ provider: value })} placeholder={t('anyProvider')} nothingFoundMessage={t('noObservedValues')} searchable clearable maxValues={FACET_LIMIT} />
+            <MultiSelect label={t('model')} data={facetData(observed.models, filters.model)} value={filters.model} onChange={(value) => updateParams({ model: value })} placeholder={t('anyModel')} nothingFoundMessage={t('noObservedValues')} searchable clearable maxValues={FACET_LIMIT} />
+            <MultiSelect label={t('keyId')} data={facetData(observed.keys, filters.key)} value={filters.key} onChange={(value) => updateParams({ key: value })} clearable searchable maxValues={FACET_LIMIT} />
+            <Select label={t('timeWindow')} data={WINDOW_KEYS.map(({ value, label }) => ({ value, label: t(label) }))} value={period || null} onChange={(value) => updateParams({ window: value ?? null, ...(value === 'custom' ? {} : { from: null, until: null }) })} placeholder={t('anyTime')} clearable />
           </SimpleGrid>
           {/* A custom window is two instants rather than a preset, so it gets its
               own row and only appears once the operator asked for it. */}
           {period === 'custom' && <SimpleGrid cols={{ base: 1, sm: 2 }}>
-            <TextInput type="datetime-local" label={t('from')} value={custom.from} onChange={(event) => { const from = event.target.value; setCustom((current) => ({ ...current, from })); setOffset(0) }} />
-            <TextInput type="datetime-local" label={t('until')} value={custom.until} onChange={(event) => { const until = event.target.value; setCustom((current) => ({ ...current, until })); setOffset(0) }} />
+            <TextInput type="datetime-local" label={t('from')} value={custom.from} onChange={(event) => updateParams({ from: event.target.value || null }, true)} />
+            <TextInput type="datetime-local" label={t('until')} value={custom.until} onChange={(event) => updateParams({ until: event.target.value || null }, true)} />
           </SimpleGrid>}
         </Stack>}
         {showPause && <Group gap="xs" align="center">
@@ -296,7 +321,7 @@ function RequestList({ observability }: { observability: ReturnType<typeof useOb
           </Table>
         </TableScrollContainer>
         {total > limit && <Group justify="flex-end" gap="sm" mt="md">
-          <Pagination total={totalPages} value={currentPage} onChange={(page) => setOffset((page - 1) * limit)} getControlProps={(control) => {
+          <Pagination total={totalPages} value={currentPage} onChange={(nextPage) => updateParams({ page: nextPage > 1 ? String(nextPage) : null })} getControlProps={(control) => {
             if (control === 'previous') return { 'aria-label': t('previous') }
             if (control === 'next') return { 'aria-label': t('next') }
             return {}

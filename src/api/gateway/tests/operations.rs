@@ -7018,13 +7018,29 @@ async fn task5_bounded_media_is_costed_and_polling_does_not_double_charge() {
 #[tokio::test]
 async fn task5_probe_quota_collector_and_invalid_schedule_isolation() {
     let f=fixture(Router::new().route("/v1/chat/completions",post(||async{Json(json!({"choices":[{"message":{"content":"OK"}}],"usage":{"prompt_tokens":2,"completion_tokens":1}}))})).route("/api/v1/key",get(||async{Json(json!({"data":{"limit_remaining":0.0}}))}))).await;
+    let probe_model = f
+        .state
+        .db
+        .query_one(ops::sql(
+            "SELECT id FROM models WHERE provider_id=? ORDER BY priority LIMIT 1",
+            vec![f.providers[0].clone().into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get::<String>("", "id")
+        .unwrap();
     for kind in ["probe", "quota"] {
         ops::jobs::enqueue(
             &f.state.db,
             Some(db::DEFAULT_PROJECT_ID),
             kind,
             kind,
-            &json!({"provider_id":f.providers[0]}),
+            &if kind == "probe" {
+                json!({"provider_id":f.providers[0],"model_id":probe_model.clone()})
+            } else {
+                json!({"provider_id":f.providers[0]})
+            },
             db::now(),
         )
         .await
@@ -7069,6 +7085,103 @@ async fn task5_probe_quota_collector_and_invalid_schedule_isolation() {
         )
         .await,
         1
+    );
+}
+
+#[tokio::test]
+async fn channel_probe_uses_the_requested_model_and_refuses_a_model_from_another_channel() {
+    let f = fixture(Router::new().route(
+        "/v1/chat/completions",
+        post(|Json(body): Json<Value>| async move {
+            if body["model"] == "chosen-upstream" {
+                (
+                    StatusCode::OK,
+                    Json(json!({"choices":[{"message":{"content":"OK"}}],"usage":{"prompt_tokens":2,"completion_tokens":5}})),
+                )
+            } else {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error":{"message":"wrong model"}})),
+                )
+            }
+        }),
+    ))
+    .await;
+    let cookie = owner(&f).await;
+    sql(
+        &f,
+        "INSERT INTO models(id,provider_id,public_name,upstream_name,capabilities,priority,enabled,created_at) VALUES('probe-chosen',?,'chosen','chosen-upstream','[]',0,1,1)",
+        vec![f.providers[0].clone().into()],
+    )
+    .await;
+    let path = format!(
+        "/api/admin/v1/projects/{}/operations/probe",
+        db::DEFAULT_PROJECT_ID
+    );
+    let queued = admin(
+        &f,
+        &cookie,
+        http::Method::POST,
+        &path,
+        json!({"provider_id":f.providers[0],"model_id":"probe-chosen"}),
+        true,
+    )
+    .await;
+    assert_eq!(queued.status(), StatusCode::OK);
+    let claim = ops::jobs::claim(&f.state.db, "worker", db::now(), 120)
+        .await
+        .unwrap()
+        .unwrap();
+    ops::runtime::execute(&f.state, &claim).await.unwrap();
+    let probe = f
+        .state
+        .db
+        .query_one(ops::sql(
+            "SELECT model,success,output_tokens,ttft_ms FROM channel_probes WHERE provider_id=? ORDER BY probed_at DESC LIMIT 1",
+            vec![f.providers[0].clone().into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        probe.try_get::<String>("", "model").unwrap(),
+        "chosen-upstream"
+    );
+    assert!(probe.try_get::<bool>("", "success").unwrap());
+    assert_eq!(probe.try_get::<i64>("", "output_tokens").unwrap(), 5);
+    assert!(
+        probe
+            .try_get::<Option<i64>>("", "ttft_ms")
+            .unwrap()
+            .is_some()
+    );
+
+    let foreign_model = f
+        .state
+        .db
+        .query_one(ops::sql(
+            "SELECT id FROM models WHERE provider_id=? LIMIT 1",
+            vec![f.providers[1].clone().into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get::<String>("", "id")
+        .unwrap();
+    let refused = admin(
+        &f,
+        &cookie,
+        http::Method::POST,
+        &path,
+        json!({"provider_id":f.providers[0],"model_id":foreign_model}),
+        true,
+    )
+    .await;
+    assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+    let refusal = json_body(refused).await;
+    assert_eq!(
+        refusal["error"]["message"],
+        json!("model is not enabled for this channel")
     );
 }
 

@@ -56,12 +56,12 @@ states plainly that no test guards it yet.
 | models, routing & pricing | 6 | 13 | 2 | 1 | 3 | 1 | 0 | 26 |
 | access control | 2 | 17 | 2 | 0 | 0 | 0 | 0 | 21 |
 | system settings & background work | 8 | 11 | 5 | 1 | 5 | 0 | 1 | 31 |
-| console-wide UX | 3 | 9 | 1 | 2 | 0 | 0 | 0 | 15 |
-| **total** | **30** | **73** | **11** | **5** | **11** | **1** | **2** | **133** |
+| console-wide UX | 3 | 11 | 1 | 0 | 0 | 0 | 0 | 15 |
+| **total** | **30** | **75** | **11** | **3** | **11** | **1** | **2** | **133** |
 
 Row count is unchanged at 133 — the six area reports' own findings. No row was
-dropped, merged or added. What changed is the status: **114 rows need no work**
-(30 already matched, 73 fixed, 11 refuted), **17 rows need work** (`partial` +
+dropped, merged or added. What changed is the status: **116 rows need no work**
+(30 already matched, 75 fixed, 11 refuted), **15 rows need work** (`partial` +
 `open` + `feature-build`), and **2 rows are recorded divergences** whose only
 remaining difference is deliberate.
 
@@ -238,9 +238,9 @@ Report: [parity-ux-extras.md](parity-ux-extras.md).
 | # | Finding | Status | Basis | Pangolin evidence | AxonHub reference | Acceptance test |
 | --- | --- | --- | --- | --- | --- | --- |
 | 1 | Bulk selection and bulk actions in lists | closed | fixed | Opt-in `selectable` adds a checkbox column, select-all, a count bar and Enable/Disable/Cancel, driving the existing `bulk-toggle` (`pages/shared.tsx:78,144-190`); exposed on channels, credentials, models, prompts and protection, and hand-built on keys | `channels-table.tsx:102,199-200`, `channels-bulk-*.tsx` | `bulkSelection.test.tsx`, `keyBulkSelection.test.tsx`, `bulkToggleResources.test.tsx` |
-| 2 | Probing a channel from inside the console | partial | — | Each channel row has a `Test` action whose dialog queues the same probe job and shows status/model/latency/HTTP status/error inline (`ChannelsPage.tsx:35`, probe panel) | `channels-test-dialog.tsx:41,91`, `channels-test-history-drawer.tsx`, `channel-health-cell.tsx:14-40` | the operator cannot choose the model (the route takes only `provider_id`); no history drawer, no bulk test, no sparkline |
+| 2 | Probing a channel from inside the console | closed | fixed | Operators choose an enabled active model, read bounded latency/TTFT/TPS history and success sparkline, and can queue all eligible channels with concurrency three. Foreign/wrong-channel models fail closed. | `channels-test-dialog.tsx:41,91`, `channels-test-history-drawer.tsx`, `channel-health-cell.tsx:14-40` | requested-model Rust contract plus `channelProbeRow.test.tsx` and `channelHealth.test.tsx` |
 | 3 | Entering a channel credential | closed | parity | Credentials dialog with channel/type/secret/priority/enabled; the secret is masked, encrypted, suffix-identified and never returned | `channels-api-key-management-dialog.tsx:63-70` | `confirmCallSites.test.tsx`, `shared.test.tsx` |
-| 4 | Filters on the request log | partial | — | Window presets + custom range and status/provider/model/key facets (`OperationsPage.tsx:120-146`) | `features/requests/index.tsx:23-33,147-158` (multi-select, URL state, reset) | URL persistence and multi-select are missing; `observabilityWiring.test.tsx` guards what exists |
+| 4 | Filters on the request log | closed | fixed | URL-backed time/page state survives reload and navigation; four bounded multi-select facets preserve exact values and use OR-within/AND-across semantics in matching list/count paths. | `features/requests/index.tsx:23-33,147-158` (multi-select, URL state, reset) | DuckDB facet contract and `observabilityWiring.test.tsx` |
 | 5 | Dismissible onboarding | closed | fixed | The banner carries a dismiss control persisted per instance in this browser and restorable from appearance settings (`Shell.tsx:34-42,158-179`) | `onboarding-flow.tsx:272-295` | `onboarding.test.tsx` |
 | 6 | Option-list queries fail silently | closed | fixed | Every option list reports failure with a retry (`pages/shared.tsx`, `ChannelsPage.tsx:225-227`, `ModelsPage.tsx:43-46`, `AccessPage.tsx:247-249`) | `AGENTS.md:63` | `channelHealth.test.tsx` ("a picker whose option list failed says so") |
 | 7 | Invitations list has no empty state | closed | fixed | `EmptyState` carrying the invite action (`AccessPage.tsx:470`) | `AGENTS.md:63` | `emptyStateControls.test.tsx` |
@@ -250,7 +250,7 @@ Report: [parity-ux-extras.md](parity-ux-extras.md).
 | 11 | Loading shimmer animates a non-composited property | closed | fixed | The sweep is `transform: translateX(...)` on the element's own layer, disabled under reduced motion (`styles.css:342-352,501-502`) | `AGENTS.md:64` | `presentationRules.test.ts` |
 | 12 | Icon-only controls have accessible names | closed | parity | Every `ActionIcon` names its row; the burger, scrim and modal close buttons are labelled | `AGENTS.md:65` | `confirmCallSites.test.tsx`, `dialogs.test.tsx` |
 | 13 | Motion budget, pointer gating and reduced motion | closed | parity | All transitions ≤260 ms, hover inside `@media (hover: hover) and (pointer: fine)`, reduced motion honoured (`styles.css`) | `AGENTS.md:64` | `presentationRules.test.ts` |
-| 14 | Channel health state has no console surface | closed | fixed | `HealthPill` renders a localized auto-disabled window, backoff or failure count, `—` when unrecorded (`ChannelsPage.tsx:150-166`); the credential relation emits `credential_id` | `channel-health-cell.tsx:14-40` | `channelHealth.test.tsx` — the success-rate sparkline remains a feature, not wiring |
+| 14 | Channel health state has no console surface | closed | fixed | `HealthPill` renders auto-disabled/backoff/failure state and `—` when unrecorded; channel rows now add bounded outcome history, success rate and sparkline without inventing measurements. | `channel-health-cell.tsx:14-40` | `channelHealth.test.tsx` |
 | 15 | "The console invents zeros for unmeasured telemetry" | closed | refuted | One formatter pair, the null rule in table cells and the request list's sentinel (`observability.tsx:10-28`, `shared.tsx:27-32`) | `AGENTS.md:62` | `observabilityTruth.test.tsx`, `unsettledUsage.test.tsx` |
 
 ## Intentional divergences
@@ -469,7 +469,7 @@ retry/model/quota settings, and CORS/timeouts. Every one of them is scheduled in
 | Developer settings | implemented+tested | versioned project rules provide developer-scoped channel associations and reasoning-effort mappings with per-model inheritance control |
 | Pricing | partial | channel price entries unreachable, no read projection (models 18, 24) |
 | Pricing modes | partial | flat/unit/tiered with cache-write variants; no volume mode (models 17) |
-| Channel probing | partial | manual probe job with status/latency/TTFT and error; no scheduled history view, no TPS, no model choice |
+| Channel probing | implemented+tested | explicit model choice, bounded history with latency/TTFT/TPS, per-row sparkline and concurrency-three bulk testing |
 | Provider quota collection | implemented+tested | configured paths plus direct/nested/used-limit normalization preserve period/source metadata; unknown shapes remain unmeasured and non-enforcing |
 | Auto-disable | implemented+tested | status/error pattern counters, duration or cron+timezone recovery, channel or credential action (`operations/runtime.rs:400-470`) |
 

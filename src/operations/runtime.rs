@@ -366,8 +366,24 @@ async fn target(
     state: &AppState,
     project: &str,
     provider: &str,
+    model_id: Option<&str>,
 ) -> Result<(crate::models::RouteTarget, String, String), ApiError> {
-    let row=state.db.query_one(sql("SELECT p.name,p.kind,p.base_url,c.id AS credential_id,c.credential_type,c.secret_envelope,m.public_name,m.upstream_name,s.proxy_url,s.proxy_username,s.proxy_secret_envelope,COALESCE(s.proxy_reuse_connections,1) AS proxy_reuse_connections FROM providers p JOIN channel_credentials c ON c.provider_id=p.id AND c.enabled=1 JOIN models m ON m.provider_id=p.id AND m.enabled=1 LEFT JOIN channel_settings s ON s.provider_id=p.id WHERE p.id=? AND p.project_id=? AND p.enabled=1 ORDER BY c.priority,m.priority LIMIT 1",vec![provider.into(),project.into()])).await?.ok_or(ApiError::NotFound)?;
+    let (query, values) = if let Some(model_id) = model_id {
+        (
+            "SELECT p.name,p.kind,p.base_url,c.id AS credential_id,c.credential_type,c.secret_envelope,m.public_name,m.upstream_name,s.proxy_url,s.proxy_username,s.proxy_secret_envelope,COALESCE(s.proxy_reuse_connections,1) AS proxy_reuse_connections FROM providers p JOIN channel_credentials c ON c.provider_id=p.id AND c.enabled=1 JOIN models m ON m.provider_id=p.id AND m.enabled=1 AND m.lifecycle='active' LEFT JOIN channel_settings s ON s.provider_id=p.id WHERE p.id=? AND p.project_id=? AND p.enabled=1 AND m.id=? ORDER BY c.priority LIMIT 1",
+            vec![provider.into(), project.into(), model_id.into()],
+        )
+    } else {
+        (
+            "SELECT p.name,p.kind,p.base_url,c.id AS credential_id,c.credential_type,c.secret_envelope,m.public_name,m.upstream_name,s.proxy_url,s.proxy_username,s.proxy_secret_envelope,COALESCE(s.proxy_reuse_connections,1) AS proxy_reuse_connections FROM providers p JOIN channel_credentials c ON c.provider_id=p.id AND c.enabled=1 JOIN models m ON m.provider_id=p.id AND m.enabled=1 AND m.lifecycle='active' LEFT JOIN channel_settings s ON s.provider_id=p.id WHERE p.id=? AND p.project_id=? AND p.enabled=1 ORDER BY c.priority,m.priority LIMIT 1",
+            vec![provider.into(), project.into()],
+        )
+    };
+    let row = state
+        .db
+        .query_one(sql(query, values))
+        .await?
+        .ok_or(ApiError::NotFound)?;
     let credential = row.try_get("", "credential_id")?;
     let secret: String = row.try_get("", "secret_envelope")?;
     Ok((
@@ -397,7 +413,8 @@ async fn target(
 async fn probe(state: &AppState, claim: &jobs::Claim, payload: &Value) -> Result<(), ApiError> {
     let project = claim.project_id.as_deref().ok_or(ApiError::Forbidden)?;
     let provider = payload["provider_id"].as_str().ok_or(ApiError::NotFound)?;
-    let (target, credential, secret) = target(state, project, provider).await?;
+    let model_id = payload["model_id"].as_str().ok_or(ApiError::NotFound)?;
+    let (target, credential, secret) = target(state, project, provider, Some(model_id)).await?;
     let endpoint = match target.provider_kind.as_str() {
         "anthropic" => "/v1/messages",
         "gemini" => "/v1beta/models:generateContent",
@@ -433,6 +450,10 @@ async fn probe(state: &AppState, claim: &jobs::Claim, payload: &Value) -> Result
         .timeout(Duration::from_secs(30))
         .send()
         .await;
+    let ttft = response
+        .as_ref()
+        .ok()
+        .map(|_| started.elapsed().as_millis() as i64);
     let code = response
         .as_ref()
         .ok()
@@ -452,7 +473,7 @@ async fn probe(state: &AppState, claim: &jobs::Claim, payload: &Value) -> Result
     let elapsed = started.elapsed().as_millis() as i64;
     let tx = state.db.begin().await?;
     jobs::fence(&tx, claim).await?;
-    tx.execute(sql("INSERT INTO channel_probes(id,provider_id,credential_id,model,success,status_code,latency_ms,output_tokens,error_code,probed_at) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO NOTHING",vec![format!("{}:{}",claim.id,claim.attempts).into(),provider.into(),credential.into(),target.upstream_name.into(),success.into(),code.into(),elapsed.into(),output.into(),(!success).then_some("probe_failed").into(),db::now().into()])).await?;
+    tx.execute(sql("INSERT INTO channel_probes(id,provider_id,credential_id,model,success,status_code,latency_ms,ttft_ms,output_tokens,error_code,probed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO NOTHING",vec![format!("{}:{}",claim.id,claim.attempts).into(),provider.into(),credential.into(),target.upstream_name.into(),success.into(),code.into(),elapsed.into(),ttft.into(),output.into(),(!success).then_some("probe_failed").into(),db::now().into()])).await?;
     tx.commit().await?;
     health(
         state,
@@ -554,7 +575,7 @@ pub(crate) fn normalize_quota(
 async fn quota(state: &AppState, claim: &jobs::Claim, payload: &Value) -> Result<(), ApiError> {
     let project = claim.project_id.as_deref().ok_or(ApiError::Forbidden)?;
     let provider = payload["provider_id"].as_str().ok_or(ApiError::NotFound)?;
-    let (target, credential, secret) = target(state, project, provider).await?;
+    let (target, credential, secret) = target(state, project, provider, None).await?;
     let provider_settings = state
         .db
         .query_one(sql(

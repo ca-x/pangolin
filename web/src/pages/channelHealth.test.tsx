@@ -25,7 +25,7 @@ const credential = (overrides: Record<string, unknown> = {}) => ({ id: 'k1', pro
 const health = (overrides: Record<string, unknown> = {}) => ({ id: 'c1', provider_id: 'c1', consecutive_failures: 0, disabled_until: null, backoff_until: null, reason: null, updated_at: 1, ...overrides })
 const credentialHealth = (overrides: Record<string, unknown> = {}) => ({ id: 'k1', credential_id: 'k1', consecutive_failures: 0, disabled_until: null, updated_at: 1, ...overrides })
 
-type Options = { channels?: unknown[]; credentials?: unknown[]; health?: unknown[]; credentialHealth?: unknown[]; healthFails?: boolean; channelOptionsFail?: boolean }
+type Options = { channels?: unknown[]; credentials?: unknown[]; health?: unknown[]; credentialHealth?: unknown[]; probes?: unknown[]; healthFails?: boolean; channelOptionsFail?: boolean }
 const mockApi = (options: Options = {}) => {
   const fetchMock = vi.fn((input: RequestInfo | URL) => {
     const path = String(input)
@@ -33,6 +33,7 @@ const mockApi = (options: Options = {}) => {
     if (path.includes('/permissions')) return json(['*'])
     if (path.includes('operations/health')) return options.healthFails ? Promise.reject(new Error('health unavailable')) : json({ data: options.health ?? [], total: (options.health ?? []).length })
     if (path.includes('operations/credential-health')) return json({ data: options.credentialHealth ?? [], total: (options.credentialHealth ?? []).length })
+    if (path.includes('operations/probes')) return json({ data: options.probes ?? [], total: (options.probes ?? []).length })
     if (path.includes('operations/credentials')) return json({ data: options.credentials ?? [], total: (options.credentials ?? []).length })
     if (path.includes('operations/channels')) {
       // The picker's own lookup (`limit=500`) fails while the table's page still loads.
@@ -75,6 +76,23 @@ describe('the channels page states recorded channel health', () => {
     renderPage()
     expect((await rowFor('Primary')).getByText('2 consecutive failures')).toBeInTheDocument()
     expect((await rowFor('Backing')).getByText(/^Backing off until/)).toBeInTheDocument()
+  })
+
+  it('draws recorded probe outcomes and prints an em dash when no history exists', async () => {
+    mockApi({
+      channels: [channel(), channel({ id: 'c2', name: 'Unreported' })],
+      probes: [
+        { id: 'p1', provider_id: 'c1', success: 1, probed_at: 2 },
+        { id: 'p2', provider_id: 'c1', success: 0, probed_at: 1 },
+      ],
+    })
+    renderPage()
+
+    const primary = await rowFor('Primary')
+    expect(primary.getByLabelText('Probe success history for Primary')).toHaveTextContent('50%')
+    expect(primary.getByLabelText('Probe success history for Primary').querySelector('svg')).not.toBeNull()
+    expect((await rowFor('Unreported')).getByLabelText('Probe success history for Unreported')).toHaveTextContent('—')
+    expect((await rowFor('Unreported')).queryByText('0%')).not.toBeInTheDocument()
   })
 
   it('renders the health recorded for each credential', async () => {

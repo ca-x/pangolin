@@ -1502,7 +1502,7 @@ fn query(resource: &str) -> Result<(&'static str, &'static str, &'static str), A
         "probes" => (
             "channel_probes",
             "provider_id IN (SELECT id FROM providers WHERE project_id=?)",
-            "json_object('id',id,'provider_id',provider_id,'success',success,'status_code',status_code,'latency_ms',latency_ms,'ttft_ms',ttft_ms,'probed_at',probed_at,'error',error_code)",
+            "json_object('id',id,'provider_id',provider_id,'model',model,'success',success,'status_code',status_code,'latency_ms',latency_ms,'ttft_ms',ttft_ms,'output_tokens',output_tokens,'probed_at',probed_at,'error',error_code)",
         ),
         "quotas" => (
             "provider_quota_snapshots",
@@ -2846,6 +2846,7 @@ async fn observation_list(
     Query(mut filter): Query<crate::observability::RequestFilter>,
 ) -> Result<Json<Value>, ApiError> {
     actor(&state, &headers, Some(&project), false).await?;
+    filter.validate_facets().map_err(ApiError::BadRequest)?;
     filter.project_id = Some(project);
     let total = state
         .observations
@@ -4481,6 +4482,21 @@ async fn mutate(
                 .is_none()
             {
                 return Err(ApiError::NotFound);
+            }
+            if resource == "probe" {
+                let model = text(&value, "model_id")?;
+                if transaction
+                    .query_one(sql(
+                        "SELECT m.id FROM models m JOIN providers p ON p.id=m.provider_id WHERE m.id=? AND m.provider_id=? AND p.project_id=? AND p.enabled=1 AND m.enabled=1 AND m.lifecycle='active'",
+                        vec![model.into(), provider.into(), project.clone().into()],
+                    ))
+                    .await?
+                    .is_none()
+                {
+                    return Err(ApiError::BadRequest(
+                        "model is not enabled for this channel".into(),
+                    ));
+                }
             }
             let job_kind = if resource == "model-sync" {
                 "model_sync"

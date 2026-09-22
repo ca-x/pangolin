@@ -1,7 +1,7 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { MemoryRouter, Route, Routes } from 'react-router'
+import { createMemoryRouter, MemoryRouter, Route, RouterProvider, Routes } from 'react-router'
 import { toast } from 'sonner'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { ConfirmHost } from '../components'
@@ -85,6 +85,15 @@ const renderRoute = (page: React.ReactElement, path: string, pattern: string) =>
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   return render(<QueryClientProvider client={client}><MemoryRouter initialEntries={[path]}><ProjectProvider><Routes><Route path={pattern} element={page} /></Routes></ProjectProvider></MemoryRouter></QueryClientProvider>)
 }
+const renderOperationsRouter = (path: string) => {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+  const router = createMemoryRouter([{
+    path: '/operations',
+    element: <ProjectProvider><OperationsPage /></ProjectProvider>,
+  }], { initialEntries: [path] })
+  render(<QueryClientProvider client={client}><RouterProvider router={router} /></QueryClientProvider>)
+  return router
+}
 const urls = (fetchMock: ReturnType<typeof vi.fn>, match: string) => fetchMock.mock.calls.map(([input]) => String(input)).filter((path) => path.includes(match))
 const paramsOf = (url: string) => new URL(url, 'http://pangolin.test').searchParams
 
@@ -123,6 +132,61 @@ describe('the request log shows why a request failed', () => {
     vi.stubGlobal('fetch', mockApi({ rows: [row({ status_code: 502, error_kind: 'provider_specific_thing' })] }))
     renderPage(<OperationsPage />)
     expect(await screen.findByText('provider_specific_thing')).toBeInTheDocument()
+  })
+})
+
+describe('the request log keeps shareable multi-value filters in navigation history', () => {
+  beforeEach(async () => { await i18n.changeLanguage('en') })
+
+  it('restores every facet from the URL and sends bounded multi-value filters to the API', async () => {
+    const fetchMock = mockApi({
+      rows: [
+        row({ request_id: 'r-openai', status_code: 200, provider: 'openai,primary', requested_model: 'fast', resolved_model: 'fast', api_key_id: 'key-a' }),
+        row({ request_id: 'r-anthropic', status_code: 429, provider: 'anthropic', requested_model: 'careful', resolved_model: 'careful', api_key_id: 'key-b' }),
+      ],
+      total: 2,
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    renderOperationsRouter('/operations?status=200&status=429&provider=openai%2Cprimary&provider=anthropic&model=fast&model=careful&key=key-a&key=key-b')
+
+    await waitFor(() => {
+      const params = paramsOf(urls(fetchMock, '/observability/requests?').at(-1)!)
+      expect(JSON.parse(params.get('status_codes')!)).toEqual(['200', '429'])
+      expect(JSON.parse(params.get('providers')!)).toEqual(['openai,primary', 'anthropic'])
+      expect(JSON.parse(params.get('models')!)).toEqual(['fast', 'careful'])
+      expect(JSON.parse(params.get('api_key_ids')!)).toEqual(['key-a', 'key-b'])
+    })
+
+    expect((await screen.findAllByText('200')).length).toBeGreaterThan(0)
+    expect(screen.getAllByText('429').length).toBeGreaterThan(0)
+    expect(screen.getAllByText('openai,primary').length).toBeGreaterThan(0)
+    expect(screen.getAllByText('anthropic').length).toBeGreaterThan(0)
+  })
+
+  it('pushes facet changes and restores the prior list on back and forward', async () => {
+    const fetchMock = mockApi({
+      rows: [
+        row({ request_id: 'r-fast', requested_model: 'fast', resolved_model: 'fast' }),
+        row({ request_id: 'r-careful', requested_model: 'careful', resolved_model: 'careful' }),
+      ],
+      total: 2,
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const router = renderOperationsRouter('/operations')
+    const model = await screen.findByRole('combobox', { name: 'Model' })
+
+    await userEvent.click(model)
+    await userEvent.click(await screen.findByRole('option', { name: 'fast' }))
+    await userEvent.click(model)
+    await userEvent.click(await screen.findByRole('option', { name: 'careful' }))
+    await waitFor(() => expect(JSON.parse(paramsOf(urls(fetchMock, '/observability/requests?').at(-1)!).get('models')!)).toEqual(['fast', 'careful']))
+
+    await router.navigate(-1)
+    await waitFor(() => expect(paramsOf(urls(fetchMock, '/observability/requests?').at(-1)!).get('model')).toBe('fast'))
+    expect(paramsOf(urls(fetchMock, '/observability/requests?').at(-1)!).has('models')).toBe(false)
+
+    await router.navigate(1)
+    await waitFor(() => expect(JSON.parse(paramsOf(urls(fetchMock, '/observability/requests?').at(-1)!).get('models')!)).toEqual(['fast', 'careful']))
   })
 })
 

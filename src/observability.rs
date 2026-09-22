@@ -221,12 +221,78 @@ pub struct RequestFilter {
     /// Which key made the requests. The projection has always carried the key id;
     /// nothing could filter on it.
     pub api_key_id: Option<String>,
+    /// JSON arrays used by the console's multi-select facets. Arrays are bounded
+    /// before they reach DuckDB, and the singular fields remain wire-compatible.
+    pub status_codes: Option<String>,
+    pub providers: Option<String>,
+    pub models: Option<String>,
+    pub api_key_ids: Option<String>,
     /// Inclusive lower bound on `started_at`, in unix seconds.
     pub from: Option<i64>,
     /// Inclusive upper bound on `started_at`, in unix seconds.
     pub until: Option<i64>,
     pub limit: Option<usize>,
     pub offset: Option<usize>,
+}
+
+const REQUEST_FACET_LIMIT: usize = 20;
+const REQUEST_FACET_VALUE_LIMIT: usize = 256;
+
+impl RequestFilter {
+    pub fn validate_facets(&self) -> std::result::Result<(), String> {
+        parse_status_facet(self.status_codes.as_deref())?;
+        for raw in [
+            self.providers.as_deref(),
+            self.models.as_deref(),
+            self.api_key_ids.as_deref(),
+        ] {
+            parse_text_facet(raw)?;
+        }
+        Ok(())
+    }
+}
+
+fn facet_array(raw: Option<&str>) -> std::result::Result<Vec<serde_json::Value>, String> {
+    let Some(raw) = raw else { return Ok(vec![]) };
+    let values = serde_json::from_str::<Vec<serde_json::Value>>(raw)
+        .map_err(|_| "invalid request facet list".to_string())?;
+    if values.is_empty() || values.len() > REQUEST_FACET_LIMIT {
+        return Err(format!(
+            "request facets accept 1–{REQUEST_FACET_LIMIT} values"
+        ));
+    }
+    Ok(values)
+}
+
+fn parse_text_facet(raw: Option<&str>) -> std::result::Result<Vec<String>, String> {
+    facet_array(raw)?
+        .into_iter()
+        .map(|value| {
+            let value = value
+                .as_str()
+                .ok_or_else(|| "request facet values must be strings".to_string())?;
+            if value.is_empty() || value.len() > REQUEST_FACET_VALUE_LIMIT {
+                return Err("invalid request facet value".to_string());
+            }
+            Ok(value.to_string())
+        })
+        .collect()
+}
+
+fn parse_status_facet(raw: Option<&str>) -> std::result::Result<Vec<i32>, String> {
+    facet_array(raw)?
+        .into_iter()
+        .map(|value| {
+            let status = value
+                .as_i64()
+                .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+                .ok_or_else(|| "request status facets must be HTTP status codes".to_string())?;
+            if !(100..=599).contains(&status) {
+                return Err("request status facets must be HTTP status codes".to_string());
+            }
+            Ok(status as i32)
+        })
+        .collect()
 }
 
 enum Command {
@@ -979,10 +1045,58 @@ fn query_summary_for(
     Ok(summary)
 }
 
+fn prepare_request_facets(connection: &Connection, filter: &RequestFilter) -> Result<()> {
+    connection.execute_batch(
+        "CREATE OR REPLACE TEMP TABLE request_filter_status_codes(value INTEGER PRIMARY KEY);
+         CREATE OR REPLACE TEMP TABLE request_filter_providers(value VARCHAR PRIMARY KEY);
+         CREATE OR REPLACE TEMP TABLE request_filter_models(value VARCHAR PRIMARY KEY);
+         CREATE OR REPLACE TEMP TABLE request_filter_api_key_ids(value VARCHAR PRIMARY KEY);",
+    )?;
+    let statuses =
+        parse_status_facet(filter.status_codes.as_deref()).map_err(anyhow::Error::msg)?;
+    let text = [
+        (
+            "request_filter_providers",
+            parse_text_facet(filter.providers.as_deref()),
+        ),
+        (
+            "request_filter_models",
+            parse_text_facet(filter.models.as_deref()),
+        ),
+        (
+            "request_filter_api_key_ids",
+            parse_text_facet(filter.api_key_ids.as_deref()),
+        ),
+    ];
+    if !statuses.is_empty() {
+        connection.execute(
+            &format!(
+                "INSERT INTO request_filter_status_codes(value) VALUES {}",
+                vec!["(?)"; statuses.len()].join(",")
+            ),
+            params_from_iter(statuses.iter()),
+        )?;
+    }
+    for (table, values) in text {
+        let values = values.map_err(anyhow::Error::msg)?;
+        if !values.is_empty() {
+            connection.execute(
+                &format!(
+                    "INSERT INTO {table}(value) VALUES {}",
+                    vec!["(?)"; values.len()].join(",")
+                ),
+                params_from_iter(values.iter()),
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn query_list(connection: &Connection, filter: &RequestFilter) -> Result<Vec<RequestListItem>> {
+    prepare_request_facets(connection, filter)?;
     let limit = filter.limit.unwrap_or(100).clamp(1, 500) as i64;
     let mut statement = connection.prepare(
-        "SELECT id,request_id,started_at,endpoint,provider,requested_model,resolved_model,status_code,error_kind,api_key_id,latency_ms,input_tokens,output_tokens,cost_micros,ttft_ms,cached_tokens,cache_write_tokens,reasoning_tokens,stream FROM request_events WHERE (? IS NULL OR project_id=?) AND (? IS NULL OR status_code=?) AND (? IS NULL OR provider=?) AND (? IS NULL OR requested_model=? OR resolved_model=?) AND (? IS NULL OR api_key_id=?) AND (? IS NULL OR started_at>=?) AND (? IS NULL OR started_at<=?) ORDER BY started_at DESC,id DESC LIMIT ? OFFSET ?",
+        "SELECT id,request_id,started_at,endpoint,provider,requested_model,resolved_model,status_code,error_kind,api_key_id,latency_ms,input_tokens,output_tokens,cost_micros,ttft_ms,cached_tokens,cache_write_tokens,reasoning_tokens,stream FROM request_events WHERE (? IS NULL OR project_id=?) AND (? IS NULL OR status_code=?) AND (? IS NULL OR status_code IN (SELECT value FROM request_filter_status_codes)) AND (? IS NULL OR provider=?) AND (? IS NULL OR provider IN (SELECT value FROM request_filter_providers)) AND (? IS NULL OR requested_model=? OR resolved_model=?) AND (? IS NULL OR requested_model IN (SELECT value FROM request_filter_models) OR resolved_model IN (SELECT value FROM request_filter_models)) AND (? IS NULL OR api_key_id=?) AND (? IS NULL OR api_key_id IN (SELECT value FROM request_filter_api_key_ids)) AND (? IS NULL OR started_at>=?) AND (? IS NULL OR started_at<=?) ORDER BY started_at DESC,id DESC LIMIT ? OFFSET ?",
     )?;
     let rows = statement.query_map(
         params![
@@ -990,13 +1104,17 @@ fn query_list(connection: &Connection, filter: &RequestFilter) -> Result<Vec<Req
             filter.project_id,
             filter.status_code,
             filter.status_code,
+            filter.status_codes,
             filter.provider,
             filter.provider,
+            filter.providers,
             filter.model,
             filter.model,
             filter.model,
+            filter.models,
             filter.api_key_id,
             filter.api_key_id,
+            filter.api_key_ids,
             filter.from,
             filter.from,
             filter.until,
@@ -1032,20 +1150,25 @@ fn query_list(connection: &Connection, filter: &RequestFilter) -> Result<Vec<Req
 }
 
 fn query_count(connection: &Connection, filter: &RequestFilter) -> Result<i64> {
+    prepare_request_facets(connection, filter)?;
     Ok(connection.query_row(
-        "SELECT count(*) FROM request_events WHERE (? IS NULL OR project_id=?) AND (? IS NULL OR status_code=?) AND (? IS NULL OR provider=?) AND (? IS NULL OR requested_model=? OR resolved_model=?) AND (? IS NULL OR api_key_id=?) AND (? IS NULL OR started_at>=?) AND (? IS NULL OR started_at<=?)",
+        "SELECT count(*) FROM request_events WHERE (? IS NULL OR project_id=?) AND (? IS NULL OR status_code=?) AND (? IS NULL OR status_code IN (SELECT value FROM request_filter_status_codes)) AND (? IS NULL OR provider=?) AND (? IS NULL OR provider IN (SELECT value FROM request_filter_providers)) AND (? IS NULL OR requested_model=? OR resolved_model=?) AND (? IS NULL OR requested_model IN (SELECT value FROM request_filter_models) OR resolved_model IN (SELECT value FROM request_filter_models)) AND (? IS NULL OR api_key_id=?) AND (? IS NULL OR api_key_id IN (SELECT value FROM request_filter_api_key_ids)) AND (? IS NULL OR started_at>=?) AND (? IS NULL OR started_at<=?)",
         params![
             filter.project_id,
             filter.project_id,
             filter.status_code,
             filter.status_code,
+            filter.status_codes,
             filter.provider,
             filter.provider,
+            filter.providers,
             filter.model,
             filter.model,
             filter.model,
+            filter.models,
             filter.api_key_id,
             filter.api_key_id,
+            filter.api_key_ids,
             filter.from,
             filter.from,
             filter.until,
@@ -1954,6 +2077,45 @@ mod tests {
             1,
             "the unmeasured row stays listable and stays unmeasured"
         );
+    }
+
+    #[tokio::test]
+    async fn multi_value_facets_match_any_selected_value_without_widening_other_facets() {
+        let directory = tempfile::tempdir().unwrap();
+        let store =
+            ObservationStore::open(directory.path().join("multi-facet.duckdb"), 30).unwrap();
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let mut first = sample("internal-first", "req-first", now);
+        first.status_code = Some(200);
+        first.provider = Some("alpha,primary".into());
+        first.requested_model = Some("fast".into());
+        first.api_key_id = Some("key-a".into());
+        let mut second = sample("internal-second", "req-second", now + 1);
+        second.status_code = Some(429);
+        second.provider = Some("beta".into());
+        second.resolved_model = Some("careful".into());
+        second.api_key_id = Some("key-b".into());
+        let mut excluded = sample("internal-excluded", "req-excluded", now + 2);
+        excluded.status_code = Some(500);
+        excluded.provider = Some("gamma".into());
+        excluded.requested_model = Some("slow".into());
+        excluded.api_key_id = Some("key-c".into());
+        store.record(first);
+        store.record(second);
+        store.record(excluded);
+        store.flush().await;
+
+        let filter = RequestFilter {
+            status_codes: Some(r#"[200,429]"#.into()),
+            providers: Some(r#"["alpha,primary","beta"]"#.into()),
+            models: Some(r#"["fast","careful"]"#.into()),
+            api_key_ids: Some(r#"["key-a","key-b"]"#.into()),
+            ..Default::default()
+        };
+        let rows = store.list(filter.clone()).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(store.count(filter).await.unwrap(), 2);
+        assert!(rows.iter().all(|row| row.status_code != Some(500)));
     }
 
     /// The console reads this payload, not the struct. Every fact the list is
