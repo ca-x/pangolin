@@ -579,7 +579,7 @@ CREATE TABLE data_storage_configs (
     id TEXT PRIMARY KEY,
     project_id TEXT REFERENCES projects(id) ON DELETE CASCADE,
     name TEXT NOT NULL,
-    kind TEXT NOT NULL CHECK(kind IN ('local','s3')),
+    kind TEXT NOT NULL CHECK(kind IN ('local','s3','gcs','webdav')),
     config_json TEXT NOT NULL DEFAULT '{"version":1}',
     secret_envelope TEXT,
     enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0,1)),
@@ -885,6 +885,89 @@ ALTER TABLE channel_settings ADD COLUMN model_synced_at INTEGER;
 ALTER TABLE channel_settings ADD COLUMN model_sync_count INTEGER;
 ALTER TABLE models ADD COLUMN discovery_managed INTEGER NOT NULL DEFAULT 0 CHECK(discovery_managed IN (0,1));
 CREATE INDEX idx_models_discovery_managed ON models(provider_id,discovery_managed,lifecycle);
+"#;
+
+// Versions 19–21 are reserved by parallel parity batches. B50–B53 own v22.
+// Rebuilding the storage table is required because SQLite cannot widen a CHECK
+// constraint in place. `legacy_alter_table` keeps child foreign keys pointed at
+// the canonical table name while the old table is moved aside.
+const V22_STORAGE_DIAGNOSTICS_PROXY: &str = r#"
+PRAGMA legacy_alter_table=ON;
+ALTER TABLE backup_runs RENAME TO backup_runs_v21;
+ALTER TABLE backup_configs RENAME TO backup_configs_v21;
+ALTER TABLE data_storage_configs RENAME TO data_storage_configs_v21;
+CREATE TABLE data_storage_configs (
+    id TEXT PRIMARY KEY,
+    project_id TEXT REFERENCES projects(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK(kind IN ('local','s3','gcs','webdav')),
+    config_json TEXT NOT NULL DEFAULT '{"version":1}',
+    secret_envelope TEXT,
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0,1)),
+    revision INTEGER NOT NULL DEFAULT 1 CHECK(revision > 0),
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+INSERT INTO data_storage_configs(
+    id,project_id,name,kind,config_json,secret_envelope,enabled,revision,created_at,updated_at
+)
+SELECT id,project_id,name,kind,config_json,secret_envelope,enabled,revision,created_at,updated_at
+FROM data_storage_configs_v21;
+CREATE TABLE backup_configs (
+    id TEXT PRIMARY KEY,
+    storage_id TEXT NOT NULL REFERENCES data_storage_configs(id) ON DELETE RESTRICT,
+    schedule TEXT,
+    retention_count INTEGER NOT NULL DEFAULT 7 CHECK(retention_count > 0),
+    resources_json TEXT NOT NULL DEFAULT '{"version":1,"resources":[]}',
+    conflict_strategy TEXT NOT NULL DEFAULT 'fail' CHECK(conflict_strategy IN ('fail','skip','overwrite')),
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0,1)),
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    revision INTEGER NOT NULL DEFAULT 1
+);
+INSERT INTO backup_configs(
+    id,storage_id,schedule,retention_count,resources_json,conflict_strategy,enabled,created_at,updated_at,revision
+)
+SELECT id,storage_id,schedule,retention_count,resources_json,conflict_strategy,enabled,created_at,updated_at,revision
+FROM backup_configs_v21;
+CREATE TABLE backup_runs (
+    id TEXT PRIMARY KEY,
+    config_id TEXT REFERENCES backup_configs(id) ON DELETE SET NULL,
+    storage_id TEXT NOT NULL REFERENCES data_storage_configs(id) ON DELETE RESTRICT,
+    status TEXT NOT NULL,
+    object_key TEXT,
+    manifest_json TEXT NOT NULL DEFAULT '{"version":1}',
+    started_at INTEGER NOT NULL,
+    finished_at INTEGER,
+    error TEXT
+);
+INSERT INTO backup_runs(
+    id,config_id,storage_id,status,object_key,manifest_json,started_at,finished_at,error
+)
+SELECT id,config_id,storage_id,status,object_key,manifest_json,started_at,finished_at,error
+FROM backup_runs_v21;
+DROP TABLE backup_runs_v21;
+DROP TABLE backup_configs_v21;
+DROP TABLE data_storage_configs_v21;
+CREATE INDEX idx_data_storage_configs_project ON data_storage_configs(project_id);
+CREATE INDEX idx_backup_configs_storage ON backup_configs(storage_id);
+CREATE INDEX idx_backup_runs_config ON backup_runs(config_id,started_at);
+CREATE INDEX idx_backup_runs_storage ON backup_runs(storage_id,started_at);
+PRAGMA legacy_alter_table=OFF;
+
+CREATE TABLE proxy_presets (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    url TEXT NOT NULL,
+    secret_envelope TEXT,
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0,1)),
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+ALTER TABLE channel_settings ADD COLUMN proxy_preset_id TEXT REFERENCES proxy_presets(id) ON DELETE SET NULL;
+ALTER TABLE webhooks ADD COLUMN timeout_secs INTEGER NOT NULL DEFAULT 20 CHECK(timeout_secs BETWEEN 1 AND 300);
+ALTER TABLE webhooks ADD COLUMN proxy_preset_id TEXT REFERENCES proxy_presets(id) ON DELETE SET NULL;
+ALTER TABLE catalog_sources ADD COLUMN proxy_preset_id TEXT REFERENCES proxy_presets(id) ON DELETE SET NULL;
 "#;
 
 const V23_CREDENTIAL_RECOVERY_AND_DEVELOPER_SETTINGS: &str = r#"
@@ -1302,6 +1385,25 @@ pub async fn migrate(db: &DatabaseConnection) -> Result<()> {
             .await?;
         transaction.commit().await?;
     }
+    let storage_diagnostics_proxy_applied = Count::find_by_statement(statement(
+        "SELECT COUNT(*) AS count FROM schema_migrations WHERE version=22",
+    ))
+    .one(db)
+    .await?
+    .is_some_and(|row| row.count > 0);
+    if !storage_diagnostics_proxy_applied {
+        let transaction = db.begin().await?;
+        transaction
+            .execute_unprepared(V22_STORAGE_DIAGNOSTICS_PROXY)
+            .await
+            .context("failed to add storage, diagnostics and outbound proxy settings")?;
+        transaction
+            .execute(statement(
+                "INSERT INTO schema_migrations(version,applied_at) VALUES(22,unixepoch())",
+            ))
+            .await?;
+        transaction.commit().await?;
+    }
     let recovery_applied = Count::find_by_statement(statement(
         "SELECT COUNT(*) AS count FROM schema_migrations WHERE version=23",
     ))
@@ -1463,6 +1565,7 @@ mod tests {
             "data_storage_configs",
             "backup_configs",
             "backup_runs",
+            "proxy_presets",
         ] {
             assert_eq!(
                 scalar(
@@ -1475,6 +1578,33 @@ mod tests {
                 1,
                 "missing table {table}"
             );
+        }
+
+        for (table, column) in [
+            ("channel_settings", "proxy_preset_id"),
+            ("webhooks", "timeout_secs"),
+            ("webhooks", "proxy_preset_id"),
+            ("catalog_sources", "proxy_preset_id"),
+        ] {
+            assert_eq!(
+                scalar(
+                    &db,
+                    &format!(
+                        "SELECT COUNT(*) AS count FROM pragma_table_info('{table}') WHERE name='{column}'"
+                    )
+                )
+                .await,
+                1,
+                "missing {table}.{column}"
+            );
+        }
+
+        for kind in ["gcs", "webdav"] {
+            db.execute(statement(&format!(
+                "INSERT INTO data_storage_configs(id,name,kind,created_at,updated_at) VALUES('{kind}','{kind}','{kind}',0,0)"
+            )))
+            .await
+            .unwrap();
         }
 
         assert_eq!(
@@ -1664,7 +1794,7 @@ mod tests {
 
         assert_eq!(
             scalar(&db, "SELECT COUNT(*) AS count FROM schema_migrations").await,
-            20
+            21
         );
         assert_eq!(
             scalar(
@@ -2443,6 +2573,94 @@ mod tests {
             )
             .await,
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn storage_rebuild_preserves_revision_and_timestamps_by_name() {
+        let db = memory_database().await;
+        db.execute_unprepared(
+            r#"
+            CREATE TABLE projects(id TEXT PRIMARY KEY);
+            INSERT INTO projects(id) VALUES('project');
+            CREATE TABLE data_storage_configs (
+                id TEXT PRIMARY KEY,
+                project_id TEXT REFERENCES projects(id) ON DELETE CASCADE,
+                name TEXT NOT NULL,
+                kind TEXT NOT NULL CHECK(kind IN ('local','s3')),
+                config_json TEXT NOT NULL DEFAULT '{"version":1}',
+                secret_envelope TEXT,
+                enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0,1)),
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                revision INTEGER NOT NULL DEFAULT 1
+            );
+            CREATE TABLE backup_configs (
+                id TEXT PRIMARY KEY,
+                storage_id TEXT NOT NULL REFERENCES data_storage_configs(id) ON DELETE RESTRICT,
+                schedule TEXT,
+                retention_count INTEGER NOT NULL DEFAULT 7 CHECK(retention_count > 0),
+                resources_json TEXT NOT NULL DEFAULT '{"version":1,"resources":[]}',
+                conflict_strategy TEXT NOT NULL DEFAULT 'fail' CHECK(conflict_strategy IN ('fail','skip','overwrite')),
+                enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0,1)),
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                revision INTEGER NOT NULL DEFAULT 1
+            );
+            CREATE TABLE backup_runs (
+                id TEXT PRIMARY KEY,
+                config_id TEXT REFERENCES backup_configs(id) ON DELETE SET NULL,
+                storage_id TEXT NOT NULL REFERENCES data_storage_configs(id) ON DELETE RESTRICT,
+                status TEXT NOT NULL,
+                object_key TEXT,
+                manifest_json TEXT NOT NULL DEFAULT '{"version":1}',
+                started_at INTEGER NOT NULL,
+                finished_at INTEGER,
+                error TEXT
+            );
+            CREATE TABLE channel_settings(provider_id TEXT PRIMARY KEY);
+            CREATE TABLE webhooks(id TEXT PRIMARY KEY);
+            CREATE TABLE catalog_sources(id TEXT PRIMARY KEY);
+            INSERT INTO data_storage_configs(
+                id,project_id,name,kind,config_json,enabled,created_at,updated_at,revision
+            ) VALUES('storage','project','Storage','s3','{"kind":"s3"}',1,100,200,7);
+            INSERT INTO backup_configs(
+                id,storage_id,created_at,updated_at,revision
+            ) VALUES('config','storage',300,400,9);
+            INSERT INTO backup_runs(id,config_id,storage_id,status,started_at)
+            VALUES('run','config','storage','succeeded',500);
+            "#,
+        )
+        .await
+        .unwrap();
+
+        db.execute_unprepared(V22_STORAGE_DIAGNOSTICS_PROXY)
+            .await
+            .unwrap();
+
+        let storage = one(
+            &db,
+            "SELECT revision,created_at,updated_at FROM data_storage_configs WHERE id='storage'",
+        )
+        .await;
+        assert_eq!(storage.try_get::<i64>("", "revision").unwrap(), 7);
+        assert_eq!(storage.try_get::<i64>("", "created_at").unwrap(), 100);
+        assert_eq!(storage.try_get::<i64>("", "updated_at").unwrap(), 200);
+        let config = one(
+            &db,
+            "SELECT revision,created_at,updated_at FROM backup_configs WHERE id='config'",
+        )
+        .await;
+        assert_eq!(config.try_get::<i64>("", "revision").unwrap(), 9);
+        assert_eq!(config.try_get::<i64>("", "created_at").unwrap(), 300);
+        assert_eq!(config.try_get::<i64>("", "updated_at").unwrap(), 400);
+        assert_eq!(
+            scalar(
+                &db,
+                "SELECT COUNT(*) AS count FROM pragma_foreign_key_check"
+            )
+            .await,
+            0
         );
     }
 }

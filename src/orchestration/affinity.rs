@@ -106,6 +106,16 @@ impl Default for Cache {
     }
 }
 impl Cache {
+    pub fn diagnostic_counts(&self) -> (u64, u64) {
+        (
+            self.hits.load(std::sync::atomic::Ordering::Relaxed),
+            self.project_generations
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .len() as u64,
+        )
+    }
+
     pub fn reset(&self) {
         self.generation
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);

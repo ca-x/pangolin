@@ -1,6 +1,6 @@
 import { ActionIcon, Alert, Badge, Button, Checkbox, Code, Group, Input, Modal, Pagination, Paper, Select, SimpleGrid, Stack, Switch, Table, TableScrollContainer, Tabs, Text, TextInput, Textarea, Title, Tooltip } from '@mantine/core'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { AlertTriangle, Copy, DatabaseBackup, Download, History, Play, RotateCcw, ShieldAlert, Webhook } from 'lucide-react'
+import { AlertTriangle, Copy, DatabaseBackup, Download, History, Play, RotateCcw, ShieldAlert, Trash2, Webhook } from 'lucide-react'
 import { useEffect, useMemo, useState, type FormEvent } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
@@ -37,6 +37,8 @@ export default function SystemPage() {
         {projectScoped && PROJECT_TABS.map((value) => <Tabs.Tab key={value} value={value}>{t(value)}</Tabs.Tab>)}
         {instanceScoped && <Tabs.Tab value="modelSettings">{t('modelSettings')}</Tabs.Tab>}
         {instanceScoped && <Tabs.Tab value="requestLogging">{t('requestLogging')}</Tabs.Tab>}
+        {instanceScoped && <Tabs.Tab value="proxyPresets">{t('proxyPresets')}</Tabs.Tab>}
+        {instanceScoped && <Tabs.Tab value="diagnostics">{t('diagnostics')}</Tabs.Tab>}
         <Tabs.Tab value="about">{t('about')}</Tabs.Tab>
       </Tabs.List>
       {!projectScoped && !instanceScoped && (
@@ -48,7 +50,7 @@ export default function SystemPage() {
           <Tabs.Panel value="orchestrationSettings"><ProjectScope /><OrchestrationSettings /></Tabs.Panel>
           <Tabs.Panel value="storage">
             <ProjectScope />
-            <ResourcePage resource="storage" title={t('storage')} description={t('storageDescription')} empty={t('storageEmpty')} createLabel={t('addStorage')} columns={[{ key: 'name', label: t('name') }, { key: 'kind', label: t('type') }, { key: 'config', label: t('configuration'), mono: true, render: (value) => storageSummary(value) }, { key: 'revision', label: t('revision') }, { key: 'enabled', label: t('status'), render: (value) => <EnabledPill enabled={value} /> }]} fields={STORAGE_FIELDS(t)} normalize={(values, editing) => storageBody(values, editing, t)} />
+            <StoragePanel />
           </Tabs.Panel>
           <Tabs.Panel value="backups">
             <ProjectScope />
@@ -57,7 +59,7 @@ export default function SystemPage() {
           </Tabs.Panel>
           <Tabs.Panel value="webhooks">
             <ProjectScope />
-            <ResourcePage resource="webhooks" title={t('webhooks')} description={t('webhooksDescription')} empty={t('webhookEmpty')} createLabel={t('addWebhook')} columns={[{ key: 'name', label: t('name') }, { key: 'url', label: 'URL', mono: true }, { key: 'subscriptions', label: t('events') }, { key: 'enabled', label: t('status'), render: (value) => <EnabledPill enabled={value} /> }]} fields={[{ key: 'name', label: t('name'), required: true }, { key: 'url', label: 'URL', required: true }, { key: 'events', sourceKey: 'subscriptions', label: t('events'), kind: 'json', defaultValue: ['channel.disabled', 'quota.exhausted', 'request.failed'] }, { key: 'headers', label: t('publicHeaders'), kind: 'json', defaultValue: {} }, { key: 'secret_headers', label: t('secretHeaders'), kind: 'json', omitWhenBlank: true }, { key: 'body', label: t('bodyTemplate'), kind: 'json', defaultValue: { body: '$event' } }, { key: 'enabled', label: t('enabled'), kind: 'checkbox' }]} />
+            <WebhookPanel showProxy={instanceScoped} />
             <WebhookDeliveries />
           </Tabs.Panel>
           <Tabs.Panel value="jobs"><ProjectScope /><JobsPanel /></Tabs.Panel>
@@ -69,6 +71,8 @@ export default function SystemPage() {
       )}
       {instanceScoped && <Tabs.Panel value="modelSettings"><ModelSettingsForm /></Tabs.Panel>}
       {instanceScoped && <Tabs.Panel value="requestLogging"><LoggingPolicy /></Tabs.Panel>}
+      {instanceScoped && <Tabs.Panel value="proxyPresets"><ProxyPresetsPanel /></Tabs.Panel>}
+      {instanceScoped && <Tabs.Panel value="diagnostics"><DiagnosticsPanel /></Tabs.Panel>}
       <Tabs.Panel value="about"><About /></Tabs.Panel>
     </Tabs>
   )
@@ -400,6 +404,71 @@ function ModelSettingsForm() {
   )
 }
 
+type CacheDiagnostic = { name: string; shape_version: number; entries: number; max_entries: number | null; hits?: number }
+type DiagnosticsExport = { version: number; generated_at: number; runtime: { generation: number; caches: CacheDiagnostic[] } }
+function DiagnosticsPanel() {
+  const { t } = useTranslation()
+  const client = useQueryClient()
+  const path = '/api/admin/v1/instance/diagnostics/cache'
+  const query = useQuery({ queryKey: ['cache-diagnostics'], queryFn: () => api<DiagnosticsExport>(path) })
+  const clear = useMutation({ mutationFn: () => api<DiagnosticsExport>(path, { method: 'DELETE' }), onSuccess: () => { toast.success(t('cacheCleared')); void client.invalidateQueries({ queryKey: ['cache-diagnostics'] }) }, onError: (error: Error) => toast.error(error.message) })
+  const confirmClear = () => confirmAction({ title: t('clearCacheTitle'), body: t('clearCacheBody'), confirmLabel: t('clearCache'), onConfirm: () => clear.mutateAsync() })
+  return <>
+    <PageHeader title={t('diagnostics')} description={t('diagnosticsDescription')} />
+    {query.isError ? <QueryError retry={() => void query.refetch()} /> : query.isLoading || !query.data ? <SkeletonRows /> : <Stack gap="md">
+      <Group justify="space-between" align="flex-end" gap="md" wrap="wrap">
+        <Text size="sm" c="dimmed">{t('cacheGeneration', { generation: query.data.runtime.generation })}</Text>
+        <Group gap="xs" wrap="wrap">
+          <Button variant="default" leftSection={<Download size={16} />} onClick={() => downloadJson('pangolin-cache-diagnostics.json', query.data)}>{t('exportDiagnostics')}</Button>
+          <Button color="red" variant="default" leftSection={<Trash2 size={16} />} loading={clear.isPending} onClick={confirmClear}>{t('clearCache')}</Button>
+        </Group>
+      </Group>
+      <TableScrollContainer minWidth={560} role="region" aria-label={t('diagnostics')} tabIndex={0}>
+        <Table highlightOnHover>
+          <Table.Thead><Table.Tr><Table.Th>{t('cacheName')}</Table.Th><Table.Th>{t('shapeVersion')}</Table.Th><Table.Th>{t('entries')}</Table.Th><Table.Th>{t('capacity')}</Table.Th></Table.Tr></Table.Thead>
+          <Table.Tbody>{query.data.runtime.caches.map((cache) => <Table.Tr key={cache.name}><Table.Td className="mono-cell">{cache.name}</Table.Td><Table.Td>{cache.shape_version}</Table.Td><Table.Td>{cache.entries}</Table.Td><Table.Td>{cache.max_entries ?? '—'}</Table.Td></Table.Tr>)}</Table.Tbody>
+        </Table>
+      </TableScrollContainer>
+    </Stack>}
+  </>
+}
+
+function ProxyPresetsPanel() {
+  const { t } = useTranslation()
+  return <ResourcePage
+    resource="proxy-presets"
+    endpoint="/api/admin/v1/instance/proxy-presets"
+    itemEndpoint={(id) => `/api/admin/v1/instance/proxy-presets/${encodeURIComponent(id)}`}
+    title={t('proxyPresets')}
+    description={t('proxyPresetsDescription')}
+    empty={t('proxyPresetsEmpty')}
+    createLabel={t('addProxyPreset')}
+    columns={[{ key: 'name', label: t('name') }, { key: 'url', label: 'URL', mono: true }, { key: 'enabled', label: t('status'), render: (value) => <EnabledPill enabled={value} /> }]}
+    fields={[{ key: 'name', label: t('name'), required: true }, { key: 'url', label: t('proxyUrl'), required: true }, { key: 'username', label: t('proxyUsername'), kind: 'secret', omitWhenBlank: true }, { key: 'password', label: t('proxyPassword'), kind: 'secret', omitWhenBlank: true }, { key: 'enabled', label: t('enabled'), kind: 'checkbox', defaultValue: true }]}
+    normalize={(values, editing) => {
+      const { username, password, ...preset } = values
+      if ((username && !password) || (!username && password)) throw new Error(t('proxyCredentialsIncomplete'))
+      return { ...preset, ...(editing ? { id: editing.id } : {}), ...(username && password ? { credentials: { username, password } } : {}) }
+    }}
+  />
+}
+
+function WebhookPanel({ showProxy }: { showProxy: boolean }) {
+  const { t } = useTranslation()
+  const proxies = useQuery({ queryKey: ['proxy-presets'], queryFn: () => api<Paged<Document>>('/api/admin/v1/instance/proxy-presets'), enabled: showProxy })
+  const proxyOptions = [{ value: 'none', label: t('noProxy') }, ...(proxies.data?.data || []).filter((row) => row.enabled !== false).map((row) => ({ value: String(row.id), label: String(row.name) }))]
+  const proxyFields: FormField[] = showProxy ? [{
+    key: 'proxy_preset_id',
+    label: t('proxyPreset'),
+    kind: 'select',
+    options: proxyOptions,
+    fromRow: (row) => row.proxy_preset_id ? String(row.proxy_preset_id) : 'none',
+    error: proxies.isError ? t('proxyPresetsUnavailable') : undefined,
+    allowManualOnError: false,
+  }] : []
+  return <ResourcePage resource="webhooks" title={t('webhooks')} description={t('webhooksDescription')} empty={t('webhookEmpty')} createLabel={t('addWebhook')} notice={showProxy && proxies.isError ? <InlineQueryError message={t('proxyPresetsUnavailable')} onRetry={() => void proxies.refetch()} /> : undefined} columns={[{ key: 'name', label: t('name') }, { key: 'url', label: 'URL', mono: true }, { key: 'subscriptions', label: t('events') }, { key: 'timeout_secs', label: t('webhookTimeout') }, { key: 'enabled', label: t('status'), render: (value) => <EnabledPill enabled={value} /> }]} fields={[{ key: 'name', label: t('name'), required: true }, { key: 'url', label: 'URL', required: true }, { key: 'events', sourceKey: 'subscriptions', label: t('events'), kind: 'json', defaultValue: ['channel.disabled', 'quota.exhausted', 'request.failed'] }, { key: 'headers', label: t('publicHeaders'), kind: 'json', defaultValue: {} }, { key: 'secret_headers', label: t('secretHeaders'), kind: 'json', omitWhenBlank: true }, { key: 'body', label: t('bodyTemplate'), kind: 'json', defaultValue: { body: '$event' } }, { key: 'timeout_secs', label: t('webhookTimeout'), hint: t('webhookTimeoutHint'), kind: 'number', defaultValue: 20 }, ...proxyFields, { key: 'enabled', label: t('enabled'), kind: 'checkbox' }]} normalize={(values, editing) => ({ ...values, ...(editing ? { id: editing.id } : {}), ...(showProxy ? { proxy_preset_id: values.proxy_preset_id === 'none' ? null : values.proxy_preset_id } : {}) })} />
+}
+
 /**
  * Selectable backup tables. `src/operations/backup.rs::TABLES` validates every
  * name against this allowlist and rejects anything else, so the console offers
@@ -460,13 +529,15 @@ function storageSummary(config: unknown): string {
   const value = (config && typeof config === 'object' ? config : {}) as Record<string, unknown>
   if (value.kind === 'local') return displayValue(value.directory)
   if (value.kind === 's3') return `${displayValue(value.bucket)} @ ${displayValue(value.endpoint)}${value.prefix ? ` · ${value.prefix}` : ''}`
+  if (value.kind === 'gcs') return `${displayValue(value.bucket)}${value.prefix ? ` · ${value.prefix}` : ''}`
+  if (value.kind === 'webdav') return `${displayValue(value.endpoint)}${value.prefix ? ` · ${value.prefix}` : ''}`
   return displayValue(config)
 }
 
 const configOf = (row: Document | null) => (row?.config && typeof row.config === 'object' ? row.config : {}) as Record<string, unknown>
 const payloadOf = (row: Document | null) => (row?.payload && typeof row.payload === 'object' ? row.payload : {}) as Record<string, unknown>
 
-/** `src/operations/storage.rs` accepts exactly these two config shapes and nothing else. */
+/** `src/operations/storage.rs` accepts these four config shapes and nothing else. */
 const STORAGE_DIRECTORY = /^[A-Za-z0-9_-]{1,128}$/
 const safeStoragePrefix = (value: string) => value.length <= 256 && value.split('/').every((segment) => segment !== '.' && segment !== '..' && /^[A-Za-z0-9_-]*$/.test(segment))
 
@@ -479,7 +550,7 @@ const safeStoragePrefix = (value: string) => value.length <= 256 && value.split(
 function STORAGE_FIELDS(t: (key: string, options?: Record<string, unknown>) => string): FormField[] {
   return [
     { key: 'name', label: t('name'), required: true },
-    { key: 'kind', label: t('type'), kind: 'select', options: [{ value: 'local', label: t('storageLocal') }, { value: 's3', label: t('storageS3') }] },
+    { key: 'kind', label: t('type'), kind: 'select', options: [{ value: 'local', label: t('storageLocal') }, { value: 's3', label: t('storageS3') }, { value: 'gcs', label: t('storageGcs') }, { value: 'webdav', label: t('storageWebdav') }] },
     { key: 'directory', label: t('storageDirectory'), hint: t('storageDirectoryHint'), omitWhenBlank: true, fromRow: (row) => configOf(row).directory },
     { key: 'endpoint', label: t('storageEndpoint'), hint: t('storageEndpointHint'), omitWhenBlank: true, fromRow: (row) => configOf(row).endpoint },
     { key: 'bucket', label: t('storageBucket'), omitWhenBlank: true, fromRow: (row) => configOf(row).bucket },
@@ -488,6 +559,9 @@ function STORAGE_FIELDS(t: (key: string, options?: Record<string, unknown>) => s
     { key: 'access_key_id', label: t('storageAccessKeyId'), kind: 'secret' },
     { key: 'secret_access_key', label: t('storageSecretAccessKey'), kind: 'secret' },
     { key: 'session_token', label: t('storageSessionToken'), kind: 'secret' },
+    { key: 'service_account', label: t('storageServiceAccount'), hint: t('storageServiceAccountHint'), kind: 'json', omitWhenBlank: true },
+    { key: 'username', label: t('storageUsername'), kind: 'secret' },
+    { key: 'password', label: t('storagePassword'), kind: 'secret' },
     { key: 'secret', label: t('storageSecret'), hint: t('storageSecretJsonHint'), kind: 'json', omitWhenBlank: true },
     { key: 'enabled', label: t('enabled'), kind: 'checkbox' },
     { key: 'revision', label: t('revision'), kind: 'number', defaultValue: 0 },
@@ -505,6 +579,15 @@ function storageSecret(values: Record<string, unknown>, kind: string, editing: b
   const secretKey = String(values.secret_access_key ?? '').trim()
   const sessionToken = String(values.session_token ?? '').trim()
   const override = values.secret && typeof values.secret === 'object' && !Array.isArray(values.secret) ? values.secret as Record<string, unknown> : null
+  if (kind === 'gcs' && values.service_account) return { service_account: values.service_account }
+  if (kind === 'webdav') {
+    const username = String(values.username ?? '').trim()
+    const password = String(values.password ?? '').trim()
+    if (username || password) {
+      if (!username || !password) throw new Error(t('storageCredentialsIncomplete'))
+      return { username, password }
+    }
+  }
   if (accessKey || secretKey) {
     if (!accessKey || !secretKey) throw new Error(t('storageCredentialsIncomplete'))
     return { access_key_id: accessKey, secret_access_key: secretKey, ...(sessionToken ? { session_token: sessionToken } : {}) }
@@ -514,6 +597,7 @@ function storageSecret(values: Record<string, unknown>, kind: string, editing: b
     return override
   }
   if (kind === 's3' && !editing) throw new Error(t('storageCredentialsRequired'))
+  if ((kind === 'gcs' || kind === 'webdav') && !editing) throw new Error(t('storageRemoteCredentialsRequired'))
   return null
 }
 
@@ -541,6 +625,21 @@ function storageBody(values: Record<string, unknown>, editing: Document | null, 
     const prefix = field('prefix', previous.prefix)
     if (!safeStoragePrefix(prefix)) throw new Error(t('storagePrefixInvalid'))
     config = { kind: 's3', endpoint, bucket, region, prefix }
+  } else if (kind === 'gcs') {
+    const bucket = field('bucket', previous.bucket)
+    const prefix = field('prefix', previous.prefix)
+    const endpoint = field('endpoint', previous.endpoint)
+    if (!bucket) throw new Error(t('storageBucketRequired'))
+    if (!safeStoragePrefix(prefix)) throw new Error(t('storagePrefixInvalid'))
+    config = { kind: 'gcs', bucket, prefix, ...(endpoint ? { endpoint } : {}) }
+  } else if (kind === 'webdav') {
+    const endpoint = field('endpoint', previous.endpoint)
+    const prefix = field('prefix', previous.prefix)
+    let url: URL | null = null
+    try { url = new URL(endpoint) } catch { url = null }
+    if (!url || url.protocol !== 'https:' || url.hostname === '' || url.username !== '' || url.password !== '' || url.search !== '' || url.hash !== '') throw new Error(t('storageEndpointInvalid'))
+    if (!safeStoragePrefix(prefix)) throw new Error(t('storagePrefixInvalid'))
+    config = { kind: 'webdav', endpoint, prefix }
   } else {
     const directory = field('directory', previous.directory)
     if (!STORAGE_DIRECTORY.test(directory)) throw new Error(t('storageDirectoryInvalid'))
@@ -548,6 +647,23 @@ function storageBody(values: Record<string, unknown>, editing: Document | null, 
   }
   const secret = storageSecret(values, kind, editing !== null, t)
   return { ...(editing ? { id: editing.id } : {}), name: values.name, config, enabled: values.enabled, revision: values.revision, ...(secret ? { secret } : {}) }
+}
+
+function StoragePanel() {
+  const { t } = useTranslation()
+  const { project } = useProject()
+  const test = useMutation({ mutationFn: (id: string) => api(`${projectOperationPath(project.id, 'storage', id)}/test`, { method: 'POST', body: '{}' }), onSuccess: () => toast.success(t('storageConnectionOk')), onError: (error: Error) => toast.error(error.message) })
+  return <ResourcePage
+    resource="storage"
+    title={t('storage')}
+    description={t('storageDescription')}
+    empty={t('storageEmpty')}
+    createLabel={t('addStorage')}
+    columns={[{ key: 'name', label: t('name') }, { key: 'kind', label: t('type') }, { key: 'config', label: t('configuration'), mono: true, render: (value) => storageSummary(value) }, { key: 'revision', label: t('revision') }, { key: 'enabled', label: t('status'), render: (value) => <EnabledPill enabled={value} /> }]}
+    fields={STORAGE_FIELDS(t)}
+    normalize={(values, editing) => storageBody(values, editing, t)}
+    rowActions={(row) => <Button variant="subtle" size="compact-sm" loading={test.isPending && test.variables === row.id} onClick={() => test.mutate(String(row.id))}>{t('testConnection')}</Button>}
+  />
 }
 
 /**
@@ -632,6 +748,7 @@ function BackupPanel() {
   const [file, setFile] = useState<File | null>(null)
   const [fileError, setFileError] = useState<string | null>(null)
   const [strategy, setStrategy] = useState('fail')
+  const [resourceStrategies, setResourceStrategies] = useState<Record<string, string>>({})
   // The project's artifact history. Downloads fetch the single artifact, which is
   // the only route that carries the encrypted payload.
   const artifacts = useQuery({
@@ -674,7 +791,7 @@ function BackupPanel() {
     onError: (error: Error) => toast.error(error.message),
   })
   const restore = useMutation({
-    mutationFn: (input: { artifact: BackupArtifact; strategy: string }) => api<{ restored: number }>(`${base}/restore`, { method: 'POST', body: JSON.stringify(input) }),
+    mutationFn: (input: { artifact: BackupArtifact; strategy: string; strategies?: Record<string, string> }) => api<{ restored: number }>(`${base}/restore`, { method: 'POST', body: JSON.stringify(input) }),
     onSuccess: (result) => {
       // A repeated import of the same artifact and strategy is a no-op the API reports as 0.
       if (result.restored > 0) toast.success(t('backupRestored', { count: result.restored }))
@@ -699,6 +816,7 @@ function BackupPanel() {
   const pickFile = async (picked: File | null) => {
     setFile(picked)
     setArtifact(null)
+    setResourceStrategies({})
     setFileError(null)
     if (!picked) return
     try {
@@ -721,7 +839,7 @@ function BackupPanel() {
       // The body names the value the API receives, which is what the operator is choosing.
       body: t('restoreBackupBody', { strategy }),
       confirmLabel: t('restore'),
-      onConfirm: () => restore.mutateAsync({ artifact, strategy }),
+      onConfirm: () => restore.mutateAsync({ artifact, strategy, ...(Object.keys(resourceStrategies).length ? { strategies: resourceStrategies } : {}) }),
     })
   }
 
@@ -832,6 +950,13 @@ function BackupPanel() {
               </Alert>
             )}
             <SelectField label={t('conflictStrategy')} value={strategy} onValueChange={setStrategy} options={['fail', 'skip', 'overwrite'].map((value) => ({ value, label: t(`strategy_${value}`) }))} />
+            {artifact && <Stack gap="xs">
+              <Text fw={600}>{t('resourceStrategies')}</Text>
+              <Text size="sm" c="dimmed">{t('resourceStrategiesHint')}</Text>
+              <SimpleGrid cols={{ base: 1, sm: 2 }} spacing="sm">
+                {artifact.resources.map((resource) => <SelectField key={resource} label={resource} value={resourceStrategies[resource] || 'inherit'} onValueChange={(value) => setResourceStrategies((current) => value === 'inherit' ? Object.fromEntries(Object.entries(current).filter(([name]) => name !== resource)) : { ...current, [resource]: value })} options={[{ value: 'inherit', label: t('useDefaultStrategy') }, ...['fail', 'skip', 'overwrite'].map((value) => ({ value, label: t(`strategy_${value}`) }))]} />)}
+              </SimpleGrid>
+            </Stack>}
             <Group>
               <Tooltip label={restoreDisabledReason ?? ''} disabled={!restoreDisabledReason}>
                 <span>

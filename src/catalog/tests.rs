@@ -114,6 +114,7 @@ fn source_input(priority: i32) -> repository::SourceInput {
         enabled: true,
         signature_policy: "optional".into(),
         public_key: None,
+        proxy_preset_id: None,
     }
 }
 

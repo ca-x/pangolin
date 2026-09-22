@@ -59,8 +59,13 @@ fn normalize(items: &mut [Value]) {
 }
 
 impl Sessions {
+    pub fn entry_count(&self) -> u64 {
+        self.records.entry_count()
+    }
+
     pub fn clear(&self) {
         self.records.invalidate_all();
+        self.records.run_pending_tasks();
     }
     pub fn prepare(&self, scope: &str, body: &mut Value) -> Result<()> {
         let previous = body.get("previous_response_id").and_then(Value::as_str);

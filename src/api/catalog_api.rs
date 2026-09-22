@@ -334,9 +334,13 @@ async fn refresh(
     Path(id): Path<String>,
 ) -> Result<Json<catalog::refresh::Outcome>, ApiError> {
     let user = manager(&state, &headers).await?;
-    let outcome = catalog::refresh::refresh(
+    let source = repo::source(&state.db, &id).await?;
+    let proxy =
+        crate::operations::proxy::resolve(&state, source.proxy_preset_id.as_deref()).await?;
+    let outcome = catalog::refresh::refresh_with_proxy(
         &state.db,
         &id,
+        proxy,
         Some(audit_ctx_for(&user, "refresh_source", &id)),
     )
     .await?;
@@ -362,7 +366,16 @@ async fn refresh_due(
     let mut results = vec![];
     for source in repo::due_sources(&state.db, db::now()).await? {
         let audit = audit_ctx_for(&user, "refresh_source", &source.id);
-        match catalog::refresh::refresh(&state.db, &source.id, Some(audit)).await {
+        let proxy =
+            crate::operations::proxy::resolve(&state, source.proxy_preset_id.as_deref()).await;
+        let outcome = match proxy {
+            Ok(proxy) => {
+                catalog::refresh::refresh_with_proxy(&state.db, &source.id, proxy, Some(audit))
+                    .await
+            }
+            Err(error) => Err(error),
+        };
+        match outcome {
             Ok(outcome) => results.push(json!(outcome)),
             Err(error) => results.push(
                 json!({"source_id":source.id,"status":"failed","error":error.public_message()}),

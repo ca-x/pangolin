@@ -1,5 +1,5 @@
 use super::*;
-use crate::operations::{self, backup, id, jobs, logging, pricing, sql, storage};
+use crate::operations::{self, backup, id, jobs, logging, pricing, proxy, sql, storage};
 use sea_orm::{ConnectionTrait, DatabaseTransaction, TransactionTrait};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -107,6 +107,18 @@ pub(super) fn router(state: AppState) -> Router<AppState> {
             post(instance_preflight),
         )
         .route("/api/admin/v1/instance/restore", post(instance_restore))
+        .route(
+            "/api/admin/v1/instance/diagnostics/cache",
+            get(cache_diagnostics).delete(clear_cache),
+        )
+        .route(
+            "/api/admin/v1/instance/proxy-presets",
+            get(proxy_presets).post(save_proxy_preset),
+        )
+        .route(
+            "/api/admin/v1/instance/proxy-presets/{id}",
+            delete(delete_proxy_preset),
+        )
         .layer(axum::extract::DefaultBodyLimit::max(
             operations::instance_backup::MAX_ARTIFACT_BYTES,
         ))
@@ -153,6 +165,10 @@ pub(super) fn router(state: AppState) -> Router<AppState> {
         .route(
             "/api/admin/v1/projects/{project}/operations/{resource}/{id}",
             get(detail).delete(remove),
+        )
+        .route(
+            "/api/admin/v1/projects/{project}/operations/storage/{id}/test",
+            post(test_storage),
         )
         .route(
             "/api/admin/v1/projects/{project}/traces/{id}/lifecycle",
@@ -251,12 +267,150 @@ pub(super) fn router(state: AppState) -> Router<AppState> {
         .merge(profile_templates)
         .merge(instance)
 }
+
+async fn cache_diagnostics(State(state): State<AppState>) -> Json<operations::diagnostics::Export> {
+    Json(operations::diagnostics::export(&state))
+}
+
+async fn clear_cache(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<operations::diagnostics::Export>, ApiError> {
+    let owner = actor(&state, &headers, None, true).await?;
+    Ok(Json(operations::diagnostics::clear(&state, &owner).await?))
+}
+
+async fn proxy_presets(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let rows = state
+        .db
+        .query_all(sql(
+            "SELECT id,name,url,enabled,created_at,updated_at FROM proxy_presets ORDER BY name,id LIMIT 100",
+            vec![],
+        ))
+        .await?;
+    let mut data = Vec::with_capacity(rows.len());
+    for row in rows {
+        data.push(json!({
+            "id":row.try_get::<String>("","id")?,
+            "name":row.try_get::<String>("","name")?,
+            "url":row.try_get::<String>("","url")?,
+            "enabled":row.try_get::<bool>("","enabled")?,
+            "created_at":row.try_get::<i64>("","created_at")?,
+            "updated_at":row.try_get::<i64>("","updated_at")?,
+        }));
+    }
+    let total = data.len();
+    Ok(Json(json!({"data":data,"total":total})))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProxyPresetInput {
+    id: Option<String>,
+    name: String,
+    url: String,
+    credentials: Option<Value>,
+    #[serde(default = "default_true")]
+    enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+async fn save_proxy_preset(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<ProxyPresetInput>,
+) -> Result<Json<Value>, ApiError> {
+    let owner = actor(&state, &headers, None, true).await?;
+    if input.name.trim().is_empty() || input.name.len() > 128 {
+        return Err(ApiError::BadRequest("invalid proxy preset name".into()));
+    }
+    proxy::validate_url(&input.url)?;
+    let preset = input.id.unwrap_or_else(id);
+    let envelope = input
+        .credentials
+        .as_ref()
+        .map(|value| proxy::envelope(&state, &preset, value))
+        .transpose()?;
+    let tx = state.db.begin().await?;
+    let exists = tx
+        .query_one(sql(
+            "SELECT id FROM proxy_presets WHERE id=?",
+            vec![preset.clone().into()],
+        ))
+        .await?
+        .is_some();
+    if !exists {
+        let count = tx
+            .query_one(sql("SELECT COUNT(*) AS count FROM proxy_presets", vec![]))
+            .await?
+            .ok_or(ApiError::NotFound)?
+            .try_get::<i64>("", "count")?;
+        if count >= 100 {
+            return Err(ApiError::BadRequest("proxy preset limit reached".into()));
+        }
+    }
+    let changed = tx.execute(sql(
+        "INSERT INTO proxy_presets(id,name,url,secret_envelope,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,url=excluded.url,secret_envelope=COALESCE(excluded.secret_envelope,proxy_presets.secret_envelope),enabled=excluded.enabled,updated_at=excluded.updated_at",
+        vec![preset.clone().into(),input.name.into(),input.url.into(),envelope.into(),input.enabled.into(),db::now().into(),db::now().into()],
+    )).await?.rows_affected();
+    if changed != 1 {
+        return Err(ApiError::Conflict("proxy preset changed".into()));
+    }
+    db::record_audit_event_in(
+        &tx,
+        owner.user_id.as_deref().ok_or(ApiError::Forbidden)?,
+        "proxy_preset.save",
+        "proxy_preset",
+        &preset,
+        json!({}),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(Json(json!({"id":preset})))
+}
+
+async fn delete_proxy_preset(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(preset): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let owner = actor(&state, &headers, None, true).await?;
+    let tx = state.db.begin().await?;
+    if tx
+        .execute(sql(
+            "DELETE FROM proxy_presets WHERE id=?",
+            vec![preset.clone().into()],
+        ))
+        .await?
+        .rows_affected()
+        != 1
+    {
+        return Err(ApiError::NotFound);
+    }
+    db::record_audit_event_in(
+        &tx,
+        owner.user_id.as_deref().ok_or(ApiError::Forbidden)?,
+        "proxy_preset.delete",
+        "proxy_preset",
+        &preset,
+        json!({}),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(Json(json!({"id":preset})))
+}
+
 async fn instance_owner(
     State(state): State<AppState>,
     request: axum::extract::Request,
     next: Next,
 ) -> Result<Response, ApiError> {
-    actor(&state, request.headers(), None, true).await?;
+    // The layer enforces owner scope for every instance route. Individual
+    // mutating handlers perform the CSRF-bearing `true` check themselves.
+    actor(&state, request.headers(), None, false).await?;
     Ok(next.run(request).await)
 }
 async fn instance_export(
@@ -851,7 +1005,7 @@ fn query(resource: &str) -> Result<(&'static str, &'static str, &'static str), A
         "channel-settings" => (
             "channel_settings",
             "provider_id IN (SELECT id FROM providers WHERE project_id=?)",
-            "json_object('id',provider_id,'provider_id',provider_id,'endpoint_mappings',json(endpoint_mappings_json),'model_rules',json(model_rules_json),'parameter_overrides',json(parameter_overrides_json),'retry_statuses',json(retry_statuses_json),'auto_disable_policy',json(auto_disable_policy_json),'proxy_url',proxy_url,'proxy_username',proxy_username,'proxy_password_configured',CASE WHEN proxy_secret_envelope IS NULL THEN json('false') ELSE json('true') END,'proxy_reuse_connections',json(CASE WHEN proxy_reuse_connections=1 THEN 'true' ELSE 'false' END),'model_sync_error',model_sync_error,'model_synced_at',model_synced_at,'model_sync_count',model_sync_count,'updated_at',updated_at)",
+            "json_object('id',provider_id,'provider_id',provider_id,'endpoint_mappings',json(endpoint_mappings_json),'model_rules',json(model_rules_json),'parameter_overrides',json(parameter_overrides_json),'retry_statuses',json(retry_statuses_json),'auto_disable_policy',json(auto_disable_policy_json),'proxy_url',proxy_url,'proxy_username',proxy_username,'proxy_password_configured',CASE WHEN proxy_secret_envelope IS NULL THEN json('false') ELSE json('true') END,'proxy_reuse_connections',json(CASE WHEN proxy_reuse_connections=1 THEN 'true' ELSE 'false' END),'proxy_preset_id',proxy_preset_id,'model_sync_error',model_sync_error,'model_synced_at',model_synced_at,'model_sync_count',model_sync_count,'updated_at',updated_at)",
         ),
         "models" => (
             "models",
@@ -962,7 +1116,7 @@ fn query(resource: &str) -> Result<(&'static str, &'static str, &'static str), A
         "webhooks" => (
             "webhooks",
             "project_id=?",
-            "json_object('id',id,'name',name,'url',url,'subscriptions',json(subscriptions_json),'enabled',enabled)",
+            "json_object('id',id,'name',name,'url',url,'subscriptions',json(subscriptions_json),'timeout_secs',timeout_secs,'proxy_preset_id',proxy_preset_id,'enabled',enabled)",
         ),
         "webhook-deliveries" => (
             "webhook_deliveries",
@@ -3231,7 +3385,7 @@ async fn mutate(
         }
         "channel-settings" => {
             let provider = text(&value, "provider_id")?;
-            let current=transaction.query_one(sql("SELECT endpoint_mappings_json,model_rules_json,parameter_overrides_json,retry_statuses_json,auto_disable_policy_json,proxy_url,proxy_username,proxy_secret_envelope,proxy_reuse_connections FROM channel_settings WHERE provider_id=? AND provider_id IN (SELECT id FROM providers WHERE project_id=?)",vec![provider.into(),project.clone().into()])).await?.ok_or(ApiError::NotFound)?;
+            let current=transaction.query_one(sql("SELECT endpoint_mappings_json,model_rules_json,parameter_overrides_json,retry_statuses_json,auto_disable_policy_json,proxy_url,proxy_username,proxy_secret_envelope,proxy_reuse_connections,proxy_preset_id FROM channel_settings WHERE provider_id=? AND provider_id IN (SELECT id FROM providers WHERE project_id=?)",vec![provider.into(),project.clone().into()])).await?.ok_or(ApiError::NotFound)?;
             let document = |key: &str, column: &str| -> Result<String, ApiError> {
                 Ok(value
                     .get(key)
@@ -3292,7 +3446,22 @@ async fn mutate(
                 .get("proxy_reuse_connections")
                 .and_then(Value::as_bool)
                 .unwrap_or(current.try_get("", "proxy_reuse_connections")?);
-            let changed = transaction.execute(sql("UPDATE channel_settings SET endpoint_mappings_json=?,model_rules_json=?,parameter_overrides_json=?,retry_statuses_json=?,auto_disable_policy_json=?,proxy_url=?,proxy_username=?,proxy_secret_envelope=?,proxy_reuse_connections=?,updated_at=? WHERE provider_id=? AND provider_id IN (SELECT id FROM providers WHERE project_id=?)",vec![document("endpoint_mappings","endpoint_mappings_json")?.into(),document("model_rules","model_rules_json")?.into(),document("parameter_overrides","parameter_overrides_json")?.into(),document("retry_statuses","retry_statuses_json")?.into(),document("auto_disable_policy","auto_disable_policy_json")?.into(),proxy_url.into(),proxy_username.into(),proxy_secret_envelope.into(),proxy_reuse_connections.into(),db::now().into(),provider.into(),project.clone().into()])).await?.rows_affected();
+            let proxy_preset = value
+                .get("proxy_preset_id")
+                .map(|item| item.as_str().map(str::to_owned))
+                .unwrap_or(current.try_get::<Option<String>>("", "proxy_preset_id")?);
+            if let Some(preset) = &proxy_preset
+                && transaction
+                    .query_one(sql(
+                        "SELECT id FROM proxy_presets WHERE id=? AND enabled=1",
+                        vec![preset.into()],
+                    ))
+                    .await?
+                    .is_none()
+            {
+                return Err(ApiError::BadRequest("unknown proxy preset".into()));
+            }
+            let changed = transaction.execute(sql("UPDATE channel_settings SET endpoint_mappings_json=?,model_rules_json=?,parameter_overrides_json=?,retry_statuses_json=?,auto_disable_policy_json=?,proxy_url=?,proxy_username=?,proxy_secret_envelope=?,proxy_reuse_connections=?,proxy_preset_id=?,updated_at=? WHERE provider_id=? AND provider_id IN (SELECT id FROM providers WHERE project_id=?)",vec![document("endpoint_mappings","endpoint_mappings_json")?.into(),document("model_rules","model_rules_json")?.into(),document("parameter_overrides","parameter_overrides_json")?.into(),document("retry_statuses","retry_statuses_json")?.into(),document("auto_disable_policy","auto_disable_policy_json")?.into(),proxy_url.into(),proxy_username.into(),proxy_secret_envelope.into(),proxy_reuse_connections.into(),proxy_preset.into(),db::now().into(),provider.into(),project.clone().into()])).await?.rows_affected();
             if changed != 1 {
                 return Err(ApiError::NotFound);
             }
@@ -3687,7 +3856,10 @@ async fn mutate(
             let secret = value
                 .get("secret")
                 .filter(|secret| !secret.is_null())
-                .map(|secret| storage::envelope(&state.secrets, &project, &resource_id, secret))
+                .map(|secret| {
+                    storage::validate_secret(&config, secret)?;
+                    storage::envelope(&state.secrets, &project, &resource_id, secret)
+                })
                 .transpose()?;
             let exists = transaction
                 .query_one(sql(
@@ -3702,9 +3874,9 @@ async fn mutate(
                 if value["revision"].as_i64() != Some(row.try_get("", "revision")?) {
                     return Err(ApiError::Conflict("storage revision changed".into()));
                 }
-                transaction.execute(sql("UPDATE data_storage_configs SET name=?,config_json=?,kind=?,secret_envelope=COALESCE(?,secret_envelope),enabled=?,revision=revision+1,updated_at=? WHERE id=? AND revision=?",vec![text(&value,"name")?.into(),serde_json::to_string(&config).unwrap().into(),match config{storage::Config::Local{..}=>"local",_=>"s3"}.into(),secret.into(),value["enabled"].as_bool().unwrap_or(true).into(),db::now().into(),resource_id.clone().into(),value["revision"].as_i64().into()])).await?;
+                transaction.execute(sql("UPDATE data_storage_configs SET name=?,config_json=?,kind=?,secret_envelope=COALESCE(?,secret_envelope),enabled=?,revision=revision+1,updated_at=? WHERE id=? AND revision=?",vec![text(&value,"name")?.into(),serde_json::to_string(&config).unwrap().into(),storage_kind(&config).into(),secret.into(),value["enabled"].as_bool().unwrap_or(true).into(),db::now().into(),resource_id.clone().into(),value["revision"].as_i64().into()])).await?;
             } else {
-                transaction.execute(sql("INSERT INTO data_storage_configs(id,project_id,name,kind,config_json,secret_envelope,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",vec![resource_id.clone().into(),project.clone().into(),text(&value,"name")?.into(),match config{storage::Config::Local{..}=>"local",_=>"s3"}.into(),serde_json::to_string(&config).unwrap().into(),secret.into(),db::now().into(),db::now().into()])).await?;
+                transaction.execute(sql("INSERT INTO data_storage_configs(id,project_id,name,kind,config_json,secret_envelope,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",vec![resource_id.clone().into(),project.clone().into(),text(&value,"name")?.into(),storage_kind(&config).into(),serde_json::to_string(&config).unwrap().into(),secret.into(),db::now().into(),db::now().into()])).await?;
             }
         }
         "prices" => {
@@ -3874,7 +4046,44 @@ async fn mutate(
             } else {
                 None
             };
-            let changed=transaction.execute(sql("INSERT INTO webhooks(id,project_id,name,url,secret_envelope,headers_json,body_template_json,subscriptions_json,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,url=excluded.url,secret_envelope=COALESCE(excluded.secret_envelope,webhooks.secret_envelope),headers_json=excluded.headers_json,body_template_json=excluded.body_template_json,subscriptions_json=excluded.subscriptions_json,enabled=excluded.enabled,updated_at=excluded.updated_at WHERE webhooks.project_id=excluded.project_id",vec![resource_id.clone().into(),project.clone().into(),text(&value,"name")?.into(),url.into(),secret.into(),json!({"version":1,"headers":value.get("headers").cloned().unwrap_or(json!({}))}).to_string().into(),json!({"version":1,"body":value.get("body").cloned().unwrap_or(json!("$event"))}).to_string().into(),json!({"version":1,"events":value.get("events").cloned().unwrap_or(json!([]))}).to_string().into(),value["enabled"].as_bool().unwrap_or(true).into(),db::now().into(),db::now().into()])).await?.rows_affected();
+            let timeout = value["timeout_secs"].as_i64().unwrap_or(20);
+            if !(1..=300).contains(&timeout) {
+                return Err(ApiError::BadRequest(
+                    "webhook timeout must be 1–300 seconds".into(),
+                ));
+            }
+            let proxy_preset = if value
+                .as_object()
+                .is_some_and(|object| object.contains_key("proxy_preset_id"))
+            {
+                value
+                    .get("proxy_preset_id")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned)
+            } else {
+                transaction
+                    .query_one(sql(
+                        "SELECT proxy_preset_id FROM webhooks WHERE id=? AND project_id=?",
+                        vec![resource_id.clone().into(), project.clone().into()],
+                    ))
+                    .await?
+                    .map(|row| row.try_get::<Option<String>>("", "proxy_preset_id"))
+                    .transpose()?
+                    .flatten()
+            };
+            if let Some(preset) = &proxy_preset
+                && transaction
+                    .query_one(sql(
+                        "SELECT id FROM proxy_presets WHERE id=? AND enabled=1",
+                        vec![preset.into()],
+                    ))
+                    .await?
+                    .is_none()
+            {
+                return Err(ApiError::BadRequest("unknown proxy preset".into()));
+            }
+            let changed=transaction.execute(sql("INSERT INTO webhooks(id,project_id,name,url,secret_envelope,headers_json,body_template_json,subscriptions_json,timeout_secs,proxy_preset_id,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,url=excluded.url,secret_envelope=COALESCE(excluded.secret_envelope,webhooks.secret_envelope),headers_json=excluded.headers_json,body_template_json=excluded.body_template_json,subscriptions_json=excluded.subscriptions_json,timeout_secs=excluded.timeout_secs,proxy_preset_id=excluded.proxy_preset_id,enabled=excluded.enabled,updated_at=excluded.updated_at WHERE webhooks.project_id=excluded.project_id",vec![resource_id.clone().into(),project.clone().into(),text(&value,"name")?.into(),url.into(),secret.into(),json!({"version":1,"headers":value.get("headers").cloned().unwrap_or(json!({}))}).to_string().into(),json!({"version":1,"body":value.get("body").cloned().unwrap_or(json!("$event"))}).to_string().into(),json!({"version":1,"events":value.get("events").cloned().unwrap_or(json!([]))}).to_string().into(),timeout.into(),proxy_preset.into(),value["enabled"].as_bool().unwrap_or(true).into(),db::now().into(),db::now().into()])).await?.rows_affected();
             if changed != 1 {
                 return Err(ApiError::Forbidden);
             }
@@ -3902,7 +4111,6 @@ async fn mutate(
     transaction.commit().await?;
     Ok(Json(json!({"id":resource_id})))
 }
-
 fn validate_proxy_url(value: &str) -> Result<(), ApiError> {
     if value.len() > 2048 {
         return Err(ApiError::BadRequest("proxy URL is too long".into()));
@@ -3919,6 +4127,40 @@ fn validate_proxy_url(value: &str) -> Result<(), ApiError> {
         ));
     }
     Ok(())
+}
+
+fn storage_kind(config: &storage::Config) -> &'static str {
+    match config {
+        storage::Config::Local { .. } => "local",
+        storage::Config::S3 { .. } => "s3",
+        storage::Config::Gcs { .. } => "gcs",
+        storage::Config::Webdav { .. } => "webdav",
+    }
+}
+
+async fn test_storage(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((project, storage_id)): Path<(String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    let user = actor(&state, &headers, Some(&project), true).await?;
+    let row = state
+        .db
+        .query_one(sql(
+            "SELECT config_json,secret_envelope FROM data_storage_configs WHERE id=? AND project_id=? AND enabled=1",
+            vec![storage_id.clone().into(), project.clone().into()],
+        ))
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    let config: storage::Config = serde_json::from_str(&row.try_get::<String>("", "config_json")?)
+        .map_err(|_| storage::invalid())?;
+    let secret: Option<String> = row.try_get("", "secret_envelope")?;
+    // The network check intentionally runs without a SQLite business transaction.
+    storage::test_connection(&state, &project, &storage_id, &config, secret.as_deref()).await?;
+    let tx = state.db.begin().await?;
+    audit_in(&tx, &user, &project, "storage.test", &storage_id).await?;
+    tx.commit().await?;
+    Ok(Json(json!({"ok":true})))
 }
 async fn remove(
     State(state): State<AppState>,
@@ -4131,7 +4373,10 @@ async fn export(
 #[serde(deny_unknown_fields)]
 struct Restore {
     artifact: backup::Artifact,
+    #[serde(default)]
     strategy: backup::Conflict,
+    #[serde(default)]
+    strategies: std::collections::BTreeMap<String, backup::Conflict>,
 }
 async fn restore(
     State(state): State<AppState>,
@@ -4140,11 +4385,14 @@ async fn restore(
     Json(input): Json<Restore>,
 ) -> Result<Json<Value>, ApiError> {
     let user = actor(&state, &headers, Some(&project), true).await?;
-    let count = backup::restore_as(
+    let count = backup::restore_with_strategies_as(
         &state,
         &project,
         &input.artifact,
-        input.strategy,
+        &backup::RestoreStrategies {
+            default: input.strategy,
+            resources: input.strategies,
+        },
         Some(&user),
     )
     .await?;

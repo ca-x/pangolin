@@ -1,10 +1,12 @@
 //! Authoritative accounting and durable operational work; DuckDB is a projection.
 pub mod backup;
+pub mod diagnostics;
 pub mod instance_backup;
 pub mod jobs;
 pub mod lifecycle;
 pub mod logging;
 pub mod pricing;
+pub mod proxy;
 pub mod runtime;
 pub mod schedule;
 pub mod storage;

@@ -55,13 +55,13 @@ states plainly that no test guards it yet.
 | prompts & playground | 6 | 12 | 1 | 0 | 0 | 0 | 1 | 20 |
 | models, routing & pricing | 6 | 13 | 2 | 1 | 3 | 1 | 0 | 26 |
 | access control | 2 | 17 | 2 | 0 | 0 | 0 | 0 | 21 |
-| system settings & background work | 8 | 9 | 5 | 1 | 5 | 2 | 1 | 31 |
+| system settings & background work | 8 | 11 | 5 | 1 | 5 | 0 | 1 | 31 |
 | console-wide UX | 3 | 9 | 1 | 2 | 0 | 0 | 0 | 15 |
-| **total** | **30** | **70** | **11** | **6** | **11** | **3** | **2** | **133** |
+| **total** | **30** | **72** | **11** | **6** | **11** | **1** | **2** | **133** |
 
 Row count is unchanged at 133 — the six area reports' own findings. No row was
-dropped, merged or added. What changed is the status: **111 rows need no work**
-(30 already matched, 70 fixed, 11 refuted), **20 rows need work** (`partial` +
+dropped, merged or added. What changed is the status: **113 rows need no work**
+(30 already matched, 72 fixed, 11 refuted), **18 rows need work** (`partial` +
 `open` + `feature-build`), and **2 rows are recorded divergences** whose only
 remaining difference is deliberate.
 
@@ -216,15 +216,15 @@ Report: [parity-system-settings.md](parity-system-settings.md).
 | 15 | No route or surface to list or re-download an artifact | closed | fixed | `GET .../backup/artifacts` + single-artifact download, consumed with the CSRF header (`operations_api.rs:64-71`, `SystemPage.tsx:563-580,690-700`) | no list route either | `artifactDownload.test.tsx` |
 | 16 | The delivered archive's location is not shown | closed | fixed | `object_key` is projected and rendered per target (`operations_api.rs:352` type, `SystemPage.tsx:806-811`) | n/a | `deliveryLocation.test.tsx` |
 | 17 | Webhook delivery history has no console surface | closed | fixed | `webhook-deliveries` resource (`operations_api.rs:421-424`) consumed by a paginated panel (`SystemPage.tsx:872`) | configuration only | `webhookDeliveries.test.tsx` |
-| 18 | Storage targets are raw JSON, local + S3 only | partial | — | Typed per-kind fields with an S3 credential path and a JSON escape hatch, validated client- and server-side (`SystemPage.tsx:397-423`, `operations/storage.rs:13-26`): the JSON box is now the fallback rather than the only path. GCS/WebDAV and a connection test are still missing | typed forms per backend (local, S3, GCS, WebDAV) with credential fields, plus a connection test | a GCS/WebDAV config test and a connection-test route test |
-| 19 | One restore conflict strategy for the whole artifact | open | — | A single `strategy` for a project artifact and a single `mode` + `force` for an instance archive | per-class strategies (`RestoreOptionsInput`) | a restore test with two classes and different strategies, or the ADR below |
+| 18 | Storage targets are raw JSON, local + S3 only | closed | fixed | Local, S3, GCS and WebDAV have typed, bounded configuration and encrypted credential paths; the project-authorized connection action performs a bounded list only and never writes an object | typed forms per backend (local, S3, GCS, WebDAV) with credential fields, plus a connection test | `b50_gcs_and_webdav_roundtrip_and_connection_test_does_not_write`, `storageTargetForm.test.tsx` |
+| 19 | One restore conflict strategy for the whole artifact | partial | — | Project artifacts accept a default plus validated per-resource `fail`/`skip`/`overwrite` strategies while preserving secrets and the prior default; instance archives still use one `mode` + `force` policy | per-class strategies (`RestoreOptionsInput`) | `b51_restore_applies_per_resource_strategies_and_defaults_to_fail`, `SystemPage.test.tsx` |
 | 20 | `catalog:manage` alone gets a System nav entry that leads nowhere | closed | fixed | `/models` is in the nav for `catalog:manage` (`Shell.tsx:45`) | catalog tab inside the system page | `SystemPage.test.tsx` permission cases |
 | 21 | Admin-route body rejections bypass the error envelope | closed | fixed | `/api/admin/` rejections are normalised (`api/errors.rs`), with a guard scoped to admin paths | GraphQL returns structured validation errors | `admin_body_rejections_answer_with_the_error_envelope` |
 | 22 | No instance-level general settings | open | — | No currency and no instance timezone setting; `formatMicros` hardcodes `$` | `general-settings.tsx:149-224` | an instance settings test; depends on the currency decision |
 | 23 | No instance-level retry or upstream-error policy settings | open | — | Retry statuses and auto-disable are per-channel JSON (`db/schema.rs:344-352`); the only instance settings routes are request-logging and system (`operations_api.rs:20-25`) | `retry-settings.tsx:149-260` | an instance policy test, or the ADR below |
 | 24 | No quota-collection or quota-routing-mode settings | open | — | An exhausted quota always removes the channel (`orchestration/repository.rs:210-211`); collection is driven per channel/schedule, with no toggle | `quota-settings.tsx:89-155` (collection switch + routing mode) | a routing-mode test, or the ADR below |
-| 25 | Diagnostics tab: cache diagnostics export and clear cache | feature-build | — | No diagnostics surface; the only derived-state reset is internal, after an instance restore | `diagnostics-settings.tsx` | build only if operators hit staleness; decide first |
-| 26 | Outbound proxy presets, and per-webhook timeout/proxy | feature-build | — | No outbound proxy support; the catalog fetch is `.no_proxy()` (`catalog/refresh.rs:35`); the webhook form has no timeout/proxy | `proxy-presets-settings.tsx:29-98`, `webhook-settings.tsx:424-522` | a proxy-preset test; depends on row 21 of models (per-channel proxy) |
+| 25 | Diagnostics tab: cache diagnostics export and clear cache | closed | fixed | Owner-only export reports bounded cache counts and shape versions without payloads or credentials; clear invalidates only derived process state, verifies SQLite authority is unchanged and writes an audit row | `diagnostics-settings.tsx` | `b52_cache_diagnostics_are_bounded_and_clear_keeps_authority_serving`, `SystemPage.test.tsx` |
+| 26 | Outbound proxy presets, and per-webhook timeout/proxy | partial | — | Instance-scoped presets encrypt credentials and are selectable by bounded-timeout webhooks and catalog sources; catalog fetches remain no-proxy by default. Channel settings can reference a preset, but provider egress still depends on models row 21 plumbing | `proxy-presets-settings.tsx:29-98`, `webhook-settings.tsx:424-522` | B53 webhook/catalog/proxy tests plus `SystemPage.test.tsx`; channel egress remains |
 | 27 | "One extra field makes every gateway request fail" (the PUT) | closed | refuted | The extra field is refused at the settings route before anything is written (`operations_api.rs:212-225`) | — | the real exposure was the stored row, now row 11 |
 | 28 | OIDC settings belong to the System page | closed | refuted | Provider and identity CRUD live on the Access page over `/api/admin/v1/oidc/...`; `SystemPage.tsx` has no OIDC tab | its OIDC surface is user-level self-service | — |
 | 29 | A principal holding only `project:manage` has no route to the System page | closed | refuted | The page renders the six project tabs for `project:manage` alone (`SystemPage.tsx:30-43`) | — | `SystemPage.test.tsx` |
@@ -284,7 +284,7 @@ row of the 133, two are matrix-level.
 | system 19 | Restore conflict granularity | (a) per-resource strategies, (b) record the single strategy as deliberate | a restore of mixed resources keeps one policy for all classes |
 | system 23 | Instance retry / upstream-error policy | (a) promote selected knobs to instance settings, (b) document them as per-channel only | operators must edit channel JSON for instance-wide intent |
 | system 24 | Quota routing mode | (a) add `IGNORE_QUOTA`/`REMOVE_ON_EXHAUSTED`/`BACKPRESSURE`, (b) document REMOVE_ON_EXHAUSTED only | an exhausted channel is always removed, with no alternative |
-| system 25 | Diagnostics tab | (a) build cache diagnostics/clear, (b) record as not planned | low value: Pangolin's caches are rebuilt from SQLite |
+| system 25 | Diagnostics tab | resolved: build bounded export and owner-only clear for derived caches | SQLite remains authoritative; clear is audited and cannot mutate access or routing records |
 | access 13 | Invitation reuse | **decided: (a)** finite max-uses (1–100), retaining email binding and bounded expiry | resolved by B27 |
 | matrix (D6) | Scoped GraphQL endpoint | (a) implement one over the same permission model, (b) record the REST-only decision as divergence D6 with an ADR | a capability AxonHub has stays absent without a recorded reason |
 | matrix | Semantic-memory provider | (a) implement an opt-in provider behind the documented interface, (b) keep the interface as documentation only | long-term memory stays unavailable even where an operator wants it |
@@ -528,7 +528,7 @@ retry/model/quota settings, and CORS/timeouts. Every one of them is scheduled in
 | System initialization/onboarding | implemented+tested | setup route, brand name/logo/title, onboarding progress |
 | System retry/model/quota settings | open | system 12, 23, 24 |
 | CORS and request timeouts | open | no operator CORS configuration and no configurable request timeout |
-| Data storage | partial | typed per-kind fields for local and S3 with an S3 credential path; GCS/WebDAV and a connection test are missing (system 18) |
+| Data storage | implemented+tested | typed local/S3/GCS/WebDAV targets with encrypted credentials, owned prefixes and bounded read-only connection tests |
 | Backup/restore | implemented+tested | selective resources, conflict strategy, secret preservation, preflight |
 | Automatic backup | partial | schedule/retention/status and manual trigger exist; interval only, no daily time or timezone (system 13) |
 | Webhooks | implemented+tested | targets, encrypted headers, body template, subscriptions, echo and delivery retry with history |
@@ -542,7 +542,7 @@ retry/model/quota settings, and CORS/timeouts. Every one of them is scheduled in
 
 | Row | Disposition | Evidence / what is missing |
 | --- | --- | --- |
-| Dashboard; analytics; keys/profiles; channels/credentials/probes/prices; models/associations; playground/chats; projects/members; roles; users; prompts; protection; requests/live/content; threads; traces/executions; usage; storage; backup/restore; OIDC/system/security/onboarding | partial | Pages exist for dashboard, keys, profiles, channels, credentials, probes, prices, models, associations, playground, projects, members, roles, users, prompts, protection, requests, threads, traces, executions, usage, storage, backup/restore, OIDC, system, security, onboarding. Missing or thinner: a live-preview page, an analytics page with its own filters, chats history, a prices editor (models 26), a groups editor (models 19), a diagnostics page, provider OAuth setup |
+| Dashboard; analytics; keys/profiles; channels/credentials/probes/prices; models/associations; playground/chats; projects/members; roles; users; prompts; protection; requests/live/content; threads; traces/executions; usage; storage; backup/restore; OIDC/system/security/onboarding | partial | Pages exist for dashboard, keys, profiles, channels, credentials, probes, prices, models, associations, playground, projects, members, roles, users, prompts, protection, requests, threads, traces, executions, usage, storage, backup/restore, diagnostics, OIDC, system, security, onboarding. Missing or thinner: a live-preview page, an analytics page with its own filters, chats history, a prices editor (models 26), a groups editor (models 19), provider OAuth setup |
 
 ## ax-llm/ax recommendation
 

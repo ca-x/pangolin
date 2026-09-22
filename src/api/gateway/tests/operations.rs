@@ -6,6 +6,7 @@ use crate::operations::{
     backup::{Conflict, Selection},
     logging::{Level, Policy},
 };
+use object_store::ObjectStoreExt;
 use std::io::{Read, Write};
 
 #[tokio::test]
@@ -1273,10 +1274,259 @@ async fn task5_backup_selective_roundtrip_encryption_atomicity_and_conflicts() {
             .is_err()
     );
 }
+
+#[tokio::test]
+async fn b51_restore_applies_per_resource_strategies_and_defaults_to_fail() {
+    let f = fixture(success()).await;
+    let project = db::DEFAULT_PROJECT_ID;
+    let artifact = ops::backup::export(
+        &f.state,
+        project,
+        &Selection {
+            resources: vec![
+                "providers".into(),
+                "models".into(),
+                "channel_credentials".into(),
+            ],
+        },
+    )
+    .await
+    .unwrap();
+    sql(
+        &f,
+        "UPDATE providers SET base_url='https://changed.example'",
+        vec![],
+    )
+    .await;
+    sql(&f, "UPDATE models SET priority=999", vec![]).await;
+    let before_secret = f
+        .state
+        .db
+        .query_one(ops::sql(
+            "SELECT secret_envelope FROM channel_credentials ORDER BY id LIMIT 1",
+            vec![],
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get::<String>("", "secret_envelope")
+        .unwrap();
+    let restored = ops::backup::restore_with_strategies_as(
+        &f.state,
+        project,
+        &artifact,
+        &ops::backup::RestoreStrategies {
+            default: Conflict::Fail,
+            resources: std::collections::BTreeMap::from([
+                ("providers".into(), Conflict::Skip),
+                ("models".into(), Conflict::Overwrite),
+                ("channel_credentials".into(), Conflict::Skip),
+            ]),
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(restored > 0);
+    assert_eq!(
+        count(&f, "SELECT COUNT(*) AS n FROM models WHERE priority=999").await,
+        0
+    );
+    assert_eq!(
+        f.state
+            .db
+            .query_one(ops::sql(
+                "SELECT secret_envelope FROM channel_credentials ORDER BY id LIMIT 1",
+                vec![]
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get::<String>("", "secret_envelope")
+            .unwrap(),
+        before_secret
+    );
+
+    let second = ops::backup::export(
+        &f.state,
+        project,
+        &Selection {
+            resources: vec!["providers".into()],
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        ops::backup::restore_with_strategies_as(
+            &f.state,
+            project,
+            &second,
+            &Default::default(),
+            None
+        )
+        .await
+        .is_err(),
+        "an omitted policy keeps fail as the default"
+    );
+    let mut foreign = second.clone();
+    foreign.project_id = "other-project".into();
+    assert!(
+        ops::backup::restore_with_strategies_as(
+            &f.state,
+            project,
+            &foreign,
+            &Default::default(),
+            None
+        )
+        .await
+        .is_err()
+    );
+}
 async fn local_target(f: &Fixture, name: &str) -> String {
     let target = ops::id();
     sql(f,"INSERT INTO data_storage_configs(id,project_id,name,kind,config_json,created_at,updated_at) VALUES(?,?,?,'local',?,0,0)",vec![target.clone().into(),db::DEFAULT_PROJECT_ID.into(),name.into(),json!({"kind":"local","directory":name}).to_string().into()]).await;
     target
+}
+
+#[tokio::test]
+async fn b50_gcs_and_webdav_roundtrip_and_connection_test_does_not_write() {
+    assert!(serde_json::from_value::<ops::storage::Config>(json!({"kind":"unknown"})).is_err());
+    let objects = Arc::new(tokio::sync::Mutex::new(HashMap::<String, Bytes>::new()));
+    let puts = Arc::new(AtomicUsize::new(0));
+    let mock_objects = objects.clone();
+    let mock_puts = puts.clone();
+    let f = fixture(Router::new().fallback(move |request: axum::extract::Request| {
+        let objects = mock_objects.clone();
+        let puts = mock_puts.clone();
+        async move {
+            let method = request.method().clone();
+            let uri = request.uri().clone();
+            let key = uri.path().to_owned();
+            if method.as_str() == "PROPFIND" {
+                return Response::builder()
+                    .status(207)
+                    .header("content-type", "application/xml")
+                    .body(Body::from("<?xml version=\"1.0\"?><d:multistatus xmlns:d=\"DAV:\"></d:multistatus>"))
+                    .unwrap();
+            }
+            if method == http::Method::GET && uri.query().is_some_and(|query| query.contains("list-type=2")) {
+                return Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/xml")
+                    .body(Body::from("<?xml version=\"1.0\"?><ListBucketResult><Name>bucket</Name><IsTruncated>false</IsTruncated></ListBucketResult>"))
+                    .unwrap();
+            }
+            if method == http::Method::PUT {
+                let bytes = to_bytes(request.into_body(), 1024 * 1024).await.unwrap();
+                objects.lock().await.insert(key, bytes);
+                puts.fetch_add(1, Ordering::SeqCst);
+                return Response::builder().status(StatusCode::OK).header("etag", "mock-etag").body(Body::empty()).unwrap();
+            }
+            if method == http::Method::GET {
+                return objects.lock().await.get(&key).cloned().map_or_else(
+                    || Response::builder().status(StatusCode::NOT_FOUND).body(Body::empty()).unwrap(),
+                    |bytes| Response::builder().status(StatusCode::OK).header("content-length", bytes.len()).header("etag", "mock-etag").header("last-modified", "Mon, 01 Jan 2024 00:00:00 GMT").body(Body::from(bytes)).unwrap(),
+                );
+            }
+            Response::builder().status(StatusCode::OK).body(Body::empty()).unwrap()
+        }
+    })).await;
+    let endpoint = f
+        .state
+        .db
+        .query_one(ops::sql("SELECT base_url FROM providers LIMIT 1", vec![]))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get::<String>("", "base_url")
+        .unwrap();
+    let cases = [
+        (
+            "gcs",
+            ops::storage::Config::Gcs {
+                bucket: "bucket".into(),
+                prefix: String::new(),
+                endpoint: Some(endpoint.clone()),
+            },
+            json!({"service_account":{"client_email":"mock@example.test","private_key":"unused","private_key_id":"unused","disable_oauth":true}}),
+        ),
+        (
+            "webdav",
+            ops::storage::Config::Webdav {
+                endpoint: format!("{endpoint}/dav/"),
+                prefix: String::new(),
+            },
+            json!({"username":"pangolin","password":"sentinel"}),
+        ),
+    ];
+    for (id, config, secret) in cases {
+        let envelope =
+            ops::storage::envelope(&f.state.secrets, db::DEFAULT_PROJECT_ID, id, &secret).unwrap();
+        let store = ops::storage::open(
+            &f.state,
+            db::DEFAULT_PROJECT_ID,
+            id,
+            &config,
+            Some(&envelope),
+        )
+        .await
+        .unwrap();
+        let key = format!(
+            "{}roundtrip.json",
+            ops::storage::owned_prefix(&config, db::DEFAULT_PROJECT_ID, id).unwrap()
+        );
+        ops::storage::put(store.as_ref(), &key, br#"{"ok":true}"#.to_vec())
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .get(&object_store::path::Path::parse(&key).unwrap())
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap()
+                .as_ref(),
+            br#"{"ok":true}"#
+        );
+    }
+
+    let before = puts.load(Ordering::SeqCst);
+    let target = ops::id();
+    let config = ops::storage::Config::Webdav {
+        endpoint: format!("{endpoint}/dav/"),
+        prefix: String::new(),
+    };
+    let secret = ops::storage::envelope(
+        &f.state.secrets,
+        db::DEFAULT_PROJECT_ID,
+        &target,
+        &json!({"username":"pangolin","password":"sentinel"}),
+    )
+    .unwrap();
+    sql(&f,"INSERT INTO data_storage_configs(id,project_id,name,kind,config_json,secret_envelope,created_at,updated_at) VALUES(?,?,?,'webdav',?,?,0,0)",vec![target.clone().into(),db::DEFAULT_PROJECT_ID.into(),"dav".into(),serde_json::to_string(&config).unwrap().into(),secret.into()]).await;
+    let cookie = owner(&f).await;
+    let response = admin(
+        &f,
+        &cookie,
+        http::Method::POST,
+        &format!(
+            "/api/admin/v1/projects/{}/operations/storage/{target}/test",
+            db::DEFAULT_PROJECT_ID
+        ),
+        json!({}),
+        true,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        puts.load(Ordering::SeqCst),
+        before,
+        "connection test must not write an object"
+    );
+    let body = json_body(response).await;
+    assert_eq!(body, json!({"ok":true}));
+    assert!(!body.to_string().contains("sentinel"));
 }
 #[tokio::test]
 async fn task5_backup_target_revision_fencing_retry_and_owned_retention() {
@@ -3192,6 +3442,182 @@ async fn task5_webhook_outbox_retries_and_gc_preserves_usage_and_latest_quota() 
         count(&f, "SELECT COUNT(*) AS n FROM provider_quota_snapshots").await,
         1
     );
+}
+
+#[tokio::test]
+async fn b52_cache_diagnostics_are_bounded_and_clear_keeps_authority_serving() {
+    let f = fixture(success()).await;
+    let cookie = owner(&f).await;
+    let before = count(&f,"SELECT (SELECT COUNT(*) FROM providers)+(SELECT COUNT(*) FROM models)+(SELECT COUNT(*) FROM api_keys) AS n").await;
+    let response = admin(
+        &f,
+        &cookie,
+        http::Method::GET,
+        "/api/admin/v1/instance/diagnostics/cache",
+        Value::Null,
+        false,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let document = json_body(response).await;
+    assert_eq!(document["version"], 1);
+    assert!(
+        document
+            .pointer("/runtime/caches")
+            .and_then(Value::as_array)
+            .is_some_and(|caches| caches.len() <= 16)
+    );
+    let serialized = document.to_string();
+    assert!(serialized.len() < 32 * 1024);
+    for forbidden in ["secret_envelope", "authorization", "api_key", "payload"] {
+        assert!(!serialized.contains(forbidden));
+    }
+
+    let response = admin(
+        &f,
+        &cookie,
+        http::Method::DELETE,
+        "/api/admin/v1/instance/diagnostics/cache",
+        Value::Null,
+        true,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(count(&f,"SELECT (SELECT COUNT(*) FROM providers)+(SELECT COUNT(*) FROM models)+(SELECT COUNT(*) FROM api_keys) AS n").await,before);
+    assert_eq!(
+        count(
+            &f,
+            "SELECT COUNT(*) AS n FROM audit_events WHERE action='diagnostics.cache.clear'"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        request(&f, "/v1/chat/completions", chat()).await.status(),
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn b53_webhook_uses_encrypted_proxy_preset_and_bounded_timeout() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = calls.clone();
+    let f = fixture(Router::new().fallback(move || {
+        seen.fetch_add(1, Ordering::SeqCst);
+        async { StatusCode::OK }
+    }))
+    .await;
+    let proxy_url = f
+        .state
+        .db
+        .query_one(ops::sql("SELECT base_url FROM providers LIMIT 1", vec![]))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get::<String>("", "base_url")
+        .unwrap();
+    let cookie = owner(&f).await;
+    let created = json_body(admin(&f,&cookie,http::Method::POST,"/api/admin/v1/instance/proxy-presets",json!({"name":"egress","url":proxy_url,"credentials":{"username":"proxy-user","password":"proxy-sentinel"},"enabled":true}),true).await).await;
+    let preset = created["id"].as_str().unwrap();
+    let listed = json_body(
+        admin(
+            &f,
+            &cookie,
+            http::Method::GET,
+            "/api/admin/v1/instance/proxy-presets",
+            Value::Null,
+            false,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(listed["data"][0]["id"], preset);
+    assert!(!listed.to_string().contains("proxy-sentinel"));
+    let envelope = f
+        .state
+        .db
+        .query_one(ops::sql(
+            "SELECT secret_envelope FROM proxy_presets WHERE id=?",
+            vec![preset.into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get::<String>("", "secret_envelope")
+        .unwrap();
+    assert!(!envelope.contains("proxy-sentinel"));
+
+    let base = format!(
+        "/api/admin/v1/projects/{}/operations/webhooks",
+        db::DEFAULT_PROJECT_ID
+    );
+    let webhook = json_body(admin(&f,&cookie,http::Method::POST,&base,json!({"name":"proxied","url":"http://destination.invalid/hook","events":["test"],"timeout_secs":3,"proxy_preset_id":preset}),true).await).await;
+    assert_eq!(admin(&f,&cookie,http::Method::POST,&base,json!({"name":"bad timeout","url":"http://destination.invalid/hook","events":["test"],"timeout_secs":301,"proxy_preset_id":preset}),true).await.status(),StatusCode::BAD_REQUEST);
+    ops::runtime::notify(
+        &f.state.db,
+        db::DEFAULT_PROJECT_ID,
+        "test",
+        "proxied",
+        &json!({"ok":true}),
+    )
+    .await
+    .unwrap();
+    let claim = ops::jobs::claim(&f.state.db, "worker", db::now(), 120)
+        .await
+        .unwrap()
+        .unwrap();
+    ops::runtime::execute(&f.state, &claim).await.unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(count(&f,&format!("SELECT COUNT(*) AS n FROM webhooks WHERE id='{}' AND timeout_secs=3 AND proxy_preset_id='{}'",webhook["id"].as_str().unwrap(),preset)).await,1);
+}
+
+#[tokio::test]
+async fn b53_scheduled_catalog_refresh_uses_its_proxy_preset() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = calls.clone();
+    let f = fixture(Router::new().fallback(move || {
+        seen.fetch_add(1, Ordering::SeqCst);
+        async { StatusCode::OK }
+    }))
+    .await;
+    let proxy_url = f
+        .state
+        .db
+        .query_one(ops::sql("SELECT base_url FROM providers LIMIT 1", vec![]))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get::<String>("", "base_url")
+        .unwrap();
+    sql(
+        &f,
+        "INSERT INTO proxy_presets(id,name,url,enabled,created_at,updated_at) VALUES('catalog-proxy','Catalog proxy',?,1,0,0)",
+        vec![proxy_url.into()],
+    )
+    .await;
+    sql(
+        &f,
+        "INSERT INTO catalog_sources(id,name,url,priority,refresh_interval_secs,enabled,signature_policy,proxy_preset_id,revision) VALUES('scheduled-source','Scheduled','https://1.1.1.1/catalog',100,3600,1,'none','catalog-proxy',1)",
+        vec![],
+    )
+    .await;
+    ops::jobs::enqueue(
+        &f.state.db,
+        None,
+        "catalog_refresh",
+        "scheduled-catalog-proxy",
+        &json!({"source_id":"scheduled-source","revision":1}),
+        db::now(),
+    )
+    .await
+    .unwrap();
+    let claim = ops::jobs::claim(&f.state.db, "worker", db::now(), 120)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert!(ops::runtime::execute(&f.state, &claim).await.is_err());
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
 /// A typo in a routing condition used to be stored happily and then abort

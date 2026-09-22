@@ -269,12 +269,49 @@ pub enum Conflict {
     Skip,
     Overwrite,
 }
+impl Default for Conflict {
+    fn default() -> Self {
+        Self::Fail
+    }
+}
 impl Conflict {
-    fn name(self) -> &'static str {
+    fn as_str(self) -> &'static str {
         match self {
             Self::Fail => "fail",
             Self::Skip => "skip",
             Self::Overwrite => "overwrite",
+        }
+    }
+}
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestoreStrategies {
+    #[serde(default)]
+    pub default: Conflict,
+    #[serde(default)]
+    pub resources: BTreeMap<String, Conflict>,
+}
+impl RestoreStrategies {
+    fn validate(&self, artifact: &Artifact) -> Result<(), ApiError> {
+        if self.resources.len() > TABLES.len()
+            || self.resources.keys().any(|name| {
+                !artifact.resources.contains(name) || !TABLES.iter().any(|(table, _)| table == name)
+            })
+        {
+            return Err(ApiError::BadRequest(
+                "unknown restore resource strategy".into(),
+            ));
+        }
+        Ok(())
+    }
+    fn for_table(&self, table: &str) -> Conflict {
+        self.resources.get(table).copied().unwrap_or(self.default)
+    }
+    fn ledger_key(&self) -> Result<String, ApiError> {
+        if self.resources.is_empty() {
+            Ok(self.default.as_str().into())
+        } else {
+            serde_json::to_string(self).map_err(|error| ApiError::Internal(error.into()))
         }
     }
 }
@@ -292,6 +329,26 @@ pub async fn restore_as(
     project: &str,
     artifact: &Artifact,
     strategy: Conflict,
+    actor: Option<&crate::access::Principal>,
+) -> Result<usize, ApiError> {
+    restore_with_strategies_as(
+        state,
+        project,
+        artifact,
+        &RestoreStrategies {
+            default: strategy,
+            resources: BTreeMap::new(),
+        },
+        actor,
+    )
+    .await
+}
+
+pub async fn restore_with_strategies_as(
+    state: &AppState,
+    project: &str,
+    artifact: &Artifact,
+    strategies: &RestoreStrategies,
     actor: Option<&crate::access::Principal>,
 ) -> Result<usize, ApiError> {
     if artifact.version != 1
@@ -320,8 +377,9 @@ pub async fn restore_as(
         resources: artifact.resources.clone(),
     }
     .validate()?;
+    strategies.validate(artifact)?;
     let tx = state.db.begin().await?;
-    let inserted=tx.execute(sql("INSERT INTO backup_restores(artifact_id,project_id,strategy,restored_at) VALUES(?,?,?,?) ON CONFLICT DO NOTHING",vec![artifact.id.clone().into(),project.into(),strategy.name().into(),db::now().into()])).await?.rows_affected();
+    let inserted=tx.execute(sql("INSERT INTO backup_restores(artifact_id,project_id,strategy,restored_at) VALUES(?,?,?,?) ON CONFLICT DO NOTHING",vec![artifact.id.clone().into(),project.into(),strategies.ledger_key()?.into(),db::now().into()])).await?.rows_affected();
     if inserted == 0 {
         tx.rollback().await?;
         return Ok(0);
@@ -334,6 +392,7 @@ pub async fn restore_as(
         let Some(records) = contents.tables.get(*table) else {
             continue;
         };
+        let strategy = strategies.for_table(table);
         let columns = columns(&tx, table).await?;
         let valid = columns
             .iter()

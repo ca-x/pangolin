@@ -161,6 +161,31 @@ describe('backup and restore are a workflow', () => {
     expect(screen.getByRole('button', { name: 'Restore' })).toBeEnabled()
   })
 
+  it('sends a resource-specific strategy beside the unchanged default', async () => {
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input)
+      if (path.endsWith('/projects')) return json([project])
+      if (path.includes('/permissions')) return json(['*'])
+      if (path.endsWith('/backup/restore')) return json({ restored: 2 })
+      return paged([])
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    renderPage()
+    await userEvent.click(await screen.findByRole('tab', { name: 'Backups' }))
+    fireEvent.change(await screen.findByLabelText(/Backup artifact file/), { target: { files: [new File([JSON.stringify(artifact)], 'backup.json', { type: 'application/json' })] } })
+    await screen.findByText(/Artifact artifact-1234abcd/)
+
+    await userEvent.click(screen.getByRole('combobox', { name: 'providers' }))
+    await userEvent.click(await screen.findByRole('option', { name: 'Overwrite conflicts' }))
+    await userEvent.click(screen.getByRole('button', { name: 'Restore' }))
+    const confirm = await screen.findByRole('dialog')
+    await userEvent.click(within(confirm).getByRole('button', { name: 'Restore' }))
+
+    await waitFor(() => expect(fetchMock.mock.calls.some(([path]) => String(path).endsWith('/backup/restore'))).toBe(true))
+    const [, init] = fetchMock.mock.calls.find(([path]) => String(path).endsWith('/backup/restore')) as [string, RequestInit]
+    expect(JSON.parse(String(init.body))).toMatchObject({ strategy: 'fail', strategies: { providers: 'overwrite' } })
+  })
+
   it('keeps the restore input intact when a delivery run is queued', async () => {
     const { clicked } = spyDownloads()
     const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
@@ -257,6 +282,52 @@ describe('backup and restore are a workflow', () => {
     expect(await screen.findByRole('heading', { name: 'Backups' })).toBeInTheDocument()
     expect(screen.queryByText('Whole-instance backup')).not.toBeInTheDocument()
     expect(screen.queryByText('Instance backup file')).not.toBeInTheDocument()
+  })
+})
+
+describe('instance diagnostics and proxy presets', () => {
+  beforeEach(async () => { await i18n.changeLanguage('en'); vi.clearAllMocks() })
+
+  it('exports bounded cache facts and confirms a clear', async () => {
+    const diagnostic = { version: 1, generated_at: 1, runtime: { generation: 3, caches: [{ name: 'rotations', shape_version: 1, entries: 2, max_entries: 10000 }] } }
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input)
+      if (path.endsWith('/projects')) return json([project])
+      if (path.includes('/permissions')) return json(['*'])
+      if (path.endsWith('/instance/diagnostics/cache')) return json(diagnostic)
+      return paged([])
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    renderPage()
+    await userEvent.click(await screen.findByRole('tab', { name: 'Diagnostics' }))
+    expect(await screen.findByText('rotations')).toBeInTheDocument()
+    await userEvent.click(screen.getByRole('button', { name: 'Clear cache' }))
+    const dialog = await screen.findByRole('dialog')
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Clear cache' }))
+    await waitFor(() => expect(fetchMock.mock.calls.some(([path, init]) => String(path).endsWith('/instance/diagnostics/cache') && init?.method === 'DELETE')).toBe(true))
+  })
+
+  it('sends proxy credentials only on the write request', async () => {
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input)
+      if (path.endsWith('/projects')) return json([project])
+      if (path.includes('/permissions')) return json(['*'])
+      if (path.endsWith('/instance/proxy-presets')) return init?.method === 'POST' ? json({ id: 'proxy-1' }) : json({ data: [], total: 0 })
+      return paged([])
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    renderPage()
+    await userEvent.click(await screen.findByRole('tab', { name: 'Outbound proxies' }))
+    await userEvent.click(await screen.findByRole('button', { name: 'Add proxy' }))
+    const dialog = await screen.findByRole('dialog')
+    await userEvent.type(within(dialog).getByRole('textbox', { name: 'Name' }), 'Corporate egress')
+    await userEvent.type(within(dialog).getByRole('textbox', { name: 'Proxy URL' }), 'https://proxy.example.test:8443')
+    await userEvent.type(within(dialog).getByLabelText('Proxy username'), 'pangolin')
+    await userEvent.type(within(dialog).getByLabelText('Proxy password'), 'sentinel')
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Save' }))
+    await waitFor(() => expect(fetchMock.mock.calls.some(([, init]) => init?.method === 'POST')).toBe(true))
+    const [, init] = fetchMock.mock.calls.find(([path, init]) => String(path).endsWith('/instance/proxy-presets') && init?.method === 'POST') as [string, RequestInit]
+    expect(JSON.parse(String(init.body))).toMatchObject({ name: 'Corporate egress', url: 'https://proxy.example.test:8443', credentials: { username: 'pangolin', password: 'sentinel' } })
   })
 })
 

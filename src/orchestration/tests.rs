@@ -1433,6 +1433,33 @@ async fn circuit_is_model_scoped_and_half_open_probe_is_exclusive() {
     assert!(runtime.circuit_available("channel:model-a", &policy));
 }
 
+#[tokio::test]
+async fn diagnostic_cache_clear_preserves_admission_and_open_circuits() {
+    let runtime = Runtime::default();
+    let limits = Limits {
+        concurrent: Some(1),
+        queue: 0,
+        ..Default::default()
+    };
+    let permit = runtime.admit("key:limited", &limits, 1).await.unwrap();
+    let policy = CircuitPolicy {
+        enabled: true,
+        failures: 1,
+        window_ms: 60_000,
+        recovery_ms: 60_000,
+    };
+    runtime
+        .enter_circuit("channel:model", &policy)
+        .unwrap()
+        .finish(false);
+
+    runtime.clear_diagnostic_caches();
+
+    assert!(runtime.admit("key:limited", &limits, 1).await.is_err());
+    assert!(!runtime.circuit_available("channel:model", &policy));
+    drop(permit);
+}
+
 // -- Multi-credential candidate selection (Issue 1) --
 
 #[tokio::test]

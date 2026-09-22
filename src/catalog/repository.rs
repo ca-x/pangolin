@@ -69,6 +69,7 @@ pub struct Source {
     pub last_error: Option<String>,
     pub active_snapshot_id: Option<String>,
     pub previous_snapshot_id: Option<String>,
+    pub proxy_preset_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -81,6 +82,8 @@ pub struct SourceInput {
     pub enabled: bool,
     pub signature_policy: String,
     pub public_key: Option<String>,
+    #[serde(default)]
+    pub proxy_preset_id: Option<String>,
 }
 impl SourceInput {
     pub fn validate(&self) -> Result<(), ApiError> {
@@ -143,7 +146,18 @@ pub async fn create_source(
         return Err(invalid("catalog source limit reached"));
     }
     let id = Uuid::new_v4().to_string();
-    tx.execute(sql("INSERT INTO catalog_sources(id,name,url,priority,refresh_interval_secs,enabled,signature_policy,public_key,revision) VALUES(?,?,?,?,?,?,?,?,1)",vec![id.clone().into(),input.name.into(),input.url.into(),input.priority.into(),input.refresh_interval_secs.into(),input.enabled.into(),input.signature_policy.into(),input.public_key.into()])).await?;
+    if let Some(preset) = &input.proxy_preset_id
+        && tx
+            .query_one(sql(
+                "SELECT id FROM proxy_presets WHERE id=? AND enabled=1",
+                vec![preset.into()],
+            ))
+            .await?
+            .is_none()
+    {
+        return Err(invalid("unknown proxy preset"));
+    }
+    tx.execute(sql("INSERT INTO catalog_sources(id,name,url,priority,refresh_interval_secs,enabled,signature_policy,public_key,proxy_preset_id,revision) VALUES(?,?,?,?,?,?,?,?,?,1)",vec![id.clone().into(),input.name.into(),input.url.into(),input.priority.into(),input.refresh_interval_secs.into(),input.enabled.into(),input.signature_policy.into(),input.public_key.into(),input.proxy_preset_id.into()])).await?;
     record_audit(&tx, &audit, &id).await?;
     tx.commit().await?;
     source(db, &id).await
@@ -158,7 +172,18 @@ pub async fn update_source(
 ) -> Result<Source, ApiError> {
     input.validate()?;
     let tx = db.begin().await?;
-    let result=tx.execute(sql("UPDATE catalog_sources SET name=?,url=?,priority=?,refresh_interval_secs=?,enabled=?,signature_policy=?,public_key=?,revision=revision+1,etag=NULL,last_modified=NULL WHERE id=? AND revision=?",vec![input.name.into(),input.url.into(),input.priority.into(),input.refresh_interval_secs.into(),input.enabled.into(),input.signature_policy.into(),input.public_key.into(),id.into(),revision.into()])).await?;
+    if let Some(preset) = &input.proxy_preset_id
+        && tx
+            .query_one(sql(
+                "SELECT id FROM proxy_presets WHERE id=? AND enabled=1",
+                vec![preset.into()],
+            ))
+            .await?
+            .is_none()
+    {
+        return Err(invalid("unknown proxy preset"));
+    }
+    let result=tx.execute(sql("UPDATE catalog_sources SET name=?,url=?,priority=?,refresh_interval_secs=?,enabled=?,signature_policy=?,public_key=?,proxy_preset_id=?,revision=revision+1,etag=NULL,last_modified=NULL WHERE id=? AND revision=?",vec![input.name.into(),input.url.into(),input.priority.into(),input.refresh_interval_secs.into(),input.enabled.into(),input.signature_policy.into(),input.public_key.into(),input.proxy_preset_id.into(),id.into(),revision.into()])).await?;
     if result.rows_affected() != 1 {
         return Err(ApiError::Conflict(
             "catalog source changed; reload its revision".into(),

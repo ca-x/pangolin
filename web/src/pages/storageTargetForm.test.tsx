@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter } from 'react-router'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
@@ -91,6 +91,44 @@ describe('storage targets are a form, not a JSON box', () => {
       config: { kind: 's3', endpoint: 'https://s3.example.test', bucket: 'archives', region: 'eu-west-1', prefix: '' },
       secret: { access_key_id: 'AKIAEXAMPLE', secret_access_key: 'super-secret' },
     })
+  })
+
+  it('posts GCS and WebDAV targets with credentials outside public config', async () => {
+    const gcsFetch = renderPage()
+    await userEvent.click(await openStorageTab())
+    let dialog = await screen.findByRole('dialog')
+    await userEvent.type(within(dialog).getByRole('textbox', { name: 'Name' }), 'GCS archive')
+    await userEvent.click(within(dialog).getByRole('combobox', { name: 'Type' }))
+    await userEvent.click(await screen.findByRole('option', { name: 'Google Cloud Storage' }))
+    await userEvent.type(within(dialog).getByLabelText('Bucket'), 'pangolin-archive')
+    fireEvent.change(within(dialog).getByLabelText('Service account JSON'), { target: { value: '{"client_email":"backup@example.test","private_key":"sentinel"}' } })
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Save' }))
+    await waitFor(() => expect(gcsFetch.mock.calls.some(([, config]) => config?.method === 'POST')).toBe(true))
+    expect(posted(gcsFetch)).toMatchObject({ config: { kind: 'gcs', bucket: 'pangolin-archive', prefix: '' }, secret: { service_account: { client_email: 'backup@example.test', private_key: 'sentinel' } } })
+
+    cleanup()
+    vi.clearAllMocks()
+    const davFetch = renderPage()
+    await userEvent.click(await openStorageTab())
+    dialog = await screen.findByRole('dialog')
+    await userEvent.type(within(dialog).getByRole('textbox', { name: 'Name' }), 'WebDAV archive')
+    await userEvent.click(within(dialog).getByRole('combobox', { name: 'Type' }))
+    await userEvent.click(await screen.findByRole('option', { name: 'WebDAV' }))
+    await userEvent.type(within(dialog).getByLabelText('Endpoint'), 'https://dav.example.test/backups')
+    await userEvent.type(within(dialog).getByLabelText('Username'), 'pangolin')
+    await userEvent.type(within(dialog).getByLabelText('Password'), 'sentinel')
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Save' }))
+    await waitFor(() => expect(davFetch.mock.calls.some(([, config]) => config?.method === 'POST')).toBe(true))
+    expect(posted(davFetch)).toMatchObject({ config: { kind: 'webdav', endpoint: 'https://dav.example.test/backups', prefix: '' }, secret: { username: 'pangolin', password: 'sentinel' } })
+  })
+
+  it('tests a stored target through the non-writing action', async () => {
+    const fetchMock = renderPage([archive])
+    await userEvent.click(await screen.findByRole('tab', { name: 'Storage' }))
+    const row = await screen.findByRole('row', { name: /Archive/ })
+    await userEvent.click(within(row).getByRole('button', { name: 'Test connection' }))
+    await waitFor(() => expect(fetchMock.mock.calls.some(([path, config]) => String(path).endsWith('/operations/storage/t2/test') && config?.method === 'POST')).toBe(true))
+    expect(toast.success).toHaveBeenCalledWith('Connection succeeded without writing an object.')
   })
 
   it('refuses a value the API would reject, and sends nothing', async () => {

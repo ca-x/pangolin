@@ -28,15 +28,31 @@ pub trait Transport: Send + Sync {
         source: &'a Source,
     ) -> Pin<Box<dyn Future<Output = Result<Download, ApiError>> + Send + 'a>>;
 }
-pub struct HttpsTransport;
+#[derive(Default)]
+pub struct HttpsTransport {
+    outbound_proxy: Option<crate::operations::proxy::Resolved>,
+}
 
-fn pinned_client(host: &str, addresses: &[SocketAddr]) -> reqwest::ClientBuilder {
-    reqwest::Client::builder()
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
-        .resolve_to_addrs(host, addresses)
-        .timeout(Duration::from_secs(15))
-        .connect_timeout(Duration::from_secs(5))
+impl HttpsTransport {
+    pub fn with_proxy(outbound_proxy: Option<crate::operations::proxy::Resolved>) -> Self {
+        Self { outbound_proxy }
+    }
+}
+
+fn pinned_client(
+    host: &str,
+    addresses: &[SocketAddr],
+    outbound_proxy: Option<&crate::operations::proxy::Resolved>,
+) -> Result<reqwest::ClientBuilder, ApiError> {
+    crate::operations::proxy::apply(
+        reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .resolve_to_addrs(host, addresses)
+            .timeout(Duration::from_secs(15))
+            .connect_timeout(Duration::from_secs(5)),
+        outbound_proxy,
+    )
 }
 
 pub fn public_address(ip: IpAddr) -> bool {
@@ -130,7 +146,7 @@ impl Transport for HttpsTransport {
             }
             // Pin this resolution for the entire request. Redirects and proxy
             // environment variables cannot bypass the address checks.
-            let client = pinned_client(host, &addresses)
+            let client = pinned_client(host, &addresses, self.outbound_proxy.as_ref())?
                 .build()
                 .map_err(|e| ApiError::Internal(e.into()))?;
             let mut request = client.get(url).header("accept", "application/json");
@@ -256,7 +272,8 @@ mod tests {
         });
         // Public-address/HTTPS policy is tested independently. This local HTTP
         // fixture exercises the exact production reqwest builder over real TCP.
-        let client = pinned_client("catalog-pin.invalid", &[address])
+        let client = pinned_client("catalog-pin.invalid", &[address], None)
+            .unwrap()
             .build()
             .unwrap();
         let response = client
@@ -271,6 +288,75 @@ mod tests {
         assert_eq!(reached.load(Ordering::SeqCst), 0);
         first.abort();
         second.abort();
+    }
+
+    #[tokio::test]
+    async fn b53_catalog_transport_uses_no_proxy_by_default_and_an_explicit_preset_when_set() {
+        let source_calls = Arc::new(AtomicUsize::new(0));
+        let source_seen = source_calls.clone();
+        let source_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let source_address = source_listener.local_addr().unwrap();
+        let source = tokio::spawn(async move {
+            axum::serve(
+                source_listener,
+                Router::new().fallback(move || {
+                    source_seen.fetch_add(1, Ordering::SeqCst);
+                    async { "source" }
+                }),
+            )
+            .await
+            .unwrap();
+        });
+        let proxy_calls = Arc::new(AtomicUsize::new(0));
+        let proxy_seen = proxy_calls.clone();
+        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_address = proxy_listener.local_addr().unwrap();
+        let proxy = tokio::spawn(async move {
+            axum::serve(
+                proxy_listener,
+                Router::new().fallback(move || {
+                    proxy_seen.fetch_add(1, Ordering::SeqCst);
+                    async { "proxy" }
+                }),
+            )
+            .await
+            .unwrap();
+        });
+        let direct = pinned_client("catalog-pin.invalid", &[source_address], None)
+            .unwrap()
+            .build()
+            .unwrap();
+        direct
+            .get(format!(
+                "http://catalog-pin.invalid:{}/catalog",
+                source_address.port()
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(source_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(proxy_calls.load(Ordering::SeqCst), 0);
+
+        let configured = crate::operations::proxy::resolved_for_test(
+            &format!("http://{proxy_address}"),
+            vec![proxy_address],
+        );
+        let proxied = pinned_client("catalog-pin.invalid", &[source_address], Some(&configured))
+            .unwrap()
+            .build()
+            .unwrap();
+        proxied
+            .get(format!(
+                "http://catalog-pin.invalid:{}/catalog",
+                source_address.port()
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(source_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(proxy_calls.load(Ordering::SeqCst), 1);
+        source.abort();
+        proxy.abort();
     }
 }
 
@@ -317,12 +403,13 @@ pub struct Outcome {
     pub snapshot_id: Option<String>,
 }
 
-pub async fn refresh(
+pub async fn refresh_with_proxy(
     db: &DatabaseConnection,
     id: &str,
+    proxy: Option<crate::operations::proxy::Resolved>,
     audit: Option<repository::CatalogAudit<'_>>,
 ) -> Result<Outcome, ApiError> {
-    refresh_with(db, id, &HttpsTransport, audit).await
+    refresh_with(db, id, &HttpsTransport::with_proxy(proxy), audit).await
 }
 
 /// The audit row of a refresh must state which outcome it recorded; otherwise a failed

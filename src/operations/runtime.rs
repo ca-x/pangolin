@@ -86,7 +86,9 @@ pub async fn execute(state: &AppState, claim: &jobs::Claim) -> Result<(), ApiErr
                 // A scheduled refresh has no interactive actor, so it records no audit
                 // row (as before); the mutation still goes through the same
                 // transactional repository call as the admin-triggered paths.
-                crate::catalog::refresh::refresh(&state.db, source, None).await?;
+                let proxy =
+                    super::proxy::resolve(state, current.proxy_preset_id.as_deref()).await?;
+                crate::catalog::refresh::refresh_with_proxy(&state.db, source, proxy, None).await?;
             }
             Ok(())
         }
@@ -812,13 +814,16 @@ pub async fn notify(
     Ok(())
 }
 async fn deliver(state: &AppState, claim: &jobs::Claim, payload: &Value) -> Result<(), ApiError> {
-    let row=state.db.query_one(sql("SELECT url,secret_envelope,headers_json,body_template_json FROM webhooks WHERE id=? AND project_id=? AND enabled=1",vec![payload["webhook_id"].as_str().into(),claim.project_id.clone().into()])).await?.ok_or(ApiError::NotFound)?;
+    let row=state.db.query_one(sql("SELECT url,secret_envelope,headers_json,body_template_json,timeout_secs,proxy_preset_id FROM webhooks WHERE id=? AND project_id=? AND enabled=1",vec![payload["webhook_id"].as_str().into(),claim.project_id.clone().into()])).await?.ok_or(ApiError::NotFound)?;
     let url: String = row.try_get("", "url")?;
-    let mut request = state
-        .oidc_client
+    let timeout = row.try_get::<i64>("", "timeout_secs")?.clamp(1, 300) as u64;
+    let proxy_preset: Option<String> = row.try_get("", "proxy_preset_id")?;
+    let resolved_proxy = super::proxy::resolve(state, proxy_preset.as_deref()).await?;
+    let client = super::proxy::client(resolved_proxy.as_ref(), Duration::from_secs(timeout))?;
+    let mut request = client
         .post(url)
         .header("idempotency-key", &claim.id)
-        .timeout(Duration::from_secs(20));
+        .timeout(Duration::from_secs(timeout));
     let public_headers: Value = serde_json::from_str(&row.try_get::<String>("", "headers_json")?)
         .map_err(|e| ApiError::Internal(e.into()))?;
     if let Some(headers) = public_headers["headers"].as_object() {

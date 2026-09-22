@@ -98,6 +98,23 @@ impl Resource {
 }
 
 impl Runtime {
+    pub fn cache_diagnostics(&self) -> serde_json::Value {
+        let (affinity_hits, affinity_projects) = self.affinity_rules.diagnostic_counts();
+        serde_json::json!({
+            "version": 1,
+            "generation": self.generation.load(Ordering::Relaxed),
+            "caches": [
+                {"name":"admission_resources","shape_version":1,"entries":self.resources.len(),"max_entries":null},
+                {"name":"circuits","shape_version":1,"entries":self.circuits.len(),"max_entries":null},
+                {"name":"rotations","shape_version":1,"entries":self.rotations.entry_count(),"max_entries":10000},
+                {"name":"sticky_affinity","shape_version":1,"entries":self.affinity.entry_count(),"max_entries":10000},
+                {"name":"durable_sessions","shape_version":1,"entries":self.sessions.entry_count(),"max_entries":null},
+                {"name":"affinity_rules","shape_version":1,"entries":affinity_projects,"max_entries":10000,"hits":affinity_hits},
+                {"name":"websocket_pins","shape_version":1,"entries":self.websocket_pins.entry_count(),"max_entries":10000}
+            ]
+        })
+    }
+
     pub fn reset_derived(&self) {
         self.generation.fetch_add(1, Ordering::Relaxed);
         self.resources.clear();
@@ -105,7 +122,20 @@ impl Runtime {
         self.rotations.invalidate_all();
         self.affinity.invalidate_all();
         self.websocket_pins.invalidate_all();
+        self.rotations.run_pending_tasks();
+        self.affinity.run_pending_tasks();
+        self.websocket_pins.run_pending_tasks();
         self.affinity_rules.reset();
+        self.sessions.clear();
+    }
+
+    /// Clear only process state whose eviction cannot reset admission or alter routing.
+    ///
+    /// Admission buckets, semaphores, circuits and affinity remain live: replacing
+    /// them while requests hold the old objects would create a second capacity pool
+    /// and could route traffic through a circuit that is still open.
+    pub fn clear_diagnostic_caches(&self) {
+        self.generation.fetch_add(1, Ordering::Relaxed);
         self.sessions.clear();
     }
     #[cfg(test)]
