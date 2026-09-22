@@ -6,6 +6,7 @@ use crate::operations::{
     backup::{Conflict, Selection},
     logging::{Level, Policy},
 };
+use std::io::{Read, Write};
 
 #[tokio::test]
 async fn unrecoverable_credential_is_fail_closed_and_replaced_with_a_one_time_token() {
@@ -1431,6 +1432,262 @@ async fn task5_provider_quota_disable_and_compaction_tool_order() {
         json!({"type":"function_call","call_id":"a"}),
         json!({"type":"function_call_output","call_id":"a","output":"done"})
     ]));
+}
+
+#[tokio::test]
+async fn channel_proxy_settings_are_encrypted_redacted_and_validated() {
+    let f = fixture(success()).await;
+    let cookie = owner(&f).await;
+    let provider = &f.providers[0];
+    let path = format!(
+        "/api/admin/v1/projects/{}/operations/channel-settings",
+        db::DEFAULT_PROJECT_ID
+    );
+    let saved = admin(
+        &f,
+        &cookie,
+        http::Method::POST,
+        &path,
+        json!({
+            "provider_id": provider,
+            "proxy_url": "socks5h://127.0.0.1:1080",
+            "proxy_username": "proxy-user",
+            "proxy_password": "proxy-password-sentinel",
+            "proxy_reuse_connections": false
+        }),
+        true,
+    )
+    .await;
+    assert_eq!(saved.status(), StatusCode::OK);
+
+    let listed =
+        json_body(admin(&f, &cookie, http::Method::GET, &path, Value::Null, false).await).await;
+    let document = listed.to_string();
+    assert!(!document.contains("proxy-password-sentinel"));
+    assert!(!document.contains("proxy_secret_envelope"));
+    let configured = listed["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["provider_id"] == *provider)
+        .unwrap();
+    assert_eq!(configured["proxy_password_configured"], json!(true));
+    assert_eq!(configured["proxy_reuse_connections"], json!(false));
+    let envelope: String = f
+        .state
+        .db
+        .query_one(ops::sql(
+            "SELECT proxy_secret_envelope FROM channel_settings WHERE provider_id=?",
+            vec![provider.clone().into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "proxy_secret_envelope")
+        .unwrap();
+    assert_ne!(envelope, "proxy-password-sentinel");
+    assert_eq!(
+        f.state.secrets.decrypt(&envelope).unwrap().as_str(),
+        "proxy-password-sentinel"
+    );
+
+    let malformed = admin(
+        &f,
+        &cookie,
+        http::Method::POST,
+        &path,
+        json!({"provider_id":provider,"proxy_url":"file:///tmp/proxy"}),
+        true,
+    )
+    .await;
+    assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn anthropic_chat_bridge_uses_the_channel_proxy() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let proxy_url = format!("http://{}", listener.local_addr().unwrap());
+    listener.set_nonblocking(true).unwrap();
+    let proxy = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let (mut socket, _) = loop {
+            match listener.accept() {
+                Ok(connection) => break connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(std::time::Instant::now() < deadline, "proxy was not used");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("proxy accept failed: {error}"),
+            }
+        };
+        socket
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut bytes = [0_u8; 4096];
+        let count = socket.read(&mut bytes).unwrap();
+        let request = String::from_utf8_lossy(&bytes[..count]).to_string();
+        let body = r#"{"id":"msg_proxy","content":[{"type":"text","text":"via proxy"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#;
+        socket
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        request
+    });
+
+    let f = fixture(Router::new()).await;
+    sql(
+        &f,
+        "UPDATE providers SET kind='anthropic',base_url='http://anthropic-upstream.invalid' WHERE id=?",
+        vec![f.providers[0].clone().into()],
+    )
+    .await;
+    sql(
+        &f,
+        "UPDATE providers SET enabled=0 WHERE id<>?",
+        vec![f.providers[0].clone().into()],
+    )
+    .await;
+    sql(
+        &f,
+        "UPDATE channel_settings SET proxy_url=?,proxy_reuse_connections=0 WHERE provider_id=?",
+        vec![proxy_url.into(), f.providers[0].clone().into()],
+    )
+    .await;
+
+    let response = request(&f, "/v1/chat/completions", chat()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        json_body(response).await["choices"][0]["message"]["content"],
+        "via proxy"
+    );
+    let proxied = proxy.join().unwrap();
+    assert!(proxied.starts_with("POST http://anthropic-upstream.invalid/v1/messages HTTP/1.1"));
+}
+
+#[tokio::test]
+async fn model_sync_is_bounded_idempotent_and_preserves_manual_models() {
+    let f = fixture(Router::new().route(
+        "/models",
+        get(|| async { Json(json!({"data":[{"id":"discovered-one"},{"id":"discovered-one"}]})) }),
+    ))
+    .await;
+    let provider = &f.providers[0];
+    for key in ["first", "second"] {
+        let job = ops::jobs::enqueue(
+            &f.state.db,
+            Some(db::DEFAULT_PROJECT_ID),
+            "model_sync",
+            key,
+            &json!({"provider_id":provider}),
+            db::now(),
+        )
+        .await
+        .unwrap();
+        let claim = ops::jobs::claim(&f.state.db, "model-sync-test", db::now(), 120)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claim.id, job);
+        ops::runtime::execute(&f.state, &claim).await.unwrap();
+        assert!(
+            ops::jobs::finish(&f.state.db, &claim, db::now(), true)
+                .await
+                .unwrap()
+        );
+    }
+    assert_eq!(
+        count(
+            &f,
+            "SELECT COUNT(*) AS n FROM models WHERE upstream_name='a-model' AND discovery_managed=0"
+        )
+        .await,
+        1,
+        "the fixture's manual model must survive discovery"
+    );
+    assert_eq!(
+        count(
+            &f,
+            "SELECT COUNT(*) AS n FROM models WHERE upstream_name='discovered-one' AND discovery_managed=1 AND lifecycle='active'"
+        )
+        .await,
+        1,
+        "replaying the sync must not duplicate a discovered model"
+    );
+}
+
+#[tokio::test]
+async fn model_sync_schedule_is_durable_and_project_scoped() {
+    let f = fixture(success()).await;
+    let cookie = owner(&f).await;
+    let provider = &f.providers[0];
+    f.state.db.execute(ops::sql("INSERT INTO operation_schedules(id,project_id,kind,payload_json,interval_secs,next_run_at) VALUES('model-schedule',?,'model_sync',?,30,?)",vec![db::DEFAULT_PROJECT_ID.into(),json!({"provider_id":provider}).to_string().into(),db::now().into()])).await.unwrap();
+    assert_eq!(
+        ops::jobs::enqueue_due(&f.state.db, db::now())
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        count(&f, "SELECT COUNT(*) AS n FROM operation_jobs WHERE kind='model_sync' AND project_id='00000000-0000-0000-0000-000000000001'").await,
+        1
+    );
+
+    sql(&f, "INSERT INTO projects(id,name,slug,is_default,enabled,created_at,updated_at) VALUES('foreign-project','Foreign','foreign-project',0,1,1,1)", vec![]).await;
+    sql(&f, "INSERT INTO providers(id,name,kind,base_url,enabled,created_at,updated_at,project_id) VALUES('foreign-provider','Foreign provider','openai','https://foreign.invalid/v1',1,1,1,'foreign-project')", vec![]).await;
+    let response = admin(
+        &f,
+        &cookie,
+        http::Method::POST,
+        &format!(
+            "/api/admin/v1/projects/{}/operations/model-sync",
+            db::DEFAULT_PROJECT_ID
+        ),
+        json!({"provider_id":"foreign-provider"}),
+        true,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn failed_model_sync_records_a_redacted_channel_error() {
+    let f =
+        fixture(Router::new().route("/models", get(|| async { StatusCode::BAD_GATEWAY }))).await;
+    let provider = &f.providers[0];
+    ops::jobs::enqueue(
+        &f.state.db,
+        Some(db::DEFAULT_PROJECT_ID),
+        "model_sync",
+        "failure",
+        &json!({"provider_id":provider}),
+        db::now(),
+    )
+    .await
+    .unwrap();
+    let claim = ops::jobs::claim(&f.state.db, "failed-model-sync", db::now(), 120)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(ops::runtime::execute(&f.state, &claim).await.is_err());
+    let error: String = f
+        .state
+        .db
+        .query_one(ops::sql(
+            "SELECT model_sync_error FROM channel_settings WHERE provider_id=?",
+            vec![provider.clone().into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "model_sync_error")
+        .unwrap();
+    assert_eq!(error, "model_sync_failed");
+    assert!(!error.contains("502"));
 }
 
 async fn admin(

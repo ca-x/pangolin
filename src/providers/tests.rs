@@ -1,5 +1,8 @@
 use super::*;
 use serde_json::json;
+use std::io::{Read, Write};
+use std::sync::{Arc, Barrier};
+use std::time::Duration;
 
 fn target(kind: &str) -> RouteTarget {
     RouteTarget {
@@ -9,9 +12,106 @@ fn target(kind: &str) -> RouteTarget {
         provider_kind: kind.into(),
         base_url: "http://localhost:8080".into(),
         secret_envelope: String::new(),
+        proxy_url: None,
+        proxy_username: None,
+        proxy_secret_envelope: None,
+        proxy_reuse_connections: true,
         input_price_micros: 0,
         output_price_micros: 0,
     }
+}
+
+#[tokio::test]
+async fn a_channel_proxy_is_used_with_write_only_credentials() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let proxy = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let (mut socket, _) = loop {
+            match listener.accept() {
+                Ok(connection) => break connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "proxy was not contacted"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("proxy accept failed: {error}"),
+            }
+        };
+        socket
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut bytes = [0_u8; 4096];
+        let count = socket.read(&mut bytes).unwrap();
+        let request = String::from_utf8_lossy(&bytes[..count]).to_string();
+        socket
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
+            )
+            .unwrap();
+        request
+    });
+
+    let client = upstream::http_client_with_proxy(
+        Duration::from_secs(3),
+        Some(upstream::ProxySettings {
+            url: &format!("http://{address}"),
+            username: Some("operator"),
+            password: Some("proxy-password-sentinel"),
+            reuse_connections: false,
+        }),
+    )
+    .unwrap();
+    let body: serde_json::Value = client
+        .get("http://upstream.invalid/v1/models")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body, json!({"ok":true}));
+
+    let request = proxy.join().unwrap();
+    assert!(request.starts_with("GET http://upstream.invalid/v1/models HTTP/1.1"));
+    assert!(request.lines().any(|line| line.eq_ignore_ascii_case(
+        "Proxy-Authorization: Basic b3BlcmF0b3I6cHJveHktcGFzc3dvcmQtc2VudGluZWw="
+    )));
+}
+
+#[test]
+fn proxy_client_cache_stays_within_its_hard_limit_under_concurrency() {
+    let pool = Arc::new(upstream::ClientPool::with_capacity(2));
+    let default = reqwest::Client::new();
+    let barrier = Arc::new(Barrier::new(16));
+    let threads = (0..16)
+        .map(|index| {
+            let pool = Arc::clone(&pool);
+            let default = default.clone();
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                pool.for_proxy(
+                    &default,
+                    Duration::from_secs(3),
+                    Some(upstream::ProxySettings {
+                        url: &format!("http://127.0.0.1:{}", 10_000 + index),
+                        username: None,
+                        password: None,
+                        reuse_connections: true,
+                    }),
+                )
+                .unwrap();
+            })
+        })
+        .collect::<Vec<_>>();
+    for thread in threads {
+        thread.join().unwrap();
+    }
+    assert!(pool.len() <= 2);
 }
 
 #[tokio::test]

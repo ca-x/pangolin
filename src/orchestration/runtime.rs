@@ -30,6 +30,7 @@ pub struct Runtime {
     pub sessions: super::session::Sessions,
     pub affinity_rules: super::affinity::Cache,
     pub websocket_pins: Cache<String, String>,
+    pub upstream_clients: crate::providers::ClientPool,
 }
 
 impl Default for Runtime {
@@ -52,6 +53,7 @@ impl Default for Runtime {
                 .max_capacity(10000)
                 .time_to_idle(Duration::from_secs(86400))
                 .build(),
+            upstream_clients: Default::default(),
         }
     }
 }

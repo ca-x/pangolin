@@ -53,15 +53,15 @@ states plainly that no test guards it yet.
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | observability | 5 | 10 | 0 | 2 | 3 | 0 | 0 | 20 |
 | prompts & playground | 6 | 12 | 1 | 0 | 0 | 0 | 1 | 20 |
-| models, routing & pricing | 6 | 8 | 2 | 2 | 6 | 2 | 0 | 26 |
+| models, routing & pricing | 6 | 10 | 2 | 2 | 5 | 1 | 0 | 26 |
 | access control | 2 | 17 | 2 | 0 | 0 | 0 | 0 | 21 |
 | system settings & background work | 8 | 9 | 5 | 1 | 5 | 2 | 1 | 31 |
 | console-wide UX | 3 | 9 | 1 | 2 | 0 | 0 | 0 | 15 |
-| **total** | **30** | **65** | **11** | **7** | **14** | **4** | **2** | **133** |
+| **total** | **30** | **67** | **11** | **7** | **13** | **3** | **2** | **133** |
 
 Row count is unchanged at 133 — the six area reports' own findings. No row was
-dropped, merged or added. What changed is the status: **106 rows need no work**
-(30 already matched, 65 fixed, 11 refuted), **25 rows need work** (`partial` +
+dropped, merged or added. What changed is the status: **108 rows need no work**
+(30 already matched, 67 fixed, 11 refuted), **23 rows need work** (`partial` +
 `open` + `feature-build`), and **2 rows are recorded divergences** whose only
 remaining difference is deliberate.
 
@@ -158,11 +158,11 @@ Report: [parity-models-routing-pricing.md](parity-models-routing-pricing.md).
 | 18 | Channel-scoped prices cannot be created | open | — | Schema supports `provider_id` (`db/schema.rs:372-386`) and the resolver prefers it (`pricing.rs:425`), but the write path inserts `NULL` (`operations_api.rs:1377-1382`) and the form has no channel field (`ModelsPage.tsx:68`) | `channel_model_price.go:27-41` | a price-creation test that stores and reads back a channel-scoped rate |
 | 19 | Service-group price ratio has no console surface | open | — | `groups` is API-only (`operations_api.rs:429-433,1383-1420`); no page renders `resource="groups"` | `channels-model-price-dialog.tsx:1190-1200` | a groups editor test |
 | 20 | Model/provider deletion safety | partial | — | Model side is complete: read-only scoped impact counts, archive-required hard delete, typed immutable-history 409 and audited deletion of an unused archived model. Provider deletion still has typed dependency refusal but no equivalent impact preview/archive lifecycle. | archive dialog + typed delete confirmation | model preview/lifecycle cases are green; provider preview remains |
-| 21 | No per-channel proxy configuration | open | — | No proxy field in `channel_settings` (`db/schema.rs:344-352`) or the form; one global client (`providers/upstream.rs`) | `channels-proxy-dialog.tsx:215-303` | an egress test asserting the channel's proxy is used |
+| 21 | No per-channel proxy configuration | closed | fixed | SQLite v20 stores validated HTTP(S)/SOCKS proxy policy with write-only encrypted password; bounded configuration-keyed clients cover forwarding, probes, quota and discovery while list projections expose only configured state. | `channels-proxy-dialog.tsx:215-303` | proxy egress/encryption/redaction/validation Rust tests plus `channelProxyDiscovery.test.tsx` |
 | 22 | No model batch create and no real bulk lifecycle | partial | — | Row selection + `bulk-toggle` exist for channels, credentials, models, prompts, protection and keys (`shared.tsx:144-190`); no batch create and no bulk delete/archive | `models-batch-create-dialog.tsx`, `channels-bulk-*.tsx` | a batch-create test; bulk delete/archive depends on row 10 |
 | 23 | No unassociated-model detection | open | — | No route or UI | `models-unassociated-dialog.tsx` | a query test for channel models with no matching enabled association |
 | 24 | Price list omits the components | open | — | The `prices` projection returns id/model/version/validity/schedule only (`operations_api.rs:381-385`); no page shows components | `channels-model-price-dialog.tsx` | a price-list test asserting each version's rates |
-| 25 | Provider model discovery / sync | feature-build | — | No route; the catalog declares `model_discovery`/`quota` and forces `implemented=false` (`catalog/types.rs:270-271`) | `internal/server/biz/model_fetcher.go`, `channel_model_sync.go` | a mock-provider discovery test plus scheduled sync |
+| 25 | Provider model discovery / sync | closed | fixed | Bounded adapter-specific discovery feeds durable fenced manual/scheduled sync. Deterministic IDs preserve manual precedence, archive missing discovered rows, audit mutations and retain only a fixed failure code. | `internal/server/biz/model_fetcher.go`, `channel_model_sync.go` | discovery parser/bounds/catalog tests and model-sync idempotency/schedule/failure cases |
 | 26 | Full price editor (tiers, schedules, timezones) | feature-build | — | `components`/`schedule` are JSON textareas (`ModelsPage.tsx:68`); append-only, no delete | 1340-line editor, `model-price-editor.tsx`, `price-schedule-editor.tsx` | an editor test producing the same document the write API accepts |
 
 ## Access control
@@ -455,9 +455,9 @@ retry/model/quota settings, and CORS/timeouts. Every one of them is scheduled in
 | Catalog online maintenance | implemented+tested | import/export, prioritized signed subscriptions, ETag, staged activation, last-known-good |
 | Multiple credentials | partial | encrypted list with suffix and per-key state; no OAuth/GCP credential types |
 | Credential recovery | implemented+tested | undecryptable credentials fail over locally and use hashed, expiring, single-use, project/credential-bound replacement tokens without returning envelopes |
-| Proxy settings | open | no per-channel proxy (models 21) |
+| Proxy settings | implemented+tested | per-channel HTTP(S)/SOCKS transport with encrypted write-only credentials and bounded client reuse |
 | Endpoint mappings | implemented+tested | `channel_settings.endpoint_mappings` + `providers/mod.rs` |
-| Model discovery/sync | feature-build | models 25 |
+| Model discovery/sync | implemented+tested | bounded OpenAI/Anthropic/Gemini discovery with durable manual/scheduled reconciliation and manual-model precedence |
 | Model transformations | implemented+tested | prefix/lowercase/mappings/exclude/stream plus exact-segment auto-trim and discovery-only original/transformed visibility flags |
 | Model protocol policy | implemented+tested | `capabilities` + per-model `stream` policy |
 | Model cards | partial | catalog metadata is stored at creation but not surfaced as columns (models 10) |

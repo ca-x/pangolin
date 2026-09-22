@@ -839,7 +839,7 @@ fn query(resource: &str) -> Result<(&'static str, &'static str, &'static str), A
         "channel-settings" => (
             "channel_settings",
             "provider_id IN (SELECT id FROM providers WHERE project_id=?)",
-            "json_object('id',provider_id,'provider_id',provider_id,'endpoint_mappings',json(endpoint_mappings_json),'model_rules',json(model_rules_json),'parameter_overrides',json(parameter_overrides_json),'retry_statuses',json(retry_statuses_json),'auto_disable_policy',json(auto_disable_policy_json),'updated_at',updated_at)",
+            "json_object('id',provider_id,'provider_id',provider_id,'endpoint_mappings',json(endpoint_mappings_json),'model_rules',json(model_rules_json),'parameter_overrides',json(parameter_overrides_json),'retry_statuses',json(retry_statuses_json),'auto_disable_policy',json(auto_disable_policy_json),'proxy_url',proxy_url,'proxy_username',proxy_username,'proxy_password_configured',CASE WHEN proxy_secret_envelope IS NULL THEN json('false') ELSE json('true') END,'proxy_reuse_connections',json(CASE WHEN proxy_reuse_connections=1 THEN 'true' ELSE 'false' END),'model_sync_error',model_sync_error,'model_synced_at',model_synced_at,'model_sync_count',model_sync_count,'updated_at',updated_at)",
         ),
         "models" => (
             "models",
@@ -2836,7 +2836,7 @@ async fn mutate(
         }
         "channel-settings" => {
             let provider = text(&value, "provider_id")?;
-            let current=transaction.query_one(sql("SELECT endpoint_mappings_json,model_rules_json,parameter_overrides_json,retry_statuses_json,auto_disable_policy_json FROM channel_settings WHERE provider_id=? AND provider_id IN (SELECT id FROM providers WHERE project_id=?)",vec![provider.into(),project.clone().into()])).await?.ok_or(ApiError::NotFound)?;
+            let current=transaction.query_one(sql("SELECT endpoint_mappings_json,model_rules_json,parameter_overrides_json,retry_statuses_json,auto_disable_policy_json,proxy_url,proxy_username,proxy_secret_envelope,proxy_reuse_connections FROM channel_settings WHERE provider_id=? AND provider_id IN (SELECT id FROM providers WHERE project_id=?)",vec![provider.into(),project.clone().into()])).await?.ok_or(ApiError::NotFound)?;
             let document = |key: &str, column: &str| -> Result<String, ApiError> {
                 Ok(value
                     .get(key)
@@ -2847,7 +2847,57 @@ async fn mutate(
             if let Some(model_rules) = value.get("model_rules").filter(|item| !item.is_null()) {
                 validate_model_rules(model_rules)?;
             }
-            let changed = transaction.execute(sql("UPDATE channel_settings SET endpoint_mappings_json=?,model_rules_json=?,parameter_overrides_json=?,retry_statuses_json=?,auto_disable_policy_json=?,updated_at=? WHERE provider_id=? AND provider_id IN (SELECT id FROM providers WHERE project_id=?)",vec![document("endpoint_mappings","endpoint_mappings_json")?.into(),document("model_rules","model_rules_json")?.into(),document("parameter_overrides","parameter_overrides_json")?.into(),document("retry_statuses","retry_statuses_json")?.into(),document("auto_disable_policy","auto_disable_policy_json")?.into(),db::now().into(),provider.into(),project.clone().into()])).await?.rows_affected();
+            let proxy_url = match value.get("proxy_url") {
+                Some(Value::String(url)) if !url.trim().is_empty() => {
+                    let url = url.trim().to_owned();
+                    validate_proxy_url(&url)?;
+                    Some(url)
+                }
+                Some(Value::String(_)) | Some(Value::Null) => None,
+                Some(_) => return Err(ApiError::BadRequest("proxy URL must be a string".into())),
+                None => current.try_get("", "proxy_url")?,
+            };
+            let proxy_username = match value.get("proxy_username") {
+                Some(Value::String(username)) if !username.trim().is_empty() => {
+                    if username.len() > 256 || username.chars().any(char::is_control) {
+                        return Err(ApiError::BadRequest("invalid proxy username".into()));
+                    }
+                    Some(username.trim().to_owned())
+                }
+                Some(Value::String(_)) | Some(Value::Null) => None,
+                Some(_) => {
+                    return Err(ApiError::BadRequest(
+                        "proxy username must be a string".into(),
+                    ));
+                }
+                None => current.try_get("", "proxy_username")?,
+            };
+            let supplied_password = value
+                .get("proxy_password")
+                .and_then(Value::as_str)
+                .filter(|password| !password.is_empty());
+            if supplied_password.is_some_and(|password| {
+                password.len() > 4096 || password.chars().any(char::is_control)
+            }) {
+                return Err(ApiError::BadRequest("invalid proxy password".into()));
+            }
+            let proxy_secret_envelope = if proxy_url.is_none() {
+                None
+            } else if let Some(password) = supplied_password {
+                Some(state.secrets.encrypt(password)?)
+            } else {
+                current.try_get("", "proxy_secret_envelope")?
+            };
+            if proxy_secret_envelope.is_some() && proxy_username.is_none() {
+                return Err(ApiError::BadRequest(
+                    "proxy username is required when a proxy password is configured".into(),
+                ));
+            }
+            let proxy_reuse_connections = value
+                .get("proxy_reuse_connections")
+                .and_then(Value::as_bool)
+                .unwrap_or(current.try_get("", "proxy_reuse_connections")?);
+            let changed = transaction.execute(sql("UPDATE channel_settings SET endpoint_mappings_json=?,model_rules_json=?,parameter_overrides_json=?,retry_statuses_json=?,auto_disable_policy_json=?,proxy_url=?,proxy_username=?,proxy_secret_envelope=?,proxy_reuse_connections=?,updated_at=? WHERE provider_id=? AND provider_id IN (SELECT id FROM providers WHERE project_id=?)",vec![document("endpoint_mappings","endpoint_mappings_json")?.into(),document("model_rules","model_rules_json")?.into(),document("parameter_overrides","parameter_overrides_json")?.into(),document("retry_statuses","retry_statuses_json")?.into(),document("auto_disable_policy","auto_disable_policy_json")?.into(),proxy_url.into(),proxy_username.into(),proxy_secret_envelope.into(),proxy_reuse_connections.into(),db::now().into(),provider.into(),project.clone().into()])).await?.rows_affected();
             if changed != 1 {
                 return Err(ApiError::NotFound);
             }
@@ -3336,7 +3386,7 @@ async fn mutate(
             let kind = text(&value, "kind")?;
             if !matches!(
                 kind,
-                "probe" | "quota" | "automatic_backup" | "backup_retention"
+                "probe" | "quota" | "model_sync" | "automatic_backup" | "backup_retention"
             ) {
                 return Err(ApiError::BadRequest("invalid schedule kind".into()));
             }
@@ -3344,12 +3394,28 @@ async fn mutate(
             if !(30..=31536000).contains(&interval) {
                 return Err(ApiError::BadRequest("invalid schedule interval".into()));
             }
+            if kind == "model_sync" {
+                let provider = value
+                    .pointer("/payload/provider_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| ApiError::BadRequest("model sync requires a channel".into()))?;
+                if transaction
+                    .query_one(sql(
+                        "SELECT id FROM providers WHERE id=? AND project_id=?",
+                        vec![provider.into(), project.clone().into()],
+                    ))
+                    .await?
+                    .is_none()
+                {
+                    return Err(ApiError::NotFound);
+                }
+            }
             let changed=transaction.execute(sql("INSERT INTO operation_schedules(id,project_id,kind,payload_json,interval_secs,next_run_at,enabled) VALUES(?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET kind=excluded.kind,payload_json=excluded.payload_json,interval_secs=excluded.interval_secs,enabled=excluded.enabled,revision=operation_schedules.revision+1 WHERE operation_schedules.project_id=excluded.project_id AND operation_schedules.revision=?",vec![resource_id.clone().into(),project.clone().into(),kind.into(),value["payload"].to_string().into(),interval.into(),db::now().into(),value["enabled"].as_bool().unwrap_or(true).into(),value["revision"].as_i64().unwrap_or(0).into()])).await?.rows_affected();
             if changed != 1 {
                 return Err(ApiError::Conflict("schedule revision changed".into()));
             }
         }
-        "probe" | "quota" => {
+        "probe" | "quota" | "model-sync" => {
             let provider = text(&value, "provider_id")?;
             if transaction
                 .query_one(sql(
@@ -3361,10 +3427,15 @@ async fn mutate(
             {
                 return Err(ApiError::NotFound);
             }
+            let job_kind = if resource == "model-sync" {
+                "model_sync"
+            } else {
+                resource.as_str()
+            };
             let job = jobs::enqueue(
                 &transaction,
                 Some(&project),
-                &resource,
+                job_kind,
                 &format!("manual:{}", id()),
                 &value,
                 db::now(),
@@ -3435,6 +3506,24 @@ async fn mutate(
     .await?;
     transaction.commit().await?;
     Ok(Json(json!({"id":resource_id})))
+}
+
+fn validate_proxy_url(value: &str) -> Result<(), ApiError> {
+    if value.len() > 2048 {
+        return Err(ApiError::BadRequest("proxy URL is too long".into()));
+    }
+    let url = reqwest::Url::parse(value)
+        .map_err(|_| ApiError::BadRequest("proxy URL is invalid".into()))?;
+    if !matches!(url.scheme(), "http" | "https" | "socks5" | "socks5h")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return Err(ApiError::BadRequest(
+            "proxy URL must use http, https, socks5 or socks5h without embedded credentials".into(),
+        ));
+    }
+    Ok(())
 }
 async fn remove(
     State(state): State<AppState>,

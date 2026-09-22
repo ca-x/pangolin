@@ -80,6 +80,10 @@ pub struct RouteTarget {
     pub provider_kind: String,
     pub base_url: String,
     pub secret_envelope: String,
+    pub proxy_url: Option<String>,
+    pub proxy_username: Option<String>,
+    pub proxy_secret_envelope: Option<String>,
+    pub proxy_reuse_connections: bool,
     pub input_price_micros: i64,
     pub output_price_micros: i64,
 }

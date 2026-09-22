@@ -1015,7 +1015,7 @@ function WebhookDeliveries() {
 }
 
 function jobKindLabel(kind: string, t: (key: string, options?: Record<string, unknown>) => string): string {
-  const key = ({ probe: 'probe', quota: 'quota', backup: 'jobKindBackup', automatic_backup: 'automaticBackup', backup_retention: 'backupRetention', gc: 'jobKindGc', catalog_refresh: 'jobKindCatalogRefresh', webhook: 'jobKindWebhook' } as Record<string, string>)[kind]
+  const key = ({ probe: 'probe', quota: 'quota', model_sync: 'syncModels', backup: 'jobKindBackup', automatic_backup: 'automaticBackup', backup_retention: 'backupRetention', gc: 'jobKindGc', catalog_refresh: 'jobKindCatalogRefresh', webhook: 'jobKindWebhook' } as Record<string, string>)[kind]
   return key ? t(key) : kind.replaceAll('_', ' ')
 }
 

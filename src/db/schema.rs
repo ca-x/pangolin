@@ -875,6 +875,18 @@ ALTER TABLE project_invitations ADD COLUMN use_count INTEGER NOT NULL DEFAULT 0 
 UPDATE project_invitations SET use_count=1 WHERE accepted_at IS NOT NULL;
 "#;
 
+const V20_CHANNEL_PROXY_AND_MODEL_SYNC: &str = r#"
+ALTER TABLE channel_settings ADD COLUMN proxy_url TEXT;
+ALTER TABLE channel_settings ADD COLUMN proxy_username TEXT;
+ALTER TABLE channel_settings ADD COLUMN proxy_secret_envelope TEXT;
+ALTER TABLE channel_settings ADD COLUMN proxy_reuse_connections INTEGER NOT NULL DEFAULT 1 CHECK(proxy_reuse_connections IN (0,1));
+ALTER TABLE channel_settings ADD COLUMN model_sync_error TEXT;
+ALTER TABLE channel_settings ADD COLUMN model_synced_at INTEGER;
+ALTER TABLE channel_settings ADD COLUMN model_sync_count INTEGER;
+ALTER TABLE models ADD COLUMN discovery_managed INTEGER NOT NULL DEFAULT 0 CHECK(discovery_managed IN (0,1));
+CREATE INDEX idx_models_discovery_managed ON models(provider_id,discovery_managed,lifecycle);
+"#;
+
 const V23_CREDENTIAL_RECOVERY_AND_DEVELOPER_SETTINGS: &str = r#"
 ALTER TABLE models ADD COLUMN disable_developer_settings_inheritance INTEGER NOT NULL DEFAULT 0 CHECK(disable_developer_settings_inheritance IN (0,1));
 CREATE TABLE credential_recovery_tokens (
@@ -1271,6 +1283,25 @@ pub async fn migrate(db: &DatabaseConnection) -> Result<()> {
             .await?;
         transaction.commit().await?;
     }
+    let channel_proxy_applied = Count::find_by_statement(statement(
+        "SELECT COUNT(*) AS count FROM schema_migrations WHERE version=20",
+    ))
+    .one(db)
+    .await?
+    .is_some_and(|row| row.count > 0);
+    if !channel_proxy_applied {
+        let transaction = db.begin().await?;
+        transaction
+            .execute_unprepared(V20_CHANNEL_PROXY_AND_MODEL_SYNC)
+            .await
+            .context("failed to add channel proxy and model-sync state")?;
+        transaction
+            .execute(statement(
+                "INSERT INTO schema_migrations(version,applied_at) VALUES(20,unixepoch())",
+            ))
+            .await?;
+        transaction.commit().await?;
+    }
     let recovery_applied = Count::find_by_statement(statement(
         "SELECT COUNT(*) AS count FROM schema_migrations WHERE version=23",
     ))
@@ -1355,6 +1386,22 @@ mod tests {
             )
             .await,
             2
+        );
+        assert_eq!(
+            scalar(
+                &db,
+                "SELECT COUNT(*) AS count FROM pragma_table_info('channel_settings') WHERE name IN ('proxy_url','proxy_username','proxy_secret_envelope','proxy_reuse_connections','model_sync_error','model_synced_at','model_sync_count')"
+            )
+            .await,
+            7
+        );
+        assert_eq!(
+            scalar(
+                &db,
+                "SELECT COUNT(*) AS count FROM pragma_table_info('models') WHERE name='discovery_managed' AND dflt_value='0'"
+            )
+            .await,
+            1
         );
         assert_eq!(
             scalar(
@@ -1617,7 +1664,7 @@ mod tests {
 
         assert_eq!(
             scalar(&db, "SELECT COUNT(*) AS count FROM schema_migrations").await,
-            19
+            20
         );
         assert_eq!(
             scalar(

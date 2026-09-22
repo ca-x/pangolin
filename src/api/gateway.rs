@@ -367,6 +367,7 @@ async fn execute_inner(
                 }
             }
             contacted = true;
+            let upstream_client = state.upstream_client(target)?;
             if endpoint == "/v1/chat/completions" && target.provider_kind == "anthropic" {
                 let mapped_endpoint = if candidate.endpoint == endpoint {
                     "/v1/messages"
@@ -374,7 +375,7 @@ async fn execute_inner(
                     &candidate.endpoint
                 };
                 let value = match call_anthropic_chat(
-                    &state.client,
+                    &upstream_client,
                     target,
                     &payload,
                     &secret,
@@ -466,8 +467,7 @@ async fn execute_inner(
                 HeaderValue::from_str(&content_type)
                     .map_err(|_| ApiError::BadRequest("invalid content type".into()))?,
             );
-            let request = state
-                .client
+            let request = upstream_client
                 .request(method, &prepared.url)
                 .headers(prepared.headers);
             attempt.contacted().await?;

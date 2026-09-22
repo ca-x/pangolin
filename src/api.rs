@@ -54,6 +54,30 @@ impl AppState {
         };
         lock.lock_owned().await
     }
+
+    pub(crate) fn upstream_client(
+        &self,
+        target: &crate::models::RouteTarget,
+    ) -> Result<reqwest::Client, ApiError> {
+        let password = target
+            .proxy_secret_envelope
+            .as_deref()
+            .map(|envelope| self.secrets.decrypt(envelope))
+            .transpose()?;
+        let proxy = target
+            .proxy_url
+            .as_deref()
+            .map(|url| crate::providers::ProxySettings {
+                url,
+                username: target.proxy_username.as_deref(),
+                password: password.as_ref().map(|password| password.as_str()),
+                reuse_connections: target.proxy_reuse_connections,
+            });
+        self.orchestrator
+            .upstream_clients
+            .for_proxy(&self.client, self.config.upstream_timeout, proxy)
+            .map_err(|_| ApiError::BadRequest("invalid channel proxy configuration".into()))
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1882,6 +1906,10 @@ mod tests {
             provider_kind: "anthropic".into(),
             base_url: format!("http://{address}/v1"),
             secret_envelope: String::new(),
+            proxy_url: None,
+            proxy_username: None,
+            proxy_secret_envelope: None,
+            proxy_reuse_connections: true,
             input_price_micros: 0,
             output_price_micros: 0,
         };

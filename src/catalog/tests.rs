@@ -18,6 +18,33 @@ fn encoded(doc: &Catalog) -> Vec<u8> {
     serde_json::to_vec(doc).unwrap()
 }
 
+#[test]
+fn discovery_is_implemented_only_by_built_in_adapters_with_an_endpoint() {
+    let catalog = builtin();
+    let openai = catalog
+        .providers
+        .iter()
+        .find(|provider| provider.id == "openai")
+        .unwrap();
+    assert!(openai.adapter_available);
+    assert!(openai.model_discovery.implemented);
+    for id in ["bedrock", "gcp", "vertex"] {
+        let provider = catalog
+            .providers
+            .iter()
+            .find(|provider| provider.id == id)
+            .unwrap();
+        assert!(provider.adapter_available);
+        assert!(!provider.model_discovery.implemented);
+    }
+    let unsupported = catalog
+        .providers
+        .iter()
+        .find(|provider| !provider.adapter_available)
+        .unwrap();
+    assert!(!unsupported.model_discovery.implemented);
+}
+
 #[tokio::test]
 async fn task4_document_extensions_merge_atomically_and_roundtrip_separately_from_capabilities() {
     let db = db::connect("sqlite::memory:").await.unwrap();

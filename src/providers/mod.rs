@@ -1,6 +1,7 @@
 //! Provider implementations are deliberately hidden behind this Pangolin boundary.
 //! No LiteLLM host, Python bridge or callback controls gateway orchestration.
 mod cloud;
+pub mod discovery;
 pub mod framing;
 #[cfg(test)]
 mod tests;
@@ -13,7 +14,7 @@ use http::{HeaderMap, HeaderValue, Method, header};
 use serde_json::Value;
 pub use transforms::ResponseTransform;
 pub use upstream::anthropic_text_request;
-pub use upstream::http_client;
+pub use upstream::{ClientPool, ProxySettings, http_client};
 
 pub const KINDS: &[&str] = &[
     "openai",

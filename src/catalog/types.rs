@@ -343,8 +343,13 @@ impl Provider {
             .adapter_kind
             .as_deref()
             .is_some_and(|kind| crate::providers::KINDS.contains(&kind));
-        // Catalogs cannot install new transport or quota collectors.
-        self.model_discovery.implemented = false;
+        // Catalogs cannot install code. Discovery is available only when this
+        // build owns the adapter and the catalog names its bounded endpoint.
+        self.model_discovery.implemented = self
+            .adapter_kind
+            .as_deref()
+            .is_some_and(crate::providers::discovery::adapter_supported)
+            && self.model_discovery.upstream_endpoint.is_some();
         self.quota.implemented = false;
         let mut formats = BTreeSet::new();
         for endpoint in &self.default_endpoints {
