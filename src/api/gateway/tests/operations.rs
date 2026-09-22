@@ -4772,6 +4772,120 @@ async fn stored_logging_policy(f: &Fixture) -> Value {
         .unwrap_or(Value::Null)
 }
 
+/// Live preview is a bounded process-local view, not another request log. The
+/// read is authorized for exactly one project, its wire shape has no place for a
+/// payload, and the request-logging policy can hide it without mutating the
+/// registry that owns the active request.
+#[tokio::test]
+async fn live_request_preview_is_project_scoped_payload_free_and_policy_gated() {
+    let f = fixture(success()).await;
+    let cookie = owner(&f).await;
+    sql(
+        &f,
+        "INSERT INTO projects(id,name,slug,is_default,enabled,created_at,updated_at) VALUES('live-foreign','Foreign','live-foreign',0,1,1,1)",
+        vec![],
+    )
+    .await;
+    ops::logging::set_policy(
+        &f.state.db,
+        &Policy {
+            live_preview_enabled: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let own = f.state.orchestrator.begin_live_request(
+        db::DEFAULT_PROJECT_ID,
+        "public",
+        &f.providers[0],
+        "key-own",
+    );
+    let foreign = f.state.orchestrator.begin_live_request(
+        "live-foreign",
+        "private-model",
+        &f.providers[1],
+        "key-foreign",
+    );
+    sql(
+        &f,
+        "INSERT INTO request_facts(id,project_id,log_level,status,started_at) VALUES('live-accounting',?,'off','running',1)",
+        vec![db::DEFAULT_PROJECT_ID.into()],
+    )
+    .await;
+    let path = format!(
+        "/api/admin/v1/projects/{}/live-requests",
+        db::DEFAULT_PROJECT_ID
+    );
+    let visible =
+        json_body(admin(&f, &cookie, http::Method::GET, &path, Value::Null, false).await).await;
+    assert_eq!(visible["enabled"], json!(true), "{visible}");
+    let rows = visible["data"].as_array().unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "another project's request must stay invisible"
+    );
+    assert_eq!(rows[0]["model"], json!("public"));
+    assert_eq!(rows[0]["channel_id"], json!(&f.providers[0]));
+    assert_eq!(rows[0]["api_key_id"], json!("key-own"));
+    assert!(rows[0]["started_at"].as_i64().is_some());
+    let keys: std::collections::BTreeSet<_> = rows[0]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        keys,
+        ["api_key_id", "channel_id", "model", "started_at"]
+            .into_iter()
+            .collect(),
+        "the live shape must have no request body, response body, or project id"
+    );
+
+    ops::logging::set_policy(
+        &f.state.db,
+        &Policy {
+            live_preview_enabled: false,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let hidden =
+        json_body(admin(&f, &cookie, http::Method::GET, &path, Value::Null, false).await).await;
+    assert_eq!(hidden, json!({"enabled":false,"data":[]}));
+    assert_eq!(
+        count(
+            &f,
+            "SELECT COUNT(*) AS n FROM request_facts WHERE id='live-accounting'",
+        )
+        .await,
+        1,
+        "preview policy changes must not remove authoritative accounting facts"
+    );
+    assert_eq!(
+        f.state
+            .orchestrator
+            .live_requests(db::DEFAULT_PROJECT_ID)
+            .len(),
+        1,
+        "the toggle hides the view; it does not alter live gateway state"
+    );
+
+    drop(own);
+    drop(foreign);
+    assert!(
+        f.state
+            .orchestrator
+            .live_requests(db::DEFAULT_PROJECT_ID)
+            .is_empty(),
+        "dropping request ownership removes the ephemeral row"
+    );
+}
+
 async fn logging_audits(f: &Fixture) -> i64 {
     count(
         f,
@@ -8583,6 +8697,7 @@ async fn analytics_api_key_filter_refuses_foreign_and_unknown_keys() {
     )
     .await;
     assert_eq!(measured["data"][0]["usage_measured"], json!(false));
+    assert_eq!(measured["data"][0]["tokens_per_second"], Value::Null);
 }
 
 /// A window that ends before it starts is a mistake the caller has to see. It is

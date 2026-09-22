@@ -280,10 +280,19 @@ async fn execute_inner(
         plan.affinity.clone(),
     )
     .await?;
+    let mut live_request = Some(state.orchestrator.begin_live_request(
+        &credential.project_id,
+        &requested,
+        &plan.candidates[0].provider_id,
+        &credential.id,
+    ));
     let mut attempts = 0usize;
     let mut contacted = false;
     let mut last_admission = None;
     'candidates: for candidate in &plan.candidates {
+        if let Some(live_request) = &live_request {
+            live_request.set_channel(&candidate.provider_id);
+        }
         for _ in 0..candidate.retry.attempts {
             if attempts >= plan.routing.max_attempts {
                 break 'candidates;
@@ -572,7 +581,9 @@ async fn execute_inner(
                 let timeout = candidate.retry.event_timeout_ms;
                 let error_policy = candidate.retry.clone();
                 let mut terminal_state = sse::TerminalState::new(&payload);
+                let live_request = live_request.take().expect("one downstream response");
                 let output = async_stream::stream! {
+                    let _live_request = live_request;
                     let mut event=first;
                     loop {
                         let terminal=terminal_state.terminal(&event,endpoint);

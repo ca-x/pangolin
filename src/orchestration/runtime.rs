@@ -1,19 +1,20 @@
 //! Process-local admission and routing state. Every acquired permit is RAII-owned,
 //! including queued cancellation and downstream body cancellation.
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     num::NonZeroU32,
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use dashmap::DashMap;
 use governor::{DefaultDirectRateLimiter, Quota, RateLimiter};
 use moka::sync::Cache;
 use rand::Rng;
+use serde::Serialize;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use super::{
@@ -31,6 +32,8 @@ pub struct Runtime {
     pub affinity_rules: super::affinity::Cache,
     pub websocket_pins: Cache<String, String>,
     pub upstream_clients: crate::providers::ClientPool,
+    live_requests: Mutex<BTreeMap<u64, LiveRequest>>,
+    next_live_request: AtomicU64,
 }
 
 impl Default for Runtime {
@@ -54,6 +57,8 @@ impl Default for Runtime {
                 .time_to_idle(Duration::from_secs(86400))
                 .build(),
             upstream_clients: Default::default(),
+            live_requests: Mutex::new(BTreeMap::new()),
+            next_live_request: AtomicU64::new(0),
         }
     }
 }
@@ -127,6 +132,62 @@ impl Runtime {
         self.websocket_pins.run_pending_tasks();
         self.affinity_rules.reset();
         self.sessions.clear();
+        self.live_requests
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
+    }
+
+    /// Own one bounded, payload-free row for as long as the gateway request is
+    /// active. The project id is retained only for filtering and is never part
+    /// of the serialized snapshot.
+    pub fn begin_live_request(
+        self: &Arc<Self>,
+        project_id: &str,
+        model: &str,
+        channel_id: &str,
+        api_key_id: &str,
+    ) -> LiveRequestGuard {
+        const MAX_LIVE_REQUESTS: usize = 256;
+        let id = self.next_live_request.fetch_add(1, Ordering::Relaxed);
+        let mut requests = self
+            .live_requests
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        while requests.len() >= MAX_LIVE_REQUESTS {
+            if let Some(oldest) = requests.keys().next().copied() {
+                requests.remove(&oldest);
+            }
+        }
+        requests.insert(
+            id,
+            LiveRequest {
+                project_id: project_id.to_owned(),
+                model: model.to_owned(),
+                channel_id: channel_id.to_owned(),
+                api_key_id: api_key_id.to_owned(),
+                started_at: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+                    .min(i64::MAX as u64) as i64,
+            },
+        );
+        drop(requests);
+        LiveRequestGuard {
+            runtime: Arc::clone(self),
+            id,
+        }
+    }
+
+    pub fn live_requests(&self, project_id: &str) -> Vec<LiveRequestSnapshot> {
+        self.live_requests
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .values()
+            .filter(|request| request.project_id == project_id)
+            .map(LiveRequestSnapshot::from)
+            .collect()
     }
 
     /// Clear only process state whose eviction cannot reset admission or alter routing.
@@ -350,6 +411,62 @@ impl Runtime {
             probe,
             settled: false,
         })
+    }
+}
+
+struct LiveRequest {
+    project_id: String,
+    model: String,
+    channel_id: String,
+    api_key_id: String,
+    started_at: i64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct LiveRequestSnapshot {
+    model: String,
+    channel_id: String,
+    api_key_id: String,
+    started_at: i64,
+}
+
+impl From<&LiveRequest> for LiveRequestSnapshot {
+    fn from(request: &LiveRequest) -> Self {
+        Self {
+            model: request.model.clone(),
+            channel_id: request.channel_id.clone(),
+            api_key_id: request.api_key_id.clone(),
+            started_at: request.started_at,
+        }
+    }
+}
+
+pub struct LiveRequestGuard {
+    runtime: Arc<Runtime>,
+    id: u64,
+}
+
+impl LiveRequestGuard {
+    pub fn set_channel(&self, channel_id: &str) {
+        if let Some(request) = self
+            .runtime
+            .live_requests
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get_mut(&self.id)
+        {
+            request.channel_id = channel_id.to_owned();
+        }
+    }
+}
+
+impl Drop for LiveRequestGuard {
+    fn drop(&mut self) {
+        self.runtime
+            .live_requests
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&self.id);
     }
 }
 

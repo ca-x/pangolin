@@ -459,17 +459,25 @@ describe('project and instance scope', () => {
   })
 
   it('shows the instance-scoped tab and the scope note for the owner', async () => {
-    vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
+    const writes: Array<Record<string, unknown>> = []
+    vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
       const path = String(input)
       if (path.endsWith('/projects')) return json([project])
       if (path.includes('/permissions')) return json(['*'])
-      if (path.includes('/settings/request-logging')) return json({ version: 1, enabled: false, default_level: 'off', key_override_enabled: false, key_disable_allowed: false })
+      if (path.includes('/settings/request-logging')) {
+        if (init?.method === 'PUT') { writes.push(JSON.parse(String(init.body))); return json({ ok: true }) }
+        return json({ version: 1, enabled: false, default_level: 'off', key_override_enabled: false, key_disable_allowed: false, live_preview_enabled: true })
+      }
       return paged([])
     }))
     renderPage()
     expect(await screen.findByRole('tab', { name: 'Request logging' })).toBeInTheDocument()
     await userEvent.click(screen.getByRole('tab', { name: 'Request logging' }))
     expect(await screen.findByRole('heading', { name: 'Request logging' })).toBeInTheDocument()
+    const livePreview = await screen.findByRole('switch', { name: /Enable live request preview/ })
+    expect(livePreview).toBeChecked()
+    await userEvent.click(livePreview)
+    await waitFor(() => expect(writes.at(-1)?.live_preview_enabled).toBe(false))
   })
 
   it('round-trips the request logging policy version', async () => {

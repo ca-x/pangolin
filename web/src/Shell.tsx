@@ -1,6 +1,6 @@
 import { AppShell, ActionIcon, Avatar, Burger, Button, Group, Menu, NavLink as MantineNavLink, Select, Stack, Text, Alert, Tooltip, UnstyledButton } from '@mantine/core'
 import { useDisclosure, useMediaQuery } from '@mantine/hooks'
-import { Activity, Boxes, FlaskConical, Gauge, KeyRound, LogOut, MessageSquareText, Settings, Unplug, UserRound, X } from 'lucide-react'
+import { Activity, BarChart3, Boxes, FlaskConical, Gauge, KeyRound, LogOut, MessageSquareText, Settings, Unplug, UserRound, X } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { useEffect, useState } from 'react'
 import { Link as RouterLink, Outlet, useLocation, useNavigate } from 'react-router'
@@ -44,7 +44,7 @@ function ShellContent({ user, branding }: { user: User; branding: Branding }) {
   const canAccess = ['project:manage', 'api_key:manage', 'role:manage', 'user:manage', 'oidc:manage', 'project:read'].some(can)
   const groups = [
     { label: t('workspace'), links: [{ to: '/', label: t('overview'), icon: Gauge, end: true }, ...(can('project:manage') ? [{ to: '/channels', label: t('channels'), icon: Unplug }, { to: '/prompts', label: t('prompts'), icon: MessageSquareText }] : []), ...((can('project:manage') || can('catalog:manage')) ? [{ to: '/models', label: t('models'), icon: Boxes }] : []), { to: '/playground', label: t('playground'), icon: FlaskConical }] },
-    { label: t('observe'), links: [{ to: '/operations', label: t('operations'), icon: Activity }] },
+    { label: t('observe'), links: [{ to: '/operations', label: t('operations'), icon: Activity }, { to: '/analytics', label: t('analytics'), icon: BarChart3 }] },
     ...((canAccess || can('catalog:manage') || can('project:manage')) ? [{ label: t('administration'), links: [...(canAccess ? [{ to: '/access', label: t('access'), icon: KeyRound }] : []), ...((can('catalog:manage') || can('project:manage')) ? [{ to: '/system', label: t('systemSettings'), icon: Settings }] : [])] }] : []),
   ]
 

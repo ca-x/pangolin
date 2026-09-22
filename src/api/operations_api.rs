@@ -204,6 +204,10 @@ pub(super) fn router(state: AppState) -> Router<AppState> {
         )
         .route("/api/admin/v1/projects/{project}/analytics", get(analytics))
         .route(
+            "/api/admin/v1/projects/{project}/live-requests",
+            get(live_requests),
+        )
+        .route(
             "/api/admin/v1/projects/{project}/settings/orchestration",
             get(orchestration_settings).put(set_orchestration_settings),
         )
@@ -2153,6 +2157,13 @@ async fn analytics(
     Query(filter): Query<Filter>,
 ) -> Result<Json<Value>, ApiError> {
     actor(&state, &headers, Some(&project), false).await?;
+    if filter
+        .from
+        .zip(filter.until)
+        .is_some_and(|(from, until)| from >= until)
+    {
+        return Err(ApiError::BadRequest("invalid analytics window".into()));
+    }
     // A key-specific analytics link is an object read, not a best-effort string
     // filter. Resolve it inside the route project before reading facts so a
     // foreign id and a nonexistent id are the same opaque 404.
@@ -2177,10 +2188,46 @@ async fn analytics(
         "project" => "r.project_id",
         _ => return Err(ApiError::BadRequest("unknown analytics dimension".into())),
     };
-    let rows=state.db.query_all(sql(format!("SELECT json_object('dimension',{dimension},'requests',COUNT(DISTINCT r.id),'attempts',COUNT(e.id),'errors',SUM(e.status!='succeeded'),'usage_measured',CASE WHEN COUNT(u.id)>0 THEN json('true') ELSE json('false') END,'input_tokens',COALESCE(SUM(u.input_tokens),0),'output_tokens',COALESCE(SUM(u.output_tokens),0),'cache_hit_tokens',COALESCE(SUM(u.cache_read_tokens),0),'cache_savings_micros',COALESCE(SUM(u.cache_savings_micros),0),'cost_micros',COALESCE(SUM(u.total_cost_micros),0),'latency_ms',AVG(x.latency_ms),'ttft_ms',AVG(x.first_token_at-x.started_at*1000)) AS document FROM request_facts r JOIN execution_facts e ON e.request_id=r.id LEFT JOIN usage_logs u ON u.execution_id=e.id LEFT JOIN request_executions x ON x.id=e.id WHERE r.project_id=? AND r.started_at>=? AND r.started_at<? AND (? IS NULL OR e.model_id=?) AND (? IS NULL OR e.provider_id=?) AND (? IS NULL OR r.api_key_id=?) GROUP BY {dimension} ORDER BY {dimension} LIMIT 500"),vec![project.into(),filter.from.unwrap_or(db::now()-86400*30).into(),filter.until.unwrap_or(db::now()+1).into(),filter.model.clone().into(),filter.model.into(),filter.provider.clone().into(),filter.provider.into(),filter.api_key.clone().into(),filter.api_key.into()])).await?;
+    let rows=state.db.query_all(sql(format!("SELECT json_object('dimension',{dimension},'requests',COUNT(DISTINCT r.id),'attempts',COUNT(e.id),'errors',SUM(e.status!='succeeded'),'usage_measured',CASE WHEN COUNT(u.id)>0 THEN json('true') ELSE json('false') END,'input_tokens',COALESCE(SUM(u.input_tokens),0),'output_tokens',COALESCE(SUM(u.output_tokens),0),'cache_hit_tokens',COALESCE(SUM(u.cache_read_tokens),0),'cache_savings_micros',COALESCE(SUM(u.cache_savings_micros),0),'cost_micros',COALESCE(SUM(u.total_cost_micros),0),'latency_ms',AVG(x.latency_ms),'ttft_ms',AVG(x.first_token_at-x.started_at*1000),'tokens_per_second',AVG(CASE WHEN u.id IS NOT NULL AND x.latency_ms>0 THEN CAST(u.output_tokens AS REAL)*1000.0/x.latency_ms END)) AS document FROM request_facts r JOIN execution_facts e ON e.request_id=r.id LEFT JOIN usage_logs u ON u.execution_id=e.id LEFT JOIN request_executions x ON x.id=e.id WHERE r.project_id=? AND r.started_at>=? AND r.started_at<? AND (? IS NULL OR e.model_id=?) AND (? IS NULL OR e.provider_id=?) AND (? IS NULL OR r.api_key_id=?) GROUP BY {dimension} ORDER BY {dimension} LIMIT 500"),vec![project.into(),filter.from.unwrap_or(db::now()-86400*30).into(),filter.until.unwrap_or(db::now()+1).into(),filter.model.clone().into(),filter.model.into(),filter.provider.clone().into(),filter.provider.into(),filter.api_key.clone().into(),filter.api_key.into()])).await?;
     Ok(Json(
         json!({"data":documents(rows)?,"source":"sqlite","derived_available":state.observations.is_available()}),
     ))
+}
+
+async fn live_requests(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    actor(&state, &headers, Some(&project), false).await?;
+    let row = state
+        .db
+        .query_one(sql(
+            "SELECT CASE WHEN typeof(value)='text' THEN value END AS value,typeof(value) AS value_type FROM settings WHERE key='request_logging'",
+            vec![],
+        ))
+        .await?;
+    let policy = match row {
+        Some(row) => match logging::parse_stored_row(&row) {
+            Ok(Some(policy)) => policy,
+            Ok(None) => logging::Policy::default(),
+            Err(problem) => {
+                tracing::warn!(
+                    problem = problem.code(),
+                    "stored request-logging policy is invalid; live preview remains disabled"
+                );
+                logging::Policy::fail_closed()
+            }
+        },
+        None => logging::Policy::default(),
+    };
+    if !policy.live_preview_enabled {
+        return Ok(Json(json!({"enabled":false,"data":[]})));
+    }
+    Ok(Json(json!({
+        "enabled": true,
+        "data": state.orchestrator.live_requests(&project),
+    })))
 }
 
 #[derive(Clone, Deserialize, Serialize)]

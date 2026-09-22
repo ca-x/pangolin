@@ -51,17 +51,17 @@ states plainly that no test guards it yet.
 
 | Area | closed (parity) | closed (fixed) | closed (refuted) | partial | open | feature-build | divergence | total |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| observability | 5 | 10 | 0 | 2 | 3 | 0 | 0 | 20 |
+| observability | 5 | 11 | 0 | 1 | 3 | 0 | 0 | 20 |
 | prompts & playground | 6 | 12 | 1 | 0 | 0 | 0 | 1 | 20 |
 | models, routing & pricing | 6 | 13 | 2 | 1 | 3 | 1 | 0 | 26 |
 | access control | 2 | 17 | 2 | 0 | 0 | 0 | 0 | 21 |
 | system settings & background work | 8 | 11 | 5 | 1 | 5 | 0 | 1 | 31 |
 | console-wide UX | 3 | 9 | 1 | 2 | 0 | 0 | 0 | 15 |
-| **total** | **30** | **72** | **11** | **6** | **11** | **1** | **2** | **133** |
+| **total** | **30** | **73** | **11** | **5** | **11** | **1** | **2** | **133** |
 
 Row count is unchanged at 133 — the six area reports' own findings. No row was
-dropped, merged or added. What changed is the status: **113 rows need no work**
-(30 already matched, 72 fixed, 11 refuted), **18 rows need work** (`partial` +
+dropped, merged or added. What changed is the status: **114 rows need no work**
+(30 already matched, 73 fixed, 11 refuted), **17 rows need work** (`partial` +
 `open` + `feature-build`), and **2 rows are recorded divergences** whose only
 remaining difference is deliberate.
 
@@ -85,7 +85,7 @@ Report: [parity-observability.md](parity-observability.md).
 | # | Finding | Status | Basis | Pangolin evidence | AxonHub reference | Acceptance test |
 | --- | --- | --- | --- | --- | --- | --- |
 | 1 | Per-dimension breakdowns absent | closed | fixed | `OverviewPage.tsx:28,74,180-253` renders a breakdown by provider, model, API key, user or project from `/analytics`; endpoint `operations_api.rs:290-292,581-590` | `features/dashboard/components/`, `features/analytics/components/dimension-pie-charts.tsx` | `observabilityWiring.test.tsx`, `trendChart.test.tsx` |
-| 2 | No period or date-range selection | partial | — | Request log has five presets plus a custom range (`OperationsPage.tsx:24-44,132-146`); Overview and its breakdown are pinned to 24h (`OverviewPage.tsx:58,191`); the generic resource list still ignores `from`/`until` (`operations_api.rs:444-461` takes only `q`/`limit`/`offset`) | `features/analytics/components/analytics-filter-bar.tsx:245-330` (`TimePeriodSelector` on every chart) | a window control on Overview that changes the summary *and* the breakdown query |
+| 2 | No period or date-range selection | closed | fixed | The dedicated Analytics page has URL-backed preset/custom half-open date ranges and dimension filters; requests send explicit `from`/`until` and charts/tables render nullable measurements as `—`. | `features/analytics/components/analytics-filter-bar.tsx:245-330` (`TimePeriodSelector` on every chart) | `liveAnalytics.test.tsx` query/filter/render cases |
 | 3 | Trend chart carries requests and errors only | open | — | `SummaryPoint` is `{bucket, requests, errors, latency_ms}` (`observability.rs:60-66`); the chart plots two series (`OverviewPage.tsx:91-123`) | `features/analytics/components/combined-trend-chart.tsx` (requests, tokens, cost) | a bucketed token/cost series asserted from `/observability/summary` |
 | 4 | Rows do not show why a request failed | closed | fixed | `OperationsPage.tsx:159,163` renders a localized `failureReason` from `row.error_kind`; field in `RequestItem` (`api.ts:30`) | `features/requests/components/request-detail-content.tsx:855-864` | `observabilityTruth.test.tsx` |
 | 5 | No time-window filter on the request log | closed | fixed | `OperationsPage.tsx:132-136` sends `from`/`until` | `features/requests/components/data-table-toolbar.tsx:26-32` | `observabilityWiring.test.tsx` ("sends the exact range the operator typed") |
@@ -512,10 +512,10 @@ retry/model/quota settings, and CORS/timeouts. Every one of them is scheduled in
 | Request execution | implemented+tested | one row per attempt with timing, retry reason and the outcome snapshot |
 | Usage log | implemented+tested | input/output/cache/reasoning tokens, units, cost reference |
 | Detailed cost | implemented+tested | price item, quantity, tiers, cache TTL variants, subtotal |
-| Live preview | open | no in-flight request snapshot resource or surface |
+| Live preview | implemented+tested | bounded payload-free process registry, project/policy-gated read route and live Operations panel with RAII/stream cleanup |
 | Content download | implemented+tested | `content` resource returns the stored bodies under project authorization (`operations_api.rs:498-503`) |
 | Dashboard | implemented+tested | summary + per-dimension breakdowns |
-| Analytics | partial | date and dimension filters exist at the API; Overview is pinned to 24h and there is no analytics page with its own filters (observability 2) |
+| Analytics | implemented+tested | dedicated URL-shareable date/dimension filters, throughput/cost charts and a table fallback |
 | Performance analytics | partial | latency and TTFT averages per dimension; no throughput/TPS or confidence intervals |
 | Cost analytics | partial | cost by channel/model/key/user/project via `/analytics`; no dedicated cost page |
 | Retention and GC | implemented+tested | per-resource policies, body cleanup, vacuum |
@@ -535,7 +535,7 @@ retry/model/quota settings, and CORS/timeouts. Every one of them is scheduled in
 | Scheduler | implemented+tested | durable jobs for probe, model sync, quota, backup and GC |
 | Favicon/static SPA | implemented+tested | embedded branded assets and deep links |
 | Playground/chat | feature-build | prompts 13 |
-| Request content policy | partial | store-chunks/body toggles are expressed as levels; no live-preview toggle |
+| Request content policy | implemented+tested | versioned logging levels plus an explicit default-off live-preview toggle; credentials and payloads never enter preview rows |
 | Provider OAuth credential helpers | feature-build | no Codex/xAI/Claude Code/Antigravity/Copilot setup flows |
 
 ### Console feature pages (1)

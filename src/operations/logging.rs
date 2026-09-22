@@ -41,6 +41,11 @@ pub struct Policy {
     pub default_level: Level,
     pub key_override_enabled: bool,
     pub key_disable_allowed: bool,
+    #[serde(skip_serializing_if = "is_false")]
+    pub live_preview_enabled: bool,
+}
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 impl Default for Policy {
     fn default() -> Self {
@@ -50,6 +55,7 @@ impl Default for Policy {
             default_level: Level::Metadata,
             key_override_enabled: false,
             key_disable_allowed: false,
+            live_preview_enabled: false,
         }
     }
 }
@@ -77,6 +83,7 @@ pub struct PolicyInput {
     default_level: Level,
     key_override_enabled: bool,
     key_disable_allowed: bool,
+    live_preview_enabled: bool,
 }
 impl Default for PolicyInput {
     /// An omitted field keeps the policy's own documented default — `enabled`
@@ -89,6 +96,7 @@ impl Default for PolicyInput {
             default_level: policy.default_level,
             key_override_enabled: policy.key_override_enabled,
             key_disable_allowed: policy.key_disable_allowed,
+            live_preview_enabled: policy.live_preview_enabled,
         }
     }
 }
@@ -113,7 +121,7 @@ impl PolicyInput {
     }
     fn invalid() -> ApiError {
         ApiError::BadRequest(
-            "invalid request-logging policy: only version, enabled, default_level, key_override_enabled and key_disable_allowed are accepted, with version 1 and the documented types and levels".into(),
+            "invalid request-logging policy: only version, enabled, default_level, key_override_enabled, key_disable_allowed and live_preview_enabled are accepted, with version 1 and the documented types and levels".into(),
         )
     }
 }
@@ -125,6 +133,7 @@ impl From<PolicyInput> for Policy {
             default_level: input.default_level,
             key_override_enabled: input.key_override_enabled,
             key_disable_allowed: input.key_disable_allowed,
+            live_preview_enabled: input.live_preview_enabled,
         }
     }
 }
@@ -153,6 +162,7 @@ struct StoredPolicyV1 {
     default_level: Level,
     key_override_enabled: bool,
     key_disable_allowed: bool,
+    live_preview_enabled: bool,
 }
 impl Default for StoredPolicyV1 {
     fn default() -> Self {
@@ -162,6 +172,7 @@ impl Default for StoredPolicyV1 {
             default_level: policy.default_level,
             key_override_enabled: policy.key_override_enabled,
             key_disable_allowed: policy.key_disable_allowed,
+            live_preview_enabled: policy.live_preview_enabled,
         }
     }
 }
@@ -195,6 +206,7 @@ pub fn parse_stored(document: &str) -> Result<Policy, StoredPolicyError> {
         default_level: stored.default_level,
         key_override_enabled: stored.key_override_enabled,
         key_disable_allowed: stored.key_disable_allowed,
+        live_preview_enabled: stored.live_preview_enabled,
     })
 }
 

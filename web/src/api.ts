@@ -8,7 +8,7 @@ export type BuildInfo = { version: string; commit: string; built_at: string; tar
  */
 export type Bootstrap = { initialized: boolean; authenticated: boolean; user: User | null; capture_payloads: boolean; observability_available?: boolean; branding: Branding; build?: BuildInfo }
 /** Site request-logging policy. `off` (or a disabled policy) means no request event is ever written. */
-export type RequestLoggingPolicy = { version: number; enabled: boolean; default_level: string; key_override_enabled: boolean; key_disable_allowed: boolean }
+export type RequestLoggingPolicy = { version: number; enabled: boolean; default_level: string; key_override_enabled: boolean; key_disable_allowed: boolean; live_preview_enabled?: boolean }
 export type User = { id: string; email: string; role: string; language: string; theme: string; created_at: number }
 export type Provider = { id: string; name: string; kind: string; base_url: string; enabled: boolean; created_at: number; updated_at: number }
 export type Model = { id: string; provider_id: string; provider_name: string; public_name: string; upstream_name: string; capabilities: string; input_price_micros: number; output_price_micros: number; priority: number; enabled: boolean; created_at: number }
@@ -52,7 +52,8 @@ export type RequestItem = { internal_id: string; request_id: string; started_at:
  * dimension. `dimension` is an opaque id for every entity facet, and `latency_ms`
  * and `ttft_ms` are averages the projection may not be able to compute.
  */
-export type AnalyticsRow = { dimension: string | null; requests: number; attempts: number; errors: number; usage_measured?: boolean; input_tokens: number; output_tokens: number; cache_hit_tokens: number; cache_savings_micros: number; cost_micros: number; latency_ms: number | null; ttft_ms: number | null }
+export type AnalyticsRow = { dimension: string | null; requests: number; attempts: number; errors: number; usage_measured?: boolean; input_tokens: number; output_tokens: number; cache_hit_tokens: number; cache_savings_micros: number; cost_micros: number; latency_ms: number | null; ttft_ms: number | null; tokens_per_second?: number | null }
+export type LiveRequest = { model: string; channel_id: string; api_key_id: string; started_at: number }
 /**
  * The projection's detail document for one request: the same facts as a list row plus
  * the record-system fields. Its own identity is `id` — the internal UUID the list row

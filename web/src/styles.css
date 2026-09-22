@@ -251,6 +251,12 @@ code { overflow-wrap: anywhere; }
 .chart-spark-line { fill: none; stroke: var(--accent); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
 .chart-spark-dot { fill: var(--surface); stroke: var(--accent); stroke-width: 2; }
 
+.analytics-bars { min-width: 0; }
+.analytics-bar-row { display: grid; gap: 7px; }
+.analytics-bar-value { flex: 0 0 auto; font-variant-numeric: tabular-nums; }
+.analytics-bar-track { height: 8px; overflow: hidden; border-radius: 999px; background: var(--surface-muted); }
+.analytics-bar-track span { display: block; height: 100%; border-radius: inherit; background: var(--accent); }
+
 /* ---------------------------------------------------------- resources ---- */
 
 .resource-grid { display: grid; gap: 10px; }

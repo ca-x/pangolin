@@ -4,7 +4,7 @@ import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Link, useLocation, useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
-import { api, type Document, type Paged, type RequestDetail, type RequestItem } from '../api'
+import { api, type Document, type LiveRequest, type Paged, type RequestDetail, type RequestItem } from '../api'
 import { ActionIcon, Alert, Anchor, Badge, Button, Card, Code, Group, Pagination, Select, SimpleGrid, Stack, Table, TableScrollContainer, Tabs, Text, TextInput, Title, Tooltip } from '@mantine/core'
 import { EmptyState, SkeletonRows, Status, confirmAction } from '../components'
 import { ObservabilityNotice, UNMEASURED, formatCount, formatMicros, usageMeasured, useErrorKindLabel, useObservability } from '../observability'
@@ -69,7 +69,7 @@ export default function OperationsPage() {
   const location = useLocation()
   const observability = useObservability()
   const [tab, setTab] = useState<string>((location.state as { tab?: string } | null)?.tab || 'requests')
-  return <><ObservabilityNotice observability={observability} onRetry={observability.refresh} />
+  return <><LiveRequestsPanel /><ObservabilityNotice observability={observability} onRetry={observability.refresh} />
     <Tabs keepMounted={false} value={tab} onChange={(value) => value && setTab(value)} mb="lg">
       <Tabs.List mb="lg">{TAB_VALUES.map(value => <Tabs.Tab key={value} value={value}>{t(value)}</Tabs.Tab>)}</Tabs.List>
       <Tabs.Panel value="requests"><RequestList observability={observability} /></Tabs.Panel>
@@ -81,6 +81,29 @@ export default function OperationsPage() {
       <Tabs.Panel value="audit"><ResourcePage resource="audit" title={t('audit')} description={t('auditDescription')} empty={t('auditEmpty')} immutable columns={[{key:'action',label:t('action')},{key:'resource_type',label:t('type')},{key:'resource_id',label:t('resourceId'),mono:true},{key:'actor_user_id',label:t('actor'),mono:true},{key:'created_at',label:t('time'),render:formatDate}]} /></Tabs.Panel>
     </Tabs>
   </>
+}
+
+function LiveRequestsPanel() {
+  const { t } = useTranslation()
+  const { project } = useProject()
+  const query = useQuery({
+    queryKey: ['live-requests', project.id],
+    queryFn: () => api<{ enabled: boolean; data: LiveRequest[] }>(`/api/admin/v1/projects/${encodeURIComponent(project.id)}/live-requests`),
+    refetchInterval: 3000,
+  })
+  if (query.isLoading) return <Card p="lg" mb="lg"><SkeletonRows count={2} /></Card>
+  if (query.isError) return <Stack mb="lg"><QueryError retry={() => void query.refetch()} /></Stack>
+  if (!query.data?.enabled) return null
+  const rows = query.data.data
+  return <Card p="lg" mb="lg">
+    <Stack gap={2} mb="md"><Title order={2}>{t('liveRequests')}</Title><Text size="sm" c="dimmed">{t('liveRequestsHint')}</Text></Stack>
+    {!rows.length ? <EmptyState icon={<Activity />} title={t('liveRequests')} copy={t('liveRequestsEmpty')} /> : <TableScrollContainer minWidth={680} role="region" aria-label={t('liveRequests')} tabIndex={0}>
+      <Table highlightOnHover>
+        <Table.Thead><Table.Tr><Table.Th>{t('model')}</Table.Th><Table.Th>{t('channel')}</Table.Th><Table.Th>{t('key')}</Table.Th><Table.Th>{t('startedAt')}</Table.Th></Table.Tr></Table.Thead>
+        <Table.Tbody>{rows.map((row, index) => <Table.Tr key={`${row.api_key_id}-${row.started_at}-${index}`}><Table.Td>{row.model}</Table.Td><Table.Td className="mono-cell">{row.channel_id}</Table.Td><Table.Td className="mono-cell">{row.api_key_id}</Table.Td><Table.Td>{formatDate(row.started_at)}</Table.Td></Table.Tr>)}</Table.Tbody>
+      </Table>
+    </TableScrollContainer>}
+  </Card>
 }
 
 /**

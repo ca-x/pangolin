@@ -8,6 +8,7 @@ import Shell from './Shell'
 import { SkeletonRows } from './components'
 const AccessPage = lazy(() => import('./pages/AccessPage'))
 const AccountPage = lazy(() => import('./pages/AccountPage'))
+const AnalyticsPage = lazy(() => import('./pages/AnalyticsPage'))
 const ChannelsPage = lazy(() => import('./pages/ChannelsPage'))
 const ModelsPage = lazy(() => import('./pages/ModelsPage'))
 const OperationsPage = lazy(() => import('./pages/OperationsPage'))
@@ -68,6 +69,7 @@ export default function App() {
           <Route path="account" element={<AccountPage />} />
           <Route path="prompts" element={<PromptsPage />} />
           <Route path="operations" element={<OperationsPage />} />
+          <Route path="analytics" element={<AnalyticsPage />} />
           <Route path="operations/requests/:id" element={<RequestDetailPage />} />
           <Route path="operations/traces/:id" element={<TraceDetailPage />} />
           <Route path="playground" element={<PlaygroundPage />} />

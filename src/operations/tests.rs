@@ -60,6 +60,7 @@ fn logging_policy_matrix_and_secrets() {
                         default_level: Metadata,
                         key_override_enabled: overrides,
                         key_disable_allowed: disable,
+                        live_preview_enabled: false,
                     };
                     let expected = if !enabled {
                         Off

@@ -327,6 +327,7 @@ export function LoggingPolicy() {
           <SelectField label={t('defaultLevel')} value={policy.default_level} onValueChange={(value) => update.mutate({ ...policy, default_level: value })} options={['off', 'metadata', 'redacted_body', 'full_body'].map((value) => ({ value, label: t(value) }))} />
           <Switch checked={policy.key_override_enabled} onChange={(event) => update.mutate({ ...policy, key_override_enabled: event.currentTarget.checked })} label={t('allowKeyOverrides')} />
           <Switch checked={policy.key_disable_allowed} onChange={(event) => update.mutate({ ...policy, key_disable_allowed: event.currentTarget.checked })} label={t('allowKeyDisable')} />
+          <Switch checked={policy.live_preview_enabled === true} onChange={(event) => update.mutate({ ...policy, live_preview_enabled: event.currentTarget.checked })} label={t('enableLivePreview')} description={t('enableLivePreviewHint')} />
         </Stack>
       </Paper>
     </>
