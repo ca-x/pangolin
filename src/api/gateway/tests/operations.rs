@@ -3366,6 +3366,145 @@ async fn a_stored_logging_policy_with_an_unknown_field_does_not_break_the_gatewa
     );
 }
 
+const MODEL_SETTINGS_PATH: &str = "/api/admin/v1/settings/models";
+
+async fn stored_model_settings(f: &Fixture) -> Value {
+    f.state
+        .db
+        .query_one(ops::sql(
+            "SELECT value FROM settings WHERE key='model_settings'",
+            vec![],
+        ))
+        .await
+        .unwrap()
+        .map(|row| serde_json::from_str(&row.try_get::<String>("", "value").unwrap()).unwrap())
+        .unwrap_or(Value::Null)
+}
+
+#[tokio::test]
+async fn b32_model_settings_strict_write_rejects_unknown_fields_versions_and_regexes() {
+    let f = fixture(success()).await;
+    let cookie = owner(&f).await;
+    let known = json!({
+        "version": 1,
+        "fallback_to_channels_on_model_not_found": false,
+        "query_all_channel_models": false,
+        "default_model_api_include_all": true,
+        "auto_reasoning_effort": true,
+        "model_blacklist_regex": "^private-",
+        "hide_unroutable_models_in_list": false,
+    });
+    assert_eq!(
+        admin(
+            &f,
+            &cookie,
+            http::Method::PUT,
+            MODEL_SETTINGS_PATH,
+            known.clone(),
+            true,
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    assert_eq!(stored_model_settings(&f).await, known);
+    assert_eq!(
+        count(
+            &f,
+            "SELECT COUNT(*) AS n FROM audit_events WHERE action='model-settings.update'",
+        )
+        .await,
+        1,
+    );
+
+    let mut unknown_field = known.clone();
+    unknown_field["query_all_channel_model"] = json!(true);
+    let mut unknown_version = known.clone();
+    unknown_version["version"] = json!(2);
+    let mut invalid_regex = known.clone();
+    invalid_regex["model_blacklist_regex"] = json!("[");
+    let mut oversized_regex = known.clone();
+    oversized_regex["model_blacklist_regex"] = json!("x".repeat(2049));
+    for invalid in [
+        unknown_field,
+        unknown_version,
+        invalid_regex,
+        oversized_regex,
+    ] {
+        let response = admin(
+            &f,
+            &cookie,
+            http::Method::PUT,
+            MODEL_SETTINGS_PATH,
+            invalid,
+            true,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(response).await;
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("model settings"))
+        );
+    }
+    assert_eq!(stored_model_settings(&f).await, known);
+    assert_eq!(
+        count(
+            &f,
+            "SELECT COUNT(*) AS n FROM audit_events WHERE action='model-settings.update'",
+        )
+        .await,
+        1,
+        "rejected writes must not persist or audit anything",
+    );
+}
+
+#[tokio::test]
+async fn b32_model_settings_tolerate_unknown_stored_fields_and_keep_admission_available() {
+    let f = fixture(success()).await;
+    let cookie = owner(&f).await;
+    sql(
+        &f,
+        "INSERT INTO settings(key,value,updated_at) VALUES('model_settings',?,0)",
+        vec![
+            json!({
+                "version": 1,
+                "fallback_to_channels_on_model_not_found": true,
+                "query_all_channel_models": true,
+                "default_model_api_include_all": false,
+                "auto_reasoning_effort": false,
+                "model_blacklist_regex": "",
+                "hide_unroutable_models_in_list": true,
+                "retained_from_a_future_build": {"enabled": true},
+            })
+            .to_string()
+            .into(),
+        ],
+    )
+    .await;
+
+    let read = admin(
+        &f,
+        &cookie,
+        http::Method::GET,
+        MODEL_SETTINGS_PATH,
+        Value::Null,
+        false,
+    )
+    .await;
+    assert_eq!(read.status(), StatusCode::OK);
+    let document = json_body(read).await;
+    assert_eq!(document.get("retained_from_a_future_build"), None);
+    assert_eq!(document["version"], 1);
+    assert_eq!(
+        request(&f, "/v1/chat/completions", chat()).await.status(),
+        StatusCode::OK,
+        "a stored field this build does not know must not break admission",
+    );
+}
+
 const LOG_POLICY_PATH: &str = "/api/admin/v1/settings/request-logging";
 
 /// The stored request-logging document, exactly as the record system holds it.

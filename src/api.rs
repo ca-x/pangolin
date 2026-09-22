@@ -904,8 +904,11 @@ async fn gateway_models(
         crate::providers::ENDPOINTS.to_vec()
     };
     // Unknown include values deliberately retain the historical response shape.
-    // Only the explicit compatibility opt-in may widen the document.
-    let models = if query.include.as_deref() == Some("all") {
+    // Only the explicit opt-in, or the instance default when omitted, widens it.
+    let settings = crate::orchestration::model_settings(&state.db).await?;
+    let include_all = query.include.as_deref() == Some("all")
+        || (query.include.is_none() && settings.default_model_api_include_all);
+    let models = if include_all {
         crate::orchestration::visible_models_with_metadata_for(
             &state.db,
             &credential,

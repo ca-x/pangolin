@@ -11,7 +11,7 @@ pub mod stream;
 
 use http::HeaderMap;
 use sea_orm::DatabaseConnection;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -36,6 +36,108 @@ pub enum Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 const ANTHROPIC_COMPLETION_COUNT_ERROR: &str = "Anthropic requests support exactly one completion";
+pub const MAX_MODEL_BLACKLIST_REGEX_BYTES: usize = 2048;
+
+/// Instance-wide model discovery and routing compatibility settings.
+///
+/// Stored records are intentionally tolerant: fields written by a newer build
+/// are ignored, while omitted historical fields retain Pangolin's pre-settings
+/// behavior. The admin write boundary owns the strict contract.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ModelSettings {
+    pub version: u32,
+    pub fallback_to_channels_on_model_not_found: bool,
+    pub query_all_channel_models: bool,
+    pub default_model_api_include_all: bool,
+    pub auto_reasoning_effort: bool,
+    pub model_blacklist_regex: String,
+    pub hide_unroutable_models_in_list: bool,
+}
+
+impl Default for ModelSettings {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            fallback_to_channels_on_model_not_found: true,
+            query_all_channel_models: true,
+            default_model_api_include_all: false,
+            auto_reasoning_effort: false,
+            model_blacklist_regex: String::new(),
+            hide_unroutable_models_in_list: true,
+        }
+    }
+}
+
+pub async fn model_settings(db: &DatabaseConnection) -> Result<ModelSettings> {
+    use sea_orm::ConnectionTrait;
+    let row = db
+        .query_one(repository::statement(
+            "SELECT value FROM settings WHERE key='model_settings'",
+            vec![],
+        ))
+        .await?;
+    row.map(|row| {
+        row.try_get::<String>("", "value")
+            .map_err(Error::from)
+            .and_then(|raw| serde_json::from_str(&raw).map_err(|_| Error::Configuration))
+    })
+    .transpose()
+    .map(Option::unwrap_or_default)
+}
+
+pub fn model_blacklist_regex(pattern: &str) -> Result<Option<regex::Regex>> {
+    if pattern.is_empty() {
+        return Ok(None);
+    }
+    if pattern.len() > MAX_MODEL_BLACKLIST_REGEX_BYTES {
+        return Err(Error::Configuration);
+    }
+    regex::RegexBuilder::new(pattern)
+        .size_limit(1024 * 1024)
+        .dfa_size_limit(1024 * 1024)
+        .build()
+        .map(Some)
+        .map_err(|_| Error::Configuration)
+}
+
+fn split_auto_reasoning_effort(model: &str) -> Option<(&str, &str)> {
+    let (base, effort) = model.rsplit_once('-')?;
+    if base.is_empty()
+        || !matches!(
+            effort.to_ascii_lowercase().as_str(),
+            "max" | "xhigh" | "high" | "medium" | "low"
+        )
+        || (effort.eq_ignore_ascii_case("max") && base.to_ascii_lowercase().starts_with("qwen"))
+    {
+        return None;
+    }
+    Some((base, effort))
+}
+
+async fn apply_auto_reasoning_effort(
+    db: &DatabaseConnection,
+    payload: &mut Value,
+) -> Result<ModelSettings> {
+    let settings = model_settings(db).await?;
+    if settings.auto_reasoning_effort
+        && let Some(model) = payload.get("model").and_then(Value::as_str)
+        && let Some((base, effort)) = split_auto_reasoning_effort(model)
+    {
+        let base = base.to_owned();
+        let effort = effort.to_ascii_lowercase();
+        payload["model"] = Value::String(base);
+        payload["reasoning_effort"] = Value::String(effort);
+    }
+    Ok(settings)
+}
+
+pub async fn normalize_auto_reasoning_effort(
+    db: &DatabaseConnection,
+    payload: &mut Value,
+) -> Result<()> {
+    apply_auto_reasoning_effort(db, payload).await.map(|_| ())
+}
 
 #[derive(Clone)]
 pub struct Candidate {
@@ -146,23 +248,54 @@ async fn visible_models_internal(
 ) -> Result<Vec<Value>> {
     use sea_orm::ConnectionTrait;
     let profile = load_profile(db, key).await?;
-    let rows=db.query_all(repository::statement("SELECT DISTINCT m.public_name,m.created_at FROM models m JOIN providers p ON p.id=m.provider_id WHERE p.project_id=? AND p.enabled=1 AND m.enabled=1 AND m.lifecycle='active' ORDER BY m.public_name",vec![key.project_id.clone().into()])).await?;
-    let mut names = std::collections::BTreeMap::new();
-    for row in rows {
-        names.insert(
-            row.try_get::<String>("", "public_name")?,
-            row.try_get::<i64>("", "created_at")?,
-        );
+    let settings = model_settings(db).await?;
+    // name -> (created, explicitly configured)
+    let mut names = std::collections::BTreeMap::<String, (i64, bool)>::new();
+    if settings.query_all_channel_models {
+        let rows=db.query_all(repository::statement("SELECT DISTINCT m.public_name,m.created_at FROM models m JOIN providers p ON p.id=m.provider_id WHERE p.project_id=? AND p.enabled=1 AND m.enabled=1 AND m.lifecycle='active' ORDER BY m.public_name",vec![key.project_id.clone().into()])).await?;
+        for row in rows {
+            names.insert(
+                row.try_get::<String>("", "public_name")?,
+                (row.try_get::<i64>("", "created_at")?, false),
+            );
+        }
+    }
+    let associations=db.query_all(repository::statement("SELECT a.match_type,a.pattern,m.created_at FROM model_associations a LEFT JOIN models m ON m.id=a.model_id LEFT JOIN providers p ON p.id=m.provider_id WHERE a.project_id=? AND a.enabled=1 AND (m.id IS NULL OR (m.lifecycle='active' AND m.enabled=1 AND p.enabled=1)) ORDER BY a.id",vec![key.project_id.clone().into()])).await?;
+    for row in associations {
+        if row.try_get::<String>("", "match_type")? != "exact" {
+            continue;
+        }
+        let name = row.try_get::<String>("", "pattern")?;
+        let created = row.try_get::<Option<i64>>("", "created_at")?.unwrap_or(0);
+        names
+            .entry(name)
+            .and_modify(|entry| entry.1 = true)
+            .or_insert((created, true));
     }
     for (source, _) in &profile.mappings {
         if !source.starts_with("regex:") {
-            names.insert(source.clone(), 0);
+            names
+                .entry(source.clone())
+                .and_modify(|entry| entry.1 = true)
+                .or_insert((0, true));
         }
     }
+    // A malformed legacy regex is treated as disabled. Strict writes ensure a
+    // new bad regex can never enter the record system.
+    let blacklist = model_blacklist_regex(&settings.model_blacklist_regex)
+        .ok()
+        .flatten();
     let mut visible = vec![];
-    for (name, created) in names {
-        let mapped = match profile.map_model(&name) {
-            Ok(name) => name,
+    for (name, (created, configured)) in names {
+        if !configured
+            && blacklist
+                .as_ref()
+                .is_some_and(|regex| regex.is_match(&name))
+        {
+            continue;
+        }
+        let (mapped, explicitly_mapped) = match profile.map_model_with_match(&name) {
+            Ok(mapped) => mapped,
             Err(Error::Forbidden) => continue,
             Err(error) => return Err(error),
         };
@@ -181,9 +314,16 @@ async fn visible_models_internal(
                 endpoint,
                 Some((&key.project_id, &key.id)),
             );
-            let candidates =
-                repository::candidates(db, key, &mapped, &context, &profile.routing, &mut vec![])
-                    .await?;
+            let candidates = repository::candidates(
+                db,
+                key,
+                &mapped,
+                &context,
+                &profile.routing,
+                &mut vec![],
+                settings.fallback_to_channels_on_model_not_found || explicitly_mapped,
+            )
+            .await?;
             if !candidates.is_empty() {
                 let mut model = serde_json::json!({"id":name,"object":"model","created":created,"owned_by":"pangolin"});
                 if include_metadata {
@@ -215,12 +355,24 @@ async fn visible_models_internal(
                 break;
             }
         }
+        if !settings.hide_unroutable_models_in_list
+            && !visible
+                .iter()
+                .any(|model| model["id"].as_str() == Some(name.as_str()))
+        {
+            visible.push(serde_json::json!({"id":name,"object":"model","created":created,"owned_by":"pangolin"}));
+        }
     }
     Ok(visible)
 }
 
 impl Profile {
     pub fn map_model(&self, requested: &str) -> Result<String> {
+        self.map_model_with_match(requested)
+            .map(|(mapped, _)| mapped)
+    }
+
+    fn map_model_with_match(&self, requested: &str) -> Result<(String, bool)> {
         // Access policy is evaluated on the public name before aliases are rewritten.
         if !self.allowed.is_empty() {
             let mut allowed = false;
@@ -237,16 +389,16 @@ impl Profile {
         }
         for (source, target) in &self.mappings {
             if source == requested {
-                return Ok(target.clone());
+                return Ok((target.clone(), true));
             }
             if let Some(pattern) = source.strip_prefix("regex:") {
                 let regex = policy::regex(pattern)?;
                 if regex.is_match(requested) {
-                    return Ok(regex.replace(requested, target).into_owned());
+                    return Ok((regex.replace(requested, target).into_owned(), true));
                 }
             }
         }
-        Ok(requested.to_owned())
+        Ok((requested.to_owned(), false))
     }
 }
 
@@ -267,11 +419,12 @@ pub async fn prepare(
     {
         return Err(Error::Forbidden);
     }
+    let settings = apply_auto_reasoning_effort(db, &mut payload).await?;
     let requested = payload
         .get("model")
         .and_then(Value::as_str)
         .ok_or(Error::Invalid("model is required"))?;
-    let mapped = profile.map_model(requested)?;
+    let (mapped, explicitly_mapped) = profile.map_model_with_match(requested)?;
     payload["model"] = Value::String(mapped.clone());
     let scope = format!("{}:{}", key.project_id, key.id);
     let context = policy::context(
@@ -292,9 +445,16 @@ pub async fn prepare(
             reason: "profile_mapping_applied",
         },
     ];
-    let mut candidates =
-        repository::candidates(db, key, &mapped, &context, &profile.routing, &mut decisions)
-            .await?;
+    let mut candidates = repository::candidates(
+        db,
+        key,
+        &mapped,
+        &context,
+        &profile.routing,
+        &mut decisions,
+        settings.fallback_to_channels_on_model_not_found || explicitly_mapped,
+    )
+    .await?;
     candidates.retain(|candidate| {
         let available = runtime.circuit_available(&candidate.circuit_id(), &candidate.circuit);
         if !available {

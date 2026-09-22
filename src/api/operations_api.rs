@@ -49,6 +49,10 @@ pub(super) fn router(state: AppState) -> Router<AppState> {
             get(system_settings).put(set_system_settings),
         )
         .route(
+            "/api/admin/v1/settings/models",
+            get(model_settings).put(set_model_settings),
+        )
+        .route(
             "/api/admin/v1/projects/{project}/operations/{resource}",
             get(list).post(mutate),
         )
@@ -337,6 +341,75 @@ async fn set_system_settings(
     tx.execute(sql("INSERT INTO settings(key,value,updated_at) VALUES('system',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",vec![serde_json::to_string(&input).unwrap().into(),db::now().into()])).await?;
     tx.execute(sql("INSERT INTO settings(key,value,updated_at) VALUES('instance_name',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",vec![input.instance_name.clone().into(),db::now().into()])).await?;
     audit_in(&tx, &user, "", "system.update", "system").await?;
+    tx.commit().await?;
+    Ok(Json(json!({"ok":true})))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModelSettingsInput {
+    version: u32,
+    fallback_to_channels_on_model_not_found: bool,
+    query_all_channel_models: bool,
+    default_model_api_include_all: bool,
+    auto_reasoning_effort: bool,
+    model_blacklist_regex: String,
+    hide_unroutable_models_in_list: bool,
+}
+
+impl ModelSettingsInput {
+    fn parse(document: Value) -> Result<crate::orchestration::ModelSettings, ApiError> {
+        let invalid = || {
+            ApiError::BadRequest(
+                "invalid model settings: version 1 and only the documented fields and types are accepted"
+                    .into(),
+            )
+        };
+        if !document.is_object() {
+            return Err(invalid());
+        }
+        let input: Self = serde_json::from_value(document).map_err(|_| invalid())?;
+        if input.version != 1
+            || crate::orchestration::model_blacklist_regex(&input.model_blacklist_regex).is_err()
+        {
+            return Err(invalid());
+        }
+        Ok(crate::orchestration::ModelSettings {
+            version: input.version,
+            fallback_to_channels_on_model_not_found: input.fallback_to_channels_on_model_not_found,
+            query_all_channel_models: input.query_all_channel_models,
+            default_model_api_include_all: input.default_model_api_include_all,
+            auto_reasoning_effort: input.auto_reasoning_effort,
+            model_blacklist_regex: input.model_blacklist_regex,
+            hide_unroutable_models_in_list: input.hide_unroutable_models_in_list,
+        })
+    }
+}
+
+async fn model_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<crate::orchestration::ModelSettings>, ApiError> {
+    actor(&state, &headers, None, false).await?;
+    Ok(Json(crate::orchestration::model_settings(&state.db).await?))
+}
+
+async fn set_model_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(document): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    let user = actor(&state, &headers, None, true).await?;
+    let settings = ModelSettingsInput::parse(document)?;
+    let tx = state.db.begin().await?;
+    tx.execute(sql(
+        "INSERT INTO settings(key,value,updated_at) VALUES('model_settings',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+        vec![serde_json::to_string(&settings)
+            .map_err(|error| ApiError::Internal(error.into()))?
+            .into(), db::now().into()],
+    ))
+    .await?;
+    audit_in(&tx, &user, "", "model-settings.update", "model_settings").await?;
     tx.commit().await?;
     Ok(Json(json!({"ok":true})))
 }

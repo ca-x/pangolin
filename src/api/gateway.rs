@@ -139,6 +139,7 @@ async fn execute_inner(
             ));
         }
     }
+    orchestration::normalize_auto_reasoning_effort(&state.db, &mut payload).await?;
     let requested = payload
         .get("model")
         .and_then(Value::as_str)

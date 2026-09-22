@@ -1,7 +1,7 @@
 import { ActionIcon, Alert, Badge, Button, Checkbox, Code, Group, Input, Modal, Pagination, Paper, Select, SimpleGrid, Stack, Switch, Table, TableScrollContainer, Tabs, Text, TextInput, Textarea, Title, Tooltip } from '@mantine/core'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { AlertTriangle, Copy, DatabaseBackup, Download, History, Play, RotateCcw, ShieldAlert, Webhook } from 'lucide-react'
-import { useMemo, useState, type FormEvent } from 'react'
+import { useEffect, useMemo, useState, type FormEvent } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 import { api, type Bootstrap, type Document, type Paged, type RequestLoggingPolicy } from '../api'
@@ -35,6 +35,7 @@ export default function SystemPage() {
       <Tabs.List mb="lg">
         <Tabs.Tab value="appearance">{t('appearance')}</Tabs.Tab>
         {projectScoped && PROJECT_TABS.map((value) => <Tabs.Tab key={value} value={value}>{t(value)}</Tabs.Tab>)}
+        {instanceScoped && <Tabs.Tab value="modelSettings">{t('modelSettings')}</Tabs.Tab>}
         {instanceScoped && <Tabs.Tab value="requestLogging">{t('requestLogging')}</Tabs.Tab>}
         <Tabs.Tab value="about">{t('about')}</Tabs.Tab>
       </Tabs.List>
@@ -66,6 +67,7 @@ export default function SystemPage() {
           </Tabs.Panel>
         </>
       )}
+      {instanceScoped && <Tabs.Panel value="modelSettings"><ModelSettingsForm /></Tabs.Panel>}
       {instanceScoped && <Tabs.Panel value="requestLogging"><LoggingPolicy /></Tabs.Panel>}
       <Tabs.Panel value="about"><About /></Tabs.Panel>
     </Tabs>
@@ -322,6 +324,77 @@ export function LoggingPolicy() {
           <Switch checked={policy.key_override_enabled} onChange={(event) => update.mutate({ ...policy, key_override_enabled: event.currentTarget.checked })} label={t('allowKeyOverrides')} />
           <Switch checked={policy.key_disable_allowed} onChange={(event) => update.mutate({ ...policy, key_disable_allowed: event.currentTarget.checked })} label={t('allowKeyDisable')} />
         </Stack>
+      </Paper>
+    </>
+  )
+}
+
+type ModelSettingsDocument = {
+  version: 1
+  fallback_to_channels_on_model_not_found: boolean
+  query_all_channel_models: boolean
+  default_model_api_include_all: boolean
+  auto_reasoning_effort: boolean
+  model_blacklist_regex: string
+  hide_unroutable_models_in_list: boolean
+}
+
+function ModelSettingsForm() {
+  const { t } = useTranslation()
+  const client = useQueryClient()
+  const path = '/api/admin/v1/settings/models'
+  const query = useQuery({ queryKey: ['model-settings'], queryFn: () => api<ModelSettingsDocument>(path), retry: false })
+  const [draft, setDraft] = useState<ModelSettingsDocument | null>(null)
+  useEffect(() => { if (query.data) setDraft(query.data) }, [query.data])
+  const save = useMutation({
+    mutationFn: (body: ModelSettingsDocument) => api(path, { method: 'PUT', body: JSON.stringify(body) }),
+    onSuccess: () => { toast.success(t('saved')); void client.invalidateQueries({ queryKey: ['model-settings'] }) },
+    onError: (error: Error) => toast.error(error.message),
+  })
+  const regexError = useMemo(() => {
+    const pattern = draft?.model_blacklist_regex ?? ''
+    if (new TextEncoder().encode(pattern).length > 2048) return t('modelBlacklistRegexTooLong')
+    if (!pattern) return ''
+    try { new RegExp(pattern); return '' } catch { return t('modelBlacklistRegexInvalid') }
+  }, [draft?.model_blacklist_regex, t])
+  if (query.isError) return <QueryError retry={() => void query.refetch()} />
+  if (query.isLoading || !draft) return <SkeletonRows count={3} />
+  const set = <K extends keyof ModelSettingsDocument>(key: K, value: ModelSettingsDocument[K]) => {
+    setDraft((current) => current ? { ...current, [key]: value } : current)
+  }
+  const submit = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    if (regexError) return
+    save.mutate(draft)
+  }
+  return (
+    <>
+      <PageHeader title={t('modelSettings')} description={t('modelSettingsDescription')} />
+      <Text size="sm" c="dimmed" mb="md">{t('instanceModelSettingsScope')}</Text>
+      <Paper withBorder p={{ base: 'md', sm: 'lg' }}>
+        <form onSubmit={submit}>
+          <Stack gap="lg">
+            <SimpleGrid cols={{ base: 1, md: 2 }} spacing="lg" verticalSpacing="lg">
+              <Switch checked={draft.fallback_to_channels_on_model_not_found} onChange={(event) => set('fallback_to_channels_on_model_not_found', event.currentTarget.checked)} label={t('modelFallback')} description={t('modelFallbackHint')} />
+              <Switch checked={draft.query_all_channel_models} onChange={(event) => set('query_all_channel_models', event.currentTarget.checked)} label={t('queryAllChannelModels')} description={t('queryAllChannelModelsHint')} />
+              <Switch checked={draft.default_model_api_include_all} onChange={(event) => set('default_model_api_include_all', event.currentTarget.checked)} label={t('defaultModelApiIncludeAll')} description={t('defaultModelApiIncludeAllHint')} />
+              <Switch checked={draft.auto_reasoning_effort} onChange={(event) => set('auto_reasoning_effort', event.currentTarget.checked)} label={t('autoReasoningEffort')} description={t('autoReasoningEffortHint')} />
+              <Switch checked={draft.hide_unroutable_models_in_list} onChange={(event) => set('hide_unroutable_models_in_list', event.currentTarget.checked)} label={t('hideUnroutableModels')} description={t('hideUnroutableModelsHint')} />
+            </SimpleGrid>
+            <TextInput
+              label={t('modelBlacklistRegex')}
+              description={t('modelBlacklistRegexHint')}
+              placeholder={t('modelBlacklistRegexPlaceholder')}
+              value={draft.model_blacklist_regex}
+              onChange={(event) => set('model_blacklist_regex', event.currentTarget.value)}
+              error={regexError || undefined}
+              maxLength={2048}
+            />
+            <Group justify="flex-end">
+              <Button type="submit" loading={save.isPending} disabled={Boolean(regexError)}>{t('save')}</Button>
+            </Group>
+          </Stack>
+        </form>
       </Paper>
     </>
   )

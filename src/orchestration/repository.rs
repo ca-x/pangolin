@@ -122,6 +122,7 @@ pub async fn candidates(
     context: &Value,
     routing: &Routing,
     decisions: &mut Vec<Decision>,
+    allow_direct_channel_model: bool,
 ) -> Result<Vec<Candidate>> {
     let rows = Row::find_by_statement(statement(r#"
         SELECT m.id AS model_id,p.id AS provider_id,c.id AS credential_id,m.public_name,m.upstream_name,m.capabilities,
@@ -155,7 +156,7 @@ pub async fn candidates(
             serde_json::from_value(settings.get("tags").cloned().unwrap_or(json!([])))
                 .map_err(|_| Error::Configuration)?;
         let mut rank = (row.priority, 1);
-        let mut matched = row.public_name == model;
+        let mut matched = allow_direct_channel_model && row.public_name == model;
         let mut association_matched = false;
         let mut association_excluded = false;
         for association in &associations {

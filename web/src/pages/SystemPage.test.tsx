@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter } from 'react-router'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
@@ -547,5 +547,108 @@ describe('orchestration settings are a form over the stored document', () => {
     expect(await screen.findByText(/neither project nor instance administration/)).toBeInTheDocument()
     expect(screen.queryByRole('tab', { name: 'Orchestration settings' })).not.toBeInTheDocument()
     expect(screen.queryByLabelText(/Routing policy/)).not.toBeInTheDocument()
+  })
+})
+
+describe('model settings are an instance form', () => {
+  beforeEach(async () => {
+    await i18n.changeLanguage('en')
+    vi.clearAllMocks()
+  })
+
+  const modelSettings = {
+    version: 1,
+    fallback_to_channels_on_model_not_found: true,
+    query_all_channel_models: true,
+    default_model_api_include_all: false,
+    auto_reasoning_effort: false,
+    model_blacklist_regex: '^private-',
+    hide_unroutable_models_in_list: true,
+  }
+
+  const renderModelSettings = async () => {
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input)
+      if (path.endsWith('/projects')) return json([project])
+      if (path.includes('/permissions')) return json(['*'])
+      if (path.endsWith('/settings/models') && init?.method === 'PUT') return json({ ok: true })
+      if (path.endsWith('/settings/models')) return json(modelSettings)
+      return paged([])
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    renderPage()
+    await userEvent.click(await screen.findByRole('tab', { name: 'Model settings' }, { timeout: 3_000 }))
+    return fetchMock
+  }
+
+  it('loads every stored knob and submits one versioned document', async () => {
+    const fetchMock = await renderModelSettings()
+
+    expect(await screen.findByRole('heading', { name: 'Model settings' })).toBeInTheDocument()
+    expect(screen.getByText('Applies to the whole Pangolin instance, independent of the selected project.')).toBeInTheDocument()
+    expect(screen.getByRole('switch', { name: /^Fallback to channel models/ })).toBeChecked()
+    expect(screen.getByRole('switch', { name: /^Query all channel models/ })).toBeChecked()
+    expect(screen.getByRole('switch', { name: /^Include extended metadata by default/ })).not.toBeChecked()
+    expect(screen.getByRole('switch', { name: /^Infer reasoning effort from model suffix/ })).not.toBeChecked()
+    expect(screen.getByRole('switch', { name: /^Hide unroutable models/ })).toBeChecked()
+    expect(screen.getByLabelText('Model blacklist regex')).toHaveValue('^private-')
+
+    await userEvent.click(screen.getByRole('switch', { name: /^Include extended metadata by default/ }))
+    await userEvent.click(screen.getByRole('switch', { name: /^Infer reasoning effort from model suffix/ }))
+    await userEvent.clear(screen.getByLabelText('Model blacklist regex'))
+    await userEvent.type(screen.getByLabelText('Model blacklist regex'), '^internal-(chat|embed)$')
+    await userEvent.click(screen.getByRole('button', { name: 'Save' }))
+
+    await waitFor(() => expect(fetchMock.mock.calls.some(([, init]) => init?.method === 'PUT')).toBe(true))
+    const [path, init] = fetchMock.mock.calls.find(([, request]) => request?.method === 'PUT') as [string, RequestInit]
+    expect(path).toBe('/api/admin/v1/settings/models')
+    expect(JSON.parse(String(init.body))).toEqual({
+      ...modelSettings,
+      default_model_api_include_all: true,
+      auto_reasoning_effort: true,
+      model_blacklist_regex: '^internal-(chat|embed)$',
+    })
+    expect(vi.mocked(toast.success)).toHaveBeenCalledWith('Saved')
+  })
+
+  it('shows inline regex validation and never sends an invalid document', async () => {
+    const fetchMock = await renderModelSettings()
+    const regex = await screen.findByLabelText('Model blacklist regex')
+    await userEvent.clear(regex)
+    fireEvent.change(regex, { target: { value: '[' } })
+    await userEvent.click(screen.getByRole('button', { name: 'Save' }))
+
+    expect(await screen.findByText('Enter a valid regular expression.')).toBeInTheDocument()
+    expect(fetchMock.mock.calls.some(([, init]) => init?.method === 'PUT')).toBe(false)
+  })
+
+  it('offers retry after a load failure and stays hidden without owner scope', async () => {
+    let attempts = 0
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const path = String(input)
+      if (path.endsWith('/projects')) return json([project])
+      if (path.includes('/permissions')) return json(['*'])
+      if (path.endsWith('/settings/models')) {
+        attempts += 1
+        return attempts === 1 ? json({ error: { message: 'unavailable' } }, 503) : json(modelSettings)
+      }
+      return paged([])
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    renderPage()
+    await userEvent.click(await screen.findByRole('tab', { name: 'Model settings' }))
+    await userEvent.click(await screen.findByRole('button', { name: 'Retry' }))
+    expect(await screen.findByLabelText('Model blacklist regex')).toHaveValue('^private-')
+
+    cleanup()
+    vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
+      const path = String(input)
+      if (path.endsWith('/projects')) return json([project])
+      if (path.includes('/permissions')) return json(['project:manage'])
+      return paged([])
+    }))
+    renderPage(['project:manage'])
+    expect(await screen.findByRole('tab', { name: 'Orchestration settings' })).toBeInTheDocument()
+    expect(screen.queryByRole('tab', { name: 'Model settings' })).not.toBeInTheDocument()
   })
 })

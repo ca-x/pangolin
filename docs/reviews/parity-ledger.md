@@ -53,15 +53,15 @@ states plainly that no test guards it yet.
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | observability | 5 | 10 | 0 | 2 | 3 | 0 | 0 | 20 |
 | prompts & playground | 6 | 12 | 1 | 0 | 0 | 0 | 1 | 20 |
-| models, routing & pricing | 6 | 6 | 2 | 2 | 8 | 2 | 0 | 26 |
+| models, routing & pricing | 6 | 7 | 2 | 2 | 7 | 2 | 0 | 26 |
 | access control | 2 | 17 | 2 | 0 | 0 | 0 | 0 | 21 |
 | system settings & background work | 8 | 9 | 5 | 1 | 5 | 2 | 1 | 31 |
 | console-wide UX | 3 | 9 | 1 | 2 | 0 | 0 | 0 | 15 |
-| **total** | **30** | **63** | **11** | **7** | **16** | **4** | **2** | **133** |
+| **total** | **30** | **64** | **11** | **7** | **15** | **4** | **2** | **133** |
 
 Row count is unchanged at 133 — the six area reports' own findings. No row was
-dropped, merged or added. What changed is the status: **104 rows need no work**
-(30 already matched, 63 fixed, 11 refuted), **27 rows need work** (`partial` +
+dropped, merged or added. What changed is the status: **105 rows need no work**
+(30 already matched, 64 fixed, 11 refuted), **26 rows need work** (`partial` +
 `open` + `feature-build`), and **2 rows are recorded divergences** whose only
 remaining difference is deliberate.
 
@@ -149,7 +149,7 @@ Report: [parity-models-routing-pricing.md](parity-models-routing-pricing.md).
 | 9 | Catalog cards are never applied to console-created models | closed | fixed | The model create form sends a stable catalog card id; the server resolves the effective card and owns capabilities, both default prices and immutable metadata. Forged browser fields cannot override it, stale ids are refused, and manual creation/edit preservation remain supported. | `models-action-dialog.tsx:198-268` | `console_model_creation_applies_the_selected_catalog_card_server_side` plus `ModelsCatalog.test.tsx` picker/manual/error cases |
 | 10 | Model rows are channel bindings, not a global model record | closed | fixed | Pangolin retains its channel-bound internal model, while matching the observable card and lifecycle contract: bundled/fallback icon, developer/type, limits/costs, active/archived state, audited archive/restore, active-only routing/discovery and separate enabled state. | `internal/ent/schema/model.go:39-53` | B29 projection/UI plus B30 archive/restore/routing/discovery tests |
 | 11 | `/v1/models` returns no extended metadata | closed | fixed | Default response bytes remain unchanged. Exact `include=all` adds only the bounded typed B29 card projection after mapping/allowlist/endpoint/candidate visibility; absent/malformed cards omit metadata and unknown include values preserve the legacy shape. | `internal/server/api/openai.go:832,882` (`?include=all`) | six `model_discovery_*` contract tests, including exact bytes, mapped id, hidden model and malformed metadata |
-| 12 | No global model settings surface | open | — | Only instance name/branding/favicon/onboarding exist (`operations_api.rs:195-200`); list filtering is hard-coded (`orchestration/mod.rs:129,159-165`) | `models-settings-dialog.tsx:28-34` | a settings document + form test for blacklist/fallback/include-all |
+| 12 | No global model settings surface | closed | fixed | Owner-only versioned instance settings control channel fallback, discovery source, default extended metadata, reasoning-effort suffixes, channel-model blacklist and unroutable visibility. Strict writes/audited transactions and forward-tolerant reads back observable gateway/discovery behavior; System provides the bilingual responsive form. | `models-settings-dialog.tsx:28-34` | eight `b32_*` Rust cases and three focused SystemPage form cases |
 | 13 | Project default routing has no write path or UI | closed | fixed | `routing` is read, validated and written by the orchestration settings route (`operations_api.rs:611-655,697,721-722`); the console renders and submits it (`SystemPage.tsx:271-298`) | `models-settings-dialog.tsx` | the harness guard is still missing — see [Deferred corrections](#deferred-corrections) |
 | 14 | Association conditions: no builder, no domain fields | closed | fixed | The bounded sanitized context includes UTC daily time, media presence, stream and request format; typed field/operator validation fails invalid configuration closed. The bilingual nested all/any editor round-trips exact documents and retains raw JSON as an advanced escape hatch. | `models-association-dialog.tsx:61-143` | domain-context/evaluator Rust test plus `ModelsPage.test.tsx` structured/raw editor cases |
 | 15 | No `channel_tags + regex` type, no association exclusions | closed | fixed | Migration v24 adds `channel_tags_regex` and versioned association exclusions for channel name regexes, IDs and tags. Write-time bounds/regex checks and read-time revalidation make exclusions veto candidates fail-closed. | `internal/objects/model.go:59-76,99-116` | candidate/exclusion Rust test plus ModelsPage payload case |

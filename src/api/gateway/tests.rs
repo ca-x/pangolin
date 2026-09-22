@@ -468,6 +468,291 @@ async fn sql(f: &Fixture, query: &str, values: Vec<sea_orm::Value>) {
 fn chat() -> Value {
     json!({"model":"public","messages":[{"role":"user","content":"hello"}]})
 }
+
+fn b32_success() -> Router {
+    Router::new().route(
+        "/v1/chat/completions",
+        post(|| async { Json(json!({"choices":[{"message":{"content":"ok"}}]})) }),
+    )
+}
+
+fn b32_model_settings() -> Value {
+    json!({
+        "version": 1,
+        "fallback_to_channels_on_model_not_found": true,
+        "query_all_channel_models": true,
+        "default_model_api_include_all": false,
+        "auto_reasoning_effort": false,
+        "model_blacklist_regex": "",
+        "hide_unroutable_models_in_list": true,
+    })
+}
+
+async fn b32_store_model_settings(f: &Fixture, settings: &Value) {
+    sql(
+        f,
+        "INSERT INTO settings(key,value,updated_at) VALUES('model_settings',?,0) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        vec![settings.to_string().into()],
+    )
+    .await;
+}
+
+async fn b32_model_list(f: &Fixture, suffix: &str) -> Value {
+    let response = router(f.state.clone())
+        .oneshot(
+            Request::get(format!("/v1/models{suffix}"))
+                .header("authorization", format!("Bearer {}", f.token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap()).unwrap()
+}
+
+#[tokio::test]
+async fn b32_fallback_to_channels_on_model_not_found_changes_admission() {
+    let f = fixture(b32_success()).await;
+    let mut settings = b32_model_settings();
+    settings["fallback_to_channels_on_model_not_found"] = json!(false);
+    b32_store_model_settings(&f, &settings).await;
+
+    assert_eq!(
+        request(&f, "/v1/chat/completions", chat()).await.status(),
+        StatusCode::BAD_REQUEST,
+        "without fallback, a direct channel model is not an explicit configured route",
+    );
+
+    sql(
+        &f,
+        "INSERT INTO model_associations(id,project_id,match_type,pattern,created_at,updated_at) VALUES('b32-configured',?,'exact','public',0,0)",
+        vec![db::DEFAULT_PROJECT_ID.into()],
+    )
+    .await;
+    assert_eq!(
+        request(&f, "/v1/chat/completions", chat()).await.status(),
+        StatusCode::OK,
+        "an explicit association remains routable when fallback is disabled",
+    );
+}
+
+#[tokio::test]
+async fn b32_hidden_unroutable_models_excludes_disabled_direct_fallback() {
+    let f = fixture(b32_success()).await;
+    let mut settings = b32_model_settings();
+    settings["fallback_to_channels_on_model_not_found"] = json!(false);
+    settings["hide_unroutable_models_in_list"] = json!(true);
+    b32_store_model_settings(&f, &settings).await;
+
+    assert_eq!(
+        request(&f, "/v1/chat/completions", chat()).await.status(),
+        StatusCode::BAD_REQUEST,
+    );
+    assert!(
+        b32_model_list(&f, "").await["data"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "discovery must not advertise a direct channel name that admission rejects",
+    );
+}
+
+#[tokio::test]
+async fn b32_profile_mapping_remains_routable_without_direct_fallback() {
+    let f = fixture(b32_success()).await;
+    sql(
+        &f,
+        "INSERT INTO api_key_profiles(id,project_id,name,routing_policy_json,created_at,updated_at) VALUES('b32-profile',?,'b32 profile','{\"version\":1}',0,0)",
+        vec![db::DEFAULT_PROJECT_ID.into()],
+    )
+    .await;
+    sql(&f, "UPDATE api_keys SET profile_id='b32-profile'", vec![]).await;
+    sql(
+        &f,
+        "INSERT INTO api_key_profile_model_mappings(id,profile_id,source_model,target_model) VALUES('b32-mapping','b32-profile','client-alias','public')",
+        vec![],
+    )
+    .await;
+    let mut settings = b32_model_settings();
+    settings["fallback_to_channels_on_model_not_found"] = json!(false);
+    b32_store_model_settings(&f, &settings).await;
+    let mut body = chat();
+    body["model"] = json!("client-alias");
+
+    assert_eq!(
+        request(&f, "/v1/chat/completions", body).await.status(),
+        StatusCode::OK,
+        "an explicit profile mapping is a configured route, not direct-name fallback",
+    );
+}
+
+#[tokio::test]
+async fn b32_query_all_channel_models_selects_the_discovery_source() {
+    let f = fixture(Router::new()).await;
+    sql(
+        &f,
+        "INSERT INTO model_associations(id,project_id,match_type,pattern,created_at,updated_at) VALUES('b32-configured',?,'exact','configured-alias',0,0)",
+        vec![db::DEFAULT_PROJECT_ID.into()],
+    )
+    .await;
+    let mut settings = b32_model_settings();
+    settings["query_all_channel_models"] = json!(false);
+    b32_store_model_settings(&f, &settings).await;
+
+    let configured = b32_model_list(&f, "").await;
+    let ids = configured["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|model| model["id"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, ["configured-alias"]);
+
+    settings["query_all_channel_models"] = json!(true);
+    b32_store_model_settings(&f, &settings).await;
+    let all = b32_model_list(&f, "").await;
+    let ids = all["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|model| model["id"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, ["configured-alias", "public"]);
+}
+
+#[tokio::test]
+async fn b32_model_blacklist_regex_filters_only_channel_derived_discovery() {
+    let f = fixture(Router::new()).await;
+    let model = db::create_model(
+        &f.state.db,
+        &ModelInput {
+            provider_id: f.providers[0].clone(),
+            public_name: "private-model".into(),
+            upstream_name: "private-upstream".into(),
+            capabilities: None,
+            input_price_micros: None,
+            output_price_micros: None,
+            priority: None,
+        },
+        db::DEFAULT_PROJECT_ID,
+    )
+    .await
+    .unwrap();
+    sql(
+        &f,
+        "INSERT INTO model_associations(id,project_id,model_id,match_type,pattern,created_at,updated_at) VALUES('b32-private-configured',?,?,'exact','configured-private',0,0)",
+        vec![db::DEFAULT_PROJECT_ID.into(), model.id.into()],
+    )
+    .await;
+    let mut settings = b32_model_settings();
+    settings["model_blacklist_regex"] = json!("^private-");
+    b32_store_model_settings(&f, &settings).await;
+
+    let body = b32_model_list(&f, "").await;
+    let ids = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|model| model["id"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(!ids.contains(&"private-model"));
+    assert!(ids.contains(&"configured-private"));
+}
+
+#[tokio::test]
+async fn b32_default_model_api_include_all_changes_the_omitted_include_shape() {
+    let f = fixture(Router::new()).await;
+    sql(
+        &f,
+        "UPDATE models SET catalog_metadata_json=?",
+        vec![
+            json!({
+                "card": {
+                    "developer": "openai",
+                    "type": "chat",
+                    "logo_key": "lobehub:OpenAI",
+                    "limits": {"context": 8192},
+                    "cost_defaults": {"currency": "USD", "unit": "per_million_tokens"}
+                }
+            })
+            .to_string()
+            .into(),
+        ],
+    )
+    .await;
+    let mut settings = b32_model_settings();
+    settings["default_model_api_include_all"] = json!(true);
+    b32_store_model_settings(&f, &settings).await;
+    assert!(
+        b32_model_list(&f, "").await["data"][0]
+            .get("metadata")
+            .is_some()
+    );
+
+    settings["default_model_api_include_all"] = json!(false);
+    b32_store_model_settings(&f, &settings).await;
+    assert!(
+        b32_model_list(&f, "").await["data"][0]
+            .get("metadata")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn b32_auto_reasoning_effort_normalizes_the_model_and_overrides_effort() {
+    let seen = Arc::new(Mutex::new(vec![]));
+    let captured = seen.clone();
+    let upstream = Router::new().route(
+        "/v1/chat/completions",
+        post(move |Json(body): Json<Value>| {
+            let captured = captured.clone();
+            async move {
+                captured.lock().await.push(body);
+                Json(json!({"choices":[{"message":{"content":"ok"}}]}))
+            }
+        }),
+    );
+    let f = fixture(upstream).await;
+    let mut body = chat();
+    body["model"] = json!("public-high");
+    body["reasoning_effort"] = json!("low");
+    assert_eq!(
+        request(&f, "/v1/chat/completions", body.clone())
+            .await
+            .status(),
+        StatusCode::BAD_REQUEST,
+    );
+
+    let mut settings = b32_model_settings();
+    settings["auto_reasoning_effort"] = json!(true);
+    b32_store_model_settings(&f, &settings).await;
+    assert_eq!(
+        request(&f, "/v1/chat/completions", body).await.status(),
+        StatusCode::OK,
+    );
+    let seen = seen.lock().await;
+    assert_eq!(seen[0]["reasoning_effort"], "high");
+    assert_eq!(seen[0]["model"], "a-model");
+}
+
+#[tokio::test]
+async fn b32_hide_unroutable_models_in_list_changes_endpoint_discovery() {
+    let f = fixture(Router::new()).await;
+    sql(&f, "UPDATE models SET capabilities='[\"chat\"]'", vec![]).await;
+    assert!(
+        b32_model_list(&f, "?endpoint=%2Fv1%2Fresponses").await["data"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    let mut settings = b32_model_settings();
+    settings["hide_unroutable_models_in_list"] = json!(false);
+    b32_store_model_settings(&f, &settings).await;
+    let visible = b32_model_list(&f, "?endpoint=%2Fv1%2Fresponses").await;
+    assert_eq!(visible["data"][0]["id"], "public");
+}
 fn streaming() -> Value {
     let mut body = chat();
     body["stream"] = json!(true);
