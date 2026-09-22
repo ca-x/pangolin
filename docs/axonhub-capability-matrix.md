@@ -67,7 +67,7 @@ sign-in page; no provider trademark asset is copied into Pangolin.
 | Catalog online maintenance | Local CRUD, import/export, prioritized signed HTTPS subscriptions, ETag refresh, diff/status, atomic activation and last-known-good fallback |
 | Multiple credentials | Encrypted key list, OAuth/GCP credentials, suffix identification and per-key disable state |
 | Credential recovery | Invalid/encryption recovery path without leaking plaintext |
-| Proxy settings | HTTP/SOCKS URL, username/password, connection reuse policy |
+| Proxy settings | Direct HTTP/SOCKS policy plus reusable encrypted presets for channels, webhooks and catalog fetches |
 | Endpoint mappings | Per-format path/base URL/transport and provider-family routing |
 | Model discovery/sync | Fetch/query channel models, manual models, scheduled auto-sync |
 | Model transformations | Prefix, lowercase, explicit mappings, auto-trim, hide original/mapped |
@@ -138,12 +138,12 @@ sign-in page; no provider trademark asset is copied into Pangolin.
 | Capability | Target behavior |
 | --- | --- |
 | System initialization/onboarding | Owner, brand name/logo/title and onboarding progress |
-| System retry/model/quota settings | Global defaults with per-resource overrides |
+| System retry/model/quota settings | Currency/timezone, retry/error defaults, model policy and three quota-routing modes with per-resource overrides |
 | CORS and request timeouts | Operator configuration with safe defaults |
-| Data storage | Local and S3-compatible storage configuration |
-| Backup/restore | Selective resources, conflict strategies, secret preservation and validation |
-| Automatic backup | Schedule/frequency/storage/retention/status and manual trigger |
-| Webhooks | Targets, headers/body template, subscriptions, echo and delivery retry |
+| Data storage | Typed local, S3-compatible, GCS and WebDAV configuration with encrypted credentials and read-only connection tests |
+| Backup/restore | Selective resources, per-resource conflict strategies, secret preservation and validation |
+| Automatic backup | Interval/daily/cron timing with IANA timezone, storage/retention/status and manual trigger |
+| Webhooks | Targets, headers/body template, subscriptions, bounded timeout, proxy preset, echo and delivery retry |
 | Scheduler | Probe, model sync, quota collection, backup and GC jobs |
 | Favicon/static SPA | Embedded branded assets and deep links |
 | Playground/chat | Admin-selected channel/model request testing |
