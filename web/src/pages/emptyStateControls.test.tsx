@@ -66,9 +66,10 @@ describe('empty states drop controls that cannot do anything', () => {
     expect(await screen.findByRole('button', { name: 'Pause' })).toBeInTheDocument()
     await pickOption('Status code', '500')
     expect(await screen.findByRole('button', { name: 'Clear filters' })).toBeInTheDocument()
-    expect(screen.getByRole('combobox', { name: 'Status code' })).toHaveValue('500')
+    const status = screen.getByRole('combobox', { name: 'Status code' })
+    expect(status.closest('.mantine-MultiSelect-root')).toHaveTextContent('500')
     await userEvent.click(screen.getByRole('button', { name: 'Clear filters' }))
-    expect(screen.getByRole('combobox', { name: 'Status code' })).toHaveValue('')
+    expect(status.closest('.mantine-MultiSelect-root')).not.toHaveTextContent('500')
   })
 
   it('localizes the clear-filters action', async () => {

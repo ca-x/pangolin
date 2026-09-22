@@ -438,7 +438,7 @@ function ModelRulesEditor({ name, label, value, setValid }: { name: string; labe
         <TextInput aria-label={`${t('mappingTarget')} ${index + 1}`} placeholder={t('mappingTarget')} value={row.target} required onChange={(event) => updateRows(rows.map((item) => item.id === row.id ? { ...item, target: event.currentTarget.value } : item))} style={{ flex: 1, minWidth: 0 }} />
         <Tooltip label={t('removeMapping')}><ActionIcon size={40} variant="subtle" color="red" aria-label={`${t('removeMapping')} ${index + 1}`} onClick={() => updateRows(rows.filter((item) => item.id !== row.id))}><Trash2 size={16} /></ActionIcon></Tooltip>
       </Group>)}
-      {duplicateSources && <Text size="xs" c="red" role="alert">{t('duplicateMappingSource')}</Text>}
+      {duplicateSources && <Text size="xs" className="error-text" role="alert">{t('duplicateMappingSource')}</Text>}
     </Stack>
     <Button variant="subtle" size="compact-sm" justify="flex-start" leftSection={<ChevronRight size={15} style={{ transform: advanced ? 'rotate(90deg)' : undefined, transition: 'transform 150ms' }} />} onClick={() => setAdvanced((open) => !open)} aria-expanded={advanced}>{t('advancedModelRules')}</Button>
     <Collapse expanded={advanced} keepMounted>
