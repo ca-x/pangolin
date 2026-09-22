@@ -1891,7 +1891,7 @@ mod tests {
 
         assert_eq!(
             scalar(&db, "SELECT COUNT(*) AS count FROM schema_migrations").await,
-            23
+            24
         );
         assert_eq!(
             scalar(
