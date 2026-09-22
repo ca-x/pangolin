@@ -1012,6 +1012,23 @@ CREATE INDEX idx_model_associations_model ON model_associations(model_id);
 CREATE INDEX idx_model_associations_provider ON model_associations(provider_id);
 "#;
 
+const V25_PROVIDER_OAUTH_STATES: &str = r#"
+CREATE TABLE provider_oauth_states (
+    state_digest TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    provider_id TEXT NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
+    flow TEXT NOT NULL CHECK(flow IN ('codex','xai','claude_code','antigravity','github_copilot')),
+    client_id TEXT NOT NULL,
+    redirect_uri TEXT,
+    secret_envelope TEXT NOT NULL,
+    interval_seconds INTEGER NOT NULL DEFAULT 0 CHECK(interval_seconds BETWEEN 0 AND 60),
+    last_poll_at INTEGER,
+    expires_at INTEGER NOT NULL,
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX idx_provider_oauth_states_expiry ON provider_oauth_states(expires_at);
+"#;
+
 #[derive(FromQueryResult)]
 struct Count {
     count: i64,
@@ -1442,6 +1459,25 @@ pub async fn migrate(db: &DatabaseConnection) -> Result<()> {
             .await?;
         transaction.commit().await?;
     }
+    let provider_oauth_applied = Count::find_by_statement(statement(
+        "SELECT COUNT(*) AS count FROM schema_migrations WHERE version=25",
+    ))
+    .one(db)
+    .await?
+    .is_some_and(|row| row.count > 0);
+    if !provider_oauth_applied {
+        let transaction = db.begin().await?;
+        transaction
+            .execute_unprepared(V25_PROVIDER_OAUTH_STATES)
+            .await
+            .context("failed to add provider OAuth state storage")?;
+        transaction
+            .execute(statement(
+                "INSERT INTO schema_migrations(version,applied_at) VALUES(25,unixepoch())",
+            ))
+            .await?;
+        transaction.commit().await?;
+    }
     Ok(())
 }
 
@@ -1479,7 +1515,7 @@ mod tests {
 
         assert_eq!(
             scalar(&db, "SELECT MAX(version) AS count FROM schema_migrations").await,
-            24
+            25
         );
         assert_eq!(
             scalar(
@@ -1549,6 +1585,7 @@ mod tests {
             "catalog_document_extensions",
             "channel_credentials",
             "credential_recovery_tokens",
+            "provider_oauth_states",
             "channel_settings",
             "model_associations",
             "model_prices",
@@ -1649,6 +1686,7 @@ mod tests {
             "idx_response_sessions_expiry",
             "idx_user_role_bindings_global_unique",
             "idx_channel_credentials_provider",
+            "idx_provider_oauth_states_expiry",
             "idx_model_associations_project",
             "idx_model_prices_model_schedule",
             "idx_model_prices_global_version",
@@ -1794,7 +1832,7 @@ mod tests {
 
         assert_eq!(
             scalar(&db, "SELECT COUNT(*) AS count FROM schema_migrations").await,
-            21
+            22
         );
         assert_eq!(
             scalar(
@@ -2236,7 +2274,7 @@ mod tests {
 
         assert_eq!(
             scalar(&db, "SELECT MAX(version) AS count FROM schema_migrations").await,
-            24
+            25
         );
         assert_eq!(
             scalar(
@@ -2356,7 +2394,7 @@ mod tests {
 
         assert_eq!(
             scalar(&db, "SELECT MAX(version) AS count FROM schema_migrations").await,
-            24
+            25
         );
         assert_eq!(
             scalar(

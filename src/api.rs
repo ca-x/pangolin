@@ -17,6 +17,7 @@ use uuid::Uuid;
 mod catalog_api;
 pub(crate) mod errors;
 pub(crate) mod gateway;
+mod http_policy;
 mod operations_api;
 mod protocols;
 mod trace_preview;
@@ -231,6 +232,10 @@ pub fn router(state: AppState) -> Router {
         .layer(middleware::from_fn(errors::native_errors))
         .layer(middleware::from_fn(capture_trusted_client_ip))
         .layer(middleware::from_fn_with_state(state.clone(), maintenance))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            http_policy::enforce,
+        ))
         .with_state(state)
 }
 
@@ -360,6 +365,12 @@ async fn bootstrap(
         .transpose()?
         .unwrap_or_else(|| "Pangolin".into());
     let system=system.unwrap_or_else(||json!({"instance_name":legacy_name,"branding_name":legacy_name,"favicon_url":"/logo.webp","onboarding_complete":false}));
+    let branding = json!({
+        "instance_name": system.get("instance_name").and_then(Value::as_str).unwrap_or("Pangolin"),
+        "branding_name": system.get("branding_name").and_then(Value::as_str).unwrap_or("Pangolin / 鲮鲤"),
+        "favicon_url": system.get("favicon_url").and_then(Value::as_str).unwrap_or("/logo.webp"),
+        "onboarding_complete": system.get("onboarding_complete").and_then(Value::as_bool).unwrap_or(false),
+    });
     Ok(Json(json!({
         "initialized": initialized,
         "authenticated": user.is_some(),
@@ -369,7 +380,7 @@ async fn bootstrap(
         "capture_payloads": state.config.capture_payloads,
         "observability_available": state.observations.is_available(),
         "build": crate::build_info::build_info_json(),
-        "branding": system,
+        "branding": branding,
     })))
 }
 
@@ -1905,6 +1916,7 @@ mod tests {
             provider_name: "Anthropic".into(),
             provider_kind: "anthropic".into(),
             base_url: format!("http://{address}/v1"),
+            credential_type: "api_key".into(),
             secret_envelope: String::new(),
             proxy_url: None,
             proxy_username: None,

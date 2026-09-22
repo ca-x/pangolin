@@ -346,7 +346,11 @@ async fn execute_inner(
                 tokio::time::sleep(Duration::from_millis(candidate.retry.delay_ms)).await;
             }
             let target = &candidate.target;
-            let secret = match state.secrets.decrypt(&target.secret_envelope) {
+            let secret = match state
+                .secrets
+                .decrypt(&target.secret_envelope)
+                .and_then(|secret| crate::oauth::credential_secret(&target.credential_type, secret))
+            {
                 Ok(secret) => secret,
                 Err(error) => {
                     tracing::error!(request_id,channel=candidate.provider_id,credential=candidate.credential_id,error=%error,"channel credential is unrecoverable");

@@ -155,6 +155,14 @@ pub(super) fn router(state: AppState) -> Router<AppState> {
             get(system_settings).put(set_system_settings),
         )
         .route(
+            "/api/admin/v1/projects/{project}/providers/{provider}/oauth/{flow}/start",
+            post(start_provider_oauth),
+        )
+        .route(
+            "/api/admin/v1/projects/{project}/providers/{provider}/oauth/{flow}/complete",
+            post(complete_provider_oauth),
+        )
+        .route(
             "/api/admin/v1/settings/models",
             get(model_settings).put(set_model_settings),
         )
@@ -571,6 +579,13 @@ struct SystemSettings {
     branding_name: String,
     favicon_url: String,
     onboarding_complete: bool,
+    #[serde(default)]
+    cors_allowed_origins: Vec<String>,
+    #[serde(default = "default_request_timeout_ms")]
+    request_timeout_ms: u64,
+}
+fn default_request_timeout_ms() -> u64 {
+    super::http_policy::DEFAULT_REQUEST_TIMEOUT_MS
 }
 impl Default for SystemSettings {
     fn default() -> Self {
@@ -579,6 +594,8 @@ impl Default for SystemSettings {
             branding_name: "Pangolin / 鲮鲤".into(),
             favicon_url: "/logo.webp".into(),
             onboarding_complete: false,
+            cors_allowed_origins: Vec::new(),
+            request_timeout_ms: default_request_timeout_ms(),
         }
     }
 }
@@ -610,6 +627,11 @@ async fn set_system_settings(
         || input.branding_name.len() > 128
         || input.favicon_url.len() > 2048
         || !(input.favicon_url.starts_with('/') || input.favicon_url.starts_with("https://"))
+        || !(super::http_policy::HttpPolicy {
+            cors_allowed_origins: input.cors_allowed_origins.clone(),
+            request_timeout_ms: input.request_timeout_ms,
+        })
+        .validate()
     {
         return Err(ApiError::BadRequest("invalid system settings".into()));
     }
@@ -621,6 +643,396 @@ async fn set_system_settings(
     Ok(Json(json!({"ok":true})))
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderOauthStartInput {
+    client_id: String,
+    redirect_uri: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderOauthCompleteInput {
+    state: String,
+    code: Option<String>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct ProviderOauthSecret {
+    verifier: Option<String>,
+    device_code: Option<String>,
+}
+
+fn oauth_state_digest(state: &str) -> String {
+    blake3::hash(state.as_bytes()).to_hex().to_string()
+}
+
+fn validate_oauth_redirect(
+    state: &AppState,
+    headers: &HeaderMap,
+    redirect_uri: &str,
+) -> Result<(), ApiError> {
+    if redirect_uri.len() > 2048 {
+        return Err(ApiError::BadRequest("invalid OAuth redirect URI".into()));
+    }
+    let redirect = reqwest::Url::parse(redirect_uri)
+        .map_err(|_| ApiError::BadRequest("invalid OAuth redirect URI".into()))?;
+    if !matches!(redirect.scheme(), "http" | "https")
+        || redirect.host_str().is_none()
+        || !redirect.username().is_empty()
+        || redirect.password().is_some()
+        || redirect.query().is_some()
+        || redirect.fragment().is_some()
+    {
+        return Err(ApiError::BadRequest("invalid OAuth redirect URI".into()));
+    }
+    let origin = redirect.origin().ascii_serialization();
+    let request_origin = headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .and_then(super::http_policy::canonical_origin);
+    let public_origin = state
+        .config
+        .public_url
+        .as_deref()
+        .and_then(|value| reqwest::Url::parse(value).ok())
+        .and_then(|mut value| {
+            value.set_path("");
+            value.set_query(None);
+            value.set_fragment(None);
+            super::http_policy::canonical_origin(value.as_str())
+        });
+    if request_origin.as_deref() != Some(origin.as_str())
+        && public_origin.as_deref() != Some(origin.as_str())
+    {
+        return Err(ApiError::BadRequest(
+            "OAuth redirect origin is not allowed".into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn start_provider_oauth(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((project, provider, flow)): Path<(String, String, String)>,
+    Json(input): Json<ProviderOauthStartInput>,
+) -> Result<Json<Value>, ApiError> {
+    let user = actor(&state, &headers, Some(&project), true).await?;
+    if input.client_id.trim().is_empty()
+        || input.client_id.trim() != input.client_id
+        || input.client_id.len() > 512
+        || input.client_id.chars().any(char::is_control)
+    {
+        return Err(ApiError::BadRequest("invalid OAuth client ID".into()));
+    }
+    if state
+        .db
+        .query_one(sql(
+            "SELECT id FROM providers WHERE id=? AND project_id=?",
+            vec![provider.clone().into(), project.clone().into()],
+        ))
+        .await?
+        .is_none()
+    {
+        return Err(ApiError::NotFound);
+    }
+    let flow = crate::oauth::Flow::parse(&flow)
+        .ok_or_else(|| ApiError::BadRequest("unsupported OAuth flow".into()))?;
+    let spec = provider_oauth_spec(&state, &provider, flow).await?;
+    let (response, secret, expires_in, interval) = if flow.is_device() {
+        if input.redirect_uri.is_some() {
+            return Err(ApiError::BadRequest(
+                "device OAuth does not accept a redirect URI".into(),
+            ));
+        }
+        let start = crate::oauth::start_device(&state.oidc_client, spec, &input.client_id)
+            .await
+            .map_err(provider_oauth_error)?;
+        let secret = ProviderOauthSecret {
+            verifier: None,
+            device_code: Some(start.device_code.clone()),
+        };
+        let expires_in = start.expires_in;
+        let interval = start.interval;
+        (
+            serde_json::to_value(&start).unwrap(),
+            secret,
+            expires_in,
+            interval,
+        )
+    } else {
+        let redirect = input
+            .redirect_uri
+            .as_deref()
+            .ok_or_else(|| ApiError::BadRequest("OAuth redirect URI is required".into()))?;
+        validate_oauth_redirect(&state, &headers, redirect)?;
+        let start = crate::oauth::start_browser(spec, &input.client_id, redirect)
+            .map_err(provider_oauth_error)?;
+        let secret = ProviderOauthSecret {
+            verifier: Some(start.verifier.clone()),
+            device_code: None,
+        };
+        (
+            serde_json::to_value(&start).unwrap(),
+            secret,
+            crate::oauth::MAX_FLOW_LIFETIME_SECS as u64,
+            0,
+        )
+    };
+    let state_value = response["state"]
+        .as_str()
+        .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("OAuth start omitted state")))?;
+    let digest = oauth_state_digest(state_value);
+    let envelope = state
+        .secrets
+        .encrypt(&serde_json::to_string(&secret).unwrap())?;
+    let now = db::now();
+    let tx = state.db.begin().await?;
+    tx.execute(sql(
+        "DELETE FROM provider_oauth_states WHERE project_id=? AND provider_id=? AND flow=?",
+        vec![
+            project.clone().into(),
+            provider.clone().into(),
+            flow.as_str().into(),
+        ],
+    ))
+    .await?;
+    tx.execute(sql(
+        "INSERT INTO provider_oauth_states(state_digest,project_id,provider_id,flow,client_id,redirect_uri,secret_envelope,interval_seconds,expires_at,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+        vec![
+            digest.into(),
+            project.clone().into(),
+            provider.clone().into(),
+            flow.as_str().into(),
+            input.client_id.into(),
+            input.redirect_uri.into(),
+            envelope.into(),
+            (interval as i64).into(),
+            (now + expires_in as i64).into(),
+            now.into(),
+        ],
+    ))
+    .await?;
+    audit_in(&tx, &user, &project, "provider_oauth.start", &provider).await?;
+    tx.commit().await?;
+    Ok(Json(response))
+}
+
+async fn complete_provider_oauth(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((project, provider, flow)): Path<(String, String, String)>,
+    Json(input): Json<ProviderOauthCompleteInput>,
+) -> Result<Json<Value>, ApiError> {
+    let user = actor(&state, &headers, Some(&project), true).await?;
+    let flow = crate::oauth::Flow::parse(&flow)
+        .ok_or_else(|| ApiError::BadRequest("unsupported OAuth flow".into()))?;
+    if input.state.len() < 32 || input.state.len() > 256 {
+        return Err(ApiError::BadRequest("invalid OAuth state".into()));
+    }
+    let digest = oauth_state_digest(&input.state);
+    let row = state
+        .db
+        .query_one(sql(
+            "SELECT client_id,redirect_uri,secret_envelope,interval_seconds,last_poll_at,expires_at FROM provider_oauth_states WHERE state_digest=? AND project_id=? AND provider_id=? AND flow=?",
+            vec![
+                digest.clone().into(),
+                project.clone().into(),
+                provider.clone().into(),
+                flow.as_str().into(),
+            ],
+        ))
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    let now = db::now();
+    let expires_at = row.try_get::<i64>("", "expires_at")?;
+    if expires_at <= now {
+        let tx = state.db.begin().await?;
+        tx.execute(sql(
+            "DELETE FROM provider_oauth_states WHERE state_digest=?",
+            vec![digest.into()],
+        ))
+        .await?;
+        audit_in(&tx, &user, &project, "provider_oauth.expired", &provider).await?;
+        tx.commit().await?;
+        return Err(ApiError::BadRequest("OAuth authorization expired".into()));
+    }
+    let client_id = row.try_get::<String>("", "client_id")?;
+    let redirect_uri = row.try_get::<Option<String>>("", "redirect_uri")?;
+    let interval = row.try_get::<i64>("", "interval_seconds")?;
+    let last_poll = row.try_get::<Option<i64>>("", "last_poll_at")?;
+    if flow.is_device() && last_poll.is_some_and(|last| now < last + interval) {
+        return Ok(Json(
+            json!({"status":"pending","retry_after":last_poll.unwrap() + interval - now}),
+        ));
+    }
+    if flow.is_device() {
+        let tx = state.db.begin().await?;
+        tx.execute(sql(
+            "UPDATE provider_oauth_states SET last_poll_at=? WHERE state_digest=?",
+            vec![now.into(), digest.clone().into()],
+        ))
+        .await?;
+        audit_in(&tx, &user, &project, "provider_oauth.poll", &provider).await?;
+        tx.commit().await?;
+    }
+    let secret_document = state
+        .secrets
+        .decrypt(&row.try_get::<String>("", "secret_envelope")?)?;
+    let secret: ProviderOauthSecret =
+        serde_json::from_str(&secret_document).map_err(|error| ApiError::Internal(error.into()))?;
+    let spec = provider_oauth_spec(&state, &provider, flow).await?;
+    let token = if flow.is_device() {
+        crate::oauth::poll_device(
+            &state.oidc_client,
+            spec,
+            &client_id,
+            secret
+                .device_code
+                .as_deref()
+                .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("device code missing")))?,
+        )
+        .await
+    } else {
+        crate::oauth::exchange_browser(
+            &state.oidc_client,
+            spec,
+            &client_id,
+            redirect_uri
+                .as_deref()
+                .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("redirect URI missing")))?,
+            input
+                .code
+                .as_deref()
+                .filter(|code| !code.is_empty() && code.len() <= 4096)
+                .ok_or_else(|| ApiError::BadRequest("OAuth code is required".into()))?,
+            secret
+                .verifier
+                .as_deref()
+                .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("PKCE verifier missing")))?,
+        )
+        .await
+    };
+    let token = match token {
+        Ok(token) => token.into_value(),
+        Err(crate::oauth::Error::Pending) => {
+            return Ok(Json(
+                json!({"status":"pending","retry_after":interval.max(5)}),
+            ));
+        }
+        Err(crate::oauth::Error::Expired | crate::oauth::Error::Declined) => {
+            let tx = state.db.begin().await?;
+            tx.execute(sql(
+                "DELETE FROM provider_oauth_states WHERE state_digest=?",
+                vec![digest.into()],
+            ))
+            .await?;
+            audit_in(&tx, &user, &project, "provider_oauth.failed", &provider).await?;
+            tx.commit().await?;
+            return Err(ApiError::BadRequest(
+                "OAuth authorization did not complete".into(),
+            ));
+        }
+        Err(error) => return Err(provider_oauth_error(error)),
+    };
+    let credential = operations::id();
+    let token_envelope = state.secrets.encrypt(&token.to_string())?;
+    let tx = state.db.begin().await?;
+    tx.execute(sql(
+        "INSERT INTO channel_credentials(id,provider_id,credential_type,secret_envelope,suffix,priority,enabled,settings_json,created_at,updated_at) VALUES(?,?,?,?,'',100,1,?,?,?)",
+        vec![
+            credential.clone().into(),
+            provider.clone().into(),
+            format!("oauth_{}", flow.as_str()).into(),
+            token_envelope.into(),
+            json!({"version":1,"oauth_flow":flow.as_str()}).to_string().into(),
+            now.into(),
+            now.into(),
+        ],
+    ))
+    .await?;
+    tx.execute(sql(
+        "DELETE FROM provider_oauth_states WHERE state_digest=?",
+        vec![digest.into()],
+    ))
+    .await?;
+    audit_in(
+        &tx,
+        &user,
+        &project,
+        "credentials.oauth.create",
+        &credential,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(Json(
+        json!({"status":"complete","credential_id":credential}),
+    ))
+}
+
+fn provider_oauth_error(error: crate::oauth::Error) -> ApiError {
+    match error {
+        crate::oauth::Error::InvalidConfiguration => {
+            ApiError::BadRequest("invalid OAuth configuration".into())
+        }
+        crate::oauth::Error::Pending => ApiError::Conflict("OAuth authorization is pending".into()),
+        crate::oauth::Error::Expired => ApiError::BadRequest("OAuth authorization expired".into()),
+        crate::oauth::Error::Declined => {
+            ApiError::BadRequest("OAuth authorization was declined".into())
+        }
+        crate::oauth::Error::ProviderUnavailable => {
+            ApiError::Upstream("OAuth provider is unavailable".into())
+        }
+    }
+}
+
+async fn provider_oauth_spec(
+    state: &AppState,
+    provider: &str,
+    flow: crate::oauth::Flow,
+) -> Result<crate::oauth::ProviderSpec, ApiError> {
+    #[cfg(test)]
+    {
+        let settings = state
+            .db
+            .query_one(sql(
+                "SELECT settings_json FROM providers WHERE id=?",
+                vec![provider.into()],
+            ))
+            .await?
+            .and_then(|row| row.try_get::<String>("", "settings_json").ok())
+            .and_then(|document| serde_json::from_str::<Value>(&document).ok());
+        if let Some(settings) = settings {
+            let token = settings
+                .pointer("/oauth_test/token_endpoint")
+                .and_then(Value::as_str);
+            if let Some(token) = token {
+                if flow.is_device() {
+                    if let Some(device) = settings
+                        .pointer("/oauth_test/device_endpoint")
+                        .and_then(Value::as_str)
+                    {
+                        return Ok(crate::oauth::ProviderSpec::test_device(
+                            device.to_owned(),
+                            token.to_owned(),
+                        ));
+                    }
+                } else if let Some(authorization) = settings
+                    .pointer("/oauth_test/authorization_endpoint")
+                    .and_then(Value::as_str)
+                {
+                    return Ok(crate::oauth::ProviderSpec::test_browser(
+                        authorization.to_owned(),
+                        token.to_owned(),
+                    ));
+                }
+            }
+        }
+    }
+    let _ = (state, provider);
+    Ok(crate::oauth::ProviderSpec::for_flow(flow))
+}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ModelSettingsInput {

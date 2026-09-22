@@ -1,4 +1,4 @@
-import { ActionIcon, Alert, Badge, Button, Card, Collapse, Group, Modal, Paper, SimpleGrid, Skeleton, Stack, Switch, Tabs, Text, Textarea, TextInput, Title, Tooltip } from '@mantine/core'
+import { ActionIcon, Alert, Badge, Button, Card, Code, Collapse, Group, Modal, Paper, Select, SimpleGrid, Skeleton, Stack, Switch, Tabs, Text, Textarea, TextInput, Title, Tooltip } from '@mantine/core'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { ChevronRight, Plus, Trash2 } from 'lucide-react'
 import { useEffect, useState } from 'react'
@@ -71,7 +71,14 @@ function useProviderKindLabel() {
 }
 
 /** Credential types as the record system stores them; anything else is data. */
-const CREDENTIAL_TYPE_KEYS: Record<string, string> = { api_key: 'credentialTypeApiKey' }
+const CREDENTIAL_TYPE_KEYS: Record<string, string> = {
+  api_key: 'credentialTypeApiKey',
+  oauth_codex: 'oauthFlow_codex',
+  oauth_xai: 'oauthFlow_xai',
+  oauth_claude_code: 'oauthFlow_claude_code',
+  oauth_antigravity: 'oauthFlow_antigravity',
+  oauth_github_copilot: 'oauthFlow_github_copilot',
+}
 
 function useCredentialTypeLabel() {
   const { t } = useTranslation()
@@ -223,6 +230,7 @@ function CredentialsPanel() {
   const retryOptions = () => void query.refetch()
   return (
     <>
+      <OAuthCredentialPanel options={options} optionsError={optionsError} retryOptions={retryOptions} />
       <ResourcePage resource="credentials" title={t('credentials')} description={t('credentialsDescription')} empty={t('credentialEmpty')} selectable="credentials" createLabel={t('addCredential')} notice={<HealthNotice kind="credential" />} columns={[{ key: 'provider_name', label: t('channel') }, { key: 'suffix', label: t('suffix'), mono: true }, { key: 'credential_type', label: t('credentialType'), render: (value) => credentialType(value) }, { key: 'state', label: t('credentialState'), render: (value) => <Badge variant="light" color={value === 'unrecoverable' ? 'red' : 'green'}>{t(value === 'unrecoverable' ? 'credentialUnrecoverable' : 'credentialReady')}</Badge> }, { key: 'priority', label: t('priority') }, { key: 'health', label: t('credentialHealth'), render: (_value, row) => <HealthCell kind="credential" id={String(row.id)} /> }, { key: 'enabled', label: t('status'), render: (value) => <EnabledPill enabled={value} /> }]} rowActions={(row) => row.state === 'unrecoverable' ? <CredentialRecoveryAction row={row} /> : null} fields={[{ key: 'provider_id', label: t('channel'), kind: 'select', required: true, options, error: optionsError, onRetry: retryOptions }, { key: 'credential_type', label: t('credentialType'), defaultValue: 'api_key', required: true }, { key: 'secret', label: t('secret'), kind: 'secret', hint: t('secretUpdateHint'), omitWhenBlank: true }, { key: 'priority', label: t('priority'), kind: 'number', defaultValue: 100 }, { key: 'enabled', label: t('status'), kind: 'checkbox' }, { key: 'settings', label: t('advancedSettings'), kind: 'json', defaultValue: { version: 1 } }]} />
       <BulkToggle resource="credentials" />
     </>
@@ -239,6 +247,78 @@ function ChannelSyncAction({ id, name }: { id: string; name: string }) {
     onError: (error: Error) => toast.error(error.message),
   })
   return <Button variant="subtle" size="compact-sm" aria-label={`${t('syncModels')} ${name}`} loading={sync.isPending} onClick={() => sync.mutate()}>{t('syncModels')}</Button>
+}
+
+type OAuthStart = { state: string; authorization_url?: string; verification_uri?: string; user_code?: string; expires_in?: number; interval?: number }
+const OAUTH_FLOWS = ['codex', 'xai', 'claude_code', 'antigravity', 'github_copilot'] as const
+
+function OAuthCredentialPanel({ options, optionsError, retryOptions }: { options: { value: string; label: string }[]; optionsError?: string; retryOptions: () => void }) {
+  const { t } = useTranslation()
+  const { project } = useProject()
+  const client = useQueryClient()
+  const [provider, setProvider] = useState('')
+  const [flow, setFlow] = useState<(typeof OAUTH_FLOWS)[number]>('codex')
+  const [clientId, setClientId] = useState('')
+  const [redirectUri, setRedirectUri] = useState(`${window.location.origin}/channels`)
+  const [code, setCode] = useState('')
+  const [started, setStarted] = useState<OAuthStart | null>(null)
+  const selectedProvider = provider || options[0]?.value || ''
+  const path = (action: 'start' | 'complete') => `/api/admin/v1/projects/${project.id}/providers/${selectedProvider}/oauth/${flow}/${action}`
+  const start = useMutation({
+    mutationFn: () => api<OAuthStart>(path('start'), { method: 'POST', body: JSON.stringify({ client_id: clientId, ...(flow === 'github_copilot' ? {} : { redirect_uri: redirectUri }) }) }),
+    onSuccess: setStarted,
+    onError: (error: Error) => toast.error(error.message),
+  })
+  const complete = useMutation({
+    mutationFn: () => api<{ status: string; retry_after?: number }>(path('complete'), { method: 'POST', body: JSON.stringify({ state: started?.state, ...(flow === 'github_copilot' ? {} : { code }) }) }),
+    onSuccess: (result) => {
+      if (result.status === 'pending') return toast.info(t('oauthPending', { seconds: result.retry_after }))
+      toast.success(t('oauthCredentialSaved'))
+      setStarted(null)
+      setCode('')
+      void client.invalidateQueries({ queryKey: ['resource', project.id, 'credentials'] })
+    },
+    onError: (error: Error) => toast.error(error.message),
+  })
+  const resetFlow = (value: string | null) => { setFlow((value || 'codex') as (typeof OAUTH_FLOWS)[number]); setStarted(null); setCode('') }
+  return (
+    <Paper withBorder p="lg" mb="lg">
+      <Stack gap="md">
+        <Stack gap={2}>
+          <Title order={2}>{t('providerOauth')}</Title>
+          <Text size="sm" c="dimmed">{t('providerOauthHint')}</Text>
+        </Stack>
+        {optionsError ? (
+          <Alert variant="light" color="red">
+            <Group justify="space-between" align="center">
+              <Text size="sm">{t('oauthOptionsUnavailable')}</Text>
+              <Button variant="outline" color="red" size="compact-xs" onClick={retryOptions}>{t('oauthRetry')}</Button>
+            </Group>
+          </Alert>
+        ) : (
+          <SimpleGrid cols={{ base: 1, sm: 2 }} spacing="md">
+            <Select label={t('oauthProvider')} value={selectedProvider} onChange={(value) => { setProvider(value || ''); setStarted(null) }} data={options} searchable required />
+            <Select label={t('oauthFlow')} value={flow} onChange={resetFlow} data={OAUTH_FLOWS.map((value) => ({ value, label: t(`oauthFlow_${value}`) }))} required />
+            <TextInput label={t('oauthClientId')} value={clientId} onChange={(event) => setClientId(event.currentTarget.value)} required />
+            {flow !== 'github_copilot' && <TextInput label={t('oauthRedirectUri')} value={redirectUri} onChange={(event) => setRedirectUri(event.currentTarget.value)} required />}
+          </SimpleGrid>
+        )}
+        {!started ? <Button onClick={() => start.mutate()} loading={start.isPending} disabled={!selectedProvider || !clientId || Boolean(optionsError)}>{t('oauthStart')}</Button> : (
+          <Alert variant="light" title={t('oauthContinue')}>
+            <Stack gap="sm">
+              {started.authorization_url && <Button component="a" href={started.authorization_url} target="_blank" rel="noreferrer" variant="default">{t('oauthOpenProvider')}</Button>}
+              {started.verification_uri && <Text size="sm">{t('oauthDeviceInstruction')} <Code>{started.user_code}</Code> <a href={started.verification_uri} target="_blank" rel="noreferrer">{started.verification_uri}</a></Text>}
+              {flow !== 'github_copilot' && <TextInput label={t('oauthAuthorizationCode')} value={code} onChange={(event) => setCode(event.currentTarget.value)} required />}
+              <Group wrap="wrap">
+                <Button onClick={() => complete.mutate()} loading={complete.isPending} disabled={flow !== 'github_copilot' && !code}>{flow === 'github_copilot' ? t('oauthCheck') : t('oauthComplete')}</Button>
+                <Button variant="subtle" onClick={() => setStarted(null)}>{t('cancel')}</Button>
+              </Group>
+            </Stack>
+          </Alert>
+        )}
+      </Stack>
+    </Paper>
+  )
 }
 
 function ChannelSettingsPanel() {

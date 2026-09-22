@@ -79,6 +79,7 @@ pub struct RouteTarget {
     pub provider_name: String,
     pub provider_kind: String,
     pub base_url: String,
+    pub credential_type: String,
     pub secret_envelope: String,
     pub proxy_url: Option<String>,
     pub proxy_username: Option<String>,

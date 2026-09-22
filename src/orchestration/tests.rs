@@ -96,6 +96,7 @@ pub(super) fn candidate(id: &str, weight: u32) -> Candidate {
             provider_name: id.into(),
             provider_kind: "openai".into(),
             base_url: "http://localhost".into(),
+            credential_type: "api_key".into(),
             secret_envelope: String::new(),
             proxy_url: None,
             proxy_username: None,

@@ -85,6 +85,7 @@ struct Row {
     provider_name: String,
     provider_kind: String,
     base_url: String,
+    credential_type: String,
     secret_envelope: String,
     proxy_url: Option<String>,
     proxy_username: Option<String>,
@@ -132,7 +133,7 @@ pub async fn candidates(
 ) -> Result<Vec<Candidate>> {
     let rows = Row::find_by_statement(statement(r#"
         SELECT m.id AS model_id,p.id AS provider_id,c.id AS credential_id,m.public_name,m.upstream_name,m.capabilities,
-        p.name AS provider_name,p.kind AS provider_kind,p.base_url,c.secret_envelope,m.input_price_micros,m.output_price_micros,m.priority,
+        p.name AS provider_name,p.kind AS provider_kind,p.base_url,c.credential_type,c.secret_envelope,m.input_price_micros,m.output_price_micros,m.priority,
         m.enabled AS model_enabled,p.enabled AS provider_enabled,p.settings_json,
         m.catalog_metadata_json,m.disable_developer_settings_inheritance,
         COALESCE(s.endpoint_mappings_json,'{"version":1}') AS endpoint_mappings_json,
@@ -401,6 +402,7 @@ pub async fn candidates(
                 provider_name: row.provider_name,
                 provider_kind: row.provider_kind,
                 base_url: row.base_url,
+                credential_type: row.credential_type,
                 secret_envelope: row.secret_envelope,
                 proxy_url: row.proxy_url,
                 proxy_username: row.proxy_username,

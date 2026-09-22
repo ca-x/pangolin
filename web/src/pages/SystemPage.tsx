@@ -226,7 +226,7 @@ function Appearance() {
   )
 }
 
-type Branding = { instance_name: string; branding_name: string; favicon_url: string; onboarding_complete: boolean }
+type Branding = { instance_name: string; branding_name: string; favicon_url: string; onboarding_complete: boolean; cors_allowed_origins?: string[]; request_timeout_ms?: number }
 function BrandingSettings() {
   const { t } = useTranslation()
   const client = useQueryClient()
@@ -235,7 +235,14 @@ function BrandingSettings() {
   const submit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     const data = new FormData(event.currentTarget);
-    save.mutate({ instance_name: String(data.get('instance_name')), branding_name: String(data.get('branding_name')), favicon_url: String(data.get('favicon_url')), onboarding_complete: data.get('onboarding_complete') === 'on' })
+    save.mutate({
+      instance_name: String(data.get('instance_name')),
+      branding_name: String(data.get('branding_name')),
+      favicon_url: String(data.get('favicon_url')),
+      onboarding_complete: data.get('onboarding_complete') === 'on',
+      cors_allowed_origins: String(data.get('cors_allowed_origins')).split(/\r?\n/).map((origin) => origin.trim()).filter(Boolean),
+      request_timeout_ms: Number(data.get('request_timeout_ms')),
+    })
   }
   const branding = query.data
   return (
@@ -255,6 +262,9 @@ function BrandingSettings() {
                   <TextInput name="branding_name" label={t('brandingName')} defaultValue={branding.branding_name} required />
                   <TextInput name="favicon_url" label={t('faviconUrl')} defaultValue={branding.favicon_url} required />
                   <Checkbox name="onboarding_complete" label={t('onboardingComplete')} defaultChecked={branding.onboarding_complete} />
+                  <Title order={3} mt="sm">{t('httpPolicy')}</Title>
+                  <Textarea name="cors_allowed_origins" label={t('corsAllowedOrigins')} description={t('corsAllowedOriginsHint')} defaultValue={(branding.cors_allowed_origins || []).join('\n')} rows={3} />
+                  <TextInput name="request_timeout_ms" type="number" min={100} max={3600000} label={t('requestTimeout')} description={t('requestTimeoutHint')} defaultValue={branding.request_timeout_ms ?? 600000} required />
                   <Button type="submit">{t('save')}</Button>
                 </Stack>
               </form>

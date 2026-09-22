@@ -141,7 +141,7 @@ async fn model_sync(
 ) -> Result<(), ApiError> {
     let project = claim.project_id.as_deref().ok_or(ApiError::Forbidden)?;
     let provider = payload["provider_id"].as_str().ok_or(ApiError::NotFound)?;
-    let row=state.db.query_one(sql("SELECT p.name,p.kind,p.base_url,c.secret_envelope,s.proxy_url,s.proxy_username,s.proxy_secret_envelope,COALESCE(s.proxy_reuse_connections,1) AS proxy_reuse_connections FROM providers p JOIN channel_credentials c ON c.provider_id=p.id AND c.enabled=1 LEFT JOIN channel_settings s ON s.provider_id=p.id WHERE p.id=? AND p.project_id=? AND p.enabled=1 ORDER BY c.priority,c.id LIMIT 1",vec![provider.into(),project.into()])).await?.ok_or(ApiError::NotFound)?;
+    let row=state.db.query_one(sql("SELECT p.name,p.kind,p.base_url,c.credential_type,c.secret_envelope,s.proxy_url,s.proxy_username,s.proxy_secret_envelope,COALESCE(s.proxy_reuse_connections,1) AS proxy_reuse_connections FROM providers p JOIN channel_credentials c ON c.provider_id=p.id AND c.enabled=1 LEFT JOIN channel_settings s ON s.provider_id=p.id WHERE p.id=? AND p.project_id=? AND p.enabled=1 ORDER BY c.priority,c.id LIMIT 1",vec![provider.into(),project.into()])).await?.ok_or(ApiError::NotFound)?;
     let secret_envelope: String = row.try_get("", "secret_envelope")?;
     let target = crate::models::RouteTarget {
         public_name: String::new(),
@@ -149,6 +149,7 @@ async fn model_sync(
         provider_name: row.try_get("", "name")?,
         provider_kind: row.try_get("", "kind")?,
         base_url: row.try_get("", "base_url")?,
+        credential_type: row.try_get("", "credential_type")?,
         secret_envelope: secret_envelope.clone(),
         proxy_url: row.try_get("", "proxy_url")?,
         proxy_username: row.try_get("", "proxy_username")?,
@@ -157,7 +158,10 @@ async fn model_sync(
         input_price_micros: 0,
         output_price_micros: 0,
     };
-    let secret = state.secrets.decrypt(&secret_envelope)?;
+    let secret = crate::oauth::credential_secret(
+        &target.credential_type,
+        state.secrets.decrypt(&secret_envelope)?,
+    )?;
     let client = state.upstream_client(&target)?;
     let discovered = crate::providers::discovery::models(
         &client,
@@ -363,7 +367,7 @@ async fn target(
     project: &str,
     provider: &str,
 ) -> Result<(crate::models::RouteTarget, String, String), ApiError> {
-    let row=state.db.query_one(sql("SELECT p.name,p.kind,p.base_url,c.id AS credential_id,c.secret_envelope,m.public_name,m.upstream_name,s.proxy_url,s.proxy_username,s.proxy_secret_envelope,COALESCE(s.proxy_reuse_connections,1) AS proxy_reuse_connections FROM providers p JOIN channel_credentials c ON c.provider_id=p.id AND c.enabled=1 JOIN models m ON m.provider_id=p.id AND m.enabled=1 LEFT JOIN channel_settings s ON s.provider_id=p.id WHERE p.id=? AND p.project_id=? AND p.enabled=1 ORDER BY c.priority,m.priority LIMIT 1",vec![provider.into(),project.into()])).await?.ok_or(ApiError::NotFound)?;
+    let row=state.db.query_one(sql("SELECT p.name,p.kind,p.base_url,c.id AS credential_id,c.credential_type,c.secret_envelope,m.public_name,m.upstream_name,s.proxy_url,s.proxy_username,s.proxy_secret_envelope,COALESCE(s.proxy_reuse_connections,1) AS proxy_reuse_connections FROM providers p JOIN channel_credentials c ON c.provider_id=p.id AND c.enabled=1 JOIN models m ON m.provider_id=p.id AND m.enabled=1 LEFT JOIN channel_settings s ON s.provider_id=p.id WHERE p.id=? AND p.project_id=? AND p.enabled=1 ORDER BY c.priority,m.priority LIMIT 1",vec![provider.into(),project.into()])).await?.ok_or(ApiError::NotFound)?;
     let credential = row.try_get("", "credential_id")?;
     let secret: String = row.try_get("", "secret_envelope")?;
     Ok((
@@ -373,6 +377,7 @@ async fn target(
             provider_name: row.try_get("", "name")?,
             provider_kind: row.try_get("", "kind")?,
             base_url: row.try_get("", "base_url")?,
+            credential_type: row.try_get("", "credential_type")?,
             secret_envelope: secret.clone(),
             proxy_url: row.try_get("", "proxy_url")?,
             proxy_username: row.try_get("", "proxy_username")?,
@@ -382,7 +387,11 @@ async fn target(
             output_price_micros: 0,
         },
         credential,
-        state.secrets.decrypt(&secret)?.to_string(),
+        crate::oauth::credential_secret(
+            &row.try_get::<String>("", "credential_type")?,
+            state.secrets.decrypt(&secret)?,
+        )?
+        .to_string(),
     ))
 }
 async fn probe(state: &AppState, claim: &jobs::Claim, payload: &Value) -> Result<(), ApiError> {

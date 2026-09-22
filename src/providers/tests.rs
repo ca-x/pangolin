@@ -11,6 +11,7 @@ fn target(kind: &str) -> RouteTarget {
         provider_name: "provider".into(),
         provider_kind: kind.into(),
         base_url: "http://localhost:8080".into(),
+        credential_type: "api_key".into(),
         secret_envelope: String::new(),
         proxy_url: None,
         proxy_username: None,

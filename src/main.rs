@@ -7,6 +7,7 @@ mod config;
 mod crypto;
 mod db;
 mod models;
+mod oauth;
 mod observability;
 mod oidc;
 mod operations;

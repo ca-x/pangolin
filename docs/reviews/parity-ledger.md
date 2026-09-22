@@ -437,11 +437,11 @@ retry/model/quota settings, and CORS/timeouts. Every one of them is scheduled in
 | API-key token mode | implemented+tested | generated or imported high-entropy token, indexed digest + Argon2id, no plaintext recovery |
 | API-key profiles/templates | implemented+tested | profiles and project-scoped save/apply/import/export templates share one validator and writer (access 18) |
 | OIDC providers | partial | discovery/config/authorize/callback/PKCE/state/JIT and manual link exist; no login-only or branding (access 14) |
-| Codex OAuth | feature-build | no start/exchange route; only generic credential storage exists |
-| xAI OAuth/SSO | feature-build | as above |
-| Claude Code OAuth | feature-build | as above |
-| Antigravity OAuth | feature-build | as above |
-| GitHub Copilot device OAuth | feature-build | no device-code flow |
+| Codex OAuth | implemented+tested | bounded PKCE authorization-code helper stores complete token response only in an encrypted credential envelope |
+| xAI OAuth/SSO | implemented+tested | bounded PKCE authorization-code helper with durable hashed state and transactional audit |
+| Claude Code OAuth | implemented+tested | bounded PKCE authorization-code helper with write-only encrypted token storage |
+| Antigravity OAuth | implemented+tested | bounded PKCE authorization-code helper with write-only encrypted token storage |
+| GitHub Copilot device OAuth | implemented+tested | bounded device-code polling, HTTPS github.com verification URL and encrypted terminal credential storage |
 | IP security | divergence | per-key allow/deny only (D3) |
 | OpenAPI GraphQL auth | divergence (ADR required) | no GraphQL endpoint (D6) |
 
@@ -527,7 +527,7 @@ retry/model/quota settings, and CORS/timeouts. Every one of them is scheduled in
 | --- | --- | --- |
 | System initialization/onboarding | implemented+tested | setup route, brand name/logo/title, onboarding progress |
 | System retry/model/quota settings | open | system 12, 23, 24 |
-| CORS and request timeouts | open | no operator CORS configuration and no configurable request timeout |
+| CORS and request timeouts | implemented+tested | audited system policy validates exact canonical origin allowlists and bounded gateway timeouts with complete 504 envelopes |
 | Data storage | implemented+tested | typed local/S3/GCS/WebDAV targets with encrypted credentials, owned prefixes and bounded read-only connection tests |
 | Backup/restore | implemented+tested | selective resources, conflict strategy, secret preservation, preflight |
 | Automatic backup | partial | schedule/retention/status and manual trigger exist; interval only, no daily time or timezone (system 13) |
@@ -536,7 +536,7 @@ retry/model/quota settings, and CORS/timeouts. Every one of them is scheduled in
 | Favicon/static SPA | implemented+tested | embedded branded assets and deep links |
 | Playground/chat | feature-build | prompts 13 |
 | Request content policy | implemented+tested | versioned logging levels plus an explicit default-off live-preview toggle; credentials and payloads never enter preview rows |
-| Provider OAuth credential helpers | feature-build | no Codex/xAI/Claude Code/Antigravity/Copilot setup flows |
+| Provider OAuth credential helpers | implemented+tested | Codex/xAI/Claude Code/Antigravity PKCE and Copilot device flows with bounded mock-IdP contracts |
 
 ### Console feature pages (1)
 
