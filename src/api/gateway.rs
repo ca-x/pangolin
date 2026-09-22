@@ -337,10 +337,14 @@ async fn execute_inner(
                 tokio::time::sleep(Duration::from_millis(candidate.retry.delay_ms)).await;
             }
             let target = &candidate.target;
-            let secret = state
-                .secrets
-                .decrypt(&target.secret_envelope)
-                .map_err(ApiError::Internal)?;
+            let secret = match state.secrets.decrypt(&target.secret_envelope) {
+                Ok(secret) => secret,
+                Err(error) => {
+                    tracing::error!(request_id,channel=candidate.provider_id,credential=candidate.credential_id,error=%error,"channel credential is unrecoverable");
+                    attempt.finish(AttemptOutcome::LocalFailure).await?;
+                    continue 'candidates;
+                }
+            };
             tracing::debug!(
                 request_id,
                 attempt = attempts,

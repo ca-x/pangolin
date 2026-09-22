@@ -2,6 +2,7 @@ use super::*;
 use crate::operations::{self, backup, id, jobs, logging, pricing, sql, storage};
 use sea_orm::{ConnectionTrait, DatabaseTransaction, TransactionTrait};
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap};
 
 use super::trace_preview;
 
@@ -84,6 +85,18 @@ pub(super) fn router(state: AppState) -> Router<AppState> {
         .route(
             "/api/admin/v1/projects/{project}/settings/orchestration",
             get(orchestration_settings).put(set_orchestration_settings),
+        )
+        .route(
+            "/api/admin/v1/projects/{project}/settings/developers",
+            get(developer_settings).put(set_developer_settings),
+        )
+        .route(
+            "/api/admin/v1/projects/{project}/credentials/{id}/recovery-token",
+            post(issue_credential_recovery_token),
+        )
+        .route(
+            "/api/admin/v1/projects/{project}/credentials/{id}/recover",
+            post(recover_credential),
         )
         .route(
             "/api/admin/v1/projects/{project}/observability/summary",
@@ -413,6 +426,260 @@ async fn set_model_settings(
     tx.commit().await?;
     Ok(Json(json!({"ok":true})))
 }
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct DeveloperAssociation {
+    #[serde(default)]
+    provider_id: Option<String>,
+    #[serde(default)]
+    channel_tags: Vec<String>,
+    #[serde(default = "default_document")]
+    conditions: Value,
+    #[serde(default)]
+    priority: i32,
+    #[serde(default = "default_weight")]
+    weight: u32,
+}
+const fn default_weight() -> u32 {
+    1
+}
+fn default_document() -> Value {
+    json!({"version":1})
+}
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct DeveloperRule {
+    developer: String,
+    #[serde(default)]
+    associations: Vec<DeveloperAssociation>,
+    #[serde(default)]
+    reasoning_effort: BTreeMap<String, String>,
+}
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct DeveloperSettings {
+    version: u8,
+    #[serde(default)]
+    rules: Vec<DeveloperRule>,
+}
+impl Default for DeveloperSettings {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            rules: vec![],
+        }
+    }
+}
+fn validate_developer_settings(input: &DeveloperSettings) -> Result<(), ApiError> {
+    if input.version != 1 || input.rules.len() > 128 {
+        return Err(ApiError::BadRequest("invalid developer settings".into()));
+    }
+    let mut names = std::collections::BTreeSet::new();
+    for rule in &input.rules {
+        if rule.developer.trim().is_empty()
+            || rule.developer.len() > 128
+            || !names.insert(rule.developer.as_str())
+            || rule.associations.len() > 128
+            || rule.reasoning_effort.len() > 32
+        {
+            return Err(ApiError::BadRequest("invalid developer settings".into()));
+        }
+        for association in &rule.associations {
+            if association.provider_id.is_none() && association.channel_tags.is_empty()
+                || association.weight == 0
+                || association.weight > 10_000
+                || association.channel_tags.len() > 64
+            {
+                return Err(ApiError::BadRequest("invalid developer association".into()));
+            }
+            crate::orchestration::policy::validate_conditions(&association.conditions).map_err(
+                |_| ApiError::BadRequest("invalid developer association conditions".into()),
+            )?;
+        }
+        if rule
+            .reasoning_effort
+            .iter()
+            .any(|(from, to)| from.is_empty() || to.is_empty() || from.len() > 64 || to.len() > 64)
+        {
+            return Err(ApiError::BadRequest(
+                "invalid reasoning-effort mapping".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+async fn developer_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project): Path<String>,
+) -> Result<Json<DeveloperSettings>, ApiError> {
+    actor(&state, &headers, Some(&project), false).await?;
+    let row = state
+        .db
+        .query_one(sql(
+            "SELECT settings_json FROM projects WHERE id=?",
+            vec![project.into()],
+        ))
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    let settings: Value = serde_json::from_str(&row.try_get::<String>("", "settings_json")?)
+        .map_err(|error| ApiError::Internal(error.into()))?;
+    serde_json::from_value(
+        settings
+            .get("developer_settings")
+            .cloned()
+            .unwrap_or_else(|| json!(DeveloperSettings::default())),
+    )
+    .map(Json)
+    .map_err(|_| ApiError::BadRequest("invalid stored developer settings".into()))
+}
+async fn set_developer_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project): Path<String>,
+    Json(input): Json<DeveloperSettings>,
+) -> Result<Json<Value>, ApiError> {
+    let user = actor(&state, &headers, Some(&project), true).await?;
+    validate_developer_settings(&input)?;
+    let tx = state.db.begin().await?;
+    let row = tx
+        .query_one(sql(
+            "SELECT settings_json FROM projects WHERE id=?",
+            vec![project.clone().into()],
+        ))
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    for provider in input
+        .rules
+        .iter()
+        .flat_map(|rule| rule.associations.iter())
+        .filter_map(|association| association.provider_id.as_deref())
+    {
+        if tx
+            .query_one(sql(
+                "SELECT 1 AS present FROM providers WHERE id=? AND project_id=?",
+                vec![provider.into(), project.clone().into()],
+            ))
+            .await?
+            .is_none()
+        {
+            return Err(ApiError::NotFound);
+        }
+    }
+    let mut settings: Value = serde_json::from_str(&row.try_get::<String>("", "settings_json")?)
+        .map_err(|error| ApiError::Internal(error.into()))?;
+    settings["developer_settings"] = json!(input);
+    tx.execute(sql(
+        "UPDATE projects SET settings_json=?,updated_at=? WHERE id=?",
+        vec![
+            settings.to_string().into(),
+            db::now().into(),
+            project.clone().into(),
+        ],
+    ))
+    .await?;
+    audit_in(
+        &tx,
+        &user,
+        &project,
+        "developer-settings.update",
+        "developer-settings",
+    )
+    .await?;
+    tx.commit().await?;
+    state.orchestrator.reset_derived();
+    Ok(Json(json!({"ok":true})))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecoveryTokenInput {
+    expires_seconds: Option<i64>,
+}
+async fn issue_credential_recovery_token(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((project, credential)): Path<(String, String)>,
+    Json(input): Json<RecoveryTokenInput>,
+) -> Result<Json<Value>, ApiError> {
+    let user = actor(&state, &headers, Some(&project), true).await?;
+    let expires = input.expires_seconds.unwrap_or(600);
+    if !(60..=3600).contains(&expires) {
+        return Err(ApiError::BadRequest(
+            "recovery token expiry must be 60–3600 seconds".into(),
+        ));
+    }
+    let row=state.db.query_one(sql("SELECT c.secret_envelope FROM channel_credentials c JOIN providers p ON p.id=c.provider_id WHERE c.id=? AND p.project_id=?",vec![credential.clone().into(),project.clone().into()])).await?.ok_or(ApiError::NotFound)?;
+    let envelope: String = row.try_get("", "secret_envelope")?;
+    if state.secrets.decrypt(&envelope).is_ok() {
+        return Err(ApiError::Conflict("credential is still recoverable".into()));
+    }
+    let token = crate::crypto::opaque_token("pcr_");
+    let hash = crate::crypto::token_hash(&token);
+    let now = db::now();
+    let tx = state.db.begin().await?;
+    tx.execute(sql("DELETE FROM credential_recovery_tokens WHERE project_id=? AND credential_id=? AND used_at IS NULL",vec![project.clone().into(),credential.clone().into()])).await?;
+    tx.execute(sql("INSERT INTO credential_recovery_tokens(token_hash,project_id,credential_id,created_by,expires_at,created_at) VALUES(?,?,?,?,?,?)",vec![hash.into(),project.clone().into(),credential.clone().into(),user.subject_id.clone().into(),(now+expires).into(),now.into()])).await?;
+    audit_in(
+        &tx,
+        &user,
+        &project,
+        "credential.recovery.issue",
+        &credential,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(Json(json!({"token":token,"expires_at":now+expires})))
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecoverCredentialInput {
+    token: String,
+    secret: String,
+}
+async fn recover_credential(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((project, credential)): Path<(String, String)>,
+    Json(input): Json<RecoverCredentialInput>,
+) -> Result<Json<Value>, ApiError> {
+    let user = actor(&state, &headers, Some(&project), true).await?;
+    if input.secret.trim().is_empty() || input.secret.len() > 64 * 1024 {
+        return Err(ApiError::BadRequest(
+            "replacement secret is required".into(),
+        ));
+    }
+    let envelope = state.secrets.encrypt(&input.secret)?;
+    let suffix = input
+        .secret
+        .chars()
+        .rev()
+        .take(4)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    let now = db::now();
+    let tx = state.db.begin().await?;
+    let changed=tx.execute(sql("UPDATE credential_recovery_tokens SET used_at=? WHERE token_hash=? AND project_id=? AND credential_id=? AND used_at IS NULL AND expires_at>?",vec![now.into(),crate::crypto::token_hash(&input.token).into(),project.clone().into(),credential.clone().into(),now.into()])).await?.rows_affected();
+    if changed != 1 {
+        return Err(ApiError::Conflict(
+            "recovery token is invalid, expired, or already used".into(),
+        ));
+    }
+    if tx.execute(sql("UPDATE channel_credentials SET secret_envelope=?,suffix=?,updated_at=? WHERE id=? AND provider_id IN (SELECT id FROM providers WHERE project_id=?)",vec![envelope.into(),suffix.into(),now.into(),credential.clone().into(),project.clone().into()])).await?.rows_affected()!=1{return Err(ApiError::NotFound)}
+    audit_in(
+        &tx,
+        &user,
+        &project,
+        "credential.recovery.replace",
+        &credential,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(Json(json!({"ok":true})))
+}
 #[derive(Deserialize, Default)]
 struct Filter {
     #[serde(default)]
@@ -484,7 +751,7 @@ fn query(resource: &str) -> Result<(&'static str, &'static str, &'static str), A
         "models" => (
             "models",
             "provider_id IN (SELECT id FROM providers WHERE project_id=?)",
-            "json_object('id',id,'provider_id',provider_id,'provider_name',(SELECT name FROM providers WHERE id=models.provider_id),'public_name',public_name,'upstream_name',upstream_name,'capabilities',json(capabilities),'input_price_micros',input_price_micros,'output_price_micros',output_price_micros,'priority',priority,'enabled',enabled,'lifecycle',lifecycle,'catalog_metadata_raw',catalog_metadata_json,'created_at',created_at)",
+            "json_object('id',id,'provider_id',provider_id,'provider_name',(SELECT name FROM providers WHERE id=models.provider_id),'public_name',public_name,'upstream_name',upstream_name,'capabilities',json(capabilities),'input_price_micros',input_price_micros,'output_price_micros',output_price_micros,'priority',priority,'enabled',enabled,'lifecycle',lifecycle,'disable_developer_settings_inheritance',disable_developer_settings_inheritance,'catalog_metadata_raw',catalog_metadata_json,'created_at',created_at)",
         ),
         "associations" => (
             "model_associations",
@@ -565,7 +832,7 @@ fn query(resource: &str) -> Result<(&'static str, &'static str, &'static str), A
         "quotas" => (
             "provider_quota_snapshots",
             "provider_id IN (SELECT id FROM providers WHERE project_id=?)",
-            "json_object('id',id,'provider_id',provider_id,'credential_id',credential_id,'remaining_micros',remaining_micros,'period_start',period_start,'period_end',period_end,'collected_at',collected_at)",
+            "json_object('id',id,'provider_id',provider_id,'credential_id',credential_id,'remaining_micros',remaining_micros,'period_start',period_start,'period_end',period_end,'quota',json(quota_json),'collected_at',collected_at)",
         ),
         "storage" => (
             "data_storage_configs",
@@ -671,7 +938,7 @@ async fn list(
     // and its total clone the same values, so pagination can never describe a
     // different window from the rows it accompanies.
     let mut predicate = format!("{scope}{lifecycle}");
-    let mut scoped_values: Vec<sea_orm::Value> = vec![project.into()];
+    let mut scoped_values: Vec<sea_orm::Value> = vec![project.clone().into()];
     if let Some(column) = event_time_column(&resource) {
         if let Some(from) = filter.from {
             predicate.push_str(&format!(" AND {}>=?", column.sql()));
@@ -702,6 +969,39 @@ async fn list(
     }
     if resource == "models" {
         project_model_catalog_cards(&mut data);
+    }
+    if resource == "credentials" {
+        let rows=state.db.query_all(sql("SELECT c.id,c.secret_envelope FROM channel_credentials c JOIN providers p ON p.id=c.provider_id WHERE p.project_id=?",vec![project.clone().into()])).await?;
+        let states: HashMap<String, bool> = rows
+            .into_iter()
+            .map(|row| {
+                Ok((
+                    row.try_get::<String>("", "id")?,
+                    state
+                        .secrets
+                        .decrypt(&row.try_get::<String>("", "secret_envelope")?)
+                        .is_ok(),
+                ))
+            })
+            .collect::<Result<_, sea_orm::DbErr>>()?;
+        for credential in &mut data {
+            if let Some(object) = credential.as_object_mut() {
+                let recoverable = object
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .and_then(|id| states.get(id))
+                    .copied()
+                    .unwrap_or(false);
+                object.insert(
+                    "state".into(),
+                    json!(if recoverable {
+                        "ready"
+                    } else {
+                        "unrecoverable"
+                    }),
+                );
+            }
+        }
     }
     Ok(Json(
         json!({"data":data,"total":total,"offset":filter.offset,"limit":limit}),
@@ -2130,13 +2430,28 @@ async fn bulk_toggle_api_keys(
             .map_err(crate::api::errors::access)?;
     Ok(Json(json!({"updated":updated})))
 }
+async fn channel_dependency_preview(
+    db: &impl ConnectionTrait,
+    project: &str,
+    ids: &[String],
+) -> Result<Vec<Value>, ApiError> {
+    let mut output = Vec::new();
+    for id in ids {
+        if let Some(row)=db.query_one(sql("SELECT p.id,p.name,(SELECT COUNT(*) FROM models WHERE provider_id=p.id) AS models,(SELECT COUNT(*) FROM channel_credentials WHERE provider_id=p.id) AS credentials FROM providers p WHERE p.id=? AND p.project_id=?",vec![id.clone().into(),project.into()])).await?{
+            let models:i64=row.try_get("","models")?;
+            let credentials:i64=row.try_get("","credentials")?;
+            output.push(json!({"id":row.try_get::<String>("","id")?,"name":row.try_get::<String>("","name")?,"models":models,"credentials":credentials,"blocked":models+credentials>0}));
+        }
+    }
+    Ok(output)
+}
 async fn mutate(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path((project, resource)): Path<(String, String)>,
     Json(value): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
-    let resource_id = value
+    let mut resource_id = value
         .get("id")
         .and_then(Value::as_str)
         .map(str::to_owned)
@@ -2200,6 +2515,136 @@ async fn mutate(
     };
     let transaction = state.db.begin().await?;
     match resource.as_str() {
+        "channel-preview" => {
+            let action = text(&value, "action")?;
+            let ids = value["ids"]
+                .as_array()
+                .ok_or_else(|| ApiError::BadRequest("ids are required".into()))?
+                .iter()
+                .map(|id| {
+                    id.as_str()
+                        .map(str::to_owned)
+                        .ok_or_else(|| ApiError::BadRequest("invalid id".into()))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if ids.is_empty()
+                || ids.len() > 100
+                || !matches!(action, "clone" | "merge" | "bulk_delete")
+            {
+                return Err(ApiError::BadRequest("invalid channel preview".into()));
+            }
+            let dependencies = channel_dependency_preview(&transaction, &project, &ids).await?;
+            if action == "merge" && ids.len() == 2 {
+                for channel in &ids {
+                    if transaction
+                        .query_one(sql(
+                            "SELECT 1 AS present FROM providers WHERE id=? AND project_id=?",
+                            vec![channel.clone().into(), project.clone().into()],
+                        ))
+                        .await?
+                        .is_none()
+                    {
+                        return Err(ApiError::NotFound);
+                    }
+                }
+                let collisions=transaction.query_all(sql("SELECT s.public_name AS name FROM models s JOIN providers sp ON sp.id=s.provider_id JOIN models t ON t.public_name=s.public_name JOIN providers tp ON tp.id=t.provider_id WHERE s.provider_id=? AND t.provider_id=? AND sp.project_id=? AND tp.project_id=? ORDER BY s.public_name",vec![ids[0].clone().into(),ids[1].clone().into(),project.clone().into(),project.clone().into()])).await?.into_iter().map(|row|row.try_get::<String>("","name")).collect::<Result<Vec<_>,_>>()?;
+                return Ok(Json(
+                    json!({"action":action,"dependencies":dependencies,"collisions":collisions,"credential_secrets_copied":false}),
+                ));
+            }
+            return Ok(Json(
+                json!({"action":action,"dependencies":dependencies,"credential_secrets_copied":false}),
+            ));
+        }
+        "channel-clone" => {
+            let source = text(&value, "source_id")?;
+            let name = text(&value, "name")?;
+            let row=transaction.query_one(sql("SELECT kind,base_url,enabled,settings_json FROM providers WHERE id=? AND project_id=?",vec![source.into(),project.clone().into()])).await?.ok_or(ApiError::NotFound)?;
+            let changed=transaction.execute(sql("INSERT INTO providers(id,name,kind,base_url,enabled,created_at,updated_at,project_id,settings_json) VALUES(?,?,?,?,?,?,?,?,?)",vec![resource_id.clone().into(),name.into(),row.try_get::<String>("","kind")?.into(),row.try_get::<String>("","base_url")?.into(),row.try_get::<bool>("","enabled")?.into(),db::now().into(),db::now().into(),project.clone().into(),row.try_get::<String>("","settings_json")?.into()])).await?.rows_affected();
+            if changed != 1 {
+                return Err(ApiError::ConflictNamed(
+                    "duplicate_channel",
+                    "a channel with that name already exists".into(),
+                ));
+            }
+            transaction.execute(sql("INSERT INTO channel_settings(provider_id,endpoint_mappings_json,model_rules_json,parameter_overrides_json,retry_statuses_json,auto_disable_policy_json,updated_at) SELECT ?,endpoint_mappings_json,model_rules_json,parameter_overrides_json,retry_statuses_json,auto_disable_policy_json,? FROM channel_settings WHERE provider_id=?",vec![resource_id.clone().into(),db::now().into(),source.into()])).await?;
+            let models=transaction.query_all(sql("SELECT public_name,upstream_name,capabilities,input_price_micros,output_price_micros,priority,enabled,catalog_metadata_json,disable_developer_settings_inheritance FROM models WHERE provider_id=? AND lifecycle='active' ORDER BY id",vec![source.into()])).await?;
+            for model in models {
+                transaction.execute(sql("INSERT INTO models(id,provider_id,public_name,upstream_name,capabilities,input_price_micros,output_price_micros,priority,enabled,created_at,catalog_metadata_json,disable_developer_settings_inheritance) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",vec![id().into(),resource_id.clone().into(),model.try_get::<String>("","public_name")?.into(),model.try_get::<String>("","upstream_name")?.into(),model.try_get::<String>("","capabilities")?.into(),model.try_get::<i64>("","input_price_micros")?.into(),model.try_get::<i64>("","output_price_micros")?.into(),model.try_get::<i64>("","priority")?.into(),model.try_get::<bool>("","enabled")?.into(),db::now().into(),model.try_get::<String>("","catalog_metadata_json")?.into(),model.try_get::<bool>("","disable_developer_settings_inheritance")?.into()])).await?;
+            }
+        }
+        "channel-merge" => {
+            let source = text(&value, "source_id")?.to_owned();
+            let target = text(&value, "target_id")?.to_owned();
+            if source == target {
+                return Err(ApiError::BadRequest(
+                    "source and target channels must differ".into(),
+                ));
+            }
+            for channel in [&source, &target] {
+                if transaction
+                    .query_one(sql(
+                        "SELECT 1 AS present FROM providers WHERE id=? AND project_id=?",
+                        vec![channel.as_str().into(), project.clone().into()],
+                    ))
+                    .await?
+                    .is_none()
+                {
+                    return Err(ApiError::NotFound);
+                }
+            }
+            let collisions=transaction.query_one(sql("SELECT COUNT(*) AS n FROM models s JOIN models t ON t.public_name=s.public_name WHERE s.provider_id=? AND t.provider_id=?",vec![source.clone().into(),target.clone().into()])).await?.and_then(|row|row.try_get::<i64>("","n").ok()).unwrap_or(0);
+            if collisions > 0 {
+                return Err(ApiError::ConflictNamed(
+                    "duplicate_model",
+                    "the source and target channels contain models with the same public name"
+                        .into(),
+                ));
+            }
+            transaction
+                .execute(sql(
+                    "UPDATE models SET provider_id=? WHERE provider_id=?",
+                    vec![target.clone().into(), source.into()],
+                ))
+                .await?;
+            resource_id = target;
+        }
+        "bulk-delete" => {
+            if text(&value, "resource")? != "channels" {
+                return Err(ApiError::BadRequest("unsupported bulk resource".into()));
+            }
+            let ids = value["ids"]
+                .as_array()
+                .filter(|ids| !ids.is_empty() && ids.len() <= 100)
+                .ok_or_else(|| ApiError::BadRequest("ids must contain 1–100 items".into()))?
+                .iter()
+                .map(|id| {
+                    id.as_str()
+                        .map(str::to_owned)
+                        .ok_or_else(|| ApiError::BadRequest("invalid id".into()))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let dependencies = channel_dependency_preview(&transaction, &project, &ids).await?;
+            if dependencies.iter().any(|row| row["blocked"] == true) {
+                return Err(ApiError::ConflictNamed(
+                    "resource_in_use",
+                    "one or more channels still have models or credentials".into(),
+                ));
+            }
+            let mut deleted = 0u64;
+            for channel in dependencies.iter().filter_map(|row| row["id"].as_str()) {
+                deleted += transaction
+                    .execute(sql(
+                        "DELETE FROM providers WHERE id=? AND project_id=?",
+                        vec![channel.into(), project.clone().into()],
+                    ))
+                    .await?
+                    .rows_affected();
+                audit_in(&transaction, &user, &project, "channels.delete", channel).await?;
+            }
+            transaction.commit().await?;
+            return Ok(Json(json!({"deleted":deleted})));
+        }
         "channels" => {
             let kind = text(&value, "kind")?;
             if !matches!(
@@ -2375,7 +2820,7 @@ async fn mutate(
                     "this channel already has a model with that name".into(),
                 ));
             }
-            let changed = transaction.execute(sql("INSERT INTO models(id,provider_id,public_name,upstream_name,capabilities,input_price_micros,output_price_micros,priority,enabled,created_at,catalog_metadata_json) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET provider_id=excluded.provider_id,public_name=excluded.public_name,upstream_name=excluded.upstream_name,capabilities=excluded.capabilities,input_price_micros=excluded.input_price_micros,output_price_micros=excluded.output_price_micros,priority=excluded.priority,enabled=excluded.enabled,catalog_metadata_json=excluded.catalog_metadata_json WHERE models.provider_id IN (SELECT id FROM providers WHERE project_id=?)",vec![resource_id.clone().into(),provider.into(),text(&value,"public_name")?.into(),text(&value,"upstream_name")?.into(),capabilities.to_string().into(),input_price.into(),output_price.into(),value["priority"].as_i64().unwrap_or(100).into(),value["enabled"].as_bool().unwrap_or(true).into(),db::now().into(),catalog_metadata.into(),project.clone().into()])).await?.rows_affected();
+            let changed = transaction.execute(sql("INSERT INTO models(id,provider_id,public_name,upstream_name,capabilities,input_price_micros,output_price_micros,priority,enabled,created_at,catalog_metadata_json,disable_developer_settings_inheritance) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET provider_id=excluded.provider_id,public_name=excluded.public_name,upstream_name=excluded.upstream_name,capabilities=excluded.capabilities,input_price_micros=excluded.input_price_micros,output_price_micros=excluded.output_price_micros,priority=excluded.priority,enabled=excluded.enabled,catalog_metadata_json=excluded.catalog_metadata_json,disable_developer_settings_inheritance=excluded.disable_developer_settings_inheritance WHERE models.provider_id IN (SELECT id FROM providers WHERE project_id=?)",vec![resource_id.clone().into(),provider.into(),text(&value,"public_name")?.into(),text(&value,"upstream_name")?.into(),capabilities.to_string().into(),input_price.into(),output_price.into(),value["priority"].as_i64().unwrap_or(100).into(),value["enabled"].as_bool().unwrap_or(true).into(),db::now().into(),catalog_metadata.into(),value["disable_developer_settings_inheritance"].as_bool().unwrap_or(false).into(),project.clone().into()])).await?.rows_affected();
             if changed != 1 {
                 return Err(ApiError::Forbidden);
             }

@@ -7,6 +7,331 @@ use crate::operations::{
     logging::{Level, Policy},
 };
 
+#[tokio::test]
+async fn unrecoverable_credential_is_fail_closed_and_replaced_with_a_one_time_token() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let upstream_calls = calls.clone();
+    let f = fixture(Router::new().route(
+        "/v1/chat/completions",
+        post(move || {
+            let calls = upstream_calls.clone();
+            async move {
+                calls.fetch_add(1, Ordering::Relaxed);
+                Json(json!({"choices":[{"message":{"content":"unexpected"}}]}))
+            }
+        }),
+    ))
+    .await;
+    let cookie = owner(&f).await;
+    let project = db::DEFAULT_PROJECT_ID;
+    let credential = f.providers[0].clone();
+    let stored_sentinel = "not-an-authenticated-envelope";
+    sql(
+        &f,
+        "UPDATE channel_credentials SET secret_envelope=? WHERE id=?",
+        vec![stored_sentinel.into(), credential.clone().into()],
+    )
+    .await;
+    sql(
+        &f,
+        "UPDATE providers SET enabled=0 WHERE id<>?",
+        vec![f.providers[0].clone().into()],
+    )
+    .await;
+
+    let listed = json_body(
+        admin(
+            &f,
+            &cookie,
+            http::Method::GET,
+            &format!("/api/admin/v1/projects/{project}/operations/credentials"),
+            Value::Null,
+            false,
+        )
+        .await,
+    )
+    .await;
+    let row = listed["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == credential)
+        .unwrap();
+    assert_eq!(row["state"], "unrecoverable");
+    assert!(!listed.to_string().contains(stored_sentinel));
+    assert!(!listed.to_string().contains("secret_envelope"));
+
+    let public = request(&f, "/v1/chat/completions", chat()).await;
+    assert_ne!(public.status(), StatusCode::OK);
+    let public = json_body(public).await;
+    assert!(!public.to_string().contains("envelope"));
+    assert!(!public.to_string().contains("decrypt"));
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
+
+    let issue_path =
+        format!("/api/admin/v1/projects/{project}/credentials/{credential}/recovery-token");
+    let issued = admin(
+        &f,
+        &cookie,
+        http::Method::POST,
+        &issue_path,
+        json!({"expires_seconds":60}),
+        true,
+    )
+    .await;
+    assert_eq!(issued.status(), StatusCode::OK);
+    let issued = json_body(issued).await;
+    let token = issued["token"].as_str().unwrap().to_owned();
+    assert!(token.starts_with("pcr_"));
+    assert!(
+        f.state
+            .db
+            .query_all(ops::sql(
+                "SELECT token_hash FROM credential_recovery_tokens WHERE token_hash=?",
+                vec![token.clone().into()]
+            ))
+            .await
+            .unwrap()
+            .is_empty(),
+        "plaintext recovery token must not be stored"
+    );
+
+    let recover_path = format!("/api/admin/v1/projects/{project}/credentials/{credential}/recover");
+    let recovered = admin(
+        &f,
+        &cookie,
+        http::Method::POST,
+        &recover_path,
+        json!({"token":token,"secret":"replacement-secret"}),
+        true,
+    )
+    .await;
+    assert_eq!(recovered.status(), StatusCode::OK);
+    assert_eq!(
+        request(&f, "/v1/chat/completions", chat()).await.status(),
+        StatusCode::OK
+    );
+    let reused = admin(
+        &f,
+        &cookie,
+        http::Method::POST,
+        &recover_path,
+        json!({"token":token,"secret":"another-secret"}),
+        true,
+    )
+    .await;
+    assert_eq!(reused.status(), StatusCode::CONFLICT);
+    sql(
+        &f,
+        "UPDATE channel_credentials SET secret_envelope=? WHERE id=?",
+        vec![stored_sentinel.into(), credential.clone().into()],
+    )
+    .await;
+    let expired = json_body(
+        admin(
+            &f,
+            &cookie,
+            http::Method::POST,
+            &issue_path,
+            json!({"expires_seconds":60}),
+            true,
+        )
+        .await,
+    )
+    .await;
+    let expired_token = expired["token"].as_str().unwrap();
+    sql(
+        &f,
+        "UPDATE credential_recovery_tokens SET expires_at=? WHERE token_hash=?",
+        vec![
+            (db::now() - 1).into(),
+            crate::crypto::token_hash(expired_token).into(),
+        ],
+    )
+    .await;
+    let expired_attempt = admin(
+        &f,
+        &cookie,
+        http::Method::POST,
+        &recover_path,
+        json!({"token":expired_token,"secret":"late-secret"}),
+        true,
+    )
+    .await;
+    assert_eq!(expired_attempt.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        count(
+            &f,
+            "SELECT COUNT(*) AS n FROM audit_events WHERE action IN ('credential.recovery.issue','credential.recovery.replace')"
+        )
+        .await,
+        3
+    );
+}
+
+#[tokio::test]
+async fn channel_clone_merge_preview_and_bulk_delete_are_safe_and_project_scoped() {
+    let f = fixture(success()).await;
+    let cookie = owner(&f).await;
+    let project = db::DEFAULT_PROJECT_ID;
+    let base = format!("/api/admin/v1/projects/{project}/operations");
+    assert_eq!(
+        admin(
+            &f,
+            &cookie,
+            http::Method::POST,
+            &format!("{base}/channels"),
+            json!({
+                "name":"Credential in URL",
+                "kind":"openai",
+                "base_url":"https://quota-user:quota-password@quota.invalid"
+            }),
+            true,
+        )
+        .await
+        .status(),
+        StatusCode::BAD_REQUEST,
+        "provider URLs must not accept userinfo credentials"
+    );
+    sql(
+        &f,
+        "UPDATE providers SET settings_json=? WHERE id=?",
+        vec![
+            json!({"version":1,"tags":["primary"]}).to_string().into(),
+            f.providers[0].clone().into(),
+        ],
+    )
+    .await;
+    sql(
+        &f,
+        "UPDATE channel_settings SET model_rules_json=? WHERE provider_id=?",
+        vec![
+            json!({"version":1,"reasoning_effort":{"auto":"high"}})
+                .to_string()
+                .into(),
+            f.providers[0].clone().into(),
+        ],
+    )
+    .await;
+
+    let preview = json_body(
+        admin(
+            &f,
+            &cookie,
+            http::Method::POST,
+            &format!("{base}/channel-preview"),
+            json!({"action":"clone","ids":[f.providers[0]]}),
+            true,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(preview["dependencies"][0]["models"], 1);
+    assert_eq!(preview["dependencies"][0]["credentials"], 1);
+    assert_eq!(preview["credential_secrets_copied"], false);
+
+    let cloned = json_body(
+        admin(
+            &f,
+            &cookie,
+            http::Method::POST,
+            &format!("{base}/channel-clone"),
+            json!({"source_id":f.providers[0],"name":"Clone without secrets"}),
+            true,
+        )
+        .await,
+    )
+    .await;
+    let clone_id = cloned["id"].as_str().unwrap();
+    assert_eq!(
+        count(
+            &f,
+            &format!("SELECT COUNT(*) AS n FROM models WHERE provider_id='{clone_id}'")
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        count(
+            &f,
+            &format!(
+                "SELECT COUNT(*) AS n FROM channel_credentials WHERE provider_id='{clone_id}'"
+            )
+        )
+        .await,
+        0
+    );
+    assert_eq!(count(&f,&format!("SELECT COUNT(*) AS n FROM channel_settings WHERE provider_id='{clone_id}' AND model_rules_json LIKE '%reasoning_effort%'" )).await,1);
+
+    let merge = admin(
+        &f,
+        &cookie,
+        http::Method::POST,
+        &format!("{base}/channel-merge"),
+        json!({"source_id":f.providers[0],"target_id":f.providers[1]}),
+        true,
+    )
+    .await;
+    assert_eq!(
+        merge.status(),
+        StatusCode::CONFLICT,
+        "same public model names must refuse a merge"
+    );
+
+    sql(&f,"INSERT INTO projects(id,name,slug,is_default,enabled,created_at,updated_at) VALUES('b60-foreign-project','Foreign','b60-foreign',0,1,0,0)",vec![]).await;
+    sql(&f,"INSERT INTO providers(id,project_id,name,kind,base_url,enabled,created_at,updated_at) VALUES('b60-empty',?,'Empty','openai','https://empty.invalid',1,0,0),('b60-foreign','b60-foreign-project','Foreign channel','openai','https://foreign.invalid',1,0,0)",vec![project.into()]).await;
+    sql(&f,"INSERT INTO models(id,provider_id,public_name,upstream_name,created_at) VALUES('b60-foreign-model','b60-foreign','public','foreign-private',0)",vec![]).await;
+    let foreign_preview = admin(
+        &f,
+        &cookie,
+        http::Method::POST,
+        &format!("{base}/channel-preview"),
+        json!({"action":"merge","ids":[f.providers[0],"b60-foreign"]}),
+        true,
+    )
+    .await;
+    assert_eq!(foreign_preview.status(), StatusCode::NOT_FOUND);
+    assert!(
+        !json_body(foreign_preview)
+            .await
+            .to_string()
+            .contains("public"),
+        "foreign channel model names must remain opaque"
+    );
+    let deleted = json_body(
+        admin(
+            &f,
+            &cookie,
+            http::Method::POST,
+            &format!("{base}/bulk-delete"),
+            json!({"resource":"channels","ids":["b60-empty","b60-foreign"]}),
+            true,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(deleted["deleted"], 1);
+    assert_eq!(
+        count(
+            &f,
+            "SELECT COUNT(*) AS n FROM providers WHERE id='b60-foreign'"
+        )
+        .await,
+        1
+    );
+    let blocked = admin(
+        &f,
+        &cookie,
+        http::Method::POST,
+        &format!("{base}/bulk-delete"),
+        json!({"resource":"channels","ids":[f.providers[0]]}),
+        true,
+    )
+    .await;
+    assert_eq!(blocked.status(), StatusCode::CONFLICT);
+    assert!(count(&f,"SELECT COUNT(*) AS n FROM audit_events WHERE action IN ('channel-clone.save','channels.delete')").await>=2);
+}
+
 /// Reads the stored `enabled` flag straight from the record system, so an assertion
 /// about a bulk key change cannot be satisfied by the response body alone.
 async fn api_key_enabled(f: &Fixture, id: &str) -> bool {

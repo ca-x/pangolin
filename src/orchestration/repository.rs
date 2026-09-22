@@ -93,6 +93,8 @@ struct Row {
     model_enabled: bool,
     provider_enabled: bool,
     settings_json: String,
+    catalog_metadata_json: String,
+    disable_developer_settings_inheritance: bool,
     endpoint_mappings_json: String,
     model_rules_json: String,
     parameter_overrides_json: String,
@@ -128,6 +130,7 @@ pub async fn candidates(
         SELECT m.id AS model_id,p.id AS provider_id,c.id AS credential_id,m.public_name,m.upstream_name,m.capabilities,
         p.name AS provider_name,p.kind AS provider_kind,p.base_url,c.secret_envelope,m.input_price_micros,m.output_price_micros,m.priority,
         m.enabled AS model_enabled,p.enabled AS provider_enabled,p.settings_json,
+        m.catalog_metadata_json,m.disable_developer_settings_inheritance,
         COALESCE(s.endpoint_mappings_json,'{"version":1}') AS endpoint_mappings_json,
         COALESCE(s.model_rules_json,'{"version":1}') AS model_rules_json,
         c.priority AS credential_priority,
@@ -149,6 +152,17 @@ pub async fn candidates(
         ORDER BY m.priority,p.id,m.id,c.priority,c.id
     "#,vec![key.project_id.clone().into(),key.id.clone().into()])).all(db).await?;
     let associations = Association::find_by_statement(statement("SELECT id,model_id,provider_id,match_type,pattern,conditions_json,exclusions_json,priority,weight FROM model_associations WHERE project_id=? AND enabled=1 ORDER BY priority,id",vec![key.project_id.clone().into()])).all(db).await?;
+    let project = db
+        .query_one(statement(
+            "SELECT settings_json FROM projects WHERE id=?",
+            vec![key.project_id.clone().into()],
+        ))
+        .await?
+        .ok_or(Error::Forbidden)?;
+    let project_settings = policy::document(&project.try_get::<String>("", "settings_json")?)?;
+    let developer_rules = project_settings
+        .pointer("/developer_settings/rules")
+        .and_then(Value::as_array);
     let mut result = vec![];
     for row in rows {
         let settings = policy::document(&row.settings_json)?;
@@ -159,6 +173,67 @@ pub async fn candidates(
         let mut matched = allow_direct_channel_model && row.public_name == model;
         let mut association_matched = false;
         let mut association_excluded = false;
+        let developer = serde_json::from_str::<Value>(&row.catalog_metadata_json)
+            .ok()
+            .and_then(|metadata| {
+                metadata
+                    .pointer("/card/developer")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            });
+        let developer_rule = (!row.disable_developer_settings_inheritance)
+            .then(|| {
+                developer_rules?
+                    .iter()
+                    .find(|rule| rule["developer"].as_str() == developer.as_deref())
+            })
+            .flatten();
+        if let Some(rule) = developer_rule
+            && let Some(developer_associations) = rule["associations"]
+                .as_array()
+                .filter(|rules| !rules.is_empty())
+        {
+            let mut developer_match = false;
+            for association in developer_associations {
+                let provider_match = association["provider_id"]
+                    .as_str()
+                    .is_some_and(|provider| provider == row.provider_id);
+                let tag_match = association["channel_tags"]
+                    .as_array()
+                    .is_some_and(|wanted| {
+                        wanted.iter().any(|tag| {
+                            tag.as_str()
+                                .is_some_and(|tag| tags.contains(&tag.to_owned()))
+                        })
+                    });
+                if (provider_match || tag_match)
+                    && policy::matches(
+                        &association.get("conditions").cloned().unwrap_or(json!({})),
+                        context,
+                    )?
+                {
+                    developer_match = true;
+                    let priority = association["priority"]
+                        .as_i64()
+                        .and_then(|value| i32::try_from(value).ok())
+                        .unwrap_or(0);
+                    let weight = association["weight"]
+                        .as_u64()
+                        .and_then(|value| u32::try_from(value).ok())
+                        .unwrap_or(1);
+                    if !association_matched || priority < rank.0 {
+                        rank = (priority, weight);
+                    }
+                    // This rule chooses among channels for the requested
+                    // developer model; it must not route an unrelated name.
+                    matched |= row.public_name == model;
+                    association_matched = true;
+                }
+            }
+            if !developer_match {
+                continue;
+            }
+        }
         for association in &associations {
             if association
                 .provider_id
@@ -258,7 +333,13 @@ pub async fn candidates(
             });
             continue;
         }
-        let model_rules = policy::document(&row.model_rules_json)?;
+        let mut model_rules = policy::document(&row.model_rules_json)?;
+        if let Some(mapping) = developer_rule
+            .and_then(|rule| rule.get("reasoning_effort"))
+            .filter(|mapping| mapping.is_object())
+        {
+            model_rules["reasoning_effort"] = mapping.clone();
+        }
         if let Some(exclusions) = model_rules.get("exclude") {
             let mut excluded = false;
             for pattern in exclusions.as_array().ok_or(Error::Configuration)? {

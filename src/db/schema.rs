@@ -875,6 +875,20 @@ ALTER TABLE project_invitations ADD COLUMN use_count INTEGER NOT NULL DEFAULT 0 
 UPDATE project_invitations SET use_count=1 WHERE accepted_at IS NOT NULL;
 "#;
 
+const V23_CREDENTIAL_RECOVERY_AND_DEVELOPER_SETTINGS: &str = r#"
+ALTER TABLE models ADD COLUMN disable_developer_settings_inheritance INTEGER NOT NULL DEFAULT 0 CHECK(disable_developer_settings_inheritance IN (0,1));
+CREATE TABLE credential_recovery_tokens (
+    token_hash TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    credential_id TEXT NOT NULL REFERENCES channel_credentials(id) ON DELETE CASCADE,
+    created_by TEXT NOT NULL,
+    expires_at INTEGER NOT NULL,
+    used_at INTEGER,
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX idx_credential_recovery_tokens_credential ON credential_recovery_tokens(project_id,credential_id,expires_at);
+"#;
+
 /// Associations gain a tag-regex selector and a versioned channel-exclusion
 /// document. Version 24 is reserved here because 18–23 belong to parallel
 /// parity migrations.
@@ -1257,6 +1271,25 @@ pub async fn migrate(db: &DatabaseConnection) -> Result<()> {
             .await?;
         transaction.commit().await?;
     }
+    let recovery_applied = Count::find_by_statement(statement(
+        "SELECT COUNT(*) AS count FROM schema_migrations WHERE version=23",
+    ))
+    .one(db)
+    .await?
+    .is_some_and(|row| row.count > 0);
+    if !recovery_applied {
+        let transaction = db.begin().await?;
+        transaction
+            .execute_unprepared(V23_CREDENTIAL_RECOVERY_AND_DEVELOPER_SETTINGS)
+            .await
+            .context("failed to add credential recovery and developer settings state")?;
+        transaction
+            .execute(statement(
+                "INSERT INTO schema_migrations(version,applied_at) VALUES(23,unixepoch())",
+            ))
+            .await?;
+        transaction.commit().await?;
+    }
     let association_filters_applied = Count::find_by_statement(statement(
         "SELECT COUNT(*) AS count FROM schema_migrations WHERE version=24",
     ))
@@ -1366,6 +1399,7 @@ mod tests {
             "catalog_overrides",
             "catalog_document_extensions",
             "channel_credentials",
+            "credential_recovery_tokens",
             "channel_settings",
             "model_associations",
             "model_prices",
@@ -1583,7 +1617,7 @@ mod tests {
 
         assert_eq!(
             scalar(&db, "SELECT COUNT(*) AS count FROM schema_migrations").await,
-            18
+            19
         );
         assert_eq!(
             scalar(

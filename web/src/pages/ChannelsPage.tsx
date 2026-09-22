@@ -1,4 +1,4 @@
-import { Badge, Button, Card, Group, Modal, Paper, SimpleGrid, Skeleton, Stack, Tabs, Text, Title, Tooltip } from '@mantine/core'
+import { Alert, Badge, Button, Card, Group, Modal, Paper, SimpleGrid, Skeleton, Stack, Tabs, Text, TextInput, Title, Tooltip } from '@mantine/core'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Plus } from 'lucide-react'
 import { useState } from 'react'
@@ -32,7 +32,7 @@ export default function ChannelsPage() {
         ))}
       </Tabs.List>
       <Tabs.Panel value="channels">
-        <ResourcePage resource="channels" title={t('channels')} description={t('channelsDescription')} empty={t('channelEmpty')} createLabel={t('addChannel')} selectable="channels" notice={<HealthNotice kind="channel" />} columns={[{ key: 'name', label: t('name'), render: (value, row) => <span className="provider-cell"><ProviderIcon logoKey={String((row.settings as Record<string, unknown>)?.logo_key || '')} name={String(value)} /><strong>{String(value)}</strong></span> }, { key: 'kind', label: t('providerType'), render: (value) => kindLabel(value) }, { key: 'base_url', label: t('baseUrl'), mono: true }, { key: 'health', label: t('channelHealth'), render: (_value, row) => <HealthCell kind="channel" id={String(row.id)} /> }, { key: 'enabled', label: t('status'), render: (value) => <EnabledPill enabled={value} /> }]} rowActions={(row) => <ProbeRowAction id={String(row.id)} name={displayValue(row.name || row.id)} />} fields={[{ key: 'name', label: t('name'), required: true }, { key: 'kind', label: t('providerType'), kind: 'provider', required: true, baseUrlKey: 'base_url', options: providerOptions(t) }, { key: 'base_url', label: t('baseUrl'), required: true, defaultValue: CHANNEL_PROVIDERS[0].defaultBaseUrl ?? '' }, { key: 'settings', label: t('advancedSettings'), kind: 'json', defaultValue: { version: 1, tags: [], limits: {}, circuit: { failures: 5, window_ms: 60000, recovery_ms: 30000 } } }, { key: 'enabled', label: t('status'), kind: 'checkbox' }]} />
+        <ResourcePage resource="channels" title={t('channels')} description={t('channelsDescription')} empty={t('channelEmpty')} createLabel={t('addChannel')} selectable="channels" bulkDelete notice={<HealthNotice kind="channel" />} columns={[{ key: 'name', label: t('name'), render: (value, row) => <span className="provider-cell"><ProviderIcon logoKey={String((row.settings as Record<string, unknown>)?.logo_key || '')} name={String(value)} /><strong>{String(value)}</strong></span> }, { key: 'kind', label: t('providerType'), render: (value) => kindLabel(value) }, { key: 'base_url', label: t('baseUrl'), mono: true }, { key: 'health', label: t('channelHealth'), render: (_value, row) => <HealthCell kind="channel" id={String(row.id)} /> }, { key: 'enabled', label: t('status'), render: (value) => <EnabledPill enabled={value} /> }]} rowActions={(row) => <><ProbeRowAction id={String(row.id)} name={displayValue(row.name || row.id)} /><ChannelLifecycleActions row={row} /></>} fields={[{ key: 'name', label: t('name'), required: true }, { key: 'kind', label: t('providerType'), kind: 'provider', required: true, baseUrlKey: 'base_url', options: providerOptions(t) }, { key: 'base_url', label: t('baseUrl'), required: true, defaultValue: CHANNEL_PROVIDERS[0].defaultBaseUrl ?? '' }, { key: 'settings', label: t('advancedSettings'), kind: 'json', defaultValue: { version: 1, tags: [], limits: {}, circuit: { failures: 5, window_ms: 60000, recovery_ms: 30000 }, quota: { path: '/api/v1/key' } } }, { key: 'enabled', label: t('status'), kind: 'checkbox' }]} />
         <BulkToggle />
       </Tabs.Panel>
       <Tabs.Panel value="credentials"><CredentialsPanel /></Tabs.Panel>
@@ -43,7 +43,7 @@ export default function ChannelsPage() {
       </Tabs.Panel>
       <Tabs.Panel value="quotas">
         <Diagnostics quota />
-        <ResourcePage resource="quotas" title={t('quotas')} description={t('quotasDescription')} empty={t('quotaEmpty')} immutable columns={[{ key: 'provider_id', label: t('channel'), mono: true }, { key: 'remaining_micros', label: t('remaining') }, { key: 'period_end', label: t('periodEnd') }, { key: 'collected_at', label: t('time') }]} />
+        <ResourcePage resource="quotas" title={t('quotas')} description={t('quotasDescription')} empty={t('quotaEmpty')} immutable columns={[{ key: 'provider_id', label: t('channel'), mono: true }, { key: 'remaining_micros', label: t('remaining'), render: (value, row) => (row.quota as Document)?.measured === false ? '—' : displayValue(value) }, { key: 'period', label: t('quotaPeriod'), render: (_value, row) => displayValue((row.quota as Document)?.period) }, { key: 'period_end', label: t('periodEnd'), render: formatDate }, { key: 'source_url', label: t('quotaUrl'), render: (_value, row) => displayValue((row.quota as Document)?.source_url) }, { key: 'collected_at', label: t('time'), render: formatDate }]} />
       </Tabs.Panel>
       <Tabs.Panel value="presets"><PresetsPanel /></Tabs.Panel>
     </Tabs>
@@ -100,6 +100,54 @@ function useChannelOptions() {
   const { project } = useProject()
   const query = useQuery({ queryKey: ['channel-options', project.id], queryFn: () => api<Paged<Document>>(projectOperationPath(project.id, 'channels') + '?limit=500') })
   return { query, options: (query.data?.data || []).map((row) => ({ value: String(row.id), label: String(row.name) })) }
+}
+
+function CredentialRecoveryAction({ row }: { row: Document }) {
+  const { t } = useTranslation()
+  const { project } = useProject()
+  const client = useQueryClient()
+  const [open, setOpen] = useState(false)
+  const [secret, setSecret] = useState('')
+  const [token, setToken] = useState('')
+  const issue = useMutation({ mutationFn: () => api<{ token: string }>(`/api/admin/v1/projects/${project.id}/credentials/${row.id}/recovery-token`, { method: 'POST', body: JSON.stringify({ expires_seconds: 600 }) }), onSuccess: (result) => { setToken(result.token); setOpen(true) }, onError: (error: Error) => toast.error(error.message) })
+  const recover = useMutation({ mutationFn: () => api(`/api/admin/v1/projects/${project.id}/credentials/${row.id}/recover`, { method: 'POST', body: JSON.stringify({ token, secret }) }), onSuccess: () => { setOpen(false); setToken(''); setSecret(''); toast.success(t('credentialRecovered')); void client.invalidateQueries({ queryKey: ['resource', project.id, 'credentials'] }) }, onError: (error: Error) => toast.error(error.message) })
+  return <>
+    <Button variant="subtle" color="red" size="compact-sm" loading={issue.isPending} onClick={() => issue.mutate()}>{t('replaceCredential')}</Button>
+    <Modal opened={open} onClose={() => !recover.isPending && setOpen(false)} title={t('replaceCredential')} closeButtonProps={{ 'aria-label': t('close') }}>
+      <Stack gap="md"><Alert color="red">{t('credentialUnrecoverableHint')}</Alert><TextInput type="password" label={t('replacementSecret')} value={secret} onChange={(event) => setSecret(event.currentTarget.value)} required /><Group justify="flex-end"><Button variant="default" onClick={() => setOpen(false)}>{t('cancel')}</Button><Button disabled={!secret} loading={recover.isPending} onClick={() => recover.mutate()}>{t('replaceCredential')}</Button></Group></Stack>
+    </Modal>
+  </>
+}
+
+function ChannelLifecycleActions({ row }: { row: Document }) {
+  const { t } = useTranslation()
+  const { project } = useProject()
+  const client = useQueryClient()
+  const { options } = useChannelOptions()
+  const [mode, setMode] = useState<'clone' | 'merge' | null>(null)
+  const [name, setName] = useState(`${String(row.name)} copy`)
+  const [target, setTarget] = useState('')
+  const [preview, setPreview] = useState<{ dependencies?: Array<{ models: number; credentials: number }>; collisions?: string[] } | null>(null)
+  const mutation = useMutation({ mutationFn: async () => {
+    const ids = mode === 'merge' ? [String(row.id), target] : [String(row.id)]
+    const result = await api<typeof preview>(projectOperationPath(project.id, 'channel-preview'), { method: 'POST', body: JSON.stringify({ action: mode, ids }) })
+    setPreview(result)
+    if (result?.collisions?.length) throw new Error(t('mergeModelCollision', { names: result.collisions.join(', ') }))
+    return api(projectOperationPath(project.id, mode === 'merge' ? 'channel-merge' : 'channel-clone'), { method: 'POST', body: JSON.stringify(mode === 'merge' ? { source_id: row.id, target_id: target } : { source_id: row.id, name }) })
+  }, onSuccess: () => { toast.success(t('saved')); setMode(null); setPreview(null); void client.invalidateQueries({ queryKey: ['resource', project.id] }) }, onError: (error: Error) => toast.error(error.message) })
+  const dependencies = preview?.dependencies?.[0]
+  return <>
+    <Button variant="subtle" size="compact-sm" onClick={() => { setPreview(null); setMode('clone') }}>{t('cloneChannel')}</Button>
+    <Button variant="subtle" size="compact-sm" onClick={() => { setPreview(null); setMode('merge') }}>{t('mergeChannel')}</Button>
+    <Modal opened={mode !== null} onClose={() => !mutation.isPending && setMode(null)} title={t(mode === 'merge' ? 'mergeChannel' : 'cloneChannel')} closeButtonProps={{ 'aria-label': t('close') }}>
+      <Stack gap="md">
+        {mode === 'clone' ? <TextInput label={t('name')} value={name} onChange={(event) => setName(event.currentTarget.value)} required /> : <SelectField label={t('targetChannel')} value={target} onValueChange={setTarget} options={options.filter((option) => option.value !== String(row.id))} />}
+        {dependencies && <Text size="sm" c="dimmed">{t('channelDependencyPreview', dependencies)}</Text>}
+        <Text size="sm" c="dimmed">{t('channelSecretsNotCopied')}</Text>
+        <Group justify="flex-end"><Button variant="default" onClick={() => setMode(null)}>{t('cancel')}</Button><Button disabled={mode === 'merge' ? !target : !name.trim()} loading={mutation.isPending} onClick={() => mutation.mutate()}>{t(mode === 'merge' ? 'mergeChannel' : 'cloneChannel')}</Button></Group>
+      </Stack>
+    </Modal>
+  </>
 }
 
 /**
@@ -175,7 +223,7 @@ function CredentialsPanel() {
   const retryOptions = () => void query.refetch()
   return (
     <>
-      <ResourcePage resource="credentials" title={t('credentials')} description={t('credentialsDescription')} empty={t('credentialEmpty')} selectable="credentials" createLabel={t('addCredential')} notice={<HealthNotice kind="credential" />} columns={[{ key: 'provider_name', label: t('channel') }, { key: 'suffix', label: t('suffix'), mono: true }, { key: 'credential_type', label: t('credentialType'), render: (value) => credentialType(value) }, { key: 'priority', label: t('priority') }, { key: 'health', label: t('credentialHealth'), render: (_value, row) => <HealthCell kind="credential" id={String(row.id)} /> }, { key: 'enabled', label: t('status'), render: (value) => <EnabledPill enabled={value} /> }]} fields={[{ key: 'provider_id', label: t('channel'), kind: 'select', required: true, options, error: optionsError, onRetry: retryOptions }, { key: 'credential_type', label: t('credentialType'), defaultValue: 'api_key', required: true }, { key: 'secret', label: t('secret'), kind: 'secret', hint: t('secretUpdateHint'), omitWhenBlank: true }, { key: 'priority', label: t('priority'), kind: 'number', defaultValue: 100 }, { key: 'enabled', label: t('status'), kind: 'checkbox' }, { key: 'settings', label: t('advancedSettings'), kind: 'json', defaultValue: { version: 1 } }]} />
+      <ResourcePage resource="credentials" title={t('credentials')} description={t('credentialsDescription')} empty={t('credentialEmpty')} selectable="credentials" createLabel={t('addCredential')} notice={<HealthNotice kind="credential" />} columns={[{ key: 'provider_name', label: t('channel') }, { key: 'suffix', label: t('suffix'), mono: true }, { key: 'credential_type', label: t('credentialType'), render: (value) => credentialType(value) }, { key: 'state', label: t('credentialState'), render: (value) => <Badge variant="light" color={value === 'unrecoverable' ? 'red' : 'green'}>{t(value === 'unrecoverable' ? 'credentialUnrecoverable' : 'credentialReady')}</Badge> }, { key: 'priority', label: t('priority') }, { key: 'health', label: t('credentialHealth'), render: (_value, row) => <HealthCell kind="credential" id={String(row.id)} /> }, { key: 'enabled', label: t('status'), render: (value) => <EnabledPill enabled={value} /> }]} rowActions={(row) => row.state === 'unrecoverable' ? <CredentialRecoveryAction row={row} /> : null} fields={[{ key: 'provider_id', label: t('channel'), kind: 'select', required: true, options, error: optionsError, onRetry: retryOptions }, { key: 'credential_type', label: t('credentialType'), defaultValue: 'api_key', required: true }, { key: 'secret', label: t('secret'), kind: 'secret', hint: t('secretUpdateHint'), omitWhenBlank: true }, { key: 'priority', label: t('priority'), kind: 'number', defaultValue: 100 }, { key: 'enabled', label: t('status'), kind: 'checkbox' }, { key: 'settings', label: t('advancedSettings'), kind: 'json', defaultValue: { version: 1 } }]} />
       <BulkToggle resource="credentials" />
     </>
   )

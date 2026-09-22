@@ -374,6 +374,12 @@ async fn quota_health_capability_and_disabled_credentials_are_filtered() {
     )
     .await;
     assert_eq!(plan(&f, body.clone()).await.unwrap().candidates.len(), 1);
+    sql(&f,"INSERT INTO provider_quota_snapshots(id,provider_id,remaining_micros,quota_json,collected_at,sequence) VALUES('unmeasured',?,NULL,?,2,99)",vec![provider.clone().into(),json!({"version":1,"measured":false,"status":"unknown","period":"unspecified"}).to_string().into()]).await;
+    assert_eq!(
+        plan(&f, body.clone()).await.unwrap().candidates.len(),
+        1,
+        "an unmeasured quota snapshot must not remove a usable channel"
+    );
     sql(
         &f,
         "INSERT INTO channel_health_state(provider_id,backoff_until,updated_at) VALUES(?,?,0)",
@@ -882,6 +888,87 @@ async fn upstream_model_rules_endpoint_and_tpm_media_policies_are_enforced() {
         result.attempt_payload(&result.candidates[0]).unwrap().0["max_tokens"],
         4096
     );
+}
+
+#[tokio::test]
+async fn developer_rules_apply_only_to_matching_models_and_can_be_disabled_per_model() {
+    let f = database_fixture().await;
+    let (preferred, _) = add_model(&f, "preferred", "shared", "shared-upstream").await;
+    let (fallback, _) = add_model(&f, "fallback", "shared", "shared-upstream").await;
+    let (other, _) = add_model(&f, "other", "other-model", "other-upstream").await;
+    for (provider, developer) in [(&preferred, "acme"), (&fallback, "acme"), (&other, "other")] {
+        sql(
+            &f,
+            "UPDATE models SET catalog_metadata_json=? WHERE provider_id=?",
+            vec![
+                json!({"card":{"developer":developer}}).to_string().into(),
+                provider.clone().into(),
+            ],
+        )
+        .await;
+    }
+    sql(&f,"UPDATE projects SET settings_json=? WHERE id=?",vec![json!({"version":1,"developer_settings":{"version":1,"rules":[{"developer":"acme","associations":[{"provider_id":preferred,"conditions":{"version":1},"priority":0,"weight":1}],"reasoning_effort":{"auto":"high"}},{"developer":"future-vendor","associations":[],"reasoning_effort":{}}]}}).to_string().into(),f.key.project_id.clone().into()]).await;
+
+    let routed = plan(&f, json!({"model":"shared"})).await.unwrap();
+    assert_eq!(routed.candidates.len(), 1);
+    assert_eq!(routed.candidates[0].provider_id, preferred);
+    let (body, _, _) = routed.attempt_payload(&routed.candidates[0]).unwrap();
+    assert_eq!(body["reasoning_effort"], "high");
+    assert_eq!(
+        plan(&f, json!({"model":"other-model"}))
+            .await
+            .unwrap()
+            .candidates[0]
+            .provider_id,
+        other
+    );
+
+    sql(
+        &f,
+        "UPDATE models SET disable_developer_settings_inheritance=1 WHERE provider_id IN (?,?)",
+        vec![preferred.clone().into(), fallback.clone().into()],
+    )
+    .await;
+    let uninherited = plan(&f, json!({"model":"shared"})).await.unwrap();
+    assert_eq!(uninherited.candidates.len(), 2);
+    let stored =
+        f.db.query_one(super::repository::statement(
+            "SELECT settings_json FROM projects WHERE id=?",
+            vec![f.key.project_id.clone().into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get::<String>("", "settings_json")
+        .unwrap();
+    assert!(
+        stored.contains("future-vendor"),
+        "unknown developers remain in the parent document"
+    );
+
+    sql(
+        &f,
+        "UPDATE models SET disable_developer_settings_inheritance=0 WHERE provider_id IN (?,?)",
+        vec![preferred.clone().into(), fallback.into()],
+    )
+    .await;
+    sql(
+        &f,
+        "INSERT INTO settings(key,value,updated_at) VALUES('model_settings',?,0)",
+        vec![
+            json!({"fallback_to_channels_on_model_not_found":false})
+                .to_string()
+                .into(),
+        ],
+    )
+    .await;
+    let developer_only = plan(&f, json!({"model":"shared"})).await.unwrap();
+    assert_eq!(
+        developer_only.candidates.len(),
+        1,
+        "developer associations must route without direct channel fallback"
+    );
+    assert_eq!(developer_only.candidates[0].provider_id, preferred);
 }
 
 #[tokio::test]

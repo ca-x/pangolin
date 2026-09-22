@@ -87,6 +87,8 @@ type ResourcePageProps = {
   canDelete?: boolean | ((row: Document) => boolean)
   /** Offers row selection and a selection bar, driven through `bulk-toggle`. */
   selectable?: BulkResource
+  /** Channels can preview dependencies and then request an atomic project-scoped bulk delete. */
+  bulkDelete?: boolean
   rowActions?: (row: Document) => ReactNode
   /**
    * The card list's own state line for a resource whose state is not `enabled`.
@@ -140,7 +142,7 @@ function readForm(form: HTMLFormElement, fields: FormField[]) {
   return output
 }
 
-export function ResourcePage({ resource, title, description, empty, columns, fields = [], createLabel, immutable, appendOnly, editDisabled = false, endpoint, itemEndpoint, createMethod = 'POST', updateMethod = 'POST', canDelete = true, rowActions, mobileStatus, filters, normalize, notice, selectable, headerAction, emptyAction, mobilePrimary, mobilePrimaryKey, mobileHiddenKeys, tableMinWidth = 700, mobileColumnLimit = 3 }: ResourcePageProps) {
+export function ResourcePage({ resource, title, description, empty, columns, fields = [], createLabel, immutable, appendOnly, editDisabled = false, endpoint, itemEndpoint, createMethod = 'POST', updateMethod = 'POST', canDelete = true, rowActions, mobileStatus, filters, normalize, notice, selectable, bulkDelete = false, headerAction, emptyAction, mobilePrimary, mobilePrimaryKey, mobileHiddenKeys, tableMinWidth = 700, mobileColumnLimit = 3 }: ResourcePageProps) {
   const { t } = useTranslation()
   const { project } = useProject()
   const client = useQueryClient()
@@ -182,6 +184,19 @@ export function ResourcePage({ resource, title, description, empty, columns, fie
     onSuccess: () => { toast.success(t('saved')); setSelected([]); void client.invalidateQueries({ queryKey: ['resource', project.id, resource] }) },
     onError: (error: Error) => toast.error(error.message),
   })
+  const bulkRemove = useMutation({
+    mutationFn: (ids: string[]) => api(projectOperationPath(project.id, 'bulk-delete'), { method: 'POST', body: JSON.stringify({ resource: 'channels', ids }) }),
+    onSuccess: () => { toast.success(t('deleted')); setSelected([]); void client.invalidateQueries({ queryKey: ['resource', project.id, resource] }) },
+    onError: (error: Error) => toast.error(error.message),
+  })
+  const previewBulkRemove = async () => {
+    try {
+      const preview = await api<{ dependencies: Array<{ models: number; credentials: number }> }>(projectOperationPath(project.id, 'channel-preview'), { method: 'POST', body: JSON.stringify({ action: 'bulk_delete', ids: selected }) })
+      const models = preview.dependencies.reduce((sum, row) => sum + row.models, 0)
+      const credentials = preview.dependencies.reduce((sum, row) => sum + row.credentials, 0)
+      confirmAction({ title: t('bulkDeleteChannelsTitle', { count: selected.length }), body: t('bulkDeleteChannelsBody', { models, credentials }), onConfirm: () => bulkRemove.mutateAsync(selected) })
+    } catch (error) { toast.error(error instanceof Error ? error.message : t('networkError')) }
+  }
   const confirmRemove = (row: Document) => confirmAction({ title: t('deleteResourceTitle', { name: displayValue(row.name || row.id) }), body: t('deleteResourceBody', { resource: title }), onConfirm: () => remove.mutateAsync(row.id) })
   const columnHelper = createColumnHelper<Document>()
   const tableColumns = useMemo(() => [
@@ -229,6 +244,7 @@ export function ResourcePage({ resource, title, description, empty, columns, fie
       <Text size="sm" fw={540}>{t('selectedCount', { count: selected.length })}</Text>
       <Button size="compact-sm" variant="default" loading={bulk.isPending} onClick={() => bulk.mutate(true)}>{t('enable')}</Button>
       <Button size="compact-sm" variant="default" loading={bulk.isPending} onClick={() => bulk.mutate(false)}>{t('disable')}</Button>
+      {bulkDelete && <Button size="compact-sm" variant="outline" color="red" loading={bulkRemove.isPending} onClick={() => void previewBulkRemove()}>{t('delete')}</Button>}
       <Button size="compact-sm" variant="subtle" onClick={() => setSelected([])}>{t('cancel')}</Button>
     </Group>}
     {query.isError ? <QueryError retry={() => void query.refetch()} /> : query.isLoading ? <SkeletonRows /> : rows.length === 0 ? <EmptyState icon={<Inbox />} title={title} copy={filter ? t('noSearchResults') : empty} action={!filter ? emptyAction ?? (!immutable && fields.length ? <Button onClick={(event) => beginCreate(event.currentTarget)}>{createLabel || t('add')}</Button> : undefined) : undefined} /> : <><TableScrollContainer minWidth={tableMinWidth} className="desktop-resource-table" style={{ maxHeight: 'min(74vh, 900px)' }} role="region" aria-label={title} tabIndex={0}><Table stickyHeader highlightOnHover><Table.Thead>{table.getHeaderGroups().map((group) => <Table.Tr key={group.id}>{group.headers.map((header) => <Table.Th key={header.id}>{flexRender(header.column.columnDef.header, header.getContext())}</Table.Th>)}</Table.Tr>)}</Table.Thead><Table.Tbody>{table.getRowModel().rows.map((row) => <Table.Tr key={row.id}>{row.getVisibleCells().map((cell) => <Table.Td key={cell.id}>{flexRender(cell.column.columnDef.cell, cell.getContext())}</Table.Td>)}</Table.Tr>)}</Table.Tbody></Table></TableScrollContainer><MobileResources rows={rows} columns={columns} rowActions={rowActions} mobileStatus={mobileStatus} onEdit={!immutable && !appendOnly && fields.length ? (row, trigger) => { lastTrigger.current = trigger; setInvalidFields(new Set()); setEditing(row); setOpen(true) } : undefined} editDisabled={editDisabled} onDelete={!immutable && !appendOnly ? confirmRemove : undefined} canDelete={canDelete} primary={mobilePrimary} primaryKey={mobilePrimaryKey} hiddenKeys={mobileHiddenKeys} columnLimit={mobileColumnLimit} /></>}

@@ -365,11 +365,111 @@ async fn probe(state: &AppState, claim: &jobs::Claim, payload: &Value) -> Result
         Err(ApiError::Upstream("probe failed".into()))
     }
 }
+#[derive(Debug)]
+pub(crate) struct NormalizedQuota {
+    pub remaining_micros: Option<i64>,
+    pub period_start: Option<i64>,
+    pub period_end: Option<i64>,
+    pub document: Value,
+}
+
+fn quota_number(value: &Value, pointers: &[&str]) -> Option<String> {
+    pointers.iter().find_map(|pointer| {
+        value.pointer(pointer).and_then(|number| {
+            if number.is_number() {
+                Some(number.to_string())
+            } else {
+                number.as_str().map(str::to_owned)
+            }
+        })
+    })
+}
+
+pub(crate) fn normalize_quota(
+    value: &Value,
+    payload: &Value,
+    source_url: &str,
+) -> Result<NormalizedQuota, ApiError> {
+    let mut safe_source_url = reqwest::Url::parse(source_url)
+        .map_err(|_| ApiError::BadRequest("invalid quota source URL".into()))?;
+    safe_source_url
+        .set_password(None)
+        .map_err(|_| ApiError::BadRequest("invalid quota source URL".into()))?;
+    safe_source_url
+        .set_username("")
+        .map_err(|_| ApiError::BadRequest("invalid quota source URL".into()))?;
+    let scale = payload["scale_micros"].as_i64().unwrap_or(1_000_000);
+    let custom = payload["remaining_pointer"].as_str();
+    let mut remaining_pointers = vec![
+        "/data/limit_remaining",
+        "/remaining",
+        "/remaining_amount",
+        "/quota/remaining",
+    ];
+    if let Some(pointer) = custom {
+        remaining_pointers.insert(0, pointer);
+    }
+    let direct = quota_number(value, &remaining_pointers)
+        .and_then(|amount| decimal_micros(&amount, scale).ok());
+    let limit = quota_number(value, &["/limit", "/total", "/usage/limit", "/quota/limit"])
+        .and_then(|amount| decimal_micros(&amount, scale).ok());
+    let used = quota_number(value, &["/used", "/usage/used", "/quota/used"])
+        .and_then(|amount| decimal_micros(&amount, scale).ok());
+    let remaining = direct.or_else(|| {
+        limit
+            .zip(used)
+            .map(|(limit, used)| limit.saturating_sub(used))
+    });
+    let period_start = payload["period_start"]
+        .as_i64()
+        .or_else(|| value.pointer("/period_start").and_then(Value::as_i64));
+    let period_end = payload["period_end"]
+        .as_i64()
+        .or_else(|| value.pointer("/period_end").and_then(Value::as_i64))
+        .or_else(|| value.pointer("/reset_at").and_then(Value::as_i64))
+        .or_else(|| value.pointer("/data/reset_at").and_then(Value::as_i64));
+    let period = payload["period"]
+        .as_str()
+        .or_else(|| value.pointer("/period").and_then(Value::as_str))
+        .or_else(|| value.pointer("/window").and_then(Value::as_str))
+        .unwrap_or("unspecified");
+    let measured = remaining.is_some();
+    let status = match remaining {
+        Some(amount) if amount <= 0 => "exhausted",
+        Some(_) => "available",
+        None => "unknown",
+    };
+    Ok(NormalizedQuota {
+        remaining_micros: remaining,
+        period_start,
+        period_end,
+        document: json!({"version":1,"measured":measured,"status":status,"period":period,"remaining_micros":remaining,"limit_micros":limit,"period_start":period_start,"period_end":period_end,"source_url":safe_source_url.as_str()}),
+    })
+}
+
 async fn quota(state: &AppState, claim: &jobs::Claim, payload: &Value) -> Result<(), ApiError> {
     let project = claim.project_id.as_deref().ok_or(ApiError::Forbidden)?;
     let provider = payload["provider_id"].as_str().ok_or(ApiError::NotFound)?;
     let (target, credential, secret) = target(state, project, provider).await?;
-    let path = payload["path"].as_str().unwrap_or("/api/v1/key");
+    let provider_settings = state
+        .db
+        .query_one(sql(
+            "SELECT settings_json FROM providers WHERE id=? AND project_id=?",
+            vec![provider.into(), project.into()],
+        ))
+        .await?
+        .ok_or(ApiError::NotFound)?
+        .try_get::<String>("", "settings_json")?;
+    let provider_settings: Value = serde_json::from_str(&provider_settings)
+        .map_err(|error| ApiError::Internal(error.into()))?;
+    let path = payload["path"]
+        .as_str()
+        .or_else(|| {
+            provider_settings
+                .pointer("/quota/path")
+                .and_then(Value::as_str)
+        })
+        .unwrap_or("/api/v1/key");
     if !path.starts_with('/') || path.starts_with("//") || path.contains(['?', '#']) {
         return Err(ApiError::BadRequest(
             "quota path must stay on configured provider origin".into(),
@@ -389,7 +489,7 @@ async fn quota(state: &AppState, claim: &jobs::Claim, payload: &Value) -> Result
     {
         return Err(ApiError::BadRequest("quota collection requires a supported API-key credential and the configured provider origin".into()));
     }
-    let request = state.oidc_client.get(url);
+    let request = state.oidc_client.get(url.clone());
     let request = match target.provider_kind.as_str() {
         "anthropic" => request
             .header("x-api-key", &secret)
@@ -414,33 +514,24 @@ async fn quota(state: &AppState, claim: &jobs::Claim, payload: &Value) -> Result
         }
     };
     let value = bounded_json(response).await?;
-    let pointer = payload["remaining_pointer"]
-        .as_str()
-        .unwrap_or("/data/limit_remaining");
-    let number = value
-        .pointer(pointer)
-        .filter(|v| v.is_number() || v.is_string())
-        .ok_or_else(|| ApiError::Upstream("quota amount missing".into()))?;
-    let scale = payload["scale_micros"].as_i64().unwrap_or(1_000_000);
-    let amount = number
-        .as_str()
-        .map(str::to_owned)
-        .unwrap_or_else(|| number.to_string());
-    let remaining = decimal_micros(&amount, scale)?;
+    let normalized = normalize_quota(&value, payload, url.as_str())?;
     let tx = state.db.begin().await?;
     jobs::fence(&tx, claim).await?;
-    let inserted=tx.execute(sql("INSERT INTO provider_quota_snapshots(id,provider_id,credential_id,period_start,period_end,remaining_micros,quota_json,collected_at,sequence) VALUES(?,?,?,?,?,?,?,?,(SELECT COALESCE(MAX(sequence),0)+1 FROM provider_quota_snapshots)) ON CONFLICT(id) DO NOTHING",vec![claim.id.clone().into(),provider.into(),credential.into(),payload["period_start"].as_i64().into(),payload["period_end"].as_i64().into(),remaining.into(),json!({"version":1,"remaining_micros":remaining}).to_string().into(),db::now().into()])).await?.rows_affected();
+    let inserted=tx.execute(sql("INSERT INTO provider_quota_snapshots(id,provider_id,credential_id,period_start,period_end,remaining_micros,quota_json,collected_at,sequence) VALUES(?,?,?,?,?,?,?,?,(SELECT COALESCE(MAX(sequence),0)+1 FROM provider_quota_snapshots)) ON CONFLICT(id) DO NOTHING",vec![claim.id.clone().into(),provider.into(),credential.into(),normalized.period_start.into(),normalized.period_end.into(),normalized.remaining_micros.into(),normalized.document.to_string().into(),db::now().into()])).await?.rows_affected();
     if inserted == 0 {
         tx.rollback().await?;
         return Ok(());
     }
-    if remaining <= 0 {
+    if normalized
+        .remaining_micros
+        .is_some_and(|remaining| remaining <= 0)
+    {
         notify(
             &tx,
             project,
             "quota.exhausted",
             &claim.id,
-            &json!({"provider_id":provider,"remaining_micros":remaining}),
+            &json!({"provider_id":provider,"remaining_micros":normalized.remaining_micros}),
         )
         .await?
     }

@@ -1,4 +1,50 @@
 use super::*;
+
+#[test]
+fn provider_quota_shapes_normalize_and_unknown_stays_unmeasured() {
+    let cases = [
+        (
+            json!({"data":{"limit_remaining":"12.5","reset_at":200}}),
+            12_500_000,
+            Some(200),
+        ),
+        (
+            json!({"remaining":7,"period":"weekly","period_end":300}),
+            7_000_000,
+            Some(300),
+        ),
+        (
+            json!({"usage":{"used":3,"limit":10},"window":"monthly"}),
+            7_000_000,
+            None,
+        ),
+    ];
+    for (shape, remaining, end) in cases {
+        let normalized = runtime::normalize_quota(
+            &shape,
+            &json!({}),
+            "https://quota-user:quota-password@quota.example/status",
+        )
+        .unwrap();
+        assert_eq!(normalized.remaining_micros, Some(remaining));
+        assert_eq!(normalized.period_end, end);
+        assert_eq!(normalized.document["measured"], true);
+        assert_eq!(
+            normalized.document["source_url"],
+            "https://quota.example/status"
+        );
+        assert!(!normalized.document.to_string().contains("quota-password"));
+    }
+    let unknown = runtime::normalize_quota(
+        &json!({"vendor":{"mystery":true}}),
+        &json!({}),
+        "https://quota.example/status",
+    )
+    .unwrap();
+    assert_eq!(unknown.remaining_micros, None);
+    assert_eq!(unknown.document["measured"], false);
+    assert_eq!(unknown.document["status"], "unknown");
+}
 use serde_json::json;
 
 #[test]

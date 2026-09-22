@@ -1354,6 +1354,11 @@ fn validate_http_url(value: &str) -> Result<(), ApiError> {
             "base URL must use http or https".into(),
         ));
     }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(ApiError::BadRequest(
+            "base URL must not contain credentials".into(),
+        ));
+    }
     Ok(())
 }
 

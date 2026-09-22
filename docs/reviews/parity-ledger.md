@@ -449,12 +449,12 @@ retry/model/quota settings, and CORS/timeouts. Every one of them is scheduled in
 
 | Row | Disposition | Evidence / what is missing |
 | --- | --- | --- |
-| Channel CRUD/bulk | partial | CRUD + enable/disable bulk; no clone/merge, no bulk delete |
+| Channel CRUD/bulk | implemented+tested | CRUD, clone, collision-safe merge, enable/disable and dependency-previewed atomic bulk delete; clone never copies credentials |
 | Channel families | implemented+tested | 18 kinds incl. OpenAI/Anthropic/Gemini/Azure/Bedrock/Vertex/GCP (`db/schema.rs` kinds check) |
 | Provider preset catalog | implemented+tested | 59 built-ins with logo keys, default URL/auth/endpoints (`catalog/data/builtin.json`) |
 | Catalog online maintenance | implemented+tested | import/export, prioritized signed subscriptions, ETag, staged activation, last-known-good |
 | Multiple credentials | partial | encrypted list with suffix and per-key state; no OAuth/GCP credential types |
-| Credential recovery | open | no recovery path for an undecryptable envelope beyond editing the credential |
+| Credential recovery | implemented+tested | undecryptable credentials fail over locally and use hashed, expiring, single-use, project/credential-bound replacement tokens without returning envelopes |
 | Proxy settings | open | no per-channel proxy (models 21) |
 | Endpoint mappings | implemented+tested | `channel_settings.endpoint_mappings` + `providers/mod.rs` |
 | Model discovery/sync | feature-build | models 25 |
@@ -465,12 +465,12 @@ retry/model/quota settings, and CORS/timeouts. Every one of them is scheduled in
 | Extensible model capabilities | partial | typed capabilities with preserved unknown extensions (`catalog/types.rs:121-122`); discovery/quota stay `implemented=false` |
 | Model CRUD/bulk | partial | CRUD + enable/disable bulk; no archive lifecycle, no batch create (models 10, 22) |
 | Associations | implemented+tested | core types plus channel-tag regex, bounded conditions and association-level channel name/id/tag exclusions |
-| Conditions | partial | nested AND/OR with 10 operators; no `daily_time`/media-presence fields (models 14) |
-| Developer settings | open | no per-developer associations, inheritance control or reasoning-effort mapping document |
+| Conditions | implemented+tested | bounded nested AND/OR with typed operators, UTC daily time, media presence, stream/request-format fields and a structured editor |
+| Developer settings | implemented+tested | versioned project rules provide developer-scoped channel associations and reasoning-effort mappings with per-model inheritance control |
 | Pricing | partial | channel price entries unreachable, no read projection (models 18, 24) |
 | Pricing modes | partial | flat/unit/tiered with cache-write variants; no volume mode (models 17) |
 | Channel probing | partial | manual probe job with status/latency/TTFT and error; no scheduled history view, no TPS, no model choice |
-| Provider quota collection | partial | snapshots with periods and backoff exist; provider-specific normalization is per-channel config |
+| Provider quota collection | implemented+tested | configured paths plus direct/nested/used-limit normalization preserve period/source metadata; unknown shapes remain unmeasured and non-enforcing |
 | Auto-disable | implemented+tested | status/error pattern counters, duration or cron+timezone recovery, channel or credential action (`operations/runtime.rs:400-470`) |
 
 ### Request orchestration (23)
