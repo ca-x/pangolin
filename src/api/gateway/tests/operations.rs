@@ -1748,6 +1748,249 @@ async fn project_user(
 async fn owner(f: &Fixture) -> String {
     owner_principal(f).await.0
 }
+
+#[tokio::test]
+async fn b40_b42_service_group_editor_round_trips_channels_ratio_and_audit() {
+    let f = fixture(success()).await;
+    let cookie = owner(&f).await;
+    let project = db::DEFAULT_PROJECT_ID;
+    let response = admin(
+        &f,
+        &cookie,
+        http::Method::POST,
+        &format!("/api/admin/v1/projects/{project}/operations/groups"),
+        json!({
+            "id": "b40-group",
+            "name": "Priority traffic",
+            "tier": "priority",
+            "ratio": 1.25,
+            "channels": [f.providers[0]],
+            "enabled": true
+        }),
+        true,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let groups = json_body(
+        admin(
+            &f,
+            &cookie,
+            http::Method::GET,
+            &format!("/api/admin/v1/projects/{project}/operations/groups"),
+            Value::Null,
+            false,
+        )
+        .await,
+    )
+    .await;
+    let group = groups["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|group| group["id"] == "b40-group")
+        .unwrap();
+    assert_eq!(group["ratio_millionths"], json!(1_250_000));
+    assert_eq!(group["channels"], json!([f.providers[0]]));
+    assert_eq!(
+        count(
+            &f,
+            "SELECT COUNT(*) AS n FROM audit_events WHERE action='groups.save' AND resource_id='b40-group'"
+        )
+        .await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn b40_b42_batch_create_names_the_invalid_row_and_writes_nothing() {
+    let f = fixture(success()).await;
+    let cookie = owner(&f).await;
+    let project = db::DEFAULT_PROJECT_ID;
+    let response = admin(
+        &f,
+        &cookie,
+        http::Method::POST,
+        &format!("/api/admin/v1/projects/{project}/models/batch"),
+        json!({"models": [
+            {
+                "catalog_model_id": "alibaba/deepseek-v4-flash-0731",
+                "provider_id": f.providers[0],
+                "public_name": "b41-valid",
+                "upstream_name": "deepseek-v4-flash-0731"
+            },
+            {
+                "catalog_model_id": "missing/catalog-card",
+                "provider_id": f.providers[0],
+                "public_name": "b41-invalid",
+                "upstream_name": "missing"
+            }
+        ]}),
+        true,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = json_body(response).await;
+    assert!(
+        body["error"]["message"].as_str().unwrap().contains("row 2"),
+        "{body}"
+    );
+    assert_eq!(
+        count(
+            &f,
+            "SELECT COUNT(*) AS n FROM models WHERE public_name LIKE 'b41-%'"
+        )
+        .await,
+        0
+    );
+}
+
+#[tokio::test]
+async fn b40_b42_bulk_archive_skips_foreign_ids_and_delete_is_atomic_on_history() {
+    let f = fixture(success()).await;
+    let cookie = owner(&f).await;
+    let project = db::DEFAULT_PROJECT_ID;
+    sql(
+        &f,
+        "INSERT INTO projects(id,name,slug,is_default,enabled,created_at,updated_at) VALUES('b41-foreign-project','Foreign','b41-foreign',0,1,0,0)",
+        vec![],
+    )
+    .await;
+    sql(
+        &f,
+        "INSERT INTO providers(id,name,kind,base_url,enabled,created_at,updated_at,project_id) VALUES('b41-foreign-provider','Foreign','openai','https://foreign.invalid',1,0,0,'b41-foreign-project')",
+        vec![],
+    )
+    .await;
+    sql(
+        &f,
+        "INSERT INTO models(id,provider_id,public_name,upstream_name,capabilities,enabled,created_at) VALUES('b41-local',?,'b41-local','b41-local','[]',1,0),('b41-foreign','b41-foreign-provider','b41-foreign','b41-foreign','[]',1,0)",
+        vec![f.providers[0].clone().into()],
+    )
+    .await;
+    let archive = json_body(
+        admin(
+            &f,
+            &cookie,
+            http::Method::POST,
+            &format!("/api/admin/v1/projects/{project}/models/bulk"),
+            json!({"ids":["b41-local", "b41-foreign"], "action":"archive"}),
+            true,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(archive["changed_ids"], json!(["b41-local"]));
+    assert_eq!(archive["skipped_ids"], json!(["b41-foreign"]));
+    assert_eq!(
+        count(
+            &f,
+            "SELECT COUNT(*) AS n FROM models WHERE id='b41-foreign' AND lifecycle='active'"
+        )
+        .await,
+        1
+    );
+
+    sql(
+        &f,
+        "INSERT INTO models(id,provider_id,public_name,upstream_name,capabilities,enabled,lifecycle,created_at) VALUES('b41-deletable',?,'b41-deletable','b41-deletable','[]',0,'archived',0),('b41-history',?,'b41-history','b41-history','[]',0,'archived',0)",
+        vec![f.providers[0].clone().into(), f.providers[0].clone().into()],
+    )
+    .await;
+    sql(
+        &f,
+        "INSERT INTO model_prices(id,model_id,version,valid_from,created_at) VALUES('b41-price','b41-history',1,0,0)",
+        vec![],
+    )
+    .await;
+    let delete = admin(
+        &f,
+        &cookie,
+        http::Method::POST,
+        &format!("/api/admin/v1/projects/{project}/models/bulk"),
+        json!({"ids":["b41-deletable", "b41-history"], "action":"delete"}),
+        true,
+    )
+    .await;
+    assert_eq!(delete.status(), StatusCode::CONFLICT);
+    assert_eq!(json_body(delete).await["error"]["type"], "history_retained");
+    assert_eq!(
+        count(
+            &f,
+            "SELECT COUNT(*) AS n FROM models WHERE id IN ('b41-deletable','b41-history')"
+        )
+        .await,
+        2,
+        "a refused bulk delete must not partially delete earlier rows"
+    );
+}
+
+#[tokio::test]
+async fn b40_b42_unassociated_models_names_only_enabled_models_without_a_match() {
+    let f = fixture(success()).await;
+    let cookie = owner(&f).await;
+    let project = db::DEFAULT_PROJECT_ID;
+    sql(&f, "UPDATE models SET enabled=0", vec![]).await;
+    sql(
+        &f,
+        "UPDATE providers SET settings_json='{\"tags\":[\"region-us\"]}' WHERE id=?",
+        vec![f.providers[0].clone().into()],
+    )
+    .await;
+    sql(
+        &f,
+        "INSERT INTO models(id,provider_id,public_name,upstream_name,capabilities,enabled,created_at) VALUES('b42-associated',?,'b42-associated','b42-associated','[]',1,0),('b42-tagged',?,'b42-tagged','b42-tagged','[]',1,0),('b42-excluded',?,'b42-excluded','b42-excluded','[]',1,0),('b42-unassociated',?,'b42-unassociated','b42-unassociated','[]',1,0),('b42-disabled',?,'b42-disabled','b42-disabled','[]',0,0)",
+        vec![
+            f.providers[0].clone().into(),
+            f.providers[0].clone().into(),
+            f.providers[0].clone().into(),
+            f.providers[0].clone().into(),
+            f.providers[0].clone().into(),
+        ],
+    )
+    .await;
+    sql(
+        &f,
+        "INSERT INTO model_associations(id,project_id,model_id,provider_id,match_type,pattern,conditions_json,priority,weight,enabled,created_at,updated_at) VALUES('b42-match',?,'b42-associated',?,'exact','b42-associated','{\"version\":1}',1,1,1,0,0),('b42-disabled-match',?,'b42-unassociated',?,'exact','b42-unassociated','{\"version\":1}',1,1,0,0,0)",
+        vec![
+            project.into(),
+            f.providers[0].clone().into(),
+            project.into(),
+            f.providers[0].clone().into(),
+        ],
+    )
+    .await;
+    sql(
+        &f,
+        "INSERT INTO model_associations(id,project_id,model_id,provider_id,match_type,pattern,conditions_json,exclusions_json,priority,weight,enabled,created_at,updated_at) VALUES('b42-tag-match',?,'b42-tagged',?,'channel_tags_regex','^region-(eu|us)$','{\"version\":1}','{\"version\":1}',1,1,1,0,0),('b42-excluded-match',?,'b42-excluded',?,'exact','b42-excluded','{\"version\":1}',?,1,1,1,0,0)",
+        vec![
+            project.into(),
+            f.providers[0].clone().into(),
+            project.into(),
+            f.providers[0].clone().into(),
+            json!({"version":1,"channel_ids":[f.providers[0].clone()]})
+                .to_string()
+                .into(),
+        ],
+    )
+    .await;
+
+    let document = json_body(
+        admin(
+            &f,
+            &cookie,
+            http::Method::GET,
+            &format!("/api/admin/v1/projects/{project}/models/unassociated"),
+            Value::Null,
+            false,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(document["total"], json!(2), "{document}");
+    assert_eq!(document["data"][0]["id"], json!("b42-excluded"));
+    assert_eq!(document["data"][1]["id"], json!("b42-unassociated"));
+}
 /// Deletes an operations resource with an API-key principal, which is how a project
 /// manager acts without a browser session.
 async fn delete_operation(f: &Fixture, token: &str, resource: &str, id: &str) -> Response {

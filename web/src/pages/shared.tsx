@@ -35,7 +35,7 @@ export type FormField = {
   key: string
   sourceKey?: string
   label: string
-  kind?: 'text' | 'number' | 'secret' | 'textarea' | 'json' | 'checkbox' | 'select' | 'provider' | 'permission-list'
+  kind?: 'text' | 'number' | 'secret' | 'textarea' | 'json' | 'checkbox' | 'select' | 'provider' | 'permission-list' | 'multi-checkbox'
   required?: boolean
   omitWhenBlank?: boolean
   hint?: string
@@ -107,6 +107,10 @@ type ResourcePageProps = {
   notice?: ReactNode
   /** Resource-specific controls can use the shared list shell without adopting its generic editor. */
   headerAction?: ReactNode
+  /** Adds a resource-specific action beside the shared create action, including in the empty state. */
+  secondaryAction?: ReactNode
+  /** Replaces enable/disable for a selected resource whose lifecycle has its own contract. */
+  bulkActions?: (selected: string[], clear: () => void) => ReactNode
   emptyAction?: ReactNode
   /** Cards may lead with a richer identity than the resource id. */
   mobilePrimary?: (row: Document) => ReactNode
@@ -131,7 +135,7 @@ function readForm(form: HTMLFormElement, fields: FormField[]) {
   const output: Record<string, unknown> = {}
   for (const field of fields) {
     if (field.kind === 'checkbox') { output[field.key] = data.get(field.key) === 'on'; continue }
-    if (field.kind === 'permission-list') { output[field.key] = data.getAll(field.key).map(String); continue }
+    if (field.kind === 'permission-list' || field.kind === 'multi-checkbox') { output[field.key] = data.getAll(field.key).map(String); continue }
     const raw = String(data.get(field.key) ?? '').trim()
     if (!raw && (field.omitWhenBlank || field.kind === 'secret')) continue
     if (!raw && !field.required) { output[field.key] = null; continue }
@@ -142,7 +146,7 @@ function readForm(form: HTMLFormElement, fields: FormField[]) {
   return output
 }
 
-export function ResourcePage({ resource, title, description, empty, columns, fields = [], createLabel, immutable, appendOnly, editDisabled = false, endpoint, itemEndpoint, createMethod = 'POST', updateMethod = 'POST', canDelete = true, rowActions, mobileStatus, filters, normalize, notice, selectable, bulkDelete = false, headerAction, emptyAction, mobilePrimary, mobilePrimaryKey, mobileHiddenKeys, tableMinWidth = 700, mobileColumnLimit = 3 }: ResourcePageProps) {
+export function ResourcePage({ resource, title, description, empty, columns, fields = [], createLabel, immutable, appendOnly, editDisabled = false, endpoint, itemEndpoint, createMethod = 'POST', updateMethod = 'POST', canDelete = true, rowActions, mobileStatus, filters, normalize, notice, selectable, bulkDelete = false, headerAction, secondaryAction, bulkActions, emptyAction, mobilePrimary, mobilePrimaryKey, mobileHiddenKeys, tableMinWidth = 700, mobileColumnLimit = 3 }: ResourcePageProps) {
   const { t } = useTranslation()
   const { project } = useProject()
   const client = useQueryClient()
@@ -233,8 +237,10 @@ export function ResourcePage({ resource, title, description, empty, columns, fie
     if (input instanceof HTMLInputElement) input.value = baseUrl
   }
   const handleClose = () => { setOpen(false); setEditing(null); requestAnimationFrame(() => lastTrigger.current?.focus()) }
+  const createAction = !immutable && fields.length ? <Button leftSection={<Plus size={17} />} onClick={(event) => beginCreate(event.currentTarget)}>{createLabel || t('add')}</Button> : undefined
+  const defaultActions = (secondaryAction || createAction) ? <Group gap="xs" wrap="wrap" justify="flex-end">{secondaryAction}{createAction}</Group> : undefined
   return <>
-    <PageHeader title={title} description={description} action={(total > 0 || filter) ? headerAction ?? (!immutable && fields.length ? <Button leftSection={<Plus size={17} />} onClick={(event) => beginCreate(event.currentTarget)}>{createLabel || t('add')}</Button> : undefined) : undefined} />
+    <PageHeader title={title} description={description} action={(total > 0 || filter) ? headerAction ?? defaultActions : undefined} />
     {/* A slot for an auxiliary query's own banner (health, a lookup). The element
         carries its own spacing so an empty slot leaves no gap. */}
     {notice}
@@ -242,12 +248,14 @@ export function ResourcePage({ resource, title, description, empty, columns, fie
     {(total > 0 || filter) && <TextInput leftSection={<Search size={17} />} placeholder={t('search')} value={filter} onChange={(event) => { setFilter(event.target.value); setOffset(0) }} aria-label={t('search')} mb="md" w={{ base: '100%', sm: 360 }} />}
     {selectable && selected.length > 0 && <Group gap="sm" mb="md" role="region" aria-label={t('bulkActions')} className="selection-bar">
       <Text size="sm" fw={540}>{t('selectedCount', { count: selected.length })}</Text>
-      <Button size="compact-sm" variant="default" loading={bulk.isPending} onClick={() => bulk.mutate(true)}>{t('enable')}</Button>
-      <Button size="compact-sm" variant="default" loading={bulk.isPending} onClick={() => bulk.mutate(false)}>{t('disable')}</Button>
-      {bulkDelete && <Button size="compact-sm" variant="outline" color="red" loading={bulkRemove.isPending} onClick={() => void previewBulkRemove()}>{t('delete')}</Button>}
-      <Button size="compact-sm" variant="subtle" onClick={() => setSelected([])}>{t('cancel')}</Button>
+      {bulkActions ? bulkActions(selected, () => setSelected([])) : <>
+        <Button size="compact-sm" variant="default" loading={bulk.isPending} onClick={() => bulk.mutate(true)}>{t('enable')}</Button>
+        <Button size="compact-sm" variant="default" loading={bulk.isPending} onClick={() => bulk.mutate(false)}>{t('disable')}</Button>
+        {bulkDelete && <Button size="compact-sm" variant="outline" color="red" loading={bulkRemove.isPending} onClick={() => void previewBulkRemove()}>{t('delete')}</Button>}
+        <Button size="compact-sm" variant="subtle" onClick={() => setSelected([])}>{t('cancel')}</Button>
+      </>}
     </Group>}
-    {query.isError ? <QueryError retry={() => void query.refetch()} /> : query.isLoading ? <SkeletonRows /> : rows.length === 0 ? <EmptyState icon={<Inbox />} title={title} copy={filter ? t('noSearchResults') : empty} action={!filter ? emptyAction ?? (!immutable && fields.length ? <Button onClick={(event) => beginCreate(event.currentTarget)}>{createLabel || t('add')}</Button> : undefined) : undefined} /> : <><TableScrollContainer minWidth={tableMinWidth} className="desktop-resource-table" style={{ maxHeight: 'min(74vh, 900px)' }} role="region" aria-label={title} tabIndex={0}><Table stickyHeader highlightOnHover><Table.Thead>{table.getHeaderGroups().map((group) => <Table.Tr key={group.id}>{group.headers.map((header) => <Table.Th key={header.id}>{flexRender(header.column.columnDef.header, header.getContext())}</Table.Th>)}</Table.Tr>)}</Table.Thead><Table.Tbody>{table.getRowModel().rows.map((row) => <Table.Tr key={row.id}>{row.getVisibleCells().map((cell) => <Table.Td key={cell.id}>{flexRender(cell.column.columnDef.cell, cell.getContext())}</Table.Td>)}</Table.Tr>)}</Table.Tbody></Table></TableScrollContainer><MobileResources rows={rows} columns={columns} rowActions={rowActions} mobileStatus={mobileStatus} onEdit={!immutable && !appendOnly && fields.length ? (row, trigger) => { lastTrigger.current = trigger; setInvalidFields(new Set()); setEditing(row); setOpen(true) } : undefined} editDisabled={editDisabled} onDelete={!immutable && !appendOnly ? confirmRemove : undefined} canDelete={canDelete} primary={mobilePrimary} primaryKey={mobilePrimaryKey} hiddenKeys={mobileHiddenKeys} columnLimit={mobileColumnLimit} /></>}
+    {query.isError ? <QueryError retry={() => void query.refetch()} /> : query.isLoading ? <SkeletonRows /> : rows.length === 0 ? <EmptyState icon={<Inbox />} title={title} copy={filter ? t('noSearchResults') : empty} action={!filter ? emptyAction ?? defaultActions : undefined} /> : <><TableScrollContainer minWidth={tableMinWidth} className="desktop-resource-table" style={{ maxHeight: 'min(74vh, 900px)' }} role="region" aria-label={title} tabIndex={0}><Table stickyHeader highlightOnHover><Table.Thead>{table.getHeaderGroups().map((group) => <Table.Tr key={group.id}>{group.headers.map((header) => <Table.Th key={header.id}>{flexRender(header.column.columnDef.header, header.getContext())}</Table.Th>)}</Table.Tr>)}</Table.Thead><Table.Tbody>{table.getRowModel().rows.map((row) => <Table.Tr key={row.id}>{row.getVisibleCells().map((cell) => <Table.Td key={cell.id}>{flexRender(cell.column.columnDef.cell, cell.getContext())}</Table.Td>)}</Table.Tr>)}</Table.Tbody></Table></TableScrollContainer><MobileResources rows={rows} columns={columns} rowActions={rowActions} mobileStatus={mobileStatus} onEdit={!immutable && !appendOnly && fields.length ? (row, trigger) => { lastTrigger.current = trigger; setInvalidFields(new Set()); setEditing(row); setOpen(true) } : undefined} editDisabled={editDisabled} onDelete={!immutable && !appendOnly ? confirmRemove : undefined} canDelete={canDelete} primary={mobilePrimary} primaryKey={mobilePrimaryKey} hiddenKeys={mobileHiddenKeys} columnLimit={mobileColumnLimit} /></>}
     {total > limit && <Group justify="flex-end" gap="sm" mt="md" className="pagination"><Pagination total={totalPages} value={currentPage} onChange={(page) => setOffset((page - 1) * limit)} getControlProps={(control) => {
       if (control === 'previous') return { 'aria-label': t('previous') }
       if (control === 'next') return { 'aria-label': t('next') }
@@ -289,6 +297,19 @@ function ResourceField({ field, value, editing, onProviderChange, onValidityChan
   const [selectedPermissions, setSelectedPermissions] = useState(() => permissionValues(value))
   const [validationError, setValidationError] = useState<string>()
   if (field.render) return field.render({ name: field.key, label: field.label, value, setValid: onValidityChange })
+  if (field.kind === 'multi-checkbox') {
+    const selected = Array.isArray(value) ? value.map(String) : []
+    return <fieldset className="permission-picker">
+      <legend>{field.label}</legend>
+      {field.hint && <Text size="sm" c="dimmed" mb="xs">{field.hint}</Text>}
+      {field.loading && <Group gap="xs" role="status"><Loader size={16} /><Text size="sm" c="dimmed">{t('loading')}</Text></Group>}
+      {field.error && <InlineQueryError message={field.error} onRetry={field.onRetry} />}
+      {!field.loading && !field.error && (field.options?.length ?? 0) === 0 && <Text size="sm" c="dimmed">{field.emptyMessage}</Text>}
+      {!field.error && <Stack gap="xs" className="permission-options">
+        {(field.options || []).map((option) => <Checkbox key={option.value} name={field.key} value={option.value} defaultChecked={selected.includes(option.value)} label={option.label} />)}
+      </Stack>}
+    </fieldset>
+  }
   if (field.kind === 'permission-list') {
     const permissions = field.permissions ?? []
     const available = new Set(permissions.map((permission) => permission.slug))

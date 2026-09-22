@@ -2,7 +2,7 @@ use super::*;
 use crate::operations::{self, backup, id, jobs, logging, pricing, sql, storage};
 use sea_orm::{ConnectionTrait, DatabaseTransaction, TransactionTrait};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::trace_preview;
 
@@ -165,6 +165,18 @@ pub(super) fn router(state: AppState) -> Router<AppState> {
         .route(
             "/api/admin/v1/projects/{project}/models/{id}/delete-impact",
             get(model_delete_impact),
+        )
+        .route(
+            "/api/admin/v1/projects/{project}/models/batch",
+            post(batch_create_models).layer(axum::extract::DefaultBodyLimit::max(256 * 1024)),
+        )
+        .route(
+            "/api/admin/v1/projects/{project}/models/bulk",
+            post(bulk_models).layer(axum::extract::DefaultBodyLimit::max(64 * 1024)),
+        )
+        .route(
+            "/api/admin/v1/projects/{project}/models/unassociated",
+            get(unassociated_models),
         )
         .route(
             "/api/admin/v1/projects/{project}/playground/chat",
@@ -960,7 +972,7 @@ fn query(resource: &str) -> Result<(&'static str, &'static str, &'static str), A
         "groups" => (
             "service_groups",
             "project_id=?",
-            "json_object('id',id,'name',name,'tier',tier,'ratio_millionths',ratio_millionths,'enabled',enabled)",
+            "json_object('id',id,'name',name,'tier',tier,'ratio_millionths',ratio_millionths,'channels',json(COALESCE((SELECT json_group_array(provider_id) FROM service_group_channels WHERE group_id=service_groups.id),'[]')),'enabled',enabled)",
         ),
         "retention" => (
             "data_retention_policies",
@@ -1403,6 +1415,389 @@ async fn model_delete_impact(
         "associations": row.try_get::<i64>("", "associations")?,
         "executions": row.try_get::<i64>("", "executions")?,
         "blocked": prices > 0 || usage_history > 0,
+    })))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BatchModelsInput {
+    models: Vec<BatchModelInput>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BatchModelInput {
+    catalog_model_id: String,
+    provider_id: String,
+    public_name: String,
+    upstream_name: String,
+}
+
+/// Import catalog-backed models as one audited unit. Catalog resolution happens
+/// before the SQLite business transaction, then every project/duplicate check and
+/// insert happens on that transaction so a bad later row cannot leave earlier rows.
+async fn batch_create_models(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project): Path<String>,
+    Json(input): Json<BatchModelsInput>,
+) -> Result<Json<Value>, ApiError> {
+    let user = actor(&state, &headers, Some(&project), true).await?;
+    if input.models.is_empty() || input.models.len() > 100 {
+        return Err(ApiError::BadRequest(
+            "models must contain 1–100 rows".into(),
+        ));
+    }
+    let mut resolved = Vec::with_capacity(input.models.len());
+    let mut identities = HashSet::with_capacity(input.models.len());
+    let catalog = crate::catalog::repository::effective(&state.db).await?;
+    for (index, row) in input.models.iter().enumerate() {
+        let row_number = index + 1;
+        if row.catalog_model_id.is_empty()
+            || row.catalog_model_id.len() > 256
+            || row.provider_id.is_empty()
+            || row.provider_id.len() > 256
+            || row.public_name.trim().is_empty()
+            || row.public_name.len() > 256
+            || row.upstream_name.trim().is_empty()
+            || row.upstream_name.len() > 256
+        {
+            return Err(ApiError::BadRequest(format!(
+                "row {row_number}: invalid model identity"
+            )));
+        }
+        let identity = (
+            row.provider_id.clone(),
+            row.public_name.trim().to_owned(),
+            row.upstream_name.trim().to_owned(),
+        );
+        if !identities.insert(identity) {
+            return Err(ApiError::BadRequest(format!(
+                "row {row_number}: duplicate model in batch"
+            )));
+        }
+        let defaults = db::catalog_model_defaults_from(&catalog, &row.catalog_model_id)
+            .ok_or_else(|| {
+                ApiError::BadRequest(format!(
+                    "row {row_number}: unknown or stale catalog model card"
+                ))
+            })?;
+        resolved.push(defaults);
+    }
+
+    let tx = state.db.begin().await?;
+    let mut created_ids = Vec::with_capacity(input.models.len());
+    for (index, (row, defaults)) in input.models.iter().zip(&resolved).enumerate() {
+        let row_number = index + 1;
+        if tx
+            .query_one(sql(
+                "SELECT id FROM providers WHERE id=? AND project_id=?",
+                vec![row.provider_id.clone().into(), project.clone().into()],
+            ))
+            .await?
+            .is_none()
+        {
+            return Err(ApiError::BadRequest(format!(
+                "row {row_number}: channel is not in this project"
+            )));
+        }
+        if tx
+            .query_one(sql(
+                "SELECT m.id FROM models m JOIN providers p ON p.id=m.provider_id WHERE m.provider_id=? AND m.public_name=? AND m.upstream_name=? AND p.project_id=?",
+                vec![
+                    row.provider_id.clone().into(),
+                    row.public_name.trim().to_owned().into(),
+                    row.upstream_name.trim().to_owned().into(),
+                    project.clone().into(),
+                ],
+            ))
+            .await?
+            .is_some()
+        {
+            return Err(ApiError::ConflictNamed(
+                "duplicate_model",
+                format!("row {row_number}: this channel already has that model"),
+            ));
+        }
+        let model = db::create_model_in(
+            &tx,
+            &ModelInput {
+                provider_id: row.provider_id.clone(),
+                public_name: row.public_name.trim().to_owned(),
+                upstream_name: row.upstream_name.trim().to_owned(),
+                capabilities: None,
+                input_price_micros: None,
+                output_price_micros: None,
+                priority: None,
+            },
+            &project,
+            defaults,
+        )
+        .await?;
+        audit_in(&tx, &user, &project, "models.batch_create", &model.id).await?;
+        created_ids.push(model.id);
+    }
+    tx.commit().await?;
+    state.orchestrator.reset_derived();
+    let created_count = created_ids.len();
+    Ok(Json(json!({
+        "created_ids": created_ids,
+        "created_count": created_count
+    })))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BulkModelsInput {
+    ids: Vec<String>,
+    action: String,
+}
+
+/// Apply B30's lifecycle and delete guards to a bounded selection in one
+/// transaction. Unknown or foreign ids are echoed only as skipped input; no
+/// foreign row is read without the project predicate.
+async fn bulk_models(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project): Path<String>,
+    Json(input): Json<BulkModelsInput>,
+) -> Result<Json<Value>, ApiError> {
+    let user = actor(&state, &headers, Some(&project), true).await?;
+    if input.ids.is_empty() || input.ids.len() > 100 {
+        return Err(ApiError::BadRequest("ids must contain 1–100 items".into()));
+    }
+    if !matches!(input.action.as_str(), "archive" | "restore" | "delete") {
+        return Err(ApiError::BadRequest("unknown bulk model action".into()));
+    }
+    let mut seen = HashSet::with_capacity(input.ids.len());
+    for model in &input.ids {
+        if model.is_empty() || model.len() > 2048 || !seen.insert(model) {
+            return Err(ApiError::BadRequest(
+                "ids must contain unique non-empty strings".into(),
+            ));
+        }
+    }
+
+    let tx = state.db.begin().await?;
+    let mut owned = Vec::with_capacity(input.ids.len());
+    let mut skipped_ids = Vec::new();
+    for model in &input.ids {
+        let row = tx
+            .query_one(sql(
+                "SELECT m.lifecycle,
+                  (SELECT COUNT(*) FROM model_prices WHERE model_id=m.id) AS prices,
+                  (SELECT COUNT(*) FROM usage_logs WHERE model_id=m.id OR price_id IN (SELECT id FROM model_prices WHERE model_id=m.id)) AS usage_history
+                 FROM models m JOIN providers p ON p.id=m.provider_id WHERE m.id=? AND p.project_id=?",
+                vec![model.clone().into(), project.clone().into()],
+            ))
+            .await?;
+        if let Some(row) = row {
+            owned.push((
+                model.clone(),
+                row.try_get::<String>("", "lifecycle")?,
+                row.try_get::<i64>("", "prices")?,
+                row.try_get::<i64>("", "usage_history")?,
+            ));
+        } else {
+            skipped_ids.push(model.clone());
+        }
+    }
+
+    if input.action == "delete" {
+        for (_, lifecycle, prices, usage_history) in &owned {
+            if lifecycle != "archived" {
+                return Err(ApiError::ConflictNamed(
+                    "archive_required",
+                    "archive every selected model and review its delete impact before deleting"
+                        .into(),
+                ));
+            }
+            if *prices > 0 || *usage_history > 0 {
+                return Err(ApiError::ConflictNamed(
+                    "history_retained",
+                    "a selected archived model has immutable price or usage history and cannot be deleted"
+                        .into(),
+                ));
+            }
+        }
+    }
+
+    let mut changed_ids = Vec::new();
+    for (model, lifecycle, _, _) in owned {
+        let (changed, audit) = match input.action.as_str() {
+            "archive" if lifecycle == "active" => (
+                tx.execute(sql(
+                    "UPDATE models SET lifecycle='archived' WHERE id=? AND lifecycle='active' AND provider_id IN (SELECT id FROM providers WHERE project_id=?)",
+                    vec![model.clone().into(), project.clone().into()],
+                ))
+                .await?
+                .rows_affected(),
+                "model.archive",
+            ),
+            "restore" if lifecycle == "archived" => (
+                tx.execute(sql(
+                    "UPDATE models SET lifecycle='active' WHERE id=? AND lifecycle='archived' AND provider_id IN (SELECT id FROM providers WHERE project_id=?)",
+                    vec![model.clone().into(), project.clone().into()],
+                ))
+                .await?
+                .rows_affected(),
+                "model.restore",
+            ),
+            "delete" => (
+                tx.execute(sql(
+                    "DELETE FROM models WHERE id=? AND lifecycle='archived' AND provider_id IN (SELECT id FROM providers WHERE project_id=?)",
+                    vec![model.clone().into(), project.clone().into()],
+                ))
+                .await?
+                .rows_affected(),
+                "models.delete",
+            ),
+            _ => {
+                skipped_ids.push(model);
+                continue;
+            }
+        };
+        if changed != 1 {
+            return Err(ApiError::Conflict(
+                "model lifecycle changed; retry the selection".into(),
+            ));
+        }
+        audit_in(&tx, &user, &project, audit, &model).await?;
+        changed_ids.push(model);
+    }
+    tx.commit().await?;
+    state.orchestrator.reset_derived();
+    let changed_count = changed_ids.len();
+    Ok(Json(json!({
+        "action": input.action,
+        "changed_ids": changed_ids,
+        "changed_count": changed_count,
+        "skipped_ids": skipped_ids
+    })))
+}
+
+/// A structural routing diagnostic: an enabled model is covered when at least
+/// one enabled association can select its channel/model and match its public name
+/// (or the channel tag used by a tag association). Request-specific conditions do
+/// not make a structurally associated model appear unassociated.
+async fn unassociated_models(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project): Path<String>,
+    Query(filter): Query<Filter>,
+) -> Result<Json<Value>, ApiError> {
+    actor(&state, &headers, Some(&project), false).await?;
+    let models = state
+        .db
+        .query_all(sql(
+            "SELECT m.id,m.public_name,p.id AS provider_id,p.name AS provider_name,p.settings_json
+             FROM models m JOIN providers p ON p.id=m.provider_id
+             WHERE p.project_id=? AND p.enabled=1 AND m.enabled=1 AND m.lifecycle='active'
+             ORDER BY m.public_name,p.name,m.id",
+            vec![project.clone().into()],
+        ))
+        .await?;
+    let associations = state
+        .db
+        .query_all(sql(
+            "SELECT model_id,provider_id,match_type,pattern,exclusions_json FROM model_associations WHERE project_id=? AND enabled=1 ORDER BY priority,id",
+            vec![project.into()],
+        ))
+        .await?;
+    let mut unassociated = Vec::new();
+    for model in models {
+        let model_id: String = model.try_get("", "id")?;
+        let public_name: String = model.try_get("", "public_name")?;
+        let provider_id: String = model.try_get("", "provider_id")?;
+        let provider_name: String = model.try_get("", "provider_name")?;
+        let settings: Value = serde_json::from_str(&model.try_get::<String>("", "settings_json")?)
+            .map_err(|error| ApiError::Internal(error.into()))?;
+        let tags: Vec<String> =
+            serde_json::from_value(settings.get("tags").cloned().unwrap_or_else(|| json!([])))
+                .map_err(|_| ApiError::Internal(anyhow::anyhow!("invalid stored channel tags")))?;
+        let mut matched = false;
+        for association in &associations {
+            if association
+                .try_get::<Option<String>>("", "model_id")?
+                .as_deref()
+                .is_some_and(|id| id != model_id.as_str())
+                || association
+                    .try_get::<Option<String>>("", "provider_id")?
+                    .as_deref()
+                    .is_some_and(|id| id != provider_id.as_str())
+            {
+                continue;
+            }
+            let pattern: String = association.try_get("", "pattern")?;
+            matched = match association.try_get::<String>("", "match_type")?.as_str() {
+                "exact" => pattern == public_name,
+                "regex" => crate::orchestration::policy::regex(&pattern)
+                    .map_err(|_| {
+                        ApiError::Internal(anyhow::anyhow!(
+                            "invalid stored model association regex"
+                        ))
+                    })?
+                    .is_match(&public_name),
+                "tag" => tags.iter().any(|tag| tag == &pattern),
+                "channel_tags_regex" => {
+                    let regex = crate::orchestration::policy::regex(&pattern).map_err(|_| {
+                        ApiError::Internal(anyhow::anyhow!(
+                            "invalid stored channel-tag association regex"
+                        ))
+                    })?;
+                    tags.iter().any(|tag| regex.is_match(tag))
+                }
+                _ => {
+                    return Err(ApiError::Internal(anyhow::anyhow!(
+                        "invalid stored model association match type"
+                    )));
+                }
+            };
+            if matched {
+                let exclusions = association.try_get::<String>("", "exclusions_json")?;
+                let exclusions = crate::orchestration::policy::AssociationExclusions::parse(
+                    &serde_json::from_str(&exclusions)
+                        .map_err(|error| ApiError::Internal(error.into()))?,
+                )
+                .map_err(|_| {
+                    ApiError::Internal(anyhow::anyhow!(
+                        "invalid stored model association exclusions"
+                    ))
+                })?;
+                matched = !exclusions
+                    .excludes(&provider_id, &provider_name, &tags)
+                    .map_err(|_| {
+                        ApiError::Internal(anyhow::anyhow!(
+                            "invalid stored model association exclusion pattern"
+                        ))
+                    })?;
+            }
+            if matched {
+                break;
+            }
+        }
+        if !matched {
+            unassociated.push(json!({
+                "id": model_id,
+                "public_name": public_name,
+                "provider_id": provider_id,
+                "provider_name": provider_name
+            }));
+        }
+    }
+    let total = unassociated.len();
+    let offset = filter.offset as usize;
+    let limit = filter.limit.unwrap_or(100).clamp(1, 500) as usize;
+    let data = unassociated
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .collect::<Vec<_>>();
+    Ok(Json(json!({
+        "data": data,
+        "total": total,
+        "offset": filter.offset,
+        "limit": limit
     })))
 }
 

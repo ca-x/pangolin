@@ -361,8 +361,18 @@ pub async fn catalog_model_defaults(
     card_id: &str,
 ) -> Result<Option<ModelCatalogDefaults>> {
     let catalog = crate::catalog::repository::effective(db).await?;
+    Ok(catalog_model_defaults_from(&catalog, card_id))
+}
+
+/// Resolve a card from one already assembled catalog. Batch callers use this so
+/// every row observes the same immutable effective snapshot without holding their
+/// business transaction while the catalog is read.
+pub fn catalog_model_defaults_from(
+    catalog: &crate::catalog::Catalog,
+    card_id: &str,
+) -> Option<ModelCatalogDefaults> {
     let Some(card) = catalog.models.iter().find(|model| model.id == card_id) else {
-        return Ok(None);
+        return None;
     };
     let price = |value: Option<f64>| {
         value
@@ -380,14 +390,14 @@ pub async fn catalog_model_defaults(
         .iter()
         .find(|provider| provider.id == card.developer)
         .map(|provider| provider.logo_key.as_str());
-    Ok(Some(ModelCatalogDefaults {
+    Some(ModelCatalogDefaults {
         capabilities: card.gateway_capabilities(),
         input_price_micros: price(priced.and_then(|model| model.cost_defaults.input)),
         output_price_micros: price(priced.and_then(|model| model.cost_defaults.output)),
         metadata:
             serde_json::json!({"catalog_version":catalog.version,"logo_key":logo_key,"card":card})
                 .to_string(),
-    }))
+    })
 }
 
 /// Insert a model on any connection — intended for callers that already hold a transaction.

@@ -1,7 +1,7 @@
 import { ActionIcon, Alert, Badge, Button, Checkbox, Collapse, Group, Loader, NumberInput, Pagination, Paper, Select, SimpleGrid, Stack, Table, TableScrollContainer, Tabs, Text, Textarea, TextInput, Title, Tooltip, UnstyledButton } from '@mantine/core'
 import { useMediaQuery } from '@mantine/hooks'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Archive, Copy, Download, Inbox, Plus, RefreshCw, RotateCcw, Search, Trash2, Upload } from 'lucide-react'
+import { Archive, Copy, Download, Inbox, Layers3, Plus, RefreshCw, RotateCcw, Search, Trash2, Upload } from 'lucide-react'
 import { useEffect, useState, type FormEvent } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
@@ -12,7 +12,7 @@ import { ProviderIcon } from '../ProviderIcon'
 import { AutoRefreshControl, useAutoRefreshInterval } from './autoRefresh'
 import { PageHeader, QueryError, ResourcePage, displayValue, formatDate } from './shared'
 
-const TAB_VALUES = ['models', 'routing', 'prices', 'catalog', 'subscriptions'] as const
+const TAB_VALUES = ['models', 'routing', 'groups', 'prices', 'catalog', 'subscriptions'] as const
 
 export default function ModelsPage() {
   const { t } = useTranslation()
@@ -24,7 +24,8 @@ export default function ModelsPage() {
         ))}
       </Tabs.List>
       <Tabs.Panel value="models"><ModelsPanel /></Tabs.Panel>
-      <Tabs.Panel value="routing"><RoutingEditor /><RoutingPreview /></Tabs.Panel>
+      <Tabs.Panel value="routing"><UnassociatedModels /><section id="association-editor"><RoutingEditor /></section><RoutingPreview /></Tabs.Panel>
+      <Tabs.Panel value="groups"><ServiceGroupsPanel /></Tabs.Panel>
       <Tabs.Panel value="prices"><PricesPanel /></Tabs.Panel>
       <Tabs.Panel value="catalog"><CatalogPanel /></Tabs.Panel>
       <Tabs.Panel value="subscriptions"><CatalogSubscriptions /></Tabs.Panel>
@@ -74,7 +75,7 @@ function ModelsPanel() {
   const modelIdentity = (row: Document) => <span className="provider-cell"><ProviderIcon logoKey={typeof row.catalog_logo_key === 'string' ? row.catalog_logo_key : undefined} name={typeof row.catalog_developer === 'string' ? row.catalog_developer : String(row.public_name)} /><strong>{String(row.public_name)}</strong></span>
   return <>
     <DeveloperSettingsEditor />
-    <ResourcePage key={project.id} resource="models" endpoint={(projectId) => `/api/admin/v1/projects/${projectId}/operations/models?lifecycle=${lifecycle}`} title={t('models')} description={t('modelsDescription')} selectable={lifecycle === 'active' ? 'models' : undefined} empty={t('modelEmpty')} createLabel={t('addModel')} tableMinWidth={1540} mobileColumnLimit={8} mobilePrimary={modelIdentity} mobilePrimaryKey="public_name" mobileHiddenKeys={['enabled', 'lifecycle']} mobileStatus={(row) => <Stack gap={4} align="flex-end"><LifecyclePill lifecycle={row.lifecycle} /><EnabledPill enabled={row.enabled} /></Stack>} filters={<Select label={t('modelLifecycle')} value={lifecycle} onChange={(value) => setLifecycle(value || 'active')} allowDeselect={false} data={[{ value: 'active', label: t('modelLifecycleActive') }, { value: 'archived', label: t('modelLifecycleArchived') }, { value: 'all', label: t('modelLifecycleAll') }]} w={{ base: '100%', sm: 220 }} />} editDisabled={(row) => row.lifecycle === 'archived'} canDelete={false} rowActions={(row) => <ModelLifecycleActions row={row} />} columns={[{ key: 'public_name', label: t('publicModel'), mono: true, render: (_value, row) => modelIdentity(row) }, { key: 'provider_name', label: t('channel') }, { key: 'upstream_name', label: t('upstreamModel'), mono: true }, { key: 'catalog_developer', label: t('modelDeveloper') }, { key: 'catalog_model_type', label: t('modelType') }, { key: 'catalog_context_limit_tokens', label: t('modelLimits'), render: (_value, row) => <ModelLimits row={row} /> }, { key: 'catalog_input_cost', label: t('catalogCostDefaults'), render: (_value, row) => <CatalogCosts row={row} /> }, { key: 'capabilities', label: t('capabilities'), render: (value) => <CapabilityTags value={value} /> }, { key: 'enabled', label: t('status'), render: (value) => <EnabledPill enabled={value} /> }, { key: 'lifecycle', label: t('modelLifecycle'), render: (value) => <LifecyclePill lifecycle={value} /> }]} fields={[{ key: 'catalog_model_id', label: t('catalogModel'), hint: t('catalogModelHint'), kind: 'select', createOnly: true, defaultValue: '__manual__', options: catalogOptions, loading: catalog.isLoading, error: catalog.isError ? t('catalogModelUnavailable') : undefined, emptyMessage: t('catalogModelEmpty'), allowManualOnError: true, onRetry: () => void catalog.refetch() }, { key: 'provider_id', label: t('channel'), kind: 'select', required: true, options: channels, error: optionsError, onRetry: retryChannels }, { key: 'public_name', label: t('publicModel'), required: true }, { key: 'upstream_name', label: t('upstreamModel'), required: true }, { key: 'capabilities', label: t('capabilities'), kind: 'json', defaultValue: ['chat', 'responses'] }, { key: 'input_price_micros', label: t('inputPrice'), kind: 'number', defaultValue: 0 }, { key: 'output_price_micros', label: t('outputPrice'), kind: 'number', defaultValue: 0 }, { key: 'priority', label: t('priority'), kind: 'number', defaultValue: 100 }, { key: 'disable_developer_settings_inheritance', label: t('disableDeveloperInheritance'), hint: t('disableDeveloperInheritanceHint'), kind: 'checkbox', defaultValue: false }, { key: 'enabled', label: t('status'), kind: 'checkbox' }]} normalize={(values, editing) => {
+    <ResourcePage key={project.id} resource="models" endpoint={(projectId) => `/api/admin/v1/projects/${projectId}/operations/models?lifecycle=${lifecycle}`} title={t('models')} description={t('modelsDescription')} selectable={lifecycle === 'all' ? undefined : 'models'} bulkActions={(selected, clear) => <ModelBulkActions ids={selected} lifecycle={lifecycle as 'active' | 'archived'} clear={clear} />} secondaryAction={<BatchModelImport cards={catalog.data?.data || []} cardsLoading={catalog.isLoading} cardsError={catalog.isError} retryCards={() => void catalog.refetch()} channels={channels} channelsError={channelsError} retryChannels={retryChannels} />} empty={t('modelEmpty')} createLabel={t('addModel')} tableMinWidth={1540} mobileColumnLimit={8} mobilePrimary={modelIdentity} mobilePrimaryKey="public_name" mobileHiddenKeys={['enabled', 'lifecycle']} mobileStatus={(row) => <Stack gap={4} align="flex-end"><LifecyclePill lifecycle={row.lifecycle} /><EnabledPill enabled={row.enabled} /></Stack>} filters={<Select label={t('modelLifecycle')} value={lifecycle} onChange={(value) => setLifecycle(value || 'active')} allowDeselect={false} data={[{ value: 'active', label: t('modelLifecycleActive') }, { value: 'archived', label: t('modelLifecycleArchived') }, { value: 'all', label: t('modelLifecycleAll') }]} w={{ base: '100%', sm: 220 }} />} editDisabled={(row) => row.lifecycle === 'archived'} canDelete={false} rowActions={(row) => <ModelLifecycleActions row={row} />} columns={[{ key: 'public_name', label: t('publicModel'), mono: true, render: (_value, row) => modelIdentity(row) }, { key: 'provider_name', label: t('channel') }, { key: 'upstream_name', label: t('upstreamModel'), mono: true }, { key: 'catalog_developer', label: t('modelDeveloper') }, { key: 'catalog_model_type', label: t('modelType') }, { key: 'catalog_context_limit_tokens', label: t('modelLimits'), render: (_value, row) => <ModelLimits row={row} /> }, { key: 'catalog_input_cost', label: t('catalogCostDefaults'), render: (_value, row) => <CatalogCosts row={row} /> }, { key: 'capabilities', label: t('capabilities'), render: (value) => <CapabilityTags value={value} /> }, { key: 'enabled', label: t('status'), render: (value) => <EnabledPill enabled={value} /> }, { key: 'lifecycle', label: t('modelLifecycle'), render: (value) => <LifecyclePill lifecycle={value} /> }]} fields={[{ key: 'catalog_model_id', label: t('catalogModel'), hint: t('catalogModelHint'), kind: 'select', createOnly: true, defaultValue: '__manual__', options: catalogOptions, loading: catalog.isLoading, error: catalog.isError ? t('catalogModelUnavailable') : undefined, emptyMessage: t('catalogModelEmpty'), allowManualOnError: true, onRetry: () => void catalog.refetch() }, { key: 'provider_id', label: t('channel'), kind: 'select', required: true, options: channels, error: optionsError, onRetry: retryChannels }, { key: 'public_name', label: t('publicModel'), required: true }, { key: 'upstream_name', label: t('upstreamModel'), required: true }, { key: 'capabilities', label: t('capabilities'), kind: 'json', defaultValue: ['chat', 'responses'] }, { key: 'input_price_micros', label: t('inputPrice'), kind: 'number', defaultValue: 0 }, { key: 'output_price_micros', label: t('outputPrice'), kind: 'number', defaultValue: 0 }, { key: 'priority', label: t('priority'), kind: 'number', defaultValue: 100 }, { key: 'disable_developer_settings_inheritance', label: t('disableDeveloperInheritance'), hint: t('disableDeveloperInheritanceHint'), kind: 'checkbox', defaultValue: false }, { key: 'enabled', label: t('status'), kind: 'checkbox' }]} normalize={(values, editing) => {
     if (editing || values.catalog_model_id === '__manual__') {
       const manual = { ...values }
       delete manual.catalog_model_id
@@ -82,6 +83,55 @@ function ModelsPanel() {
     }
     return values
     }} />
+  </>
+}
+
+function BatchModelImport({ cards, cardsLoading, cardsError, retryCards, channels, channelsError, retryChannels }: { cards: Document[]; cardsLoading: boolean; cardsError: boolean; retryCards: () => void; channels: Array<{ value: string; label: string }>; channelsError: boolean; retryChannels: () => void }) {
+  const { t } = useTranslation()
+  const { project } = useProject()
+  const client = useQueryClient()
+  const [open, setOpen] = useState(false)
+  const [provider, setProvider] = useState<string | null>(null)
+  const [selected, setSelected] = useState<string[]>([])
+  const [error, setError] = useState<string | null>(null)
+  const create = useMutation({
+    mutationFn: () => api(`/api/admin/v1/projects/${project.id}/models/batch`, { method: 'POST', body: JSON.stringify({ models: selected.map((cardId) => { const card = cards.find((item) => String(item.id) === cardId)!; return { catalog_model_id: cardId, provider_id: provider, public_name: String(card.name || card.id), upstream_name: String(card.upstream_id || card.id) } }) }) }),
+    onSuccess: () => { toast.success(t('modelsImported', { count: selected.length })); setOpen(false); setProvider(null); setSelected([]); void client.invalidateQueries({ queryKey: ['resource', project.id, 'models'] }) },
+    onError: (cause: unknown) => setError(describeFailure(cause, t)),
+  })
+  const toggle = (cardId: string, checked: boolean) => setSelected((current) => checked ? [...current, cardId] : current.filter((id) => id !== cardId))
+  const close = () => { if (!create.isPending) { setOpen(false); setError(null) } }
+  return <>
+    <Button variant="default" leftSection={<Layers3 size={17} />} onClick={() => setOpen(true)}>{t('importCatalogModels')}</Button>
+    <Modal open={open} onOpenChange={(value) => value ? setOpen(true) : close()} title={t('importCatalogModels')} description={t('importCatalogModelsHint')}>
+      <form onSubmit={(event) => { event.preventDefault(); setError(null); create.mutate() }}>
+        <Stack gap="md">
+          {cardsError ? <QueryError retry={retryCards} /> : cardsLoading ? <Group role="status" gap="xs"><Loader size={16} /><Text size="sm">{t('loading')}</Text></Group> : cards.length === 0 ? <Text size="sm" c="dimmed">{t('catalogModelEmpty')}</Text> : <fieldset className="permission-picker">
+            <legend>{t('catalogModels')}</legend>
+            <Stack gap="xs" className="permission-options">{cards.map((card) => <Checkbox key={String(card.id)} checked={selected.includes(String(card.id))} onChange={(event) => toggle(String(card.id), event.currentTarget.checked)} label={<Stack gap={0}><Text size="sm" fw={540}>{String(card.name || card.id)}</Text><Text size="xs" c="dimmed" className="mono-cell">{String(card.upstream_id || card.id)}</Text></Stack>} />)}</Stack>
+          </fieldset>}
+          {channelsError ? <Stack gap={4}><Text size="sm" fw={500}>{t('channel')}</Text><QueryError retry={retryChannels} /></Stack> : <Select label={t('targetModelChannel')} data={channels} value={provider} onChange={setProvider} required disabled={channels.length === 0} description={channels.length === 0 ? t('channelRequiredForImport') : undefined} />}
+          {error && <Alert color="red" role="alert">{error}</Alert>}
+          <Group justify="flex-end" gap="xs"><Button type="button" variant="default" disabled={create.isPending} onClick={close}>{t('cancel')}</Button><Button type="submit" loading={create.isPending} disabled={cardsLoading || cardsError || channelsError || !provider || selected.length === 0}>{t('importSelected', { count: selected.length })}</Button></Group>
+        </Stack>
+      </form>
+    </Modal>
+  </>
+}
+
+function ModelBulkActions({ ids, lifecycle, clear }: { ids: string[]; lifecycle: 'active' | 'archived'; clear: () => void }) {
+  const { t } = useTranslation()
+  const { project } = useProject()
+  const client = useQueryClient()
+  const mutate = useMutation({
+    mutationFn: (action: 'archive' | 'restore' | 'delete') => api(`/api/admin/v1/projects/${project.id}/models/bulk`, { method: 'POST', body: JSON.stringify({ ids, action }) }),
+    onSuccess: (_result, action) => { toast.success(t(action === 'delete' ? 'deleted' : 'saved')); clear(); void client.invalidateQueries({ queryKey: ['resource', project.id, 'models'] }) },
+    onError: (cause: unknown) => toast.error(describeFailure(cause, t)),
+  })
+  const run = (action: 'archive' | 'restore' | 'delete') => confirmAction({ title: t(action === 'delete' ? 'bulkDeleteModelsTitle' : action === 'archive' ? 'bulkArchiveModelsTitle' : 'bulkRestoreModelsTitle', { count: ids.length }), body: t(action === 'delete' ? 'bulkDeleteModelsBody' : action === 'archive' ? 'bulkArchiveModelsBody' : 'bulkRestoreModelsBody'), confirmLabel: t(action === 'delete' ? 'delete' : action === 'archive' ? 'archive' : 'restore'), onConfirm: () => mutate.mutateAsync(action) })
+  return <>
+    {lifecycle === 'active' ? <Button size="compact-sm" variant="default" loading={mutate.isPending && mutate.variables === 'archive'} onClick={() => run('archive')}>{t('archive')}</Button> : <><Button size="compact-sm" variant="default" loading={mutate.isPending && mutate.variables === 'restore'} onClick={() => run('restore')}>{t('restore')}</Button><Button size="compact-sm" color="red" loading={mutate.isPending && mutate.variables === 'delete'} onClick={() => run('delete')}>{t('delete')}</Button></>}
+    <Button size="compact-sm" variant="subtle" disabled={mutate.isPending} onClick={clear}>{t('cancel')}</Button>
   </>
 }
 
@@ -351,6 +401,29 @@ function ConditionEditor({ name, value, setValid }: { name: string; value: unkno
 }
 
 const commaList = (value: unknown) => String(value || '').split(',').map((item) => item.trim()).filter(Boolean)
+
+function ServiceGroupsPanel() {
+  const { t, i18n } = useTranslation()
+  const { channels, channelsError, retryChannels } = useModelRelations()
+  const channelNames = new Map(channels.map((channel) => [channel.value, channel.label]))
+  return <ResourcePage resource="groups" title={t('serviceGroups')} description={t('serviceGroupsDescription')} empty={t('serviceGroupsEmpty')} createLabel={t('addServiceGroup')} columns={[{ key: 'name', label: t('name') }, { key: 'tier', label: t('serviceTier') }, { key: 'ratio_millionths', label: t('requestCostRatio'), render: (value) => typeof value === 'number' ? new Intl.NumberFormat(i18n.language, { maximumFractionDigits: 6 }).format(value / 1_000_000) : '—' }, { key: 'channels', label: t('channels'), render: (value) => Array.isArray(value) && value.length > 0 ? value.map((id) => channelNames.get(String(id)) || String(id)).join(', ') : t('allChannels') }, { key: 'enabled', label: t('status'), render: (value) => <EnabledPill enabled={value} /> }]} fields={[{ key: 'name', label: t('name'), required: true }, { key: 'tier', label: t('serviceTier'), required: true, defaultValue: 'standard' }, { key: 'ratio', label: t('requestCostRatio'), hint: t('requestCostRatioHint'), kind: 'number', required: true, defaultValue: 1, fromRow: (row) => Number(row.ratio_millionths) / 1_000_000 }, { key: 'channels', label: t('assignedChannels'), hint: t('assignedChannelsHint'), kind: 'multi-checkbox', options: channels, error: channelsError ? t('optionsUnavailable') : undefined, onRetry: retryChannels, emptyMessage: t('noChannelsForGroup'), fromRow: (row) => row.channels }, { key: 'enabled', label: t('status'), kind: 'checkbox' }]} />
+}
+
+function UnassociatedModels() {
+  const { t } = useTranslation()
+  const { project } = useProject()
+  const query = useQuery({ queryKey: ['unassociated-models', project.id], queryFn: () => api<Paged<Document>>(`/api/admin/v1/projects/${project.id}/models/unassociated?limit=500`) })
+  if (query.isLoading) return <Paper withBorder p="md" mb="lg"><Group role="status" gap="xs"><Loader size={16} /><Text size="sm">{t('checkingModelAssociations')}</Text></Group></Paper>
+  if (query.isError) return <Paper withBorder p="md" mb="lg"><QueryError retry={() => void query.refetch()} /></Paper>
+  const models = query.data?.data || []
+  if (models.length === 0) return <Paper withBorder p="md" mb="lg"><Text fw={600}>{t('unassociatedModels')}</Text><Text size="sm" c="dimmed">{t('unassociatedModelsEmpty')}</Text></Paper>
+  return <Alert color="orange" variant="light" mb="lg" title={t('unassociatedModels')}>
+    <Stack gap="sm">
+      <Text size="sm">{t('unassociatedModelsHint', { count: query.data?.total ?? models.length })}</Text>
+      <Stack gap={4}>{models.map((model) => <Group key={String(model.id)} justify="space-between" wrap="wrap"><Text size="sm"><strong>{String(model.public_name)}</strong> · {String(model.provider_name)}</Text><Button component="a" href="#association-editor" variant="subtle" size="compact-sm">{t('editAssociations')}</Button></Group>)}</Stack>
+    </Stack>
+  </Alert>
+}
 
 function RoutingEditor() {
   const { t } = useTranslation()

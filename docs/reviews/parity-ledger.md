@@ -53,15 +53,15 @@ states plainly that no test guards it yet.
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | observability | 5 | 10 | 0 | 2 | 3 | 0 | 0 | 20 |
 | prompts & playground | 6 | 12 | 1 | 0 | 0 | 0 | 1 | 20 |
-| models, routing & pricing | 6 | 10 | 2 | 2 | 5 | 1 | 0 | 26 |
+| models, routing & pricing | 6 | 13 | 2 | 1 | 3 | 1 | 0 | 26 |
 | access control | 2 | 17 | 2 | 0 | 0 | 0 | 0 | 21 |
 | system settings & background work | 8 | 9 | 5 | 1 | 5 | 2 | 1 | 31 |
 | console-wide UX | 3 | 9 | 1 | 2 | 0 | 0 | 0 | 15 |
-| **total** | **30** | **67** | **11** | **7** | **13** | **3** | **2** | **133** |
+| **total** | **30** | **70** | **11** | **6** | **11** | **3** | **2** | **133** |
 
 Row count is unchanged at 133 — the six area reports' own findings. No row was
-dropped, merged or added. What changed is the status: **108 rows need no work**
-(30 already matched, 67 fixed, 11 refuted), **23 rows need work** (`partial` +
+dropped, merged or added. What changed is the status: **111 rows need no work**
+(30 already matched, 70 fixed, 11 refuted), **20 rows need work** (`partial` +
 `open` + `feature-build`), and **2 rows are recorded divergences** whose only
 remaining difference is deliberate.
 
@@ -156,11 +156,11 @@ Report: [parity-models-routing-pricing.md](parity-models-routing-pricing.md).
 | 16 | No auto-trim or hide-original/hide-mapped transformations | closed | fixed | Strict versioned model rules support exact-segment auto-trim, mappings and discovery-only hide-original/hide-mapped flags. Both identifiers remain routable; the bilingual structured editor retains advanced JSON for compatible rules. | `internal/objects/channel.go:163-180`, `channel_llm.go:1473,1490-1522` | three Rust transform/write tests plus `channelModelRules.test.tsx` |
 | 17 | No volume (non-marginal) tier pricing mode | open | — | `calculate` is marginal-only (`operations/pricing.rs:310-322`); the pre-flight upper bound uses the maximum tier rate (`:371-378`) | `internal/objects/price.go:26-31` (`usage_volume`) | a pricing test for per-component volume mode |
 | 18 | Channel-scoped prices cannot be created | open | — | Schema supports `provider_id` (`db/schema.rs:372-386`) and the resolver prefers it (`pricing.rs:425`), but the write path inserts `NULL` (`operations_api.rs:1377-1382`) and the form has no channel field (`ModelsPage.tsx:68`) | `channel_model_price.go:27-41` | a price-creation test that stores and reads back a channel-scoped rate |
-| 19 | Service-group price ratio has no console surface | open | — | `groups` is API-only (`operations_api.rs:429-433,1383-1420`); no page renders `resource="groups"` | `channels-model-price-dialog.tsx:1190-1200` | a groups editor test |
+| 19 | Service-group price ratio has no console surface | closed | fixed | Models has a bilingual service-group editor for the per-request ratio and project-scoped channel assignments; writes reuse the audited transactional `groups` resource contract. | `channels-model-price-dialog.tsx:1190-1200` | `b40_b42_service_group_editor_round_trips_channels_ratio_and_audit` plus `modelOperations.test.tsx` |
 | 20 | Model/provider deletion safety | partial | — | Model side is complete: read-only scoped impact counts, archive-required hard delete, typed immutable-history 409 and audited deletion of an unused archived model. Provider deletion still has typed dependency refusal but no equivalent impact preview/archive lifecycle. | archive dialog + typed delete confirmation | model preview/lifecycle cases are green; provider preview remains |
 | 21 | No per-channel proxy configuration | closed | fixed | SQLite v20 stores validated HTTP(S)/SOCKS proxy policy with write-only encrypted password; bounded configuration-keyed clients cover forwarding, probes, quota and discovery while list projections expose only configured state. | `channels-proxy-dialog.tsx:215-303` | proxy egress/encryption/redaction/validation Rust tests plus `channelProxyDiscovery.test.tsx` |
-| 22 | No model batch create and no real bulk lifecycle | partial | — | Row selection + `bulk-toggle` exist for channels, credentials, models, prompts, protection and keys (`shared.tsx:144-190`); no batch create and no bulk delete/archive | `models-batch-create-dialog.tsx`, `channels-bulk-*.tsx` | a batch-create test; bulk delete/archive depends on row 10 |
-| 23 | No unassociated-model detection | open | — | No route or UI | `models-unassociated-dialog.tsx` | a query test for channel models with no matching enabled association |
+| 22 | No model batch create and no real bulk lifecycle | closed | fixed | A bounded catalog-backed batch create validates every named row before one audited transaction; the Models table bulk archives/restores active lifecycle rows and applies B30's archive/history guards to atomic bulk delete while skipping foreign IDs. | `models-batch-create-dialog.tsx`, `channels-bulk-*.tsx` | B41 Rust atomicity/project-scope cases plus `modelOperations.test.tsx` |
+| 23 | No unassociated-model detection | closed | fixed | The project-scoped diagnostic covers enabled active models against enabled exact/regex/tag/channel-tag-regex associations, honors channel exclusions, and the routing tab names gaps with an association-editor link or explicit empty state. | `models-unassociated-dialog.tsx` | `b40_b42_unassociated_models_names_only_enabled_models_without_a_match` plus `modelOperations.test.tsx` |
 | 24 | Price list omits the components | open | — | The `prices` projection returns id/model/version/validity/schedule only (`operations_api.rs:381-385`); no page shows components | `channels-model-price-dialog.tsx` | a price-list test asserting each version's rates |
 | 25 | Provider model discovery / sync | closed | fixed | Bounded adapter-specific discovery feeds durable fenced manual/scheduled sync. Deterministic IDs preserve manual precedence, archive missing discovered rows, audit mutations and retain only a fixed failure code. | `internal/server/biz/model_fetcher.go`, `channel_model_sync.go` | discovery parser/bounds/catalog tests and model-sync idempotency/schedule/failure cases |
 | 26 | Full price editor (tiers, schedules, timezones) | feature-build | — | `components`/`schedule` are JSON textareas (`ModelsPage.tsx:68`); append-only, no delete | 1340-line editor, `model-price-editor.tsx`, `price-schedule-editor.tsx` | an editor test producing the same document the write API accepts |
