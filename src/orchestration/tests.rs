@@ -1030,9 +1030,14 @@ fn association_domain_context_is_sanitized_bounded_and_evaluable() {
     );
     assert_eq!(text_only["has_image"], false);
 
+    let mut crowded_messages = vec![json!({"type":"text","text":"x"}); 600];
+    crowded_messages.push(json!({
+        "type": "image_url",
+        "image_url": {"url": "https://example.invalid/late.png"}
+    }));
     let crowded = policy::context_at(
         &json!({
-            "messages": vec![json!({"type":"text","text":"x"}); 600],
+            "messages": crowded_messages,
             "model": "gpt",
             "stream": true
         }),
@@ -1044,6 +1049,11 @@ fn association_domain_context_is_sanitized_bounded_and_evaluable() {
     assert_eq!(crowded["body"]["model"], "gpt");
     assert_eq!(crowded["body"]["stream"], true);
     assert_eq!(crowded["stream"], true);
+    assert_eq!(crowded["has_image"], true);
+    assert!(
+        !crowded["body"].to_string().contains("late.png"),
+        "late media should affect only the derived boolean, not bypass the context bound"
+    );
 }
 
 #[test]

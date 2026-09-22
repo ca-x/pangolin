@@ -604,9 +604,16 @@ impl MediaPresence {
             || value == "application/pdf"
             || value.starts_with("text/");
     }
+
+    fn complete(&self) -> bool {
+        self.image && self.video && self.document && self.audio
+    }
 }
 
 fn media_presence(value: &Value, presence: &mut MediaPresence) {
+    if presence.complete() {
+        return;
+    }
     match value {
         Value::String(value) => {
             if let Some(media_type) = value
@@ -619,10 +626,18 @@ fn media_presence(value: &Value, presence: &mut MediaPresence) {
         Value::Array(values) => {
             for value in values {
                 media_presence(value, presence);
+                if presence.complete() {
+                    break;
+                }
             }
         }
         Value::Object(values) => {
             for (key, value) in values {
+                // The scan derives booleans only, but sensitive subtrees still do
+                // not participate in policy context or media classification.
+                if sensitive_header(key) {
+                    continue;
+                }
                 if matches!(
                     key.as_str(),
                     "image"
@@ -649,6 +664,9 @@ fn media_presence(value: &Value, presence: &mut MediaPresence) {
                     presence.observe(value);
                 }
                 media_presence(value, presence);
+                if presence.complete() {
+                    break;
+                }
             }
         }
         _ => {}
@@ -672,10 +690,14 @@ pub fn context_at(
     now: OffsetDateTime,
 ) -> Value {
     let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    // Gateway request bodies are bounded at ingress. Scan that complete parsed
+    // request before constructing the smaller condition context so media after
+    // its node budget cannot be mistaken for an absent modality. Only the four
+    // booleans below survive this scan; no request content is retained by it.
+    let mut media = MediaPresence::default();
+    media_presence(body, &mut media);
     let mut remaining = MAX_CONTEXT_NODES;
     let body = bounded_body(body, 0, &mut remaining).unwrap_or_else(|| json!({}));
-    let mut media = MediaPresence::default();
-    media_presence(&body, &mut media);
     let mut context = json!({
         "body": body,
         "headers": safe_headers(headers),
