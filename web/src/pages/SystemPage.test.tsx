@@ -548,6 +548,7 @@ describe('orchestration settings are a form over the stored document', () => {
     version: 1,
     affinity_rules: [{ id: 'sticky-session', mode: 'prefer', source: { kind: 'header', value: 'x-session-id' }, ttl_secs: 600, release_on_failure: true }],
     session_compaction: { enabled: true, threshold_tokens: 4096, retain_items: 8, native: false, summarizer_model: 'gpt-4o-mini' },
+    semantic_memory: { enabled: false, max_candidates: 4, rerank: false },
     routing: { version: 1, all: [{ field: '/body/model', op: 'regex', value: '^gpt-4' }, { field: '/headers/x-tier', op: 'eq', value: 'pro' }] },
   }
 
@@ -575,9 +576,11 @@ describe('orchestration settings are a form over the stored document', () => {
     // populated from the stored document rather than from a placeholder.
     const affinity = await screen.findByLabelText(/Affinity rules JSON/)
     const compaction = screen.getByLabelText(/Session compaction JSON/)
+    const semanticMemory = screen.getByLabelText(/Semantic memory JSON/)
     const routing = screen.getByLabelText(/Routing policy/)
     expect(affinity).toHaveValue(JSON.stringify(stored.affinity_rules, null, 2))
     expect(compaction).toHaveValue(JSON.stringify(stored.session_compaction, null, 2))
+    expect(semanticMemory).toHaveValue(JSON.stringify(stored.semantic_memory, null, 2))
     expect(routing).toHaveValue(JSON.stringify(stored.routing, null, 2))
 
     // A different, valid routing document: the operator's edit must be what is sent.
@@ -594,6 +597,7 @@ describe('orchestration settings are a form over the stored document', () => {
       version: 1,
       affinity_rules: stored.affinity_rules,
       session_compaction: stored.session_compaction,
+      semantic_memory: stored.semantic_memory,
       routing: edited,
     })
     expect(vi.mocked(toast.success).mock.calls.map(([message]) => message)).toContain('Saved')

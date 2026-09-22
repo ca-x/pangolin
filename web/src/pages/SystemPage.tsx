@@ -284,7 +284,7 @@ function BrandingSettings() {
   )
 }
 
-type OrchestrationDocument = { version: number; affinity_rules: unknown[]; session_compaction: Record<string, unknown>; routing?: unknown }
+type OrchestrationDocument = { version: number; affinity_rules: unknown[]; session_compaction: Record<string, unknown>; semantic_memory: Record<string, unknown>; routing?: unknown }
 function OrchestrationSettings() {
   const { t } = useTranslation()
   const { project } = useProject()
@@ -298,7 +298,7 @@ function OrchestrationSettings() {
     event.preventDefault();
     const data = new FormData(event.currentTarget);
     try {
-      save.mutate({ version: 1, affinity_rules: JSON.parse(String(data.get('affinity_rules'))), session_compaction: JSON.parse(String(data.get('session_compaction'))), routing: JSON.parse(String(data.get('routing'))) })
+      save.mutate({ version: 1, affinity_rules: JSON.parse(String(data.get('affinity_rules'))), session_compaction: JSON.parse(String(data.get('session_compaction'))), semantic_memory: JSON.parse(String(data.get('semantic_memory'))), routing: JSON.parse(String(data.get('routing'))) })
     } catch { toast.error(t('invalidJson')) }
   }
   return (
@@ -309,6 +309,7 @@ function OrchestrationSettings() {
           <Stack gap="md">
             <Textarea name="affinity_rules" label={t('affinityRules')} description={t('affinityRulesHint')} rows={12} defaultValue={JSON.stringify(query.data.affinity_rules, null, 2)} required />
             <Textarea name="session_compaction" label={t('sessionCompaction')} description={t('sessionCompactionHint')} rows={10} defaultValue={JSON.stringify(query.data.session_compaction, null, 2)} required />
+            <Textarea name="semantic_memory" label={t('semanticMemory')} description={t('semanticMemoryHint')} rows={7} defaultValue={JSON.stringify(query.data.semantic_memory, null, 2)} required />
             {/* The policy was in the document all along; the form neither showed
                 nor sent it, so the console could not edit a project's routing. */}
             <Textarea name="routing" label={t('routingPolicy')} description={t('routingPolicyHint')} rows={10} defaultValue={JSON.stringify(query.data.routing ?? { version: 1 }, null, 2)} required />

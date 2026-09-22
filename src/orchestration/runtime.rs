@@ -30,6 +30,7 @@ pub struct Runtime {
     affinity: Cache<String, String>,
     pub sessions: super::session::Sessions,
     pub affinity_rules: super::affinity::Cache,
+    pub semantic_memory: super::compaction::SemanticMemoryRuntime,
     pub websocket_pins: Cache<String, String>,
     pub upstream_clients: crate::providers::ClientPool,
     live_requests: Mutex<BTreeMap<u64, LiveRequest>>,
@@ -52,6 +53,7 @@ impl Default for Runtime {
                 .build(),
             sessions: Default::default(),
             affinity_rules: Default::default(),
+            semantic_memory: Default::default(),
             websocket_pins: Cache::builder()
                 .max_capacity(10000)
                 .time_to_idle(Duration::from_secs(86400))

@@ -2651,12 +2651,30 @@ struct SessionCompactionSettings {
     native: bool,
     summarizer_model: Option<String>,
 }
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+struct SemanticMemorySettings {
+    enabled: bool,
+    max_candidates: usize,
+    rerank: bool,
+}
+impl Default for SemanticMemorySettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_candidates: 4,
+            rerank: false,
+        }
+    }
+}
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct OrchestrationSettings {
     version: u8,
     affinity_rules: Vec<crate::orchestration::affinity::Rule>,
     session_compaction: SessionCompactionSettings,
+    #[serde(default)]
+    semantic_memory: SemanticMemorySettings,
     /// The project's default routing conditions. The orchestrator already reads
     /// this; until now no route wrote it. `None` means the request did not mention
     /// it, and the stored policy must be left alone: a form that does not carry
@@ -2677,6 +2695,7 @@ impl Default for OrchestrationSettings {
                 native: true,
                 summarizer_model: None,
             },
+            semantic_memory: SemanticMemorySettings::default(),
             routing: None,
         }
     }
@@ -2687,6 +2706,8 @@ fn validate_orchestration_settings(input: &OrchestrationSettings) -> Result<(), 
         || input.session_compaction.threshold_tokens < 128
         || input.session_compaction.threshold_tokens > 10_000_000
         || input.session_compaction.retain_items > 128
+        || input.semantic_memory.enabled
+            && !(1..=16).contains(&input.semantic_memory.max_candidates)
         || input.session_compaction.enabled
             && !input.session_compaction.native
             && input
@@ -2743,6 +2764,13 @@ async fn orchestration_settings(
                 .unwrap_or(json!(default.session_compaction)),
         )
         .map_err(|_| ApiError::BadRequest("invalid stored compaction settings".into()))?,
+        semantic_memory: serde_json::from_value(
+            settings
+                .get("semantic_memory")
+                .cloned()
+                .unwrap_or(json!(default.semantic_memory)),
+        )
+        .map_err(|_| ApiError::BadRequest("invalid stored semantic memory settings".into()))?,
         routing: settings.get("routing").cloned(),
     };
     Ok(Json(output))
@@ -2767,6 +2795,7 @@ async fn set_orchestration_settings(
         .map_err(|error| ApiError::Internal(error.into()))?;
     settings["affinity_rules"] = json!(input.affinity_rules);
     settings["session_compaction"] = json!(input.session_compaction);
+    settings["semantic_memory"] = json!(input.semantic_memory);
     if let Some(routing) = &input.routing {
         settings["routing"] = routing.clone();
     }

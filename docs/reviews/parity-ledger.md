@@ -269,7 +269,7 @@ one of the 133).
 | D3 | IP security is per API key (`allowed_ips`/`denied_ips`), not an instance-wide blocklist | Keeps the enforcement point at admission, where the key is already resolved | `db.rs` admission checks; `AccessPage.tsx:233-234` | row `system 9`; ADR recommended |
 | D4 | Bulk API-key state requires `api_key:manage` (with `project:manage ⇒ api_key:manage` preserved) and applies the owner-membership rule | One authority for one lifecycle; the generic `project:manage` gate would have bypassed the key contract | `access.rs::set_scoped_api_keys_enabled`, `operations_api.rs:909`; `bulk_key_state_takes_the_key_permission_and_keeps_the_session_guard` | controller ruling, recorded in the SDD ledger |
 | D5 | Invitations remain email-bound, finitely reusable and bounded to 30 days | B27 deliberately keeps identity binding and finite expiry while adding an operator-selected 1–100 use limit; AxonHub's reusable links have no email binding and can be unlimited | `access.rs` invitation acceptance; SQLite v18 | superseded by the implemented B27 decision; no longer blocks access 13 |
-| D6 | No GraphQL endpoint; the admin surface is REST with a documented envelope | One control-plane protocol, one error contract, one authorization path | `api/errors.rs`, `api/operations_api.rs` router | **ADR required** — this is a capability AxonHub has and Pangolin does not |
+| D6 | No GraphQL endpoint; the admin surface is REST with a documented envelope | One control-plane protocol, one error contract, one authorization and transactional-audit path | `api/errors.rs`, `api/operations_api.rs` router | Accepted: [ADR 0003](../adr/0003-rest-only-control-plane.md) |
 
 ## Decisions required
 
@@ -286,8 +286,8 @@ row of the 133, two are matrix-level.
 | system 24 | Quota routing mode | (a) add `IGNORE_QUOTA`/`REMOVE_ON_EXHAUSTED`/`BACKPRESSURE`, (b) document REMOVE_ON_EXHAUSTED only | an exhausted channel is always removed, with no alternative |
 | system 25 | Diagnostics tab | resolved: build bounded export and owner-only clear for derived caches | SQLite remains authoritative; clear is audited and cannot mutate access or routing records |
 | access 13 | Invitation reuse | **decided: (a)** finite max-uses (1–100), retaining email binding and bounded expiry | resolved by B27 |
-| matrix (D6) | Scoped GraphQL endpoint | (a) implement one over the same permission model, (b) record the REST-only decision as divergence D6 with an ADR | a capability AxonHub has stays absent without a recorded reason |
-| matrix | Semantic-memory provider | (a) implement an opt-in provider behind the documented interface, (b) keep the interface as documentation only | long-term memory stays unavailable even where an operator wants it |
+| matrix (D6) | Scoped GraphQL endpoint | REST-only divergence D6 recorded in [ADR 0003](../adr/0003-rest-only-control-plane.md) | closed as an intentional divergence; no second authorization/mutation surface |
+| matrix | Semantic-memory provider | Opt-in project setting and bounded project/API-key-scoped provider interface implemented; optional reranker only scores already scoped candidates | closed at the provider-interface boundary; no provider is installed by default |
 
 ## Deferred corrections carried forward
 
@@ -443,7 +443,7 @@ retry/model/quota settings, and CORS/timeouts. Every one of them is scheduled in
 | Antigravity OAuth | implemented+tested | bounded PKCE authorization-code helper with write-only encrypted token storage |
 | GitHub Copilot device OAuth | implemented+tested | bounded device-code polling, HTTPS github.com verification URL and encrypted terminal credential storage |
 | IP security | divergence | per-key allow/deny only (D3) |
-| OpenAPI GraphQL auth | divergence (ADR required) | no GraphQL endpoint (D6) |
+| OpenAPI GraphQL auth | divergence | REST-only control plane; D6 accepted in [ADR 0003](../adr/0003-rest-only-control-plane.md) |
 
 ### Channels, credentials and models (23)
 

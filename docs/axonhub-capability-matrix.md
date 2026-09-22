@@ -49,7 +49,7 @@ This inventory is the parity source of truth. It is cross-checked against AxonHu
 | Antigravity OAuth | start/exchange |
 | GitHub Copilot device OAuth | start/poll lifecycle |
 | IP security | Global blocklist, per-key allowlist, request-log ban affordance |
-| OpenAPI GraphQL auth | Scoped service GraphQL endpoint and playground |
+| OpenAPI GraphQL auth | Intentional REST-only divergence D6; one authorization/error/audit surface ([ADR 0003](adr/0003-rest-only-control-plane.md)) |
 
 OIDC branding intentionally diverges from AxonHub's remote `icon_url` field.
 Pangolin stores `logo_key`, resolves it only through the bundled `ProviderIcon`
@@ -110,7 +110,7 @@ sign-in page; no provider trademark asset is copied into Pangolin.
 | Allowed tools | Tool allow/filter behavior without corrupting message order |
 | Auto reasoning effort | Developer/model-aware effort inference |
 | Responses sessions | Session continuity and compact behavior |
-| Cross-upstream context economy | Sticky route, durable exact replay, optional threshold compaction, prompt-cache hints; semantic memory provider remains opt-in |
+| Cross-upstream context economy | Sticky route, durable exact replay, optional threshold compaction, prompt-cache hints; bounded project/key-scoped semantic memory remains opt-in, with optional scoped-candidate reranking |
 | Channel/API-key request tracking | In-flight and terminal counters are concurrency safe |
 
 ## Request lifecycle, observability and analytics

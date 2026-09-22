@@ -2949,7 +2949,7 @@ async fn task6_patch_preserves_omitted_secrets_and_channel_settings() {
         .unwrap();
     assert_eq!(serde_json::from_str::<Value>(&preserved).unwrap(), settings);
 
-    let orchestration = json!({"version":1,"affinity_rules":[{"id":"cache","mode":"prefer","source":{"kind":"pointer","value":"/prompt_cache_key"},"ttl_secs":900,"release_on_failure":true}],"session_compaction":{"enabled":true,"threshold_tokens":4096,"retain_items":12,"native":true,"summarizer_model":null}});
+    let orchestration = json!({"version":1,"affinity_rules":[{"id":"cache","mode":"prefer","source":{"kind":"pointer","value":"/prompt_cache_key"},"ttl_secs":900,"release_on_failure":true}],"session_compaction":{"enabled":true,"threshold_tokens":4096,"retain_items":12,"native":true,"summarizer_model":null},"semantic_memory":{"enabled":true,"max_candidates":4,"rerank":false}});
     assert_eq!(
         admin(
             &f,
@@ -2987,6 +2987,7 @@ async fn task6_patch_preserves_omitted_secrets_and_channel_settings() {
         fetched["session_compaction"],
         orchestration["session_compaction"]
     );
+    assert_eq!(fetched["semantic_memory"], orchestration["semantic_memory"]);
     let mut invalid = orchestration;
     invalid["affinity_rules"][0]["ttl_secs"] = json!(0);
     assert_eq!(
@@ -3318,6 +3319,129 @@ async fn task5_compaction_is_opt_in_cached_and_failure_preserves_exact_history()
         StatusCode::OK
     );
     assert_eq!(seen.lock().await[3]["input"], json!(history));
+}
+
+struct FailingSemanticMemory {
+    calls: Arc<AtomicUsize>,
+    scopes: Arc<Mutex<Vec<(String, String)>>>,
+}
+
+impl crate::orchestration::compaction::SemanticMemory for FailingSemanticMemory {
+    fn retrieve<'a>(
+        &'a self,
+        project: &'a str,
+        key: &'a str,
+        _query: &'a str,
+        _limit: usize,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        Vec<crate::orchestration::compaction::SemanticMemoryCandidate>,
+                        crate::orchestration::compaction::SemanticMemoryError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.scopes
+                .lock()
+                .await
+                .push((project.to_owned(), key.to_owned()));
+            Err(crate::orchestration::compaction::SemanticMemoryError)
+        })
+    }
+}
+
+#[tokio::test]
+async fn semantic_memory_is_explicitly_scoped_and_failure_preserves_exact_replay() {
+    let seen = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let captured = seen.clone();
+    let f = fixture(Router::new().route(
+        "/v1/responses",
+        post(move |Json(body): Json<Value>| {
+            let captured = captured.clone();
+            async move {
+                captured.lock().await.push(body);
+                Json(json!({
+                    "id": "resp_memory",
+                    "status": "completed",
+                    "output": [{"type":"message","role":"assistant","content":"ok"}],
+                    "usage": {"input_tokens": 10, "output_tokens": 2}
+                }))
+            }
+        }),
+    ))
+    .await;
+    sql(
+        &f,
+        "UPDATE models SET capabilities='[\"responses\"]'",
+        vec![],
+    )
+    .await;
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let scopes = Arc::new(Mutex::new(Vec::new()));
+    f.state
+        .orchestrator
+        .semantic_memory
+        .install_provider(Arc::new(FailingSemanticMemory {
+            calls: calls.clone(),
+            scopes: scopes.clone(),
+        }));
+    let history = vec![
+        json!({"type":"message","role":"user","content":"Use the saved preference"}),
+        json!({"type":"function_call","call_id":"call_1","name":"lookup","arguments":"{}"}),
+        json!({"type":"function_call_output","call_id":"call_1","output":"first"}),
+        json!({"type":"message","role":"user","content":"Continue exactly"}),
+    ];
+    let body = json!({"model":"public","input":history});
+
+    assert_eq!(
+        request(&f, "/v1/responses", body.clone()).await.status(),
+        StatusCode::OK
+    );
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
+    assert_eq!(seen.lock().await[0]["input"], json!(history));
+
+    sql(
+        &f,
+        "UPDATE projects SET settings_json=?",
+        vec![
+            json!({
+                "version": 1,
+                "semantic_memory": {"enabled": true, "max_candidates": 4, "rerank": false}
+            })
+            .to_string()
+            .into(),
+        ],
+    )
+    .await;
+    assert_eq!(
+        request(&f, "/v1/responses", body).await.status(),
+        StatusCode::OK
+    );
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        *scopes.lock().await,
+        vec![(
+            db::DEFAULT_PROJECT_ID.to_owned(),
+            f.state
+                .db
+                .query_one(ops::sql(
+                    "SELECT id FROM api_keys WHERE project_id=?",
+                    vec![db::DEFAULT_PROJECT_ID.into()],
+                ))
+                .await
+                .unwrap()
+                .unwrap()
+                .try_get::<String>("", "id")
+                .unwrap(),
+        )]
+    );
+    assert_eq!(seen.lock().await[1]["input"], json!(history));
 }
 
 #[tokio::test]
