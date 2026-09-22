@@ -679,19 +679,27 @@ async fn start_provider_oauth(
     {
         return Err(ApiError::BadRequest("invalid OAuth client ID".into()));
     }
-    if state
+    let provider_row = state
         .db
         .query_one(sql(
-            "SELECT id FROM providers WHERE id=? AND project_id=?",
+            "SELECT kind FROM providers WHERE id=? AND project_id=?",
             vec![provider.clone().into(), project.clone().into()],
         ))
         .await?
-        .is_none()
-    {
-        return Err(ApiError::NotFound);
-    }
+        .ok_or(ApiError::NotFound)?;
     let flow = crate::oauth::Flow::parse(&flow)
         .ok_or_else(|| ApiError::BadRequest("unsupported OAuth flow".into()))?;
+    if !flow.is_available() {
+        return Err(ApiError::BadRequest(
+            "OAuth flow is unavailable until its provider adapter is implemented".into(),
+        ));
+    }
+    let provider_kind = provider_row.try_get::<String>("", "kind")?;
+    if !flow.supports_provider_kind(&provider_kind) {
+        return Err(ApiError::BadRequest(
+            "OAuth flow is incompatible with this channel type".into(),
+        ));
+    }
     let spec = provider_oauth_spec(&state, &provider, flow).await?;
     let (response, secret, expires_in, interval) = if flow.is_device() {
         if input.redirect_uri.is_some() {
@@ -781,6 +789,25 @@ async fn complete_provider_oauth(
     let user = actor(&state, &headers, Some(&project), true).await?;
     let flow = crate::oauth::Flow::parse(&flow)
         .ok_or_else(|| ApiError::BadRequest("unsupported OAuth flow".into()))?;
+    if !flow.is_available() {
+        return Err(ApiError::BadRequest(
+            "OAuth flow is unavailable until its provider adapter is implemented".into(),
+        ));
+    }
+    let provider_kind = state
+        .db
+        .query_one(sql(
+            "SELECT kind FROM providers WHERE id=? AND project_id=?",
+            vec![provider.clone().into(), project.clone().into()],
+        ))
+        .await?
+        .ok_or(ApiError::NotFound)?
+        .try_get::<String>("", "kind")?;
+    if !flow.supports_provider_kind(&provider_kind) {
+        return Err(ApiError::BadRequest(
+            "OAuth flow is incompatible with this channel type".into(),
+        ));
+    }
     if input.state.len() < 32 || input.state.len() > 256 {
         return Err(ApiError::BadRequest("invalid OAuth state".into()));
     }
@@ -860,6 +887,7 @@ async fn complete_provider_oauth(
                 .as_deref()
                 .filter(|code| !code.is_empty() && code.len() <= 4096)
                 .ok_or_else(|| ApiError::BadRequest("OAuth code is required".into()))?,
+            &input.state,
             secret
                 .verifier
                 .as_deref()
@@ -976,6 +1004,7 @@ async fn provider_oauth_spec(
                     .and_then(Value::as_str)
                 {
                     return Ok(crate::oauth::ProviderSpec::test_browser(
+                        flow,
                         authorization.to_owned(),
                         token.to_owned(),
                     ));

@@ -219,38 +219,20 @@ async fn oauth_api_encrypts_the_token_and_never_returns_it() {
 }
 
 #[tokio::test]
-async fn oauth_api_device_polling_is_bounded_and_expires_without_a_credential() {
+async fn oauth_api_refuses_flows_without_complete_provider_adapters() {
     let polls = Arc::new(AtomicUsize::new(0));
     let counter = Arc::clone(&polls);
-    let device_code = Arc::new(format!("device-{}", Uuid::new_v4()));
-    let response_device_code = Arc::clone(&device_code);
     let mock = Router::new()
         .route(
             "/device",
-            post(move || {
-                let device_code = Arc::clone(&response_device_code);
-                async move {
-                    Json(json!({
-                        "device_code":device_code.as_str(),
-                        "user_code":"ABCD-EFGH",
-                        "verification_uri":"https://github.com/login/device",
-                        "expires_in":1,
-                        "interval":1
-                    }))
-                }
+            post(move || async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Json(json!({"unexpected":true}))
             }),
         )
         .route(
             "/token",
-            post(move || {
-                counter.fetch_add(1, Ordering::SeqCst);
-                async {
-                    (
-                        StatusCode::BAD_REQUEST,
-                        Json(json!({"error":"authorization_pending"})),
-                    )
-                }
-            }),
+            post(|| async { Json(json!({"unexpected":true})) }),
         );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -275,35 +257,14 @@ async fn oauth_api_device_polling_is_bounded_and_expires_without_a_credential() 
         .await
         .unwrap();
     let cookie = oauth_owner(&f).await;
-    let base = format!(
-        "/api/admin/v1/projects/{}/providers/{provider}/oauth/github_copilot",
-        db::DEFAULT_PROJECT_ID
-    );
-    let started = oauth_request(
-        &f,
-        &cookie,
-        &format!("{base}/start"),
-        json!({"client_id":"test-client"}),
-    )
-    .await;
-    let bytes = to_bytes(started.into_body(), 64 * 1024).await.unwrap();
-    assert!(!String::from_utf8_lossy(&bytes).contains(device_code.as_str()));
-    let started: Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(started["interval"], 5);
-    let complete_path = format!("{base}/complete");
-    let complete = || {
-        oauth_request(
-            &f,
-            &cookie,
-            &complete_path,
-            json!({"state":started["state"]}),
-        )
-    };
-    assert_eq!(complete().await.status(), StatusCode::OK);
-    assert_eq!(complete().await.status(), StatusCode::OK);
-    assert_eq!(polls.load(Ordering::SeqCst), 1);
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    assert_eq!(complete().await.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(polls.load(Ordering::SeqCst), 1);
+    for flow in ["github_copilot", "antigravity"] {
+        let path = format!(
+            "/api/admin/v1/projects/{}/providers/{provider}/oauth/{flow}/start",
+            db::DEFAULT_PROJECT_ID
+        );
+        let response = oauth_request(&f, &cookie, &path, json!({"client_id":"test-client"})).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{flow}");
+    }
+    assert_eq!(polls.load(Ordering::SeqCst), 0);
     server.abort();
 }

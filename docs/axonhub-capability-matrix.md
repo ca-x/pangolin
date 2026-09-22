@@ -46,8 +46,8 @@ This inventory is the parity source of truth. It is cross-checked against AxonHu
 | Codex OAuth | start/exchange and auth JSON decode |
 | xAI OAuth/SSO | start/exchange/SSO decode |
 | Claude Code OAuth | start/exchange |
-| Antigravity OAuth | start/exchange |
-| GitHub Copilot device OAuth | start/poll lifecycle |
+| Antigravity OAuth | Explicitly unavailable until Code Assist project resolution and refresh-backed provider auth are implemented |
+| GitHub Copilot device OAuth | Explicitly unavailable until GitHub-to-Copilot token exchange and provider headers are implemented |
 | IP security | Global blocklist, per-key allowlist, request-log ban affordance |
 | OpenAPI GraphQL auth | Intentional REST-only divergence D6; one authorization/error/audit surface ([ADR 0003](adr/0003-rest-only-control-plane.md)) |
 
@@ -148,7 +148,7 @@ sign-in page; no provider trademark asset is copied into Pangolin.
 | Favicon/static SPA | Embedded branded assets and deep links |
 | Playground/chat | Admin-selected channel/model request testing |
 | Request content policy | Store chunks/body/live preview toggles |
-| Provider OAuth credential helpers | Codex/xAI/Claude Code/Antigravity/Copilot setup flows |
+| Provider OAuth credential helpers | Codex/xAI/Claude Code setup flows; Antigravity/Copilot fail closed pending complete provider adapters |
 
 ## Console feature pages
 

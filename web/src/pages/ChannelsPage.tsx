@@ -275,7 +275,7 @@ function ChannelSyncAction({ id, name }: { id: string; name: string }) {
 }
 
 type OAuthStart = { state: string; authorization_url?: string; verification_uri?: string; user_code?: string; expires_in?: number; interval?: number }
-const OAUTH_FLOWS = ['codex', 'xai', 'claude_code', 'antigravity', 'github_copilot'] as const
+const OAUTH_FLOWS = ['codex', 'xai', 'claude_code'] as const
 
 function OAuthCredentialPanel({ options, optionsError, retryOptions }: { options: { value: string; label: string }[]; optionsError?: string; retryOptions: () => void }) {
   const { t } = useTranslation()
@@ -290,12 +290,12 @@ function OAuthCredentialPanel({ options, optionsError, retryOptions }: { options
   const selectedProvider = provider || options[0]?.value || ''
   const path = (action: 'start' | 'complete') => `/api/admin/v1/projects/${project.id}/providers/${selectedProvider}/oauth/${flow}/${action}`
   const start = useMutation({
-    mutationFn: () => api<OAuthStart>(path('start'), { method: 'POST', body: JSON.stringify({ client_id: clientId, ...(flow === 'github_copilot' ? {} : { redirect_uri: redirectUri }) }) }),
+    mutationFn: () => api<OAuthStart>(path('start'), { method: 'POST', body: JSON.stringify({ client_id: clientId, redirect_uri: redirectUri }) }),
     onSuccess: setStarted,
     onError: (error: Error) => toast.error(error.message),
   })
   const complete = useMutation({
-    mutationFn: () => api<{ status: string; retry_after?: number }>(path('complete'), { method: 'POST', body: JSON.stringify({ state: started?.state, ...(flow === 'github_copilot' ? {} : { code }) }) }),
+    mutationFn: () => api<{ status: string; retry_after?: number }>(path('complete'), { method: 'POST', body: JSON.stringify({ state: started?.state, code }) }),
     onSuccess: (result) => {
       if (result.status === 'pending') return toast.info(t('oauthPending', { seconds: result.retry_after }))
       toast.success(t('oauthCredentialSaved'))
@@ -325,7 +325,7 @@ function OAuthCredentialPanel({ options, optionsError, retryOptions }: { options
             <Select label={t('oauthProvider')} value={selectedProvider} onChange={(value) => { setProvider(value || ''); setStarted(null) }} data={options} searchable required />
             <Select label={t('oauthFlow')} value={flow} onChange={resetFlow} data={OAUTH_FLOWS.map((value) => ({ value, label: t(`oauthFlow_${value}`) }))} required />
             <TextInput label={t('oauthClientId')} value={clientId} onChange={(event) => setClientId(event.currentTarget.value)} required />
-            {flow !== 'github_copilot' && <TextInput label={t('oauthRedirectUri')} value={redirectUri} onChange={(event) => setRedirectUri(event.currentTarget.value)} required />}
+            <TextInput label={t('oauthRedirectUri')} value={redirectUri} onChange={(event) => setRedirectUri(event.currentTarget.value)} required />
           </SimpleGrid>
         )}
         {!started ? <Button onClick={() => start.mutate()} loading={start.isPending} disabled={!selectedProvider || !clientId || Boolean(optionsError)}>{t('oauthStart')}</Button> : (
@@ -333,9 +333,9 @@ function OAuthCredentialPanel({ options, optionsError, retryOptions }: { options
             <Stack gap="sm">
               {started.authorization_url && <Button component="a" href={started.authorization_url} target="_blank" rel="noreferrer" variant="default">{t('oauthOpenProvider')}</Button>}
               {started.verification_uri && <Text size="sm">{t('oauthDeviceInstruction')} <Code>{started.user_code}</Code> <a href={started.verification_uri} target="_blank" rel="noreferrer">{started.verification_uri}</a></Text>}
-              {flow !== 'github_copilot' && <TextInput label={t('oauthAuthorizationCode')} value={code} onChange={(event) => setCode(event.currentTarget.value)} required />}
+              <TextInput label={t('oauthAuthorizationCode')} value={code} onChange={(event) => setCode(event.currentTarget.value)} required />
               <Group wrap="wrap">
-                <Button onClick={() => complete.mutate()} loading={complete.isPending} disabled={flow !== 'github_copilot' && !code}>{flow === 'github_copilot' ? t('oauthCheck') : t('oauthComplete')}</Button>
+                <Button onClick={() => complete.mutate()} loading={complete.isPending} disabled={!code}>{t('oauthComplete')}</Button>
                 <Button variant="subtle" onClick={() => setStarted(null)}>{t('cancel')}</Button>
               </Group>
             </Stack>

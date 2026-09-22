@@ -44,10 +44,24 @@ impl Flow {
     pub(crate) fn is_device(self) -> bool {
         self == Self::GithubCopilot
     }
+
+    pub(crate) fn is_available(self) -> bool {
+        matches!(self, Self::Codex | Self::Xai | Self::ClaudeCode)
+    }
+
+    pub(crate) fn supports_provider_kind(self, kind: &str) -> bool {
+        match self {
+            Self::Codex => matches!(kind, "openai" | "openai_compatible"),
+            Self::Xai => kind == "xai",
+            Self::ClaudeCode => kind == "anthropic",
+            Self::Antigravity | Self::GithubCopilot => false,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
 pub(crate) struct ProviderSpec {
+    flow: Flow,
     authorization_endpoint: Option<&'static str>,
     token_endpoint: &'static str,
     device_endpoint: Option<&'static str>,
@@ -58,26 +72,31 @@ impl ProviderSpec {
     pub(crate) fn for_flow(flow: Flow) -> Self {
         match flow {
             Flow::Codex => Self::browser(
+                Flow::Codex,
                 "https://auth.openai.com/oauth/authorize",
                 "https://auth.openai.com/oauth/token",
                 "openid profile email offline_access",
             ),
             Flow::Xai => Self::browser(
+                Flow::Xai,
                 "https://auth.x.ai/oauth2/authorize",
                 "https://auth.x.ai/oauth2/token",
-                "openid offline_access",
+                "openid profile email offline_access grok-cli:access api:access",
             ),
             Flow::ClaudeCode => Self::browser(
+                Flow::ClaudeCode,
                 "https://claude.ai/oauth/authorize",
-                "https://console.anthropic.com/v1/oauth/token",
-                "org:create_api_key user:profile",
+                "https://api.anthropic.com/v1/oauth/token",
+                "org:create_api_key user:profile user:inference",
             ),
             Flow::Antigravity => Self::browser(
+                Flow::Antigravity,
                 "https://accounts.google.com/o/oauth2/v2/auth",
                 "https://oauth2.googleapis.com/token",
-                "openid email profile",
+                "https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile https://www.googleapis.com/auth/cclog https://www.googleapis.com/auth/experimentsandconfigs",
             ),
             Flow::GithubCopilot => Self {
+                flow,
                 authorization_endpoint: None,
                 token_endpoint: "https://github.com/login/oauth/access_token",
                 device_endpoint: Some("https://github.com/login/device/code"),
@@ -87,11 +106,13 @@ impl ProviderSpec {
     }
 
     const fn browser(
+        flow: Flow,
         authorization_endpoint: &'static str,
         token_endpoint: &'static str,
         scope: &'static str,
     ) -> Self {
         Self {
+            flow,
             authorization_endpoint: Some(authorization_endpoint),
             token_endpoint,
             device_endpoint: None,
@@ -100,8 +121,13 @@ impl ProviderSpec {
     }
 
     #[cfg(test)]
-    pub(crate) fn test_browser(authorization_endpoint: String, token_endpoint: String) -> Self {
+    pub(crate) fn test_browser(
+        flow: Flow,
+        authorization_endpoint: String,
+        token_endpoint: String,
+    ) -> Self {
         Self::browser(
+            flow,
             Box::leak(authorization_endpoint.into_boxed_str()),
             Box::leak(token_endpoint.into_boxed_str()),
             "openid",
@@ -111,6 +137,7 @@ impl ProviderSpec {
     #[cfg(test)]
     pub(crate) fn test_device(device_endpoint: String, token_endpoint: String) -> Self {
         Self {
+            flow: Flow::GithubCopilot,
             authorization_endpoint: None,
             token_endpoint: Box::leak(token_endpoint.into_boxed_str()),
             device_endpoint: Some(Box::leak(device_endpoint.into_boxed_str())),
@@ -167,6 +194,12 @@ pub(crate) fn credential_secret(
     if !credential_type.starts_with("oauth_") {
         return Ok(secret);
     }
+    if matches!(
+        credential_type,
+        "oauth_antigravity" | "oauth_github_copilot"
+    ) {
+        anyhow::bail!("OAuth credential requires an unavailable provider adapter");
+    }
     let document: Value = serde_json::from_str(&secret)
         .map_err(|_| anyhow::anyhow!("invalid encrypted OAuth credential"))?;
     let token = document
@@ -200,6 +233,25 @@ pub(crate) fn start_browser(
         .append_pair("state", &state)
         .append_pair("code_challenge", challenge.as_str())
         .append_pair("code_challenge_method", "S256");
+    match spec.flow {
+        Flow::Codex => {
+            url.query_pairs_mut()
+                .append_pair("id_token_add_organizations", "true")
+                .append_pair("codex_cli_simplified_flow", "true");
+        }
+        Flow::Xai => {
+            url.query_pairs_mut()
+                .append_pair("nonce", &random_secret())
+                .append_pair("plan", "generic")
+                .append_pair("referrer", "pangolin");
+        }
+        Flow::Antigravity => {
+            url.query_pairs_mut()
+                .append_pair("access_type", "offline")
+                .append_pair("prompt", "consent");
+        }
+        Flow::ClaudeCode | Flow::GithubCopilot => {}
+    }
     Ok(BrowserStart {
         authorization_url: url.into(),
         state,
@@ -253,8 +305,28 @@ pub(crate) async fn exchange_browser(
     client_id: &str,
     redirect_uri: &str,
     code: &str,
+    state: &str,
     verifier: &str,
 ) -> Result<Token, Error> {
+    if spec.flow == Flow::ClaudeCode {
+        let response = client
+            .post(spec.token_endpoint)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .json(&serde_json::json!({
+                "grant_type": "authorization_code",
+                "client_id": client_id,
+                "redirect_uri": redirect_uri,
+                "code": code,
+                "state": state,
+                "code_verifier": verifier,
+            }))
+            .send()
+            .await
+            .map_err(|_| Error::ProviderUnavailable)?;
+        let document = response_json(response).await?;
+        required_text(&document, "access_token")?;
+        return Ok(Token(document));
+    }
     exchange(
         client,
         spec.token_endpoint,
@@ -389,8 +461,9 @@ mod tests {
         let (base, handle) = server(app).await;
         let token_endpoint = endpoint(format!("{base}/token"));
         let client = Client::new();
-        for flow in [Flow::Codex, Flow::Xai, Flow::ClaudeCode, Flow::Antigravity] {
+        for flow in [Flow::Codex, Flow::Xai] {
             let spec = ProviderSpec {
+                flow,
                 authorization_endpoint: Some("https://idp.example/authorize"),
                 token_endpoint,
                 device_endpoint: None,
@@ -409,6 +482,7 @@ mod tests {
                 "client",
                 "https://console.example/callback",
                 "returned-code",
+                &start.state,
                 &start.verifier,
             )
             .await
@@ -417,6 +491,78 @@ mod tests {
             assert_eq!(token["access_token"], access_token.as_str(), "{flow:?}");
         }
         handle.abort();
+    }
+
+    #[tokio::test]
+    async fn claude_code_uses_its_json_exchange_contract() {
+        let app = Router::new().route(
+            "/token",
+            post(
+                |headers: http::HeaderMap, Json(body): Json<Value>| async move {
+                    assert_eq!(
+                        headers.get(http::header::CONTENT_TYPE).unwrap(),
+                        "application/json"
+                    );
+                    assert_eq!(body["code"], "returned-code");
+                    assert_eq!(body["state"], "returned-state");
+                    assert_eq!(body["code_verifier"], "returned-verifier");
+                    Json(json!({"access_token":"claude-access","refresh_token":"claude-refresh"}))
+                },
+            ),
+        );
+        let (base, handle) = server(app).await;
+        let spec = ProviderSpec::test_browser(
+            Flow::ClaudeCode,
+            "https://claude.example/authorize".into(),
+            format!("{base}/token"),
+        );
+        let token = exchange_browser(
+            &Client::new(),
+            spec,
+            "client",
+            "https://console.example/callback",
+            "returned-code",
+            "returned-state",
+            "returned-verifier",
+        )
+        .await
+        .unwrap()
+        .into_value();
+        assert_eq!(token["access_token"], "claude-access");
+        handle.abort();
+    }
+
+    #[test]
+    fn provider_authorization_contracts_are_specific_and_unfinished_flows_are_disabled() {
+        let claude = ProviderSpec::for_flow(Flow::ClaudeCode);
+        assert_eq!(
+            claude.token_endpoint,
+            "https://api.anthropic.com/v1/oauth/token"
+        );
+        assert!(claude.scope.contains("user:inference"));
+
+        let xai = ProviderSpec::for_flow(Flow::Xai);
+        assert!(xai.scope.contains("grok-cli:access"));
+        assert!(xai.scope.contains("api:access"));
+
+        let antigravity = ProviderSpec::for_flow(Flow::Antigravity);
+        assert!(antigravity.scope.contains("auth/cloud-platform"));
+        let start =
+            start_browser(antigravity, "client", "https://console.example/callback").unwrap();
+        let url = Url::parse(&start.authorization_url).unwrap();
+        let query = url
+            .query_pairs()
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(
+            query.get("access_type").map(|value| value.as_ref()),
+            Some("offline")
+        );
+        assert_eq!(
+            query.get("prompt").map(|value| value.as_ref()),
+            Some("consent")
+        );
+        assert!(!Flow::Antigravity.is_available());
+        assert!(!Flow::GithubCopilot.is_available());
     }
 
     #[tokio::test]
@@ -465,6 +611,7 @@ mod tests {
             );
         let (base, handle) = server(app).await;
         let spec = ProviderSpec {
+            flow: Flow::GithubCopilot,
             authorization_endpoint: None,
             token_endpoint: endpoint(format!("{base}/token")),
             device_endpoint: Some(endpoint(format!("{base}/device"))),

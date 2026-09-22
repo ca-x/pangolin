@@ -36,9 +36,25 @@ pub(super) async fn authenticate_at(
     signing_time: SystemTime,
 ) -> Result<(), ApiError> {
     let unavailable = |_| ApiError::Upstream("channel credential could not be resolved".into());
+    let oauth_kind_matches = match target.credential_type.as_str() {
+        "oauth_codex" => matches!(
+            target.provider_kind.as_str(),
+            "openai" | "openai_compatible"
+        ),
+        "oauth_xai" => target.provider_kind == "xai",
+        "oauth_claude_code" => target.provider_kind == "anthropic",
+        "oauth_antigravity" | "oauth_github_copilot" => false,
+        kind if kind.starts_with("oauth_") => false,
+        _ => true,
+    };
+    if !oauth_kind_matches {
+        return Err(ApiError::Upstream(
+            "channel credential could not be resolved".into(),
+        ));
+    }
     match target.provider_kind.as_str() {
         "anthropic" => {
-            if secret.starts_with("sk-ant-oat") {
+            if target.credential_type == "oauth_claude_code" || secret.starts_with("sk-ant-oat") {
                 header(headers, "authorization", &format!("Bearer {secret}"))?;
             } else {
                 header(headers, "x-api-key", secret)?;

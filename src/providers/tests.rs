@@ -147,6 +147,63 @@ async fn compatible_presets_preserve_json_and_own_auth() {
 }
 
 #[tokio::test]
+async fn oauth_credentials_use_only_their_completed_provider_auth_contract() {
+    let body = json!({"model":"model","messages":[{"role":"user","content":"hi"}]});
+    for (kind, credential_type) in [
+        ("openai", "oauth_codex"),
+        ("xai", "oauth_xai"),
+        ("anthropic", "oauth_claude_code"),
+    ] {
+        let mut target = target(kind);
+        target.credential_type = credential_type.into();
+        let request = prepare(
+            &target,
+            if kind == "anthropic" {
+                "/v1/messages"
+            } else {
+                "/v1/chat/completions"
+            },
+            &body,
+            "oauth-access-token",
+            HeaderMap::new(),
+            &HeaderMap::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            request.headers["authorization"],
+            "Bearer oauth-access-token"
+        );
+        assert!(!request.headers.contains_key("x-api-key"));
+        assert!(!request.headers.contains_key("x-goog-api-key"));
+    }
+
+    for (kind, credential_type) in [
+        ("gemini", "oauth_antigravity"),
+        ("openai", "oauth_github_copilot"),
+        ("gemini", "oauth_codex"),
+    ] {
+        let mut target = target(kind);
+        target.credential_type = credential_type.into();
+        assert!(
+            prepare(
+                &target,
+                "/v1/chat/completions",
+                &body,
+                "oauth-access-token",
+                HeaderMap::new(),
+                &HeaderMap::new(),
+                None,
+            )
+            .await
+            .is_err(),
+            "{credential_type} must fail closed for {kind}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn azure_api_key_and_entra_token_use_deployment_and_version() {
     let body = json!({"model":"model","messages":[{"role":"user","content":"hi"}]});
     let key = prepare(
