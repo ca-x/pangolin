@@ -10241,6 +10241,30 @@ async fn session_playground_reuses_gateway_policy_and_accounting_without_a_token
         .unwrap()
         .try_get("", "id")
         .unwrap();
+    sql(
+        &f,
+        "UPDATE models SET capabilities='[\"responses\"]'",
+        vec![],
+    )
+    .await;
+    let models_path = format!(
+        "/api/admin/v1/projects/{}/playground/models?api_key_id={key}",
+        db::DEFAULT_PROJECT_ID
+    );
+    let models = json_body(
+        admin(
+            &f,
+            &cookie,
+            http::Method::GET,
+            &models_path,
+            Value::Null,
+            false,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(models["data"][0]["id"], "public");
+    assert!(models["data"][0]["id"].is_string());
     let path = format!(
         "/api/admin/v1/projects/{}/playground/chat",
         db::DEFAULT_PROJECT_ID

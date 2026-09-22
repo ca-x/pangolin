@@ -2395,7 +2395,7 @@ async fn playground_models(
             .await?;
     Ok(Json(json!({
         "object":"list",
-        "data":models.into_iter().map(|id|json!({"id":id,"object":"model"})).collect::<Vec<_>>()
+        "data":models
     })))
 }
 

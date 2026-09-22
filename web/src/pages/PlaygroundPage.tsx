@@ -55,7 +55,14 @@ function useReachableModels(keyId: string, projectId: string) {
     const query = new URLSearchParams({ api_key_id: keyId })
     fetch(`/api/admin/v1/projects/${encodeURIComponent(projectId)}/playground/models?${query}`, { credentials: 'same-origin', signal: controller.signal })
       .then((response) => (response.ok ? response.json() : null))
-      .then((body) => { if (controller.signal.aborted) return; if (body === null) { setModels(null); setFailed(true) } else setModels(body?.data?.map((entry: { id: string }) => entry.id) ?? []) })
+      .then((body) => {
+        if (controller.signal.aborted) return
+        if (body === null) { setModels(null); setFailed(true); return }
+        const values = (body?.data ?? [])
+          .map((entry: unknown) => typeof entry === 'string' ? entry : (entry as { id?: unknown })?.id)
+          .filter((id: unknown): id is string => typeof id === 'string' && id.length > 0)
+        setModels(values)
+      })
       .catch(() => { if (!controller.signal.aborted) { setModels(null); setFailed(true) } })
       .finally(() => { if (!controller.signal.aborted) setLoading(false) })
     return () => controller.abort()

@@ -73,6 +73,15 @@ describe('the playground model picker', () => {
     expect(screen.queryByText('The option list could not be loaded.')).not.toBeInTheDocument()
   })
 
+  it('accepts the release API string model shape without crashing the picker', async () => {
+    vi.stubGlobal('fetch', mockApi(() => json({ data: ['qa-model'] })))
+    renderPage()
+
+    const picker = await screen.findByRole('combobox', { name: 'Model' })
+    await userEvent.click(picker)
+    expect(await screen.findByRole('option', { name: 'qa-model' })).toBeInTheDocument()
+  })
+
   it('asks the server for models reachable through the Responses endpoint', async () => {
     const fetchMock = mockApi(() => json({ data: [{ id: 'responses-model' }] }))
     vi.stubGlobal('fetch', fetchMock)
