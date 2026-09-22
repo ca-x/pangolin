@@ -252,12 +252,19 @@ async fn visible_models_internal(
     // name -> (created, explicitly configured)
     let mut names = std::collections::BTreeMap::<String, (i64, bool)>::new();
     if settings.query_all_channel_models {
-        let rows=db.query_all(repository::statement("SELECT DISTINCT m.public_name,m.created_at FROM models m JOIN providers p ON p.id=m.provider_id WHERE p.project_id=? AND p.enabled=1 AND m.enabled=1 AND m.lifecycle='active' ORDER BY m.public_name",vec![key.project_id.clone().into()])).await?;
+        let rows=db.query_all(repository::statement("SELECT DISTINCT m.public_name,m.created_at,COALESCE(s.model_rules_json,'{\"version\":1}') AS model_rules_json FROM models m JOIN providers p ON p.id=m.provider_id LEFT JOIN channel_settings s ON s.provider_id=p.id WHERE p.project_id=? AND p.enabled=1 AND m.enabled=1 AND m.lifecycle='active' ORDER BY m.public_name",vec![key.project_id.clone().into()])).await?;
         for row in rows {
-            names.insert(
-                row.try_get::<String>("", "public_name")?,
-                (row.try_get::<i64>("", "created_at")?, false),
-            );
+            let original = row.try_get::<String>("", "public_name")?;
+            let created = row.try_get::<i64>("", "created_at")?;
+            let rules = policy::document(&row.try_get::<String>("", "model_rules_json")?)?;
+            let mapped = repository::resolve_model(&original, &rules)?;
+            if rules.get("hide_original").and_then(Value::as_bool) != Some(true) {
+                names.insert(original.clone(), (created, false));
+            }
+            if mapped != original && rules.get("hide_mapped").and_then(Value::as_bool) != Some(true)
+            {
+                names.insert(mapped, (created, false));
+            }
         }
     }
     let associations=db.query_all(repository::statement("SELECT a.match_type,a.pattern,m.created_at FROM model_associations a LEFT JOIN models m ON m.id=a.model_id LEFT JOIN providers p ON p.id=m.provider_id WHERE a.project_id=? AND a.enabled=1 AND (m.id IS NULL OR (m.lifecycle='active' AND m.enabled=1 AND p.enabled=1)) ORDER BY a.id",vec![key.project_id.clone().into()])).await?;

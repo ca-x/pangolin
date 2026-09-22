@@ -6,6 +6,99 @@ use std::collections::{BTreeMap, HashMap};
 
 use super::trace_preview;
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModelRulesInput {
+    version: u8,
+    strip_prefix: Option<String>,
+    auto_trim_prefixes: Option<Vec<String>>,
+    lowercase: Option<bool>,
+    mappings: Option<std::collections::BTreeMap<String, String>>,
+    prefix: Option<String>,
+    hide_original: Option<bool>,
+    hide_mapped: Option<bool>,
+    exclude: Option<Vec<String>>,
+    stream: Option<bool>,
+    developer_to_system: Option<bool>,
+    force_content_array: Option<bool>,
+    reasoning_effort: Option<std::collections::BTreeMap<String, String>>,
+}
+
+fn validate_model_rules(value: &Value) -> Result<(), ApiError> {
+    if value.to_string().len() > 64 * 1024 {
+        return Err(ApiError::BadRequest("invalid model rules".into()));
+    }
+    let rules: ModelRulesInput = serde_json::from_value(value.clone())
+        .map_err(|_| ApiError::BadRequest("invalid model rules".into()))?;
+    if rules.version != 1 {
+        return Err(ApiError::BadRequest("invalid model rules".into()));
+    }
+    let valid_text = |value: &str| {
+        !value.is_empty()
+            && value.len() <= 512
+            && value.trim() == value
+            && !value.chars().any(char::is_control)
+    };
+    if rules
+        .strip_prefix
+        .as_deref()
+        .is_some_and(|value| !valid_text(value))
+        || rules
+            .prefix
+            .as_deref()
+            .is_some_and(|value| !valid_text(value))
+    {
+        return Err(ApiError::BadRequest("invalid model rules".into()));
+    }
+    if let Some(prefixes) = &rules.auto_trim_prefixes {
+        let mut unique = std::collections::HashSet::new();
+        if prefixes.len() > 64
+            || prefixes.iter().any(|prefix| {
+                !valid_text(prefix)
+                    || prefix.starts_with('/')
+                    || prefix.ends_with('/')
+                    || !unique.insert(prefix)
+            })
+        {
+            return Err(ApiError::BadRequest("invalid model rules".into()));
+        }
+    }
+    if rules.mappings.as_ref().is_some_and(|mappings| {
+        mappings.len() > 256
+            || mappings
+                .iter()
+                .any(|(source, target)| !valid_text(source) || !valid_text(target))
+    }) {
+        return Err(ApiError::BadRequest("invalid model rules".into()));
+    }
+    if let Some(patterns) = &rules.exclude {
+        if patterns.len() > 64
+            || patterns
+                .iter()
+                .any(|pattern| !valid_text(pattern) || regex::Regex::new(pattern).is_err())
+        {
+            return Err(ApiError::BadRequest("invalid model rules".into()));
+        }
+    }
+    if rules.reasoning_effort.as_ref().is_some_and(|mappings| {
+        mappings.len() > 32
+            || mappings
+                .iter()
+                .any(|(source, target)| !valid_text(source) || !valid_text(target))
+    }) {
+        return Err(ApiError::BadRequest("invalid model rules".into()));
+    }
+    let _ = (
+        rules.lowercase,
+        rules.hide_original,
+        rules.hide_mapped,
+        rules.stream,
+        rules.developer_to_system,
+        rules.force_content_array,
+    );
+    Ok(())
+}
+
 pub(super) fn router(state: AppState) -> Router<AppState> {
     let instance = Router::new()
         .route("/api/admin/v1/instance/backup", post(instance_export))
@@ -2751,6 +2844,9 @@ async fn mutate(
                     .map(Value::to_string)
                     .unwrap_or(current.try_get::<String>("", column)?))
             };
+            if let Some(model_rules) = value.get("model_rules").filter(|item| !item.is_null()) {
+                validate_model_rules(model_rules)?;
+            }
             let changed = transaction.execute(sql("UPDATE channel_settings SET endpoint_mappings_json=?,model_rules_json=?,parameter_overrides_json=?,retry_statuses_json=?,auto_disable_policy_json=?,updated_at=? WHERE provider_id=? AND provider_id IN (SELECT id FROM providers WHERE project_id=?)",vec![document("endpoint_mappings","endpoint_mappings_json")?.into(),document("model_rules","model_rules_json")?.into(),document("parameter_overrides","parameter_overrides_json")?.into(),document("retry_statuses","retry_statuses_json")?.into(),document("auto_disable_policy","auto_disable_policy_json")?.into(),db::now().into(),provider.into(),project.clone().into()])).await?.rows_affected();
             if changed != 1 {
                 return Err(ApiError::NotFound);

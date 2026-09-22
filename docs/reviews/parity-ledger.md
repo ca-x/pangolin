@@ -53,15 +53,15 @@ states plainly that no test guards it yet.
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | observability | 5 | 10 | 0 | 2 | 3 | 0 | 0 | 20 |
 | prompts & playground | 6 | 12 | 1 | 0 | 0 | 0 | 1 | 20 |
-| models, routing & pricing | 6 | 7 | 2 | 2 | 7 | 2 | 0 | 26 |
+| models, routing & pricing | 6 | 8 | 2 | 2 | 6 | 2 | 0 | 26 |
 | access control | 2 | 17 | 2 | 0 | 0 | 0 | 0 | 21 |
 | system settings & background work | 8 | 9 | 5 | 1 | 5 | 2 | 1 | 31 |
 | console-wide UX | 3 | 9 | 1 | 2 | 0 | 0 | 0 | 15 |
-| **total** | **30** | **64** | **11** | **7** | **15** | **4** | **2** | **133** |
+| **total** | **30** | **65** | **11** | **7** | **14** | **4** | **2** | **133** |
 
 Row count is unchanged at 133 — the six area reports' own findings. No row was
-dropped, merged or added. What changed is the status: **105 rows need no work**
-(30 already matched, 64 fixed, 11 refuted), **26 rows need work** (`partial` +
+dropped, merged or added. What changed is the status: **106 rows need no work**
+(30 already matched, 65 fixed, 11 refuted), **25 rows need work** (`partial` +
 `open` + `feature-build`), and **2 rows are recorded divergences** whose only
 remaining difference is deliberate.
 
@@ -153,7 +153,7 @@ Report: [parity-models-routing-pricing.md](parity-models-routing-pricing.md).
 | 13 | Project default routing has no write path or UI | closed | fixed | `routing` is read, validated and written by the orchestration settings route (`operations_api.rs:611-655,697,721-722`); the console renders and submits it (`SystemPage.tsx:271-298`) | `models-settings-dialog.tsx` | the harness guard is still missing — see [Deferred corrections](#deferred-corrections) |
 | 14 | Association conditions: no builder, no domain fields | closed | fixed | The bounded sanitized context includes UTC daily time, media presence, stream and request format; typed field/operator validation fails invalid configuration closed. The bilingual nested all/any editor round-trips exact documents and retains raw JSON as an advanced escape hatch. | `models-association-dialog.tsx:61-143` | domain-context/evaluator Rust test plus `ModelsPage.test.tsx` structured/raw editor cases |
 | 15 | No `channel_tags + regex` type, no association exclusions | closed | fixed | Migration v24 adds `channel_tags_regex` and versioned association exclusions for channel name regexes, IDs and tags. Write-time bounds/regex checks and read-time revalidation make exclusions veto candidates fail-closed. | `internal/objects/model.go:59-76,99-116` | candidate/exclusion Rust test plus ModelsPage payload case |
-| 16 | No auto-trim or hide-original/hide-mapped transformations | open | — | No `auto_trim`/`hide_original`/`hide_mapped` anywhere; `model_rules` is a raw JSON box (`ChannelsPage.tsx:184`) | `internal/objects/channel.go:163-180`, `channel_llm.go:1473,1490-1522` | a resolution test for auto-trim and both hide flags |
+| 16 | No auto-trim or hide-original/hide-mapped transformations | closed | fixed | Strict versioned model rules support exact-segment auto-trim, mappings and discovery-only hide-original/hide-mapped flags. Both identifiers remain routable; the bilingual structured editor retains advanced JSON for compatible rules. | `internal/objects/channel.go:163-180`, `channel_llm.go:1473,1490-1522` | three Rust transform/write tests plus `channelModelRules.test.tsx` |
 | 17 | No volume (non-marginal) tier pricing mode | open | — | `calculate` is marginal-only (`operations/pricing.rs:310-322`); the pre-flight upper bound uses the maximum tier rate (`:371-378`) | `internal/objects/price.go:26-31` (`usage_volume`) | a pricing test for per-component volume mode |
 | 18 | Channel-scoped prices cannot be created | open | — | Schema supports `provider_id` (`db/schema.rs:372-386`) and the resolver prefers it (`pricing.rs:425`), but the write path inserts `NULL` (`operations_api.rs:1377-1382`) and the form has no channel field (`ModelsPage.tsx:68`) | `channel_model_price.go:27-41` | a price-creation test that stores and reads back a channel-scoped rate |
 | 19 | Service-group price ratio has no console surface | open | — | `groups` is API-only (`operations_api.rs:429-433,1383-1420`); no page renders `resource="groups"` | `channels-model-price-dialog.tsx:1190-1200` | a groups editor test |
@@ -458,7 +458,7 @@ retry/model/quota settings, and CORS/timeouts. Every one of them is scheduled in
 | Proxy settings | open | no per-channel proxy (models 21) |
 | Endpoint mappings | implemented+tested | `channel_settings.endpoint_mappings` + `providers/mod.rs` |
 | Model discovery/sync | feature-build | models 25 |
-| Model transformations | partial | prefix/lowercase/mappings/exclude/stream exist; auto-trim and hide flags do not (models 16) |
+| Model transformations | implemented+tested | prefix/lowercase/mappings/exclude/stream plus exact-segment auto-trim and discovery-only original/transformed visibility flags |
 | Model protocol policy | implemented+tested | `capabilities` + per-model `stream` policy |
 | Model cards | partial | catalog metadata is stored at creation but not surfaced as columns (models 10) |
 | Model catalog defaults | implemented+tested | versioned snapshot with refresh/cache, aliases and operator override |

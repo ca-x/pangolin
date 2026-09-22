@@ -972,6 +972,109 @@ async fn developer_rules_apply_only_to_matching_models_and_can_be_disabled_per_m
 }
 
 #[tokio::test]
+async fn channel_model_auto_trim_uses_only_configured_prefixes() {
+    let f = database_fixture().await;
+    let (trimmed_provider, _) = add_model(
+        &f,
+        "trimmed",
+        "vendor/client-model",
+        "vendor/upstream-model",
+    )
+    .await;
+    sql(
+        &f,
+        "UPDATE channel_settings SET model_rules_json=? WHERE provider_id=?",
+        vec![
+            json!({"version":1,"auto_trim_prefixes":["vendor"]})
+                .to_string()
+                .into(),
+            trimmed_provider.into(),
+        ],
+    )
+    .await;
+    let (untouched_provider, _) = add_model(
+        &f,
+        "untouched",
+        "other/client-model",
+        "other/upstream-model",
+    )
+    .await;
+    sql(
+        &f,
+        "UPDATE channel_settings SET model_rules_json=? WHERE provider_id=?",
+        vec![
+            json!({"version":1,"auto_trim_prefixes":["vendor"]})
+                .to_string()
+                .into(),
+            untouched_provider.into(),
+        ],
+    )
+    .await;
+
+    let original = plan(&f, json!({"model":"vendor/client-model"}))
+        .await
+        .unwrap();
+    assert_eq!(
+        original.candidates[0].target.upstream_name,
+        "upstream-model"
+    );
+    let alias = plan(&f, json!({"model":"client-model"})).await.unwrap();
+    assert_eq!(alias.candidates[0].target.upstream_name, "upstream-model");
+    let untouched = plan(&f, json!({"model":"other/client-model"}))
+        .await
+        .unwrap();
+    assert_eq!(
+        untouched.candidates[0].target.upstream_name,
+        "other/upstream-model"
+    );
+}
+
+#[tokio::test]
+async fn hidden_original_and_mapped_channel_names_remain_routable() {
+    let f = database_fixture().await;
+    let (hide_original_provider, _) =
+        add_model(&f, "hide-original", "vendor/alpha", "vendor/alpha").await;
+    sql(
+        &f,
+        "UPDATE channel_settings SET model_rules_json=? WHERE provider_id=?",
+        vec![
+            json!({"version":1,"auto_trim_prefixes":["vendor"],"hide_original":true})
+                .to_string()
+                .into(),
+            hide_original_provider.into(),
+        ],
+    )
+    .await;
+    let (hide_mapped_provider, _) =
+        add_model(&f, "hide-mapped", "vendor/beta", "vendor/beta").await;
+    sql(
+        &f,
+        "UPDATE channel_settings SET model_rules_json=? WHERE provider_id=?",
+        vec![
+            json!({"version":1,"auto_trim_prefixes":["vendor"],"hide_mapped":true})
+                .to_string()
+                .into(),
+            hide_mapped_provider.into(),
+        ],
+    )
+    .await;
+
+    let names = visible_models(&f.db, &f.key, &HeaderMap::new())
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|model| model["id"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    assert!(names.contains(&"alpha".into()));
+    assert!(!names.contains(&"vendor/alpha".into()));
+    assert!(names.contains(&"vendor/beta".into()));
+    assert!(!names.contains(&"beta".into()));
+
+    assert!(plan(&f, json!({"model":"vendor/alpha"})).await.is_ok());
+    assert!(plan(&f, json!({"model":"beta"})).await.is_ok());
+}
+
+#[tokio::test]
 async fn credential_quota_selects_next_eligible_secret_and_schema_rejects_foreign_session_owner() {
     let f = database_fixture().await;
     let (provider, _) = add_model(&f, "a", "public", "actual").await;

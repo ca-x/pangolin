@@ -1,7 +1,7 @@
-import { Alert, Badge, Button, Card, Group, Modal, Paper, SimpleGrid, Skeleton, Stack, Tabs, Text, TextInput, Title, Tooltip } from '@mantine/core'
+import { ActionIcon, Alert, Badge, Button, Card, Collapse, Group, Modal, Paper, SimpleGrid, Skeleton, Stack, Switch, Tabs, Text, Textarea, TextInput, Title, Tooltip } from '@mantine/core'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Plus } from 'lucide-react'
-import { useState } from 'react'
+import { ChevronRight, Plus, Trash2 } from 'lucide-react'
+import { useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 import { api, type Document, type Paged } from '../api'
@@ -233,8 +233,111 @@ function ChannelSettingsPanel() {
   const { t } = useTranslation()
   const { options, query } = useChannelOptions()
   return (
-    <ResourcePage resource="channel-settings" title={t('channelPolicies')} description={t('channelPoliciesHint')} empty={t('channelPoliciesEmpty')} canDelete={false} columns={[{ key: 'provider_id', label: t('channel'), render: (value) => options.find((option) => option.value === value)?.label || String(value) }, { key: 'retry_statuses', label: t('retryStatuses') }, { key: 'auto_disable_policy', label: t('autoDisable') }]} fields={[{ key: 'provider_id', label: t('channel'), kind: 'select', required: true, options, error: query.isError ? t('optionsUnavailable') : undefined, onRetry: () => void query.refetch() }, { key: 'endpoint_mappings', label: t('endpointMappings'), kind: 'json', defaultValue: { version: 1 } }, { key: 'model_rules', label: t('modelRules'), kind: 'json', defaultValue: { version: 1 } }, { key: 'parameter_overrides', label: t('parameterOverrides'), kind: 'json', defaultValue: { version: 1 } }, { key: 'retry_statuses', label: t('retryStatuses'), kind: 'json', defaultValue: { version: 1, statuses: [408, 409, 429, 500, 502, 503, 504] } }, { key: 'auto_disable_policy', label: t('autoDisable'), kind: 'json', defaultValue: { version: 1, enabled: false } }]} />
+    <ResourcePage resource="channel-settings" title={t('channelPolicies')} description={t('channelPoliciesHint')} empty={t('channelPoliciesEmpty')} canDelete={false} columns={[{ key: 'provider_id', label: t('channel'), render: (value) => options.find((option) => option.value === value)?.label || String(value) }, { key: 'retry_statuses', label: t('retryStatuses') }, { key: 'auto_disable_policy', label: t('autoDisable') }]} fields={[{ key: 'provider_id', label: t('channel'), kind: 'select', required: true, options, error: query.isError ? t('optionsUnavailable') : undefined, onRetry: () => void query.refetch() }, { key: 'endpoint_mappings', label: t('endpointMappings'), kind: 'json', defaultValue: { version: 1 } }, { key: 'model_rules', label: t('modelRules'), kind: 'json', defaultValue: { version: 1 }, render: (input) => <ModelRulesEditor {...input} /> }, { key: 'parameter_overrides', label: t('parameterOverrides'), kind: 'json', defaultValue: { version: 1 } }, { key: 'retry_statuses', label: t('retryStatuses'), kind: 'json', defaultValue: { version: 1, statuses: [408, 409, 429, 500, 502, 503, 504] } }, { key: 'auto_disable_policy', label: t('autoDisable'), kind: 'json', defaultValue: { version: 1, enabled: false } }]} />
   )
+}
+
+type MappingRow = { id: number; source: string; target: string }
+
+function modelRules(value: unknown): Record<string, unknown> {
+  if (value && typeof value === 'object' && !Array.isArray(value)) return value as Record<string, unknown>
+  if (typeof value === 'string') {
+    try {
+      const parsed: unknown = JSON.parse(value)
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed as Record<string, unknown>
+    } catch { /* A malformed stored document falls back to the repairable versioned shape. */ }
+  }
+  return { version: 1 }
+}
+
+function parseModelRules(value: string): Record<string, unknown> | null {
+  try {
+    const parsed: unknown = JSON.parse(value)
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : null
+  } catch {
+    return null
+  }
+}
+
+function mappingRows(value: Record<string, unknown>): MappingRow[] {
+  const mappings = value.mappings
+  if (!mappings || typeof mappings !== 'object' || Array.isArray(mappings)) return []
+  return Object.entries(mappings).map(([source, target], index) => ({ id: index, source, target: String(target) }))
+}
+
+/** A channel mapping remains one model-rules document on the wire. Structured
+ * controls edit the common cases; the bounded JSON field remains available for
+ * the older transformation and request-shape rules that share the document. */
+function ModelRulesEditor({ name, label, value, setValid }: { name: string; label: string; value: unknown; setValid: (valid: boolean) => void }) {
+  const { t } = useTranslation()
+  const initial = modelRules(value)
+  const [text, setText] = useState(() => JSON.stringify(initial, null, 2))
+  const [rows, setRows] = useState<MappingRow[]>(() => mappingRows(initial))
+  const [prefixText, setPrefixText] = useState(() => Array.isArray(initial.auto_trim_prefixes) ? initial.auto_trim_prefixes.filter((prefix): prefix is string => typeof prefix === 'string').join(', ') : '')
+  const [nextId, setNextId] = useState(rows.length)
+  const [advanced, setAdvanced] = useState(false)
+  const rules = parseModelRules(text)
+
+  const write = (next: Record<string, unknown>, nextRows = rows) => {
+    const mappings = Object.fromEntries(nextRows.filter((row) => row.source && row.target).map((row) => [row.source, row.target]))
+    setText(JSON.stringify({ ...next, version: 1, mappings }, null, 2))
+  }
+  const update = (key: string, next: unknown) => { if (rules) write({ ...rules, [key]: next }) }
+  const updateRows = (next: MappingRow[]) => {
+    setRows(next)
+    if (rules) write(rules, next)
+  }
+  const duplicateSources = rows.some((row, index) => row.source && rows.findIndex((item) => item.source === row.source) !== index)
+  useEffect(() => setValid(Boolean(rules) && !duplicateSources), [duplicateSources, rules, setValid])
+  return <Stack gap="sm">
+    <Stack gap={2}>
+      <Text fw={600} size="sm">{label}</Text>
+      <Text size="xs" c="dimmed">{t('modelRulesHint')}</Text>
+    </Stack>
+    <TextInput
+      label={t('autoTrimPrefixes')}
+      description={t('autoTrimPrefixesHint')}
+      placeholder={t('autoTrimPrefixesPlaceholder')}
+      value={prefixText}
+      disabled={!rules}
+      onChange={(event) => {
+        const next = event.currentTarget.value
+        setPrefixText(next)
+        update('auto_trim_prefixes', next.split(',').map((prefix) => prefix.trim()).filter(Boolean))
+      }}
+    />
+    <SimpleGrid cols={{ base: 1, sm: 2 }} spacing="sm">
+      <Switch checked={rules?.hide_original === true} disabled={!rules} label={t('hideOriginalModels')} description={t('hideOriginalModelsHint')} onChange={(event) => update('hide_original', event.currentTarget.checked)} />
+      <Switch checked={rules?.hide_mapped === true} disabled={!rules} label={t('hideMappedModels')} description={t('hideMappedModelsHint')} onChange={(event) => update('hide_mapped', event.currentTarget.checked)} />
+    </SimpleGrid>
+    <Stack gap="xs">
+      <Group justify="space-between" align="center">
+        <Text fw={600} size="sm">{t('modelMappings')}</Text>
+        <Button variant="default" size="compact-sm" leftSection={<Plus size={15} />} disabled={!rules} onClick={() => { setRows((current) => [...current, { id: nextId, source: '', target: '' }]); setNextId((current) => current + 1) }}>{t('addMapping')}</Button>
+      </Group>
+      {rows.length === 0 && <Text size="sm" c="dimmed">{t('modelMappingsEmpty')}</Text>}
+      {rows.map((row, index) => <Group key={row.id} gap="xs" align="flex-start" wrap="nowrap">
+        <TextInput aria-label={`${t('mappingSource')} ${index + 1}`} placeholder={t('mappingSource')} value={row.source} required ref={(input) => input?.setCustomValidity(row.source && rows.some((item) => item.id !== row.id && item.source === row.source) ? t('duplicateMappingSource') : '')} onChange={(event) => updateRows(rows.map((item) => item.id === row.id ? { ...item, source: event.currentTarget.value } : item))} style={{ flex: 1, minWidth: 0 }} />
+        <TextInput aria-label={`${t('mappingTarget')} ${index + 1}`} placeholder={t('mappingTarget')} value={row.target} required onChange={(event) => updateRows(rows.map((item) => item.id === row.id ? { ...item, target: event.currentTarget.value } : item))} style={{ flex: 1, minWidth: 0 }} />
+        <Tooltip label={t('removeMapping')}><ActionIcon size={40} variant="subtle" color="red" aria-label={`${t('removeMapping')} ${index + 1}`} onClick={() => updateRows(rows.filter((item) => item.id !== row.id))}><Trash2 size={16} /></ActionIcon></Tooltip>
+      </Group>)}
+      {duplicateSources && <Text size="xs" c="red" role="alert">{t('duplicateMappingSource')}</Text>}
+    </Stack>
+    <Button variant="subtle" size="compact-sm" justify="flex-start" leftSection={<ChevronRight size={15} style={{ transform: advanced ? 'rotate(90deg)' : undefined, transition: 'transform 150ms' }} />} onClick={() => setAdvanced((open) => !open)} aria-expanded={advanced}>{t('advancedModelRules')}</Button>
+    <Collapse expanded={advanced} keepMounted>
+      <div inert={!advanced}>
+        <Textarea name={name} aria-label={t('advancedModelRules')} value={text} rows={9} error={!rules ? t('invalidJson') : duplicateSources ? t('duplicateMappingSource') : undefined} onChange={(event) => {
+          const next = event.currentTarget.value
+          setText(next)
+          const parsed = parseModelRules(next)
+          if (parsed) {
+            setRows(mappingRows(parsed))
+            setPrefixText(Array.isArray(parsed.auto_trim_prefixes) ? parsed.auto_trim_prefixes.filter((prefix): prefix is string => typeof prefix === 'string').join(', ') : '')
+          }
+        }} />
+      </div>
+    </Collapse>
+  </Stack>
 }
 
 type ProbeRow = { id?: string; provider_id?: string; model?: string | null; success?: number | null; status_code?: number | null; latency_ms?: number | null; probed_at?: number | null; error?: string | null }

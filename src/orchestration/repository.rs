@@ -292,6 +292,10 @@ pub async fn candidates(
         if association_excluded {
             continue;
         }
+        if allow_direct_channel_model && !matched {
+            let rules = policy::document(&row.model_rules_json)?;
+            matched = resolve_model(&row.public_name, &rules)? == model;
+        }
         if !matched {
             continue;
         }
@@ -436,13 +440,23 @@ pub async fn candidates(
     Ok(result)
 }
 
-fn resolve_model(original: &str, rules: &Value) -> Result<String> {
+pub(super) fn resolve_model(original: &str, rules: &Value) -> Result<String> {
     let mut name = original.to_owned();
     if let Some(prefix) = rules.get("strip_prefix") {
         name = name
             .strip_prefix(prefix.as_str().ok_or(Error::Configuration)?)
             .unwrap_or(&name)
             .to_owned();
+    }
+    if let Some(prefixes) = rules.get("auto_trim_prefixes") {
+        for prefix in prefixes.as_array().ok_or(Error::Configuration)? {
+            let prefix = prefix.as_str().ok_or(Error::Configuration)?;
+            let segment = format!("{prefix}/");
+            if let Some(trimmed) = name.strip_prefix(&segment) {
+                name = trimmed.to_owned();
+                break;
+            }
+        }
     }
     if rules.get("lowercase").and_then(Value::as_bool) == Some(true) {
         name = name.to_lowercase();

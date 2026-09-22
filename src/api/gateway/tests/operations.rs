@@ -6253,6 +6253,66 @@ async fn channel_settings_response_excludes_proxy_settings() {
 }
 
 #[tokio::test]
+async fn channel_model_rules_are_validated_before_write() {
+    let f = fixture(success()).await;
+    let cookie = owner(&f).await;
+    let path = format!(
+        "/api/admin/v1/projects/{}/operations/channel-settings",
+        db::DEFAULT_PROJECT_ID
+    );
+
+    let invalid = admin(
+        &f,
+        &cookie,
+        http::Method::POST,
+        &path,
+        json!({
+            "provider_id": f.providers[0],
+            "model_rules": {
+                "version": 1,
+                "auto_trim_prefixes": ["vendor", ""],
+                "mappings": {"alias": "target"}
+            }
+        }),
+        true,
+    )
+    .await;
+    assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+
+    let valid_rules = json!({
+        "version": 1,
+        "auto_trim_prefixes": ["vendor"],
+        "hide_original": true,
+        "hide_mapped": false,
+        "mappings": {"vendor/model": "model"}
+    });
+    let valid = admin(
+        &f,
+        &cookie,
+        http::Method::POST,
+        &path,
+        json!({"provider_id": f.providers[0], "model_rules": valid_rules.clone()}),
+        true,
+    )
+    .await;
+    assert_eq!(valid.status(), StatusCode::OK);
+
+    let stored = f
+        .state
+        .db
+        .query_one(ops::sql(
+            "SELECT model_rules_json FROM channel_settings WHERE provider_id=?",
+            vec![f.providers[0].clone().into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get::<String>("", "model_rules_json")
+        .unwrap();
+    assert_eq!(serde_json::from_str::<Value>(&stored).unwrap(), valid_rules);
+}
+
+#[tokio::test]
 async fn bulk_toggle_covers_api_keys_and_stays_inside_the_project() {
     let f = fixture(success()).await;
     let cookie = owner(&f).await;
