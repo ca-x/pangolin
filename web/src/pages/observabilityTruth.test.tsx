@@ -136,6 +136,8 @@ describe('money has one representation', () => {
     expect(formatMicros(undefined)).toBe('—')
     expect(formatMicros(-1)).toBe('—')
     expect(formatMicros(0)).toBe('$0.000000')
+    expect(formatMicros(1_500_000, 'EUR')).toBe('€1.500000')
+    expect(formatMicros(1_500_000, 'JPY')).toBe('¥1.500000')
   })
 })
 

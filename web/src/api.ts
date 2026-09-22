@@ -1,4 +1,7 @@
-export type Branding = { instance_name: string; branding_name: string; favicon_url: string; onboarding_complete: boolean }
+export type Branding = { instance_name: string; branding_name: string; favicon_url: string; onboarding_complete: boolean; currency?: string; timezone?: string }
+export let displayCurrency = 'USD'
+const browserTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'
+export let displayTimezone = browserTimezone
 /** Provenance of the running binary, reported by `/api/v1/bootstrap` and `/api/v1/version`. */
 export type BuildInfo = { version: string; commit: string; built_at: string; target: string; profile: string }
 /**
@@ -86,5 +89,15 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
     throw new ApiFailure(response.status, payload?.error?.message || response.statusText, code)
   }
   if (response.status === 204) return undefined as T
-  return response.json() as Promise<T>
+  const payload = await response.json() as T
+  if (path === '/api/v1/bootstrap') {
+    const currency = (payload as Bootstrap | undefined)?.branding?.currency
+    displayCurrency = typeof currency === 'string' && /^[A-Z]{3}$/.test(currency) ? currency : 'USD'
+    const timezone = (payload as Bootstrap | undefined)?.branding?.timezone
+    try {
+      new Intl.DateTimeFormat('en', { timeZone: timezone || browserTimezone }).format(0)
+      displayTimezone = timezone || browserTimezone
+    } catch { displayTimezone = browserTimezone }
+  }
+  return payload
 }

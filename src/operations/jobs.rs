@@ -5,6 +5,71 @@ use sea_orm::{ConnectionTrait, DatabaseConnection, FromQueryResult, TransactionT
 use serde::Serialize;
 use serde_json::Value;
 
+pub(crate) fn next_run_at(payload: &Value, now: i64, interval: i64) -> Result<i64, ApiError> {
+    let Some(timing) = payload.get("schedule") else {
+        return Ok(now + interval);
+    };
+    let timing = timing
+        .as_object()
+        .ok_or_else(|| ApiError::BadRequest("invalid schedule timing".into()))?;
+    let kind = timing
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ApiError::BadRequest("invalid schedule timing".into()))?;
+    if kind == "interval" {
+        return Ok(now + interval);
+    }
+    let timezone = timing
+        .get("timezone")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ApiError::BadRequest("schedule timezone is required".into()))?
+        .parse::<chrono_tz::Tz>()
+        .map_err(|_| ApiError::BadRequest("invalid schedule timezone".into()))?;
+    let expression = match kind {
+        "daily" => {
+            let time = timing
+                .get("time")
+                .and_then(Value::as_str)
+                .ok_or_else(|| ApiError::BadRequest("daily schedule time is required".into()))?;
+            let (hour, minute) = time
+                .split_once(':')
+                .and_then(|(hour, minute)| {
+                    Some((hour.parse::<u8>().ok()?, minute.parse::<u8>().ok()?))
+                })
+                .filter(|(hour, minute)| *hour < 24 && *minute < 60)
+                .ok_or_else(|| ApiError::BadRequest("invalid daily schedule time".into()))?;
+            if time.len() != 5 {
+                return Err(ApiError::BadRequest("invalid daily schedule time".into()));
+            }
+            format!("0 {minute} {hour} * * *")
+        }
+        "cron" => {
+            let expression = timing
+                .get("expression")
+                .and_then(Value::as_str)
+                .filter(|expression| !expression.is_empty() && expression.len() <= 128)
+                .ok_or_else(|| ApiError::BadRequest("invalid schedule cron".into()))?;
+            if expression.split_whitespace().count() == 5 {
+                format!("0 {expression}")
+            } else {
+                expression.to_owned()
+            }
+        }
+        _ => return Err(ApiError::BadRequest("invalid schedule timing".into())),
+    };
+    let schedule = expression
+        .parse::<cron::Schedule>()
+        .map_err(|_| ApiError::BadRequest("invalid schedule cron".into()))?;
+    let current = chrono::DateTime::from_timestamp(now, 0)
+        .ok_or_else(|| ApiError::BadRequest("invalid schedule timestamp".into()))?
+        .with_timezone(&timezone);
+    schedule
+        .after(&current)
+        .next()
+        .map(|next| next.timestamp())
+        .ok_or_else(|| ApiError::BadRequest("schedule cron has no future time".into()))
+}
+
 #[derive(Clone, Debug, FromQueryResult, Serialize)]
 pub struct Claim {
     pub id: String,
@@ -76,15 +141,23 @@ pub async fn enqueue_due(db: &DatabaseConnection, now: i64) -> Result<usize, Api
         let interval: i64 = row.try_get("", "interval_secs")?;
         let project: Option<String> = row.try_get("", "project_id")?;
         let kind: String = row.try_get("", "kind")?;
+        let payload: Result<Value, _> =
+            serde_json::from_str(&row.try_get::<String>("", "payload_json")?);
+        let next = payload
+            .as_ref()
+            .ok()
+            .and_then(|payload| next_run_at(payload, now, interval).ok())
+            .unwrap_or(now + interval);
         let tx = db.begin().await?;
-        let changed=tx.execute(sql("UPDATE operation_schedules SET next_run_at=?,last_error=NULL WHERE id=? AND revision=? AND next_run_at=? AND enabled=1",vec![(now+interval).into(),schedule.clone().into(),revision.into(),slot.into()])).await?.rows_affected();
+        let changed=tx.execute(sql("UPDATE operation_schedules SET next_run_at=?,last_error=NULL WHERE id=? AND revision=? AND next_run_at=? AND enabled=1",vec![next.into(),schedule.clone().into(),revision.into(),slot.into()])).await?.rows_affected();
         if changed != 1 {
             tx.rollback().await?;
             continue;
         }
         let key = format!("schedule:{schedule}:{revision}:{slot}");
         let result:Result<(),ApiError>=async {
-            let payload:Value=serde_json::from_str(&row.try_get::<String>("","payload_json")?).map_err(|_|ApiError::BadRequest("invalid schedule payload".into()))?;
+            let payload = payload.map_err(|_|ApiError::BadRequest("invalid schedule payload".into()))?;
+            next_run_at(&payload, now, interval)?;
             if kind=="automatic_backup" {
                 let targets:Vec<String>=serde_json::from_value(payload["targets"].clone()).map_err(|_|ApiError::BadRequest("invalid scheduled backup targets".into()))?;
                 let resources:Vec<String>=serde_json::from_value(payload["resources"].clone()).map_err(|_|ApiError::BadRequest("invalid scheduled backup resources".into()))?;
@@ -104,7 +177,7 @@ pub async fn enqueue_due(db: &DatabaseConnection, now: i64) -> Result<usize, Api
             Err(_) => {
                 tx.rollback().await?;
                 let tx = db.begin().await?;
-                let changed=tx.execute(sql("UPDATE operation_schedules SET next_run_at=?,last_error='invalid_configuration' WHERE id=? AND revision=? AND next_run_at=?",vec![(now+interval).into(),schedule.clone().into(),revision.into(),slot.into()])).await?.rows_affected();
+                let changed=tx.execute(sql("UPDATE operation_schedules SET next_run_at=?,last_error='invalid_configuration' WHERE id=? AND revision=? AND next_run_at=?",vec![next.into(),schedule.clone().into(),revision.into(),slot.into()])).await?.rows_affected();
                 if changed == 1 {
                     let job = enqueue(
                         &tx,
@@ -122,4 +195,50 @@ pub async fn enqueue_due(db: &DatabaseConnection, now: i64) -> Result<usize, Api
         }
     }
     Ok(count)
+}
+
+#[cfg(test)]
+mod schedule_tests {
+    use super::*;
+    use chrono::TimeZone;
+    use serde_json::json;
+
+    #[test]
+    fn daily_schedule_skips_a_nonexistent_dst_wall_time() {
+        let before_gap = chrono::Utc
+            .with_ymd_and_hms(2026, 3, 7, 7, 1, 0)
+            .unwrap()
+            .timestamp();
+        let expected = chrono::Utc
+            .with_ymd_and_hms(2026, 3, 9, 6, 0, 0)
+            .unwrap()
+            .timestamp();
+        let payload = json!({
+            "schedule": {
+                "type": "daily",
+                "time": "02:00",
+                "timezone": "America/New_York"
+            }
+        });
+
+        assert_eq!(next_run_at(&payload, before_gap, 3600).unwrap(), expected);
+    }
+
+    #[test]
+    fn timezone_schedule_refuses_an_unknown_zone() {
+        let payload = json!({
+            "schedule": {
+                "type": "cron",
+                "expression": "0 0 2 * * *",
+                "timezone": "Mars/Olympus_Mons"
+            }
+        });
+
+        assert!(next_run_at(&payload, 0, 3600).is_err());
+    }
+
+    #[test]
+    fn interval_schedule_keeps_the_existing_relative_behavior() {
+        assert_eq!(next_run_at(&json!({}), 1_000, 60).unwrap(), 1_060);
+    }
 }

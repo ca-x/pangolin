@@ -250,6 +250,13 @@ async fn execute_inner(
         }
     }
     if plan.candidates.is_empty() {
+        if plan
+            .decisions
+            .iter()
+            .any(|decision| decision.reason == "quota_backpressure")
+        {
+            return Err(ApiError::RateLimited("provider quota exhausted".into()));
+        }
         return Err(ApiError::BadRequest(
             "no eligible route for requested model and endpoint".into(),
         ));

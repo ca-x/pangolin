@@ -1,3 +1,4 @@
+use super::policy::ErrorMode;
 use super::*;
 
 #[test]
@@ -372,6 +373,57 @@ async fn quota_health_capability_and_disabled_credentials_are_filtered() {
             .iter()
             .any(|d| d.reason == "quota_exhausted")
     );
+    sql(&f,"INSERT INTO settings(key,value,updated_at) VALUES('system',?,0) ON CONFLICT(key) DO UPDATE SET value=excluded.value",vec![json!({"quota_routing_mode":"IGNORE_QUOTA"}).to_string().into()]).await;
+    let ignored = plan(&f, body.clone()).await.unwrap();
+    assert_eq!(ignored.candidates.len(), 1);
+    assert!(
+        ignored
+            .decisions
+            .iter()
+            .any(|d| d.reason == "quota_ignored")
+    );
+    sql(
+        &f,
+        "UPDATE settings SET value=? WHERE key='system'",
+        vec![
+            json!({"quota_routing_mode":"BACKPRESSURE"})
+                .to_string()
+                .into(),
+        ],
+    )
+    .await;
+    let backpressured = plan(&f, body.clone()).await.unwrap();
+    assert!(backpressured.candidates.is_empty());
+    assert!(
+        backpressured
+            .decisions
+            .iter()
+            .any(|d| d.reason == "quota_backpressure")
+    );
+    sql(
+        &f,
+        "UPDATE settings SET value=? WHERE key='system'",
+        vec![json!({"quota_collection_enabled":false}).to_string().into()],
+    )
+    .await;
+    let collection_disabled = plan(&f, body.clone()).await.unwrap();
+    assert_eq!(collection_disabled.candidates.len(), 1);
+    assert!(
+        collection_disabled
+            .decisions
+            .iter()
+            .any(|d| d.reason == "quota_collection_disabled")
+    );
+    sql(
+        &f,
+        "UPDATE settings SET value=? WHERE key='system'",
+        vec![
+            json!({"quota_routing_mode":"REMOVE_ON_EXHAUSTED"})
+                .to_string()
+                .into(),
+        ],
+    )
+    .await;
     sql(
         &f,
         "UPDATE provider_quota_snapshots SET period_end=1 WHERE id='quota'",
@@ -403,6 +455,48 @@ async fn quota_health_capability_and_disabled_credentials_are_filtered() {
     )
     .await;
     assert!(plan(&f, body).await.unwrap().candidates.is_empty());
+}
+
+#[tokio::test]
+async fn instance_retry_defaults_apply_until_a_channel_overrides_each_knob() {
+    let f = database_fixture().await;
+    let (provider, _) = add_model(&f, "a", "public", "actual").await;
+    sql(
+        &f,
+        "UPDATE channel_settings SET retry_statuses_json=? WHERE provider_id=?",
+        vec![
+            json!({"version":1}).to_string().into(),
+            provider.clone().into(),
+        ],
+    )
+    .await;
+    sql(&f,"INSERT INTO settings(key,value,updated_at) VALUES('system',?,0) ON CONFLICT(key) DO UPDATE SET value=excluded.value",vec![json!({"retry_policy":{"version":1,"attempts":4,"error_mode":"custom","error_message":"Try again"}}).to_string().into()]).await;
+
+    let inherited = plan(&f, json!({"model":"public"})).await.unwrap();
+    assert_eq!(inherited.candidates[0].retry.attempts, 4);
+    assert_eq!(inherited.candidates[0].retry.error_mode, ErrorMode::Custom);
+    assert_eq!(
+        inherited.candidates[0].retry.error_message.as_deref(),
+        Some("Try again")
+    );
+
+    sql(
+        &f,
+        "UPDATE channel_settings SET retry_statuses_json=? WHERE provider_id=?",
+        vec![
+            json!({"version":1,"attempts":2,"error_mode":"pass_through"})
+                .to_string()
+                .into(),
+            provider.into(),
+        ],
+    )
+    .await;
+    let overridden = plan(&f, json!({"model":"public"})).await.unwrap();
+    assert_eq!(overridden.candidates[0].retry.attempts, 2);
+    assert_eq!(
+        overridden.candidates[0].retry.error_mode,
+        ErrorMode::PassThrough
+    );
 }
 
 #[tokio::test]

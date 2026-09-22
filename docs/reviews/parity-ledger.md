@@ -55,13 +55,13 @@ states plainly that no test guards it yet.
 | prompts & playground | 6 | 12 | 1 | 0 | 0 | 0 | 1 | 20 |
 | models, routing & pricing | 6 | 17 | 2 | 1 | 0 | 0 | 0 | 26 |
 | access control | 2 | 17 | 2 | 0 | 0 | 0 | 0 | 21 |
-| system settings & background work | 8 | 11 | 5 | 1 | 5 | 0 | 1 | 31 |
+| system settings & background work | 8 | 15 | 5 | 1 | 1 | 0 | 1 | 31 |
 | console-wide UX | 3 | 11 | 1 | 0 | 0 | 0 | 0 | 15 |
-| **total** | **30** | **79** | **11** | **3** | **8** | **0** | **2** | **133** |
+| **total** | **30** | **83** | **11** | **3** | **4** | **0** | **2** | **133** |
 
 Row count is unchanged at 133 — the six area reports' own findings. No row was
-dropped, merged or added. What changed is the status: **120 rows need no work**
-(30 already matched, 79 fixed, 11 refuted), **11 rows need work** (`partial` +
+dropped, merged or added. What changed is the status: **124 rows need no work**
+(30 already matched, 83 fixed, 11 refuted), **7 rows need work** (`partial` +
 `open` + `feature-build`), and **2 rows are recorded divergences** whose only
 remaining difference is deliberate.
 
@@ -211,7 +211,7 @@ Report: [parity-system-settings.md](parity-system-settings.md).
 | 10 | The retention form still offers the removed `retain_payloads` switch | closed | fixed | Gone from the console, the projection and both locales (`rg retain_payloads` is empty) | n/a | `SystemPage.test.tsx` retention case |
 | 11 | The stored request-logging policy is parsed with `deny_unknown_fields` and has no `version` | closed | fixed | Version 1 is explicit on reads/writes; strict request parsing rejects unknown/unsupported input while stored v1 documents tolerate forward fields and legacy unversioned rows upgrade in memory. Startup emits bounded diagnostics for malformed/unsupported rows; admission stays available with logging disabled and GET returns a writable repair shape. | `internal/server/biz/system.go:988-1004` | version/strict-write/startup/fail-closed Rust cases plus `SystemPage.test.tsx` round-trip |
 | 12 | A broken schedule fails silently | closed | fixed | `last_error` is projected (`operations_api.rs:404`) and rendered as a red badge or `—` (`SystemPage.tsx:840`) | `backup-settings.tsx:560-586` | `backupScheduleRetention.test.tsx` |
-| 13 | No cron, time-of-day or timezone for schedules | open | — | `interval_secs` only, bounded 30 s–1 year (`operations_api.rs:1430-1434`, `SystemPage.tsx:840`); cron + timezone exist only inside the per-channel auto-disable policy (`operations_api.rs:1289-1302`) | `internal/server/backup/autobackup.go:27-28,76-81` | a schedule test for a daily time in an IANA timezone |
+| 13 | No cron, time-of-day or timezone for schedules | closed | fixed | Versioned schedule timing supports legacy intervals plus daily/cron anchors in explicit IANA zones, handles DST gaps, preserves interval phase on edits and isolates invalid schedules. | `internal/server/backup/autobackup.go:27-28,76-81` | schedule module plus write/phase tests and `backupScheduleRetention.test.tsx` |
 | 14 | Auto-backup retention count only via raw JSON | closed | fixed | `keep` is a first-class field with a hint and range check (`SystemPage.tsx:840,492-493`) | `backup-settings.tsx:547-556` | `backupScheduleRetention.test.tsx` |
 | 15 | No route or surface to list or re-download an artifact | closed | fixed | `GET .../backup/artifacts` + single-artifact download, consumed with the CSRF header (`operations_api.rs:64-71`, `SystemPage.tsx:563-580,690-700`) | no list route either | `artifactDownload.test.tsx` |
 | 16 | The delivered archive's location is not shown | closed | fixed | `object_key` is projected and rendered per target (`operations_api.rs:352` type, `SystemPage.tsx:806-811`) | n/a | `deliveryLocation.test.tsx` |
@@ -220,9 +220,9 @@ Report: [parity-system-settings.md](parity-system-settings.md).
 | 19 | One restore conflict strategy for the whole artifact | partial | — | Project artifacts accept a default plus validated per-resource `fail`/`skip`/`overwrite` strategies while preserving secrets and the prior default; instance archives still use one `mode` + `force` policy | per-class strategies (`RestoreOptionsInput`) | `b51_restore_applies_per_resource_strategies_and_defaults_to_fail`, `SystemPage.test.tsx` |
 | 20 | `catalog:manage` alone gets a System nav entry that leads nowhere | closed | fixed | `/models` is in the nav for `catalog:manage` (`Shell.tsx:45`) | catalog tab inside the system page | `SystemPage.test.tsx` permission cases |
 | 21 | Admin-route body rejections bypass the error envelope | closed | fixed | `/api/admin/` rejections are normalised (`api/errors.rs`), with a guard scoped to admin paths | GraphQL returns structured validation errors | `admin_body_rejections_answer_with_the_error_envelope` |
-| 22 | No instance-level general settings | open | — | No currency and no instance timezone setting; `formatMicros` hardcodes `$` | `general-settings.tsx:149-224` | an instance settings test; depends on the currency decision |
-| 23 | No instance-level retry or upstream-error policy settings | open | — | Retry statuses and auto-disable are per-channel JSON (`db/schema.rs:344-352`); the only instance settings routes are request-logging and system (`operations_api.rs:20-25`) | `retry-settings.tsx:149-260` | an instance policy test, or the ADR below |
-| 24 | No quota-collection or quota-routing-mode settings | open | — | An exhausted quota always removes the channel (`orchestration/repository.rs:210-211`); collection is driven per channel/schedule, with no toggle | `quota-settings.tsx:89-155` (collection switch + routing mode) | a routing-mode test, or the ADR below |
+| 22 | No instance-level general settings | closed | fixed | Strict audited instance settings add display currency and IANA timezone while authoritative money remains integer micro-USD; all monetary/date presentation uses the stored policy. | `general-settings.tsx:149-224` | instance settings Rust round-trip plus `instanceSettings.test.tsx`/observability formatting cases |
+| 23 | No instance-level retry or upstream-error policy settings | closed | fixed | Versioned instance retry/error defaults apply below explicit per-channel overrides and preserve the no-retry-after-stream-commit boundary. | `retry-settings.tsx:149-260` | instance retry inheritance/override test |
+| 24 | No quota-collection or quota-routing-mode settings | closed | fixed | Instance policy controls collection plus remove/ignore/backpressure routing; disabled collection makes old provider and credential snapshots observational only. | `quota-settings.tsx:89-155` | quota eligibility/collector isolation tests |
 | 25 | Diagnostics tab: cache diagnostics export and clear cache | closed | fixed | Owner-only export reports bounded cache counts and shape versions without payloads or credentials; clear invalidates only derived process state, verifies SQLite authority is unchanged and writes an audit row | `diagnostics-settings.tsx` | `b52_cache_diagnostics_are_bounded_and_clear_keeps_authority_serving`, `SystemPage.test.tsx` |
 | 26 | Outbound proxy presets, and per-webhook timeout/proxy | partial | — | Instance-scoped presets encrypt credentials and are selectable by bounded-timeout webhooks and catalog sources; catalog fetches remain no-proxy by default. Channel settings can reference a preset, but provider egress still depends on models row 21 plumbing | `proxy-presets-settings.tsx:29-98`, `webhook-settings.tsx:424-522` | B53 webhook/catalog/proxy tests plus `SystemPage.test.tsx`; channel egress remains |
 | 27 | "One extra field makes every gateway request fail" (the PUT) | closed | refuted | The extra field is refused at the settings route before anything is written (`operations_api.rs:212-225`) | — | the real exposure was the stored row, now row 11 |
@@ -440,8 +440,8 @@ retry/model/quota settings, and CORS/timeouts. Every one of them is scheduled in
 | Codex OAuth | implemented+tested | bounded PKCE authorization-code helper stores complete token response only in an encrypted credential envelope |
 | xAI OAuth/SSO | implemented+tested | bounded PKCE authorization-code helper with durable hashed state and transactional audit |
 | Claude Code OAuth | implemented+tested | bounded PKCE authorization-code helper with write-only encrypted token storage |
-| Antigravity OAuth | implemented+tested | bounded PKCE authorization-code helper with write-only encrypted token storage |
-| GitHub Copilot device OAuth | implemented+tested | bounded device-code polling, HTTPS github.com verification URL and encrypted terminal credential storage |
+| Antigravity OAuth | unavailable | fails closed until Code Assist project resolution and refresh-backed provider authentication are implemented |
+| GitHub Copilot device OAuth | unavailable | fails closed until GitHub-to-Copilot token exchange and required provider headers are implemented |
 | IP security | divergence | per-key allow/deny only (D3) |
 | OpenAPI GraphQL auth | divergence | REST-only control plane; D6 accepted in [ADR 0003](../adr/0003-rest-only-control-plane.md) |
 
@@ -536,7 +536,7 @@ retry/model/quota settings, and CORS/timeouts. Every one of them is scheduled in
 | Favicon/static SPA | implemented+tested | embedded branded assets and deep links |
 | Playground/chat | feature-build | prompts 13 |
 | Request content policy | implemented+tested | versioned logging levels plus an explicit default-off live-preview toggle; credentials and payloads never enter preview rows |
-| Provider OAuth credential helpers | implemented+tested | Codex/xAI/Claude Code/Antigravity PKCE and Copilot device flows with bounded mock-IdP contracts |
+| Provider OAuth credential helpers | partial | provider-specific Codex/xAI/Claude Code contracts are mock-tested; Antigravity and Copilot are explicitly unavailable rather than storing unusable credentials |
 
 ### Console feature pages (1)
 

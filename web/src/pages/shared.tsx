@@ -5,7 +5,7 @@ import { AlertTriangle, ChevronRight, Copy, Inbox, Plus, Search, Trash2 } from '
 import { useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
-import { api, type Document, type Paged } from '../api'
+import { api, displayTimezone, type Document, type Paged } from '../api'
 import { confirmAction, EmptyState, EnabledPill, InlineQueryError, SecretInput, SkeletonRows } from '../components'
 import i18n from '../i18n'
 import { projectOperationPath, useProject } from '../project'
@@ -21,7 +21,7 @@ export function QueryError({ retry }: { retry: () => void }) {
 }
 
 export const formatDate = (value: unknown) => typeof value === 'number' && value > 0
-  ? new Intl.DateTimeFormat(i18n.language, { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(value * 1000))
+  ? new Intl.DateTimeFormat(i18n.language, { dateStyle: 'medium', timeStyle: 'short', timeZone: displayTimezone }).format(new Date(value * 1000))
   : '—'
 
 export const displayValue = (value: unknown) => {

@@ -9,6 +9,7 @@ pub mod pricing;
 pub mod proxy;
 pub mod runtime;
 pub mod schedule;
+pub mod settings;
 pub mod storage;
 
 use sea_orm::{DbBackend, Statement};

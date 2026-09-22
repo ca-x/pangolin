@@ -572,67 +572,20 @@ async fn set_log_policy(
     tx.commit().await?;
     Ok(Json(json!({"ok":true})))
 }
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct SystemSettings {
-    instance_name: String,
-    branding_name: String,
-    favicon_url: String,
-    onboarding_complete: bool,
-    #[serde(default)]
-    cors_allowed_origins: Vec<String>,
-    #[serde(default = "default_request_timeout_ms")]
-    request_timeout_ms: u64,
-}
-fn default_request_timeout_ms() -> u64 {
-    super::http_policy::DEFAULT_REQUEST_TIMEOUT_MS
-}
-impl Default for SystemSettings {
-    fn default() -> Self {
-        Self {
-            instance_name: "Pangolin".into(),
-            branding_name: "Pangolin / 鲮鲤".into(),
-            favicon_url: "/logo.webp".into(),
-            onboarding_complete: false,
-            cors_allowed_origins: Vec::new(),
-            request_timeout_ms: default_request_timeout_ms(),
-        }
-    }
-}
 async fn system_settings(
     State(state): State<AppState>,
     headers: HeaderMap,
-) -> Result<Json<SystemSettings>, ApiError> {
+) -> Result<Json<operations::settings::SystemSettings>, ApiError> {
     actor(&state, &headers, None, false).await?;
-    let row = state
-        .db
-        .query_one(sql("SELECT value FROM settings WHERE key='system'", vec![]))
-        .await?;
-    let value = match row {
-        Some(row) => serde_json::from_str(&row.try_get::<String>("", "value")?)
-            .map_err(|error| ApiError::Internal(error.into()))?,
-        None => SystemSettings::default(),
-    };
-    Ok(Json(value))
+    Ok(Json(operations::settings::load(&state.db).await?))
 }
 async fn set_system_settings(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(input): Json<SystemSettings>,
+    Json(input): Json<operations::settings::SystemSettings>,
 ) -> Result<Json<Value>, ApiError> {
     let user = actor(&state, &headers, None, true).await?;
-    if input.instance_name.trim().is_empty()
-        || input.instance_name.len() > 128
-        || input.branding_name.trim().is_empty()
-        || input.branding_name.len() > 128
-        || input.favicon_url.len() > 2048
-        || !(input.favicon_url.starts_with('/') || input.favicon_url.starts_with("https://"))
-        || !(super::http_policy::HttpPolicy {
-            cors_allowed_origins: input.cors_allowed_origins.clone(),
-            request_timeout_ms: input.request_timeout_ms,
-        })
-        .validate()
-    {
+    if !input.validate() {
         return Err(ApiError::BadRequest("invalid system settings".into()));
     }
     let tx = state.db.begin().await?;
@@ -4467,9 +4420,13 @@ async fn mutate(
             if !(30..=31536000).contains(&interval) {
                 return Err(ApiError::BadRequest("invalid schedule interval".into()));
             }
+            let payload = value
+                .get("payload")
+                .filter(|payload| payload.is_object())
+                .ok_or_else(|| ApiError::BadRequest("invalid schedule payload".into()))?;
             if kind == "model_sync" {
-                let provider = value
-                    .pointer("/payload/provider_id")
+                let provider = payload
+                    .get("provider_id")
                     .and_then(Value::as_str)
                     .ok_or_else(|| ApiError::BadRequest("model sync requires a channel".into()))?;
                 if transaction
@@ -4483,7 +4440,32 @@ async fn mutate(
                     return Err(ApiError::NotFound);
                 }
             }
-            let changed=transaction.execute(sql("INSERT INTO operation_schedules(id,project_id,kind,payload_json,interval_secs,next_run_at,enabled) VALUES(?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET kind=excluded.kind,payload_json=excluded.payload_json,interval_secs=excluded.interval_secs,enabled=excluded.enabled,revision=operation_schedules.revision+1 WHERE operation_schedules.project_id=excluded.project_id AND operation_schedules.revision=?",vec![resource_id.clone().into(),project.clone().into(),kind.into(),value["payload"].to_string().into(),interval.into(),db::now().into(),value["enabled"].as_bool().unwrap_or(true).into(),value["revision"].as_i64().unwrap_or(0).into()])).await?.rows_affected();
+            let now = db::now();
+            let anchored = payload
+                .pointer("/schedule/type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| matches!(kind, "daily" | "cron"));
+            let computed = payload
+                .get("schedule")
+                .map(|_| jobs::next_run_at(payload, now, interval))
+                .transpose()?;
+            let next_run = if anchored {
+                computed.expect("anchored schedules have timing")
+            } else {
+                // Legacy interval schedules fire once immediately, then advance
+                // relative to the worker's current time. Editing one keeps its
+                // already-advertised next run instead of resetting its phase.
+                transaction
+                    .query_one(sql(
+                        "SELECT next_run_at FROM operation_schedules WHERE id=? AND project_id=?",
+                        vec![resource_id.clone().into(), project.clone().into()],
+                    ))
+                    .await?
+                    .map(|row| row.try_get::<i64>("", "next_run_at"))
+                    .transpose()?
+                    .unwrap_or(now)
+            };
+            let changed=transaction.execute(sql("INSERT INTO operation_schedules(id,project_id,kind,payload_json,interval_secs,next_run_at,enabled) VALUES(?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET kind=excluded.kind,payload_json=excluded.payload_json,interval_secs=excluded.interval_secs,next_run_at=excluded.next_run_at,enabled=excluded.enabled,revision=operation_schedules.revision+1 WHERE operation_schedules.project_id=excluded.project_id AND operation_schedules.revision=?",vec![resource_id.clone().into(),project.clone().into(),kind.into(),payload.to_string().into(),interval.into(),next_run.into(),value["enabled"].as_bool().unwrap_or(true).into(),value["revision"].as_i64().unwrap_or(0).into()])).await?.rows_affected();
             if changed != 1 {
                 return Err(ApiError::Conflict("schedule revision changed".into()));
             }

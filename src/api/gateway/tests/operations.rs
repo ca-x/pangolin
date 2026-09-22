@@ -6489,6 +6489,168 @@ async fn a_broken_schedule_reports_why_it_failed() {
     );
 }
 
+#[tokio::test]
+async fn a_schedule_write_refuses_an_invalid_timezone() {
+    let f = fixture(success()).await;
+    let cookie = owner(&f).await;
+    let path = format!(
+        "/api/admin/v1/projects/{}/operations/schedules",
+        db::DEFAULT_PROJECT_ID
+    );
+    let response = admin(
+        &f,
+        &cookie,
+        http::Method::POST,
+        &path,
+        json!({
+            "kind": "automatic_backup",
+            "payload": {
+                "targets": [],
+                "resources": [],
+                "schedule": {
+                    "type": "daily",
+                    "time": "02:00",
+                    "timezone": "Mars/Olympus_Mons"
+                }
+            },
+            "interval_secs": 3600,
+            "enabled": true
+        }),
+        true,
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn interval_schedule_writes_keep_immediate_create_and_existing_phase() {
+    let f = fixture(success()).await;
+    let cookie = owner(&f).await;
+    let path = format!(
+        "/api/admin/v1/projects/{}/operations/schedules",
+        db::DEFAULT_PROJECT_ID
+    );
+    let before = db::now();
+    let body = json!({
+        "id": "interval-compat",
+        "kind": "probe",
+        "payload": {"provider_id": f.providers[0]},
+        "interval_secs": 60,
+        "enabled": true
+    });
+    assert_eq!(
+        admin(&f, &cookie, http::Method::POST, &path, body, true)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        count(&f, &format!("SELECT COUNT(*) AS n FROM operation_schedules WHERE id='interval-compat' AND next_run_at BETWEEN {before} AND {}", db::now())).await,
+        1
+    );
+    sql(
+        &f,
+        "UPDATE operation_schedules SET next_run_at=4242 WHERE id='interval-compat'",
+        vec![],
+    )
+    .await;
+    assert_eq!(
+        admin(
+            &f,
+            &cookie,
+            http::Method::POST,
+            &path,
+            json!({
+                "id": "interval-compat",
+                "kind": "probe",
+                "payload": {"provider_id": f.providers[0]},
+                "interval_secs": 120,
+                "enabled": true,
+                "revision": 1
+            }),
+            true,
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        count(&f, "SELECT COUNT(*) AS n FROM operation_schedules WHERE id='interval-compat' AND next_run_at=4242 AND interval_secs=120").await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn instance_settings_round_trip_and_tolerate_future_stored_fields() {
+    let f = fixture(success()).await;
+    let cookie = owner(&f).await;
+    let path = "/api/admin/v1/settings/system";
+    let document = json!({
+        "instance_name": "Operations",
+        "branding_name": "Pangolin / 鲮鲤",
+        "favicon_url": "/logo.webp",
+        "onboarding_complete": true,
+        "currency": "EUR",
+        "timezone": "Europe/Berlin",
+        "retry_policy": {"version": 1, "attempts": 2, "error_mode": "custom", "error_message": "Try again"},
+        "quota_collection_enabled": false,
+        "quota_routing_mode": "IGNORE_QUOTA",
+        "cors_allowed_origins": [],
+        "request_timeout_ms": 600000
+    });
+    assert_eq!(
+        admin(&f, &cookie, http::Method::PUT, path, document.clone(), true)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    let read =
+        json_body(admin(&f, &cookie, http::Method::GET, path, Value::Null, false).await).await;
+    assert_eq!(read, document);
+    let mut typo = document.clone();
+    typo["quota_route_mode"] = json!("BACKPRESSURE");
+    assert_eq!(
+        admin(&f, &cookie, http::Method::PUT, path, typo, true)
+            .await
+            .status(),
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    assert_eq!(
+        count(
+            &f,
+            "SELECT COUNT(*) AS n FROM audit_events WHERE action='system.update'"
+        )
+        .await,
+        1
+    );
+
+    sql(
+        &f,
+        "UPDATE settings SET value=? WHERE key='system'",
+        vec![
+            json!({
+                "instance_name": "Future",
+                "branding_name": "Pangolin / 鲮鲤",
+                "favicon_url": "/logo.webp",
+                "onboarding_complete": false,
+                "currency": "JPY",
+                "timezone": "Asia/Tokyo",
+                "future_field": {"version": 99}
+            })
+            .to_string()
+            .into(),
+        ],
+    )
+    .await;
+    let future =
+        json_body(admin(&f, &cookie, http::Method::GET, path, Value::Null, false).await).await;
+    assert_eq!(future["instance_name"], "Future");
+    assert_eq!(future["currency"], "JPY");
+    assert_eq!(future["quota_routing_mode"], "REMOVE_ON_EXHAUSTED");
+    assert!(future.get("future_field").is_none());
+}
+
 /// A duplicate model hit UNIQUE(provider_id, public_name, upstream_name) and
 /// surfaced as an opaque 500 whose only clue was the constraint name in the log.
 #[tokio::test]
@@ -7134,6 +7296,27 @@ async fn task5_probe_quota_collector_and_invalid_schedule_isolation() {
         )
         .await,
         1
+    );
+    sql(&f, "DELETE FROM provider_quota_snapshots", vec![]).await;
+    sql(&f,"INSERT INTO settings(key,value,updated_at) VALUES('system',?,0) ON CONFLICT(key) DO UPDATE SET value=excluded.value",vec![json!({"quota_collection_enabled":false}).to_string().into()]).await;
+    ops::jobs::enqueue(
+        &f.state.db,
+        Some(db::DEFAULT_PROJECT_ID),
+        "quota",
+        "quota-disabled",
+        &json!({"provider_id":f.providers[0]}),
+        db::now(),
+    )
+    .await
+    .unwrap();
+    let claim = ops::jobs::claim(&f.state.db, "worker", db::now(), 120)
+        .await
+        .unwrap()
+        .unwrap();
+    ops::runtime::execute(&f.state, &claim).await.unwrap();
+    assert_eq!(
+        count(&f, "SELECT COUNT(*) AS n FROM provider_quota_snapshots").await,
+        0
     );
     sql(&f,"INSERT INTO operation_schedules(id,project_id,kind,payload_json,interval_secs,next_run_at) VALUES('bad',?,'automatic_backup','{}',60,0),('good',?,'probe',?,60,0)",vec![db::DEFAULT_PROJECT_ID.into(),db::DEFAULT_PROJECT_ID.into(),json!({"provider_id":f.providers[1]}).to_string().into()]).await;
     assert_eq!(

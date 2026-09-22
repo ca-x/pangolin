@@ -344,32 +344,14 @@ async fn bootstrap(
 ) -> Result<impl IntoResponse, ApiError> {
     let initialized = db::is_initialized(&state.db).await?;
     let user = optional_user(&state, &headers).await?;
-    let system = state
-        .db
-        .query_one(sea_orm::Statement::from_string(
-            sea_orm::DbBackend::Sqlite,
-            "SELECT value FROM settings WHERE key='system'",
-        ))
-        .await?
-        .map(|row| row.try_get::<String>("", "value"))
-        .transpose()?
-        .and_then(|value| serde_json::from_str::<Value>(&value).ok());
-    let legacy_name = state
-        .db
-        .query_one(sea_orm::Statement::from_string(
-            sea_orm::DbBackend::Sqlite,
-            "SELECT value FROM settings WHERE key='instance_name'",
-        ))
-        .await?
-        .map(|row| row.try_get::<String>("", "value"))
-        .transpose()?
-        .unwrap_or_else(|| "Pangolin".into());
-    let system=system.unwrap_or_else(||json!({"instance_name":legacy_name,"branding_name":legacy_name,"favicon_url":"/logo.webp","onboarding_complete":false}));
+    let system = crate::operations::settings::load(&state.db).await?;
     let branding = json!({
-        "instance_name": system.get("instance_name").and_then(Value::as_str).unwrap_or("Pangolin"),
-        "branding_name": system.get("branding_name").and_then(Value::as_str).unwrap_or("Pangolin / 鲮鲤"),
-        "favicon_url": system.get("favicon_url").and_then(Value::as_str).unwrap_or("/logo.webp"),
-        "onboarding_complete": system.get("onboarding_complete").and_then(Value::as_bool).unwrap_or(false),
+        "instance_name": system.instance_name,
+        "branding_name": system.branding_name,
+        "favicon_url": system.favicon_url,
+        "onboarding_complete": system.onboarding_complete,
+        "currency": system.currency,
+        "timezone": system.timezone,
     });
     Ok(Json(json!({
         "initialized": initialized,

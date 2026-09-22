@@ -4,7 +4,7 @@ import { AlertTriangle, Copy, DatabaseBackup, Download, History, Play, RotateCcw
 import { useEffect, useMemo, useState, type FormEvent } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
-import { api, type Bootstrap, type Document, type Paged, type RequestLoggingPolicy } from '../api'
+import { api, displayTimezone, type Bootstrap, type Document, type Paged, type RequestLoggingPolicy } from '../api'
 import { confirmAction, EmptyState, EnabledPill, InlineQueryError, SecretInput, SelectField, SkeletonRows } from '../components'
 import { restoreOnboarding } from '../onboarding'
 import { palettes } from '../palettes'
@@ -226,8 +226,8 @@ function Appearance() {
   )
 }
 
-type Branding = { instance_name: string; branding_name: string; favicon_url: string; onboarding_complete: boolean; cors_allowed_origins?: string[]; request_timeout_ms?: number }
-function BrandingSettings() {
+type Branding = { instance_name: string; branding_name: string; favicon_url: string; onboarding_complete: boolean; currency: string; timezone: string; retry_policy: Record<string, unknown>; quota_collection_enabled: boolean; quota_routing_mode: string; cors_allowed_origins?: string[]; request_timeout_ms?: number }
+export function BrandingSettings() {
   const { t } = useTranslation()
   const client = useQueryClient()
   const query = useQuery({ queryKey: ['system-settings'], queryFn: () => api<Branding>('/api/admin/v1/settings/system') })
@@ -235,14 +235,9 @@ function BrandingSettings() {
   const submit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     const data = new FormData(event.currentTarget);
-    save.mutate({
-      instance_name: String(data.get('instance_name')),
-      branding_name: String(data.get('branding_name')),
-      favicon_url: String(data.get('favicon_url')),
-      onboarding_complete: data.get('onboarding_complete') === 'on',
-      cors_allowed_origins: String(data.get('cors_allowed_origins')).split(/\r?\n/).map((origin) => origin.trim()).filter(Boolean),
-      request_timeout_ms: Number(data.get('request_timeout_ms')),
-    })
+    try {
+      save.mutate({ instance_name: String(data.get('instance_name')), branding_name: String(data.get('branding_name')), favicon_url: String(data.get('favicon_url')), onboarding_complete: data.get('onboarding_complete') === 'on', currency: String(data.get('currency')), timezone: String(data.get('timezone')), retry_policy: JSON.parse(String(data.get('retry_policy'))), quota_collection_enabled: data.get('quota_collection_enabled') === 'on', quota_routing_mode: String(data.get('quota_routing_mode')), cors_allowed_origins: String(data.get('cors_allowed_origins')).split(/\r?\n/).map((origin) => origin.trim()).filter(Boolean), request_timeout_ms: Number(data.get('request_timeout_ms')) })
+    } catch { toast.error(t('invalidJson')) }
   }
   const branding = query.data
   return (
@@ -261,6 +256,11 @@ function BrandingSettings() {
                   <TextInput name="instance_name" label={t('instanceName')} defaultValue={branding.instance_name} required />
                   <TextInput name="branding_name" label={t('brandingName')} defaultValue={branding.branding_name} required />
                   <TextInput name="favicon_url" label={t('faviconUrl')} defaultValue={branding.favicon_url} required />
+                  <TextInput name="currency" label={t('currency')} defaultValue={branding.currency || 'USD'} required />
+                  <TextInput name="timezone" label={t('timezone')} defaultValue={branding.timezone || displayTimezone} required />
+                  <Textarea name="retry_policy" label={t('instanceRetryPolicy')} description={t('instanceRetryPolicyHint')} defaultValue={JSON.stringify(branding.retry_policy || { version: 1, attempts: 1, error_mode: 'normalized' }, null, 2)} rows={7} required />
+                  <Select name="quota_routing_mode" label={t('quotaRoutingMode')} defaultValue={branding.quota_routing_mode || 'REMOVE_ON_EXHAUSTED'} data={[{ value: 'REMOVE_ON_EXHAUSTED', label: t('quotaRemoveOnExhausted') }, { value: 'IGNORE_QUOTA', label: t('quotaIgnore') }, { value: 'BACKPRESSURE', label: t('quotaBackpressure') }]} allowDeselect={false} />
+                  <Switch name="quota_collection_enabled" label={t('quotaCollection')} description={t('quotaCollectionHint')} defaultChecked={branding.quota_collection_enabled ?? true} />
                   <Checkbox name="onboarding_complete" label={t('onboardingComplete')} defaultChecked={branding.onboarding_complete} />
                   <Title order={3} mt="sm">{t('httpPolicy')}</Title>
                   <Textarea name="cors_allowed_origins" label={t('corsAllowedOrigins')} description={t('corsAllowedOriginsHint')} defaultValue={(branding.cors_allowed_origins || []).join('\n')} rows={3} />
@@ -694,13 +694,19 @@ function scheduleBody(values: Record<string, unknown>, editing: Document | null,
     throw new Error(t('scheduleIntervalRange'))
   }
   const previous = payloadOf(editing)
-  const { storage_id, keep, ...rest } = values
+  const { storage_id, keep, schedule_mode, daily_time, cron_expression, timezone, ...rest } = values
+  const mode = String(schedule_mode || 'interval')
+  const schedule = mode === 'daily'
+    ? { type: 'daily', time: String(daily_time || ''), timezone: String(timezone || '') }
+    : mode === 'cron'
+      ? { type: 'cron', expression: String(cron_expression || ''), timezone: String(timezone || '') }
+      : undefined
   const row = editing ? { id: editing.id } : {}
   if (rest.kind !== 'backup_retention') {
     // Every other kind is defined by its payload, so the JSON box is the only
     // place it can come from and it has to be an object.
     if (!rest.payload || typeof rest.payload !== 'object' || Array.isArray(rest.payload)) throw new Error(t('schedulePayloadRequired'))
-    return { ...row, ...rest }
+    return { ...row, ...rest, payload: { ...(rest.payload as Record<string, unknown>), ...(schedule ? { schedule } : {}) } }
   }
   // A retention payload is exactly these two values, so the JSON box is not
   // required and cannot contradict them.
@@ -708,7 +714,7 @@ function scheduleBody(values: Record<string, unknown>, editing: Document | null,
   if (!storage) throw new Error(t('backupRetentionNeedsStorage'))
   const count = Number(keep ?? previous.keep ?? 7)
   if (!Number.isInteger(count) || count < 1 || count > 1000) throw new Error(t('backupRetentionCountRange'))
-  return { ...row, ...rest, payload: { storage_id: storage, keep: count } }
+  return { ...row, ...rest, payload: { storage_id: storage, keep: count, ...(schedule ? { schedule } : {}) } }
 }
 
 function BackupResourcePicker({ selected, onChange }: { selected: string[]; onChange: (next: string[]) => void }) {
@@ -753,6 +759,7 @@ function BackupPanel() {
   const { t } = useTranslation()
   const { project } = useProject()
   const client = useQueryClient()
+  const instanceTimezone = displayTimezone
   const base = `/api/admin/v1/projects/${project.id}/backup`
   const [resources, setResources] = useState<string[]>(CONFIGURATION_BACKUP_TABLES)
   const [targets, setTargets] = useState<string[]>([])
@@ -1046,7 +1053,7 @@ function BackupPanel() {
             target list is an auxiliary lookup: a failed read is reported above
             the table rather than in the dialog, because three of the four kinds
             do not need a target and must stay creatable. */}
-        <ResourcePage resource="schedules" title={t('backupSchedules')} description={t('backupScheduleHint')} empty={t('backupEmpty')} createLabel={t('addSchedule')} notice={storage.isError ? <InlineQueryError message={t('optionsUnavailable')} onRetry={() => void storage.refetch()} /> : undefined} columns={[{ key: 'kind', label: t('type') }, { key: 'interval_secs', label: t('interval') }, { key: 'next_run_at', label: t('nextRun'), render: formatDate }, { key: 'enabled', label: t('status'), render: (value) => <EnabledPill enabled={value} /> }, { key: 'last_error', label: t('lastError'), render: (value) => value ? <Badge variant="light" color="red">{errorLabel(String(value))}</Badge> : '—' }, { key: 'revision', label: t('revision') }]} fields={[{ key: 'kind', label: t('type'), kind: 'select', options: [{ value: 'automatic_backup', label: t('automaticBackup') }, { value: 'backup_retention', label: t('backupRetention') }, { value: 'probe', label: t('probe') }, { value: 'quota', label: t('quota') }] }, { key: 'storage_id', label: t('storageTarget'), hint: t('backupRetentionStorageHint'), kind: 'select', omitWhenBlank: true, options: storageOptions, fromRow: (row) => payloadOf(row).storage_id }, { key: 'keep', label: t('backupRetentionCount'), hint: t('backupRetentionCountHint'), kind: 'number', omitWhenBlank: true, fromRow: (row) => payloadOf(row).keep }, { key: 'payload', label: t('configuration'), kind: 'json', defaultValue: { targets: [], resources: [] } }, { key: 'interval_secs', label: t('intervalSeconds'), kind: 'number', hint: t('scheduleIntervalRange'), defaultValue: 3600 }, { key: 'enabled', label: t('enabled'), kind: 'checkbox' }, { key: 'revision', label: t('revision'), kind: 'number', defaultValue: 0 }]} normalize={(values, editing) => scheduleBody(values, editing, t)} />
+        <ResourcePage resource="schedules" title={t('backupSchedules')} description={t('backupScheduleHint')} empty={t('backupEmpty')} createLabel={t('addSchedule')} notice={storage.isError ? <InlineQueryError message={t('optionsUnavailable')} onRetry={() => void storage.refetch()} /> : undefined} columns={[{ key: 'kind', label: t('type') }, { key: 'interval_secs', label: t('interval') }, { key: 'next_run_at', label: t('nextRun'), render: formatDate }, { key: 'enabled', label: t('status'), render: (value) => <EnabledPill enabled={value} /> }, { key: 'last_error', label: t('lastError'), render: (value) => value ? <Badge variant="light" color="red">{errorLabel(String(value))}</Badge> : '—' }, { key: 'revision', label: t('revision') }]} fields={[{ key: 'kind', label: t('type'), kind: 'select', options: [{ value: 'automatic_backup', label: t('automaticBackup') }, { value: 'backup_retention', label: t('backupRetention') }, { value: 'probe', label: t('probe') }, { value: 'quota', label: t('quota') }] }, { key: 'storage_id', label: t('storageTarget'), hint: t('backupRetentionStorageHint'), kind: 'select', omitWhenBlank: true, options: storageOptions, fromRow: (row) => payloadOf(row).storage_id }, { key: 'keep', label: t('backupRetentionCount'), hint: t('backupRetentionCountHint'), kind: 'number', omitWhenBlank: true, fromRow: (row) => payloadOf(row).keep }, { key: 'payload', label: t('configuration'), kind: 'json', defaultValue: { targets: [], resources: [] } }, { key: 'schedule_mode', label: t('scheduleMode'), kind: 'select', options: [{ value: 'interval', label: t('scheduleModeInterval') }, { value: 'daily', label: t('scheduleModeDaily') }, { value: 'cron', label: t('scheduleModeCron') }], fromRow: (row) => (payloadOf(row).schedule as Record<string, unknown> | undefined)?.type || 'interval' }, { key: 'daily_time', label: t('dailyTime'), defaultValue: '02:00', fromRow: (row) => (payloadOf(row).schedule as Record<string, unknown> | undefined)?.time || '02:00' }, { key: 'cron_expression', label: t('cronExpression'), defaultValue: '0 0 2 * * *', fromRow: (row) => (payloadOf(row).schedule as Record<string, unknown> | undefined)?.expression || '0 0 2 * * *' }, { key: 'timezone', label: t('timezone'), defaultValue: instanceTimezone, fromRow: (row) => (payloadOf(row).schedule as Record<string, unknown> | undefined)?.timezone || instanceTimezone }, { key: 'interval_secs', label: t('intervalSeconds'), kind: 'number', hint: t('scheduleIntervalRange'), defaultValue: 3600 }, { key: 'enabled', label: t('enabled'), kind: 'checkbox' }, { key: 'revision', label: t('revision'), kind: 'number', defaultValue: 0 }]} normalize={(values, editing) => scheduleBody(values, editing, t)} />
       </Stack>
     </>
   )

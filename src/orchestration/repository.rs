@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 
 use super::{
     Candidate, Decision, Error, Profile, Result,
-    policy::{self, CircuitPolicy, Limits, Retry, Routing},
+    policy::{self, CircuitPolicy, Limits, Routing},
 };
 use crate::{
     db,
@@ -107,6 +107,7 @@ struct Row {
     disabled_until: Option<i64>,
     backoff_until: Option<i64>,
     quota_exhausted: bool,
+    credential_quota_exhausted: bool,
 }
 
 #[derive(FromQueryResult)]
@@ -131,6 +132,7 @@ pub async fn candidates(
     decisions: &mut Vec<Decision>,
     allow_direct_channel_model: bool,
 ) -> Result<Vec<Candidate>> {
+    let instance = crate::operations::settings::load(db).await?;
     let rows = Row::find_by_statement(statement(r#"
         SELECT m.id AS model_id,p.id AS provider_id,c.id AS credential_id,m.public_name,m.upstream_name,m.capabilities,
         p.name AS provider_name,p.kind AS provider_kind,p.base_url,c.credential_type,c.secret_envelope,m.input_price_micros,m.output_price_micros,m.priority,
@@ -144,12 +146,12 @@ pub async fn candidates(
         COALESCE(s.retry_statuses_json,'{"version":1}') AS retry_statuses_json,
         h.disabled_until,h.backoff_until,
         EXISTS(SELECT 1 FROM provider_quota_snapshots q WHERE q.remaining_micros<=0 AND (q.period_end IS NULL OR q.period_end>unixepoch())
-          AND q.provider_id=p.id AND q.id=(SELECT qq.id FROM provider_quota_snapshots qq WHERE qq.provider_id=p.id AND qq.credential_id IS NULL ORDER BY qq.sequence DESC,qq.collected_at DESC,qq.id LIMIT 1)) AS quota_exhausted
+          AND q.provider_id=p.id AND q.id=(SELECT qq.id FROM provider_quota_snapshots qq WHERE qq.provider_id=p.id AND qq.credential_id IS NULL ORDER BY qq.sequence DESC,qq.collected_at DESC,qq.id LIMIT 1)) AS quota_exhausted,
+        EXISTS(SELECT 1 FROM provider_quota_snapshots cq WHERE cq.id=(SELECT latest.id FROM provider_quota_snapshots latest WHERE latest.provider_id=p.id AND latest.credential_id=c.id ORDER BY latest.sequence DESC,latest.collected_at DESC,latest.id LIMIT 1)
+          AND cq.remaining_micros<=0 AND (cq.period_end IS NULL OR cq.period_end>unixepoch())) AS credential_quota_exhausted
         FROM models m JOIN providers p ON p.id=m.provider_id
         JOIN channel_credentials c ON c.provider_id=p.id AND c.enabled=1
           AND NOT EXISTS(SELECT 1 FROM credential_health_state ch WHERE ch.credential_id=c.id AND ch.disabled_until>unixepoch())
-          AND NOT EXISTS(SELECT 1 FROM provider_quota_snapshots cq WHERE cq.id=(SELECT latest.id FROM provider_quota_snapshots latest WHERE latest.provider_id=p.id AND latest.credential_id=c.id ORDER BY latest.sequence DESC,latest.collected_at DESC,latest.id LIMIT 1)
-            AND cq.remaining_micros<=0 AND (cq.period_end IS NULL OR cq.period_end>unixepoch()))
         LEFT JOIN channel_settings s ON s.provider_id=p.id LEFT JOIN channel_health_state h ON h.provider_id=p.id
         WHERE p.project_id=? AND m.lifecycle='active' AND NOT EXISTS(
           SELECT 1 FROM service_group_keys gk JOIN service_groups g ON g.id=gk.group_id
@@ -306,6 +308,35 @@ pub async fn candidates(
             continue;
         }
         let id = format!("{}:{}", row.provider_id, row.model_id);
+        let quota_reason = if row.quota_exhausted || row.credential_quota_exhausted {
+            if !instance.quota_collection_enabled {
+                decisions.push(Decision {
+                    stage: "eligibility",
+                    candidate: Some(id.clone()),
+                    reason: "quota_collection_disabled",
+                });
+                None
+            } else {
+                match instance.quota_routing_mode {
+                    crate::operations::settings::QuotaRoutingMode::IgnoreQuota => {
+                        decisions.push(Decision {
+                            stage: "eligibility",
+                            candidate: Some(id.clone()),
+                            reason: "quota_ignored",
+                        });
+                        None
+                    }
+                    crate::operations::settings::QuotaRoutingMode::RemoveOnExhausted => {
+                        Some("quota_exhausted")
+                    }
+                    crate::operations::settings::QuotaRoutingMode::Backpressure => {
+                        Some("quota_backpressure")
+                    }
+                }
+            }
+        } else {
+            None
+        };
         let reject = if !row.model_enabled || !row.provider_enabled {
             Some("disabled")
         } else if !routing.allows_tags(&tags) {
@@ -314,8 +345,8 @@ pub async fn candidates(
             || row.backoff_until.is_some_and(|n| n > db::now())
         {
             Some("health_backoff")
-        } else if row.quota_exhausted {
-            Some("quota_exhausted")
+        } else if quota_reason.is_some() {
+            quota_reason
         } else {
             None
         };
@@ -418,7 +449,7 @@ pub async fn candidates(
             credential_priority: row.credential_priority,
             weight: rank.1,
             limits,
-            retry: Retry::parse(&row.retry_statuses_json)?,
+            retry: instance.effective_retry(&row.retry_statuses_json)?,
             circuit,
             overrides: row.parameter_overrides_json,
             model_rules,

@@ -573,6 +573,12 @@ pub(crate) fn normalize_quota(
 }
 
 async fn quota(state: &AppState, claim: &jobs::Claim, payload: &Value) -> Result<(), ApiError> {
+    if !crate::operations::settings::load(&state.db)
+        .await?
+        .quota_collection_enabled
+    {
+        return Ok(());
+    }
     let project = claim.project_id.as_deref().ok_or(ApiError::Forbidden)?;
     let provider = payload["provider_id"].as_str().ok_or(ApiError::NotFound)?;
     let (target, credential, secret) = target(state, project, provider, None).await?;

@@ -209,3 +209,27 @@ describe('a schedule interval the server would refuse is refused locally, in the
     expect(posted).toHaveLength(0)
   })
 })
+
+describe('a daily backup schedule keeps its wall time and timezone', () => {
+  beforeEach(async () => { await i18n.changeLanguage('en'); vi.clearAllMocks() })
+
+  it('submits an anchored daily schedule without replacing interval schedules', async () => {
+    const fetchMock = renderPage([])
+    await userEvent.click(await screen.findByRole('tab', { name: 'Backups' }))
+    await userEvent.click(await screen.findByRole('button', { name: 'Add schedule' }))
+
+    const dialog = await screen.findByRole('dialog')
+    await userEvent.click(within(dialog).getByRole('combobox', { name: 'Schedule mode' }))
+    await userEvent.click(await screen.findByRole('option', { name: 'Daily time' }))
+    await userEvent.clear(within(dialog).getByLabelText('Daily time'))
+    await userEvent.type(within(dialog).getByLabelText('Daily time'), '02:00')
+    await userEvent.clear(within(dialog).getByLabelText('Timezone'))
+    await userEvent.type(within(dialog).getByLabelText('Timezone'), 'America/New_York')
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Save' }))
+
+    await waitFor(() => expect(fetchMock.mock.calls.some(([, config]) => config?.method === 'POST')).toBe(true))
+    const [, init] = fetchMock.mock.calls.find(([, config]) => config?.method === 'POST') as [string, RequestInit]
+    const body = JSON.parse(String(init.body))
+    expect(body.payload.schedule).toEqual({ type: 'daily', time: '02:00', timezone: 'America/New_York' })
+  })
+})

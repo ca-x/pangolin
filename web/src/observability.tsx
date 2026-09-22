@@ -3,7 +3,7 @@ import { useQuery } from '@tanstack/react-query'
 import { AlertTriangle, EyeOff, HelpCircle } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { Link } from 'react-router'
-import { api, type Bootstrap, type RequestLoggingPolicy } from './api'
+import { api, displayCurrency, type Bootstrap, type RequestLoggingPolicy } from './api'
 import i18n from './i18n'
 
 /** Rendered wherever telemetry exists but carries no value. Never an invented zero. */
@@ -16,9 +16,13 @@ export const UNMEASURED = '—'
  * Negative values follow the "unmeasured" sentinel convention the latency
  * columns already use (`latency_ms >= 0`).
  */
-export function formatMicros(micros: unknown): string {
+export function formatMicros(micros: unknown, currency = displayCurrency): string {
   if (typeof micros !== 'number' || !Number.isFinite(micros) || micros < 0) return UNMEASURED
-  return `$${new Intl.NumberFormat(i18n.language, { minimumFractionDigits: 6, maximumFractionDigits: 6 }).format(micros / 1_000_000)}`
+  try {
+    return new Intl.NumberFormat(i18n.language, { style: 'currency', currency, currencyDisplay: 'narrowSymbol', minimumFractionDigits: 6, maximumFractionDigits: 6 }).format(micros / 1_000_000)
+  } catch {
+    return new Intl.NumberFormat(i18n.language, { style: 'currency', currency: 'USD', currencyDisplay: 'narrowSymbol', minimumFractionDigits: 6, maximumFractionDigits: 6 }).format(micros / 1_000_000)
+  }
 }
 
 /** Token and request counts. A measured zero is a real zero and prints as `0`. */
