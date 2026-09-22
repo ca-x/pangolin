@@ -515,7 +515,7 @@ export function BulkToggle({ resource = 'channels' }: { resource?: BulkResource 
   if (total === 0) return null
   return (
     <Paper withBorder p="md" mt="md">
-      <Title order={3} mb="md">{t('bulkActions')}</Title>
+      <Title order={3} mb="md">{t('bulkToggleTitle')}</Title>
       <form onSubmit={submit}>
         <Group gap="md" align="end" wrap="wrap">
           <TextInput name="ids" label={t('resourceIds')} placeholder={t('resourceIdsPlaceholder')} required style={{ minWidth: 260, flex: '1 1 240px' }} />
