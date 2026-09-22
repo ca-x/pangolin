@@ -383,6 +383,7 @@ pub struct InvitationInput {
     pub email: String,
     pub role_id: String,
     pub expires_in_seconds: Option<i64>,
+    pub max_uses: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, FromQueryResult)]
@@ -393,6 +394,8 @@ pub struct InvitationView {
     pub role_id: String,
     pub expires_at: i64,
     pub accepted_at: Option<i64>,
+    pub max_uses: i64,
+    pub use_count: i64,
     pub created_at: i64,
 }
 
@@ -1265,13 +1268,19 @@ pub async fn create_invitation(
             "invitation lifetime must be between 60 seconds and 30 days".into(),
         ));
     }
+    let max_uses = input.max_uses.unwrap_or(1);
+    if !(1..=100).contains(&max_uses) {
+        return Err(AccessError::Invalid(
+            "invitation max uses must be between 1 and 100".into(),
+        ));
+    }
     let token = crypto::opaque_token("pi_");
     let id = Uuid::new_v4().to_string();
     let timestamp = db::now();
     let transaction = db.begin().await?;
     transaction.execute(statement(
-        "INSERT INTO project_invitations(id,project_id,email,role_id,invited_by_user_id,token_hash,expires_at,created_at) VALUES(?,?,?,?,?,?,?,?)",
-        vec![id.clone().into(), project_id.into(), email.clone().into(), input.role_id.clone().into(), actor.user_id.clone().into(), crypto::token_hash(&token).into(), (timestamp + ttl).into(), timestamp.into()],
+        "INSERT INTO project_invitations(id,project_id,email,role_id,invited_by_user_id,token_hash,expires_at,max_uses,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+        vec![id.clone().into(), project_id.into(), email.clone().into(), input.role_id.clone().into(), actor.user_id.clone().into(), crypto::token_hash(&token).into(), (timestamp + ttl).into(), max_uses.into(), timestamp.into()],
     )).await.map_err(|error| AccessError::Invalid(error.to_string()))?;
     audit(
         &transaction,
@@ -1279,7 +1288,7 @@ pub async fn create_invitation(
         "create",
         "project_invitation",
         &id,
-        json!({"project_id":project_id,"email":email,"role_id":input.role_id}),
+        json!({"project_id":project_id,"email":email,"role_id":input.role_id,"max_uses":max_uses}),
     )
     .await?;
     transaction.commit().await?;
@@ -1293,7 +1302,7 @@ pub async fn list_invitations(
     project_id: &str,
 ) -> Result<Vec<InvitationView>, AccessError> {
     authorize(db, actor, Some(project_id), "project:manage").await?;
-    Ok(InvitationView::find_by_statement(statement("SELECT id,project_id,email,role_id,expires_at,accepted_at,created_at FROM project_invitations WHERE project_id=? ORDER BY created_at DESC,id", vec![project_id.into()])).all(db).await?)
+    Ok(InvitationView::find_by_statement(statement("SELECT id,project_id,email,role_id,expires_at,accepted_at,max_uses,use_count,created_at FROM project_invitations WHERE project_id=? ORDER BY created_at DESC,id", vec![project_id.into()])).all(db).await?)
 }
 
 pub async fn delete_invitation(
@@ -1331,7 +1340,7 @@ pub async fn inspect_invitation(
     token: &str,
 ) -> Result<InvitationView, AccessError> {
     InvitationView::find_by_statement(statement(
-        "SELECT id,project_id,email,role_id,expires_at,accepted_at,created_at FROM project_invitations WHERE token_hash=? AND accepted_at IS NULL AND expires_at>?",
+        "SELECT id,project_id,email,role_id,expires_at,accepted_at,max_uses,use_count,created_at FROM project_invitations WHERE token_hash=? AND use_count<max_uses AND expires_at>?",
         vec![crypto::token_hash(token).into(), db::now().into()],
     )).one(db).await?.ok_or(AccessError::NotFound)
 }
@@ -1346,14 +1355,18 @@ pub async fn accept_invitation(
     struct Existing {
         id: String,
     }
+    let timestamp = db::now();
+    let transaction = db.begin().await?;
+    let claimed = transaction.execute(statement("UPDATE project_invitations SET use_count=use_count+1,accepted_at=COALESCE(accepted_at,?) WHERE id=? AND use_count<max_uses AND expires_at>?", vec![timestamp.into(), invitation.id.clone().into(), timestamp.into()])).await?;
+    if claimed.rows_affected() == 0 {
+        return Err(AccessError::NotFound);
+    }
     let existing = Existing::find_by_statement(statement(
         "SELECT id FROM users WHERE email=? COLLATE NOCASE",
         vec![invitation.email.clone().into()],
     ))
-    .one(db)
+    .one(&transaction)
     .await?;
-    let timestamp = db::now();
-    let transaction = db.begin().await?;
     let user_id = if let Some(existing) = existing {
         if authenticated_principal.is_none_or(|principal| {
             principal.kind != PrincipalKind::Session
@@ -1382,12 +1395,6 @@ pub async fn accept_invitation(
         )).await?;
         id
     };
-    let claimed = transaction.execute(statement("UPDATE project_invitations SET accepted_at=? WHERE id=? AND accepted_at IS NULL AND expires_at>?", vec![timestamp.into(), invitation.id.clone().into(), timestamp.into()])).await?;
-    if claimed.rows_affected() == 0 {
-        return Err(AccessError::Conflict(
-            "invitation was already used or expired".into(),
-        ));
-    }
     let project_owner = ProjectOwnerRow::find_by_statement(statement(
         "SELECT owner_user_id FROM projects WHERE id=?",
         vec![invitation.project_id.clone().into()],
@@ -2490,6 +2497,7 @@ mod tests {
                 email: "invitee@example.com".into(),
                 role_id: SYSTEM_MEMBER_ROLE_ID.into(),
                 expires_in_seconds: Some(60),
+                max_uses: None,
             },
         )
         .await
@@ -2526,6 +2534,319 @@ mod tests {
             .await,
             Err(AccessError::NotFound)
         ));
+    }
+
+    #[tokio::test]
+    async fn invitation_supports_two_email_bound_audited_uses() {
+        let (database, owner) = owner_database().await;
+        let (invitation, token) = create_invitation(
+            &database,
+            &owner,
+            db::DEFAULT_PROJECT_ID,
+            &InvitationInput {
+                email: "reusable-invitee@example.com".into(),
+                role_id: SYSTEM_MEMBER_ROLE_ID.into(),
+                expires_in_seconds: Some(60),
+                max_uses: Some(2),
+            },
+        )
+        .await
+        .unwrap();
+
+        let accepted = accept_invitation(
+            &database,
+            None,
+            &AcceptInvitationInput {
+                token: token.clone(),
+                password: Some("an invited password".into()),
+                display_name: None,
+                language: None,
+            },
+        )
+        .await
+        .unwrap();
+        let after_first = inspect_invitation(&database, &token).await.unwrap();
+        assert_eq!(after_first.use_count, 1);
+        assert_eq!(after_first.max_uses, 2);
+        let first_accepted_at = after_first.accepted_at.unwrap();
+        let other = create_user(
+            &database,
+            &owner,
+            &UserInput {
+                email: "other-invitee@example.com".into(),
+                password: "another secure password".into(),
+                display_name: None,
+                language: None,
+                enabled: true,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            accept_invitation(
+                &database,
+                Some(&Principal::session(other.id)),
+                &AcceptInvitationInput {
+                    token: token.clone(),
+                    password: None,
+                    display_name: None,
+                    language: None,
+                },
+            )
+            .await,
+            Err(AccessError::Forbidden)
+        ));
+        assert_eq!(
+            inspect_invitation(&database, &token)
+                .await
+                .unwrap()
+                .use_count,
+            1
+        );
+
+        accept_invitation(
+            &database,
+            Some(&Principal::session(accepted.id)),
+            &AcceptInvitationInput {
+                token: token.clone(),
+                password: None,
+                display_name: None,
+                language: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            inspect_invitation(&database, &token).await,
+            Err(AccessError::NotFound)
+        ));
+        let exhausted = list_invitations(&database, &owner, db::DEFAULT_PROJECT_ID)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|item| item.id == invitation.id)
+            .unwrap();
+        assert_eq!(exhausted.use_count, 2);
+        assert_eq!(exhausted.accepted_at, Some(first_accepted_at));
+
+        let audit_count = PermissionRow::find_by_statement(statement(
+            "SELECT CAST(COUNT(*) AS TEXT) AS slug FROM audit_events WHERE action='accept' AND resource_type='project_invitation' AND resource_id=?",
+            vec![invitation.id.into()],
+        ))
+        .one(&database)
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(audit_count.slug, "2");
+    }
+
+    #[tokio::test]
+    async fn concurrent_accepts_cannot_both_claim_the_last_invitation_use() {
+        let (database, owner) = owner_database().await;
+        let (invitation, token) = create_invitation(
+            &database,
+            &owner,
+            db::DEFAULT_PROJECT_ID,
+            &InvitationInput {
+                email: "concurrent-invitee@example.com".into(),
+                role_id: SYSTEM_MEMBER_ROLE_ID.into(),
+                expires_in_seconds: Some(60),
+                max_uses: Some(2),
+            },
+        )
+        .await
+        .unwrap();
+        let accepted = accept_invitation(
+            &database,
+            None,
+            &AcceptInvitationInput {
+                token: token.clone(),
+                password: Some("an invited password".into()),
+                display_name: None,
+                language: None,
+            },
+        )
+        .await
+        .unwrap();
+        let principal = Principal::session(accepted.id);
+        let left_input = AcceptInvitationInput {
+            token: token.clone(),
+            password: None,
+            display_name: None,
+            language: None,
+        };
+        let right_input = AcceptInvitationInput {
+            token,
+            password: None,
+            display_name: None,
+            language: None,
+        };
+
+        let (left, right) = tokio::join!(
+            accept_invitation(&database, Some(&principal), &left_input),
+            accept_invitation(&database, Some(&principal), &right_input),
+        );
+        assert!(matches!(
+            (&left, &right),
+            (Ok(_), Err(AccessError::NotFound)) | (Err(AccessError::NotFound), Ok(_))
+        ));
+
+        let exhausted = list_invitations(&database, &owner, db::DEFAULT_PROJECT_ID)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|item| item.id == invitation.id)
+            .unwrap();
+        assert_eq!(exhausted.use_count, 2);
+        let audit_count = PermissionRow::find_by_statement(statement(
+            "SELECT CAST(COUNT(*) AS TEXT) AS slug FROM audit_events WHERE action='accept' AND resource_type='project_invitation' AND resource_id=?",
+            vec![invitation.id.into()],
+        ))
+        .one(&database)
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(audit_count.slug, "2");
+    }
+
+    #[tokio::test]
+    async fn invitation_acceptance_rolls_back_when_the_audit_write_fails() {
+        let (database, owner) = owner_database().await;
+        let email = "rollback-invitee@example.com";
+        let (invitation, token) = create_invitation(
+            &database,
+            &owner,
+            db::DEFAULT_PROJECT_ID,
+            &InvitationInput {
+                email: email.into(),
+                role_id: SYSTEM_MEMBER_ROLE_ID.into(),
+                expires_in_seconds: Some(60),
+                max_uses: Some(2),
+            },
+        )
+        .await
+        .unwrap();
+        database
+            .execute_unprepared(
+                "CREATE TRIGGER fail_invitation_accept_audit BEFORE INSERT ON audit_events WHEN NEW.action='accept' AND NEW.resource_type='project_invitation' BEGIN SELECT RAISE(ABORT,'audit refused'); END;",
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            accept_invitation(
+                &database,
+                None,
+                &AcceptInvitationInput {
+                    token: token.clone(),
+                    password: Some("an invited password".into()),
+                    display_name: None,
+                    language: None,
+                },
+            )
+            .await
+            .is_err()
+        );
+
+        let available = inspect_invitation(&database, &token).await.unwrap();
+        assert_eq!(available.use_count, 0);
+        assert_eq!(available.accepted_at, None);
+        let user_count = PermissionRow::find_by_statement(statement(
+            "SELECT CAST(COUNT(*) AS TEXT) AS slug FROM users WHERE email=? COLLATE NOCASE",
+            vec![email.into()],
+        ))
+        .one(&database)
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(user_count.slug, "0");
+        let membership_count = PermissionRow::find_by_statement(statement(
+            "SELECT CAST(COUNT(*) AS TEXT) AS slug FROM project_memberships m JOIN users u ON u.id=m.user_id WHERE m.project_id=? AND u.email=? COLLATE NOCASE",
+            vec![db::DEFAULT_PROJECT_ID.into(), email.into()],
+        ))
+        .one(&database)
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(membership_count.slug, "0");
+        let audit_count = PermissionRow::find_by_statement(statement(
+            "SELECT CAST(COUNT(*) AS TEXT) AS slug FROM audit_events WHERE action='accept' AND resource_type='project_invitation' AND resource_id=?",
+            vec![invitation.id.into()],
+        ))
+        .one(&database)
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(audit_count.slug, "0");
+    }
+
+    #[tokio::test]
+    async fn exhausted_invitation_is_as_opaque_as_an_unknown_token() {
+        let (database, owner) = owner_database().await;
+        let (_, token) = create_invitation(
+            &database,
+            &owner,
+            db::DEFAULT_PROJECT_ID,
+            &InvitationInput {
+                email: "exhausted-invitee@example.com".into(),
+                role_id: SYSTEM_MEMBER_ROLE_ID.into(),
+                expires_in_seconds: Some(60),
+                max_uses: Some(1),
+            },
+        )
+        .await
+        .unwrap();
+        let accepted = accept_invitation(
+            &database,
+            None,
+            &AcceptInvitationInput {
+                token: token.clone(),
+                password: Some("an invited password".into()),
+                display_name: None,
+                language: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        for candidate in [token, "unknown-token".into()] {
+            assert!(matches!(
+                accept_invitation(
+                    &database,
+                    Some(&Principal::session(accepted.id.clone())),
+                    &AcceptInvitationInput {
+                        token: candidate,
+                        password: None,
+                        display_name: None,
+                        language: None,
+                    },
+                )
+                .await,
+                Err(AccessError::NotFound)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn invitation_reuse_is_finitely_bounded() {
+        let (database, owner) = owner_database().await;
+        for max_uses in [0, 101] {
+            assert!(matches!(
+                create_invitation(
+                    &database,
+                    &owner,
+                    db::DEFAULT_PROJECT_ID,
+                    &InvitationInput {
+                        email: "bounded-invitee@example.com".into(),
+                        role_id: SYSTEM_MEMBER_ROLE_ID.into(),
+                        expires_in_seconds: Some(60),
+                        max_uses: Some(max_uses),
+                    },
+                )
+                .await,
+                Err(AccessError::Invalid(_))
+            ));
+        }
     }
 
     #[tokio::test]

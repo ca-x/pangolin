@@ -54,14 +54,14 @@ states plainly that no test guards it yet.
 | observability | 5 | 10 | 0 | 2 | 3 | 0 | 0 | 20 |
 | prompts & playground | 6 | 12 | 1 | 0 | 0 | 0 | 1 | 20 |
 | models, routing & pricing | 6 | 6 | 2 | 2 | 8 | 2 | 0 | 26 |
-| access control | 2 | 16 | 2 | 0 | 0 | 1 | 0 | 21 |
+| access control | 2 | 17 | 2 | 0 | 0 | 0 | 0 | 21 |
 | system settings & background work | 8 | 9 | 5 | 1 | 5 | 2 | 1 | 31 |
 | console-wide UX | 3 | 9 | 1 | 2 | 0 | 0 | 0 | 15 |
-| **total** | **30** | **62** | **11** | **7** | **16** | **5** | **2** | **133** |
+| **total** | **30** | **63** | **11** | **7** | **16** | **4** | **2** | **133** |
 
 Row count is unchanged at 133 — the six area reports' own findings. No row was
-dropped, merged or added. What changed is the status: **103 rows need no work**
-(30 already matched, 62 fixed, 11 refuted), **28 rows need work** (`partial` +
+dropped, merged or added. What changed is the status: **104 rows need no work**
+(30 already matched, 63 fixed, 11 refuted), **27 rows need work** (`partial` +
 `open` + `feature-build`), and **2 rows are recorded divergences** whose only
 remaining difference is deliberate.
 
@@ -183,7 +183,7 @@ Report: [parity-access-control.md](parity-access-control.md).
 | 10 | Key status hides expiry, spend and last use | closed | fixed | Derived state from admission's own rule (`AccessPage.tsx:74-95`) plus spend/budget, expiry, last-used and IP-policy columns (`:163-186`); `expires_at`/`spent_micros` are returned (`access.rs`, `ScopedApiKeyView`) | `apikeys-columns.tsx:194-241` | `accessKeyState.test.tsx`, `accessKeyLastUsed.test.tsx` |
 | 11 | Per-key usage and cost unreachable from the key | closed | fixed | Every key row opens its own Today/7-day/all-retained usage dialog with input/output/cache/total tokens, cost and top models. Empty windows show `—`, failures retry, and the backend rejects foreign/unknown key filters with the same 404. | `apikeys/components/data-table-row-actions.tsx`, `api-key-token-chart-dialog.tsx` | `keyUsage.test.tsx` plus `analytics_api_key_filter_refuses_foreign_and_unknown_keys` |
 | 12 | No rotate, archive or bulk key operations | closed | fixed | Explicit rotate/single archive/bulk archive routes share project + `api_key:manage` authority. Rotate atomically replaces the secret and returns it once; archive is audited durable state, blocks all mutable/auth paths, skips foreign bulk ids and remains available for emergency revocation. The UI confirms and captures project/key context. | `apikeys/components/data-table-row-actions.tsx`, archive/rotate dialogs | Rust rotate rollback/auth/lifecycle/bulk tests plus `keyBulkSelection.test.tsx` |
-| 13 | Invitations are single-use and email-bound | feature-build | — | `InvitationInput` has no max-uses; acceptance is single-use and bound to the invited email; lifetime is bounded to 60 s–30 d (`access.rs`) | `users-invite-dialog.tsx:20-23` (maxUses 1 or unlimited, no email) | either a max-uses implementation test or the ADR below |
+| 13 | Invitations are single-use and email-bound | closed | fixed | SQLite v18 adds an operator-selected 1–100 use limit while retaining email binding and the 60 s–30 d lifetime. A conditional claim, identity/member writes and one acceptance audit share a transaction; exhausted/expired/unknown tokens remain opaque. | `users-invite-dialog.tsx:20-23` (maxUses 1 or unlimited, no email) | reuse/exhaustion/migration Rust cases plus `accessInvitations.test.tsx` |
 | 14 | OIDC providers have no login-only mode or branding | closed | fixed | SQLite v16 adds login-only policy and validated safe branding. Password login is refused before identity lookup when all enabled providers are login-only; public discovery exposes only safe display fields. Pangolin deliberately uses bundled `logo_key` instead of remote `icon_url`, with accessible contrast/fallback UI. | `user-auth-form.tsx:45,148-183` | OIDC branding/privacy tests, login policy/audit tests and focused Auth/Access Web tests |
 | 15 | Role editor edits raw permission JSON | closed | fixed | Project-scoped typed permission catalog is filtered by the same delegation predicate as server role writes; the role form uses an accessible picker, preserves unknown stored slugs and cannot grant a scope the actor lacks. System roles remain protected. | `scopes-cell.tsx`, `roles-action-dialog.tsx` | `permission_catalog*` Rust/HTTP tests and `accessRoles.test.tsx` |
 | 16 | Role bindings can be created but never listed or revoked | closed | fixed | List + revoke with a project-and-user-scoped cache key (`AccessPage.tsx:302-419`); routes `access_api.rs:71,75` | `project-user-action-dialog.tsx:172-175` | `roleBindings.test.tsx` (5 cases, incl. two mid-flight project switches) |
@@ -268,7 +268,7 @@ one of the 133).
 | D2 | Hard delete for prompts and protection rules (AxonHub soft-deletes and keeps an archived state) | Simpler record model; the delete is audited and project-scoped | `operations_api.rs` delete path; `orchestration/protection.rs:28` filters `enabled=1` | row `prompts 18`; ADR optional |
 | D3 | IP security is per API key (`allowed_ips`/`denied_ips`), not an instance-wide blocklist | Keeps the enforcement point at admission, where the key is already resolved | `db.rs` admission checks; `AccessPage.tsx:233-234` | row `system 9`; ADR recommended |
 | D4 | Bulk API-key state requires `api_key:manage` (with `project:manage ⇒ api_key:manage` preserved) and applies the owner-membership rule | One authority for one lifecycle; the generic `project:manage` gate would have bypassed the key contract | `access.rs::set_scoped_api_keys_enabled`, `operations_api.rs:909`; `bulk_key_state_takes_the_key_permission_and_keeps_the_session_guard` | controller ruling, recorded in the SDD ledger |
-| D5 | Invitations are email-bound, single-use and bounded to 30 days | The bound and the binding are deliberate; AxonHub's reusable links have no email binding | `access.rs` invitation acceptance | recorded in `parity-access-control.md:34`; ADR required if max-uses is ever wanted |
+| D5 | Invitations remain email-bound, finitely reusable and bounded to 30 days | B27 deliberately keeps identity binding and finite expiry while adding an operator-selected 1–100 use limit; AxonHub's reusable links have no email binding and can be unlimited | `access.rs` invitation acceptance; SQLite v18 | superseded by the implemented B27 decision; no longer blocks access 13 |
 | D6 | No GraphQL endpoint; the admin surface is REST with a documented envelope | One control-plane protocol, one error contract, one authorization path | `api/errors.rs`, `api/operations_api.rs` router | **ADR required** — this is a capability AxonHub has and Pangolin does not |
 
 ## Decisions required
@@ -285,7 +285,7 @@ row of the 133, two are matrix-level.
 | system 23 | Instance retry / upstream-error policy | (a) promote selected knobs to instance settings, (b) document them as per-channel only | operators must edit channel JSON for instance-wide intent |
 | system 24 | Quota routing mode | (a) add `IGNORE_QUOTA`/`REMOVE_ON_EXHAUSTED`/`BACKPRESSURE`, (b) document REMOVE_ON_EXHAUSTED only | an exhausted channel is always removed, with no alternative |
 | system 25 | Diagnostics tab | (a) build cache diagnostics/clear, (b) record as not planned | low value: Pangolin's caches are rebuilt from SQLite |
-| access 13 | Invitation reuse | (a) add max-uses, (b) keep single-use as deliberate (D5) | one more round trip per invited user |
+| access 13 | Invitation reuse | **decided: (a)** finite max-uses (1–100), retaining email binding and bounded expiry | resolved by B27 |
 | matrix (D6) | Scoped GraphQL endpoint | (a) implement one over the same permission model, (b) record the REST-only decision as divergence D6 with an ADR | a capability AxonHub has stays absent without a recorded reason |
 | matrix | Semantic-memory provider | (a) implement an opt-in provider behind the documented interface, (b) keep the interface as documentation only | long-term memory stays unavailable even where an operator wants it |
 
@@ -430,7 +430,7 @@ retry/model/quota settings, and CORS/timeouts. Every one of them is scheduled in
 | --- | --- | --- |
 | Users and owner | implemented+tested | `access.rs` user CRUD, profile, language, password |
 | Projects | implemented+tested | project CRUD, selection, isolation (`access.rs`, `project.tsx`) |
-| Memberships and invitations | partial | members have no in-place edit, no search/pagination/mobile; invitations have no max-uses (access 3, 4, 13) |
+| Memberships and invitations | implemented+tested | members support in-place role/status edits, search, pagination and mobile cards; invitations support bounded email-bound reuse with atomic exhaustion (access 3, 4, 13) |
 | Roles and permissions | partial | roles and bindings work; the permission catalog has no route (access 15) |
 | API-key types | implemented+tested | `user`/`service`/`personal`/`no_auth` validated server-side; the create form still hardcodes `service` (access 9) |
 | API-key status/scopes | implemented+tested | enable/expiry/budget/IP policy enforced at admission; console shows the enforced state |

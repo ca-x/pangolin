@@ -69,7 +69,7 @@ Row numbers refer to the numbered finding in the matching area report.
 | access | 10 Key status hides expiry, spend and last use | partial | The view now returns `expires_at` and `spent_micros` (`access.rs:452-458`, `src/models.rs:53`; test `the_key_view_carries_expiry_and_spend`); the console still shows an enable toggle and no expiry/spend/last-used column (`AccessPage.tsx:107-134`) |
 | access | 11 Per-key usage and cost unreachable from the key | partial | Reachable through the Overview `api_key` breakdown (`OverviewPage.tsx:28,40`), not from the key row |
 | access | 12 No rotate, archive or bulk key operations | feature-build | No rotate/revoke route (`access.rs:1390-1530`) |
-| access | 13 Invitations are single-use and email-bound | feature-build | `InvitationInput` has no max-uses (`access.rs:326-330`) |
+| access | 13 Invitations are single-use and email-bound | closed | SQLite v18 and `InvitationInput.max_uses` provide email-bound finite reuse (1–100), atomic exhaustion and one transactional audit per acceptance |
 | access | 14 OIDC providers have no login-only mode or branding | feature-build | `oidc_providers` columns unchanged (`schema.rs:270-281`) |
 | access | 15 Role editor edits raw permission JSON | feature-build | `AccessPage.tsx:59` permissions JSON; no permission-catalog route |
 | access | 16 Role bindings never listed or revoked | open | `AccessPage.tsx:255-262` POST only; no consumer for `GET`/`DELETE .../role-bindings` (`access_api.rs:71,75`) |

@@ -939,7 +939,7 @@ function OidcIdentitiesPanel() {
 type OidcProvider = { id: string; name: string }
 type OidcIdentity = { id: string; provider_id: string; user_id: string; subject: string; created_at: number }
 
-type InvitationRow = { id: string; email: string; role_id: string; expires_at: number; accepted_at: number | null }
+type InvitationRow = { id: string; email: string; role_id: string; expires_at: number; accepted_at: number | null; max_uses: number; use_count: number }
 function InvitationsPanel() {
   const { t } = useTranslation()
   const { project } = useProject()
@@ -953,7 +953,7 @@ function InvitationsPanel() {
   const roleOptions = (roles.data || []).map((item) => ({ value: item.id, label: item.name }))
   const create = useMutation({ mutationFn: (body: unknown) => api<{ invitation: InvitationRow; token: string }>(path, { method: 'POST', body: JSON.stringify(body) }), onSuccess: (data) => { void client.invalidateQueries({ queryKey: ['invitations', project.id] }); setOpen(false); setDelivery(`${location.origin}/invite?token=${encodeURIComponent(data.token)}`) }, onError: (error: Error) => toast.error(error.message) })
   const remove = useMutation({ mutationFn: (id: string) => api(`${path}/${id}`, { method: 'DELETE' }), onSuccess: () => void client.invalidateQueries({ queryKey: ['invitations', project.id] }) })
-  const submit = (event: FormEvent<HTMLFormElement>) => { event.preventDefault(); const data = new FormData(event.currentTarget); create.mutate({ email: data.get('email'), role_id: role, expires_in_seconds: Number(data.get('expires_in_seconds')) }) }
+  const submit = (event: FormEvent<HTMLFormElement>) => { event.preventDefault(); const data = new FormData(event.currentTarget); create.mutate({ email: data.get('email'), role_id: role, expires_in_seconds: Number(data.get('expires_in_seconds')), max_uses: Number(data.get('max_uses')) }) }
   // A project with no invitations showed a bare table header: the list now says
   // what it is for and carries the one action that fills it.
   const invite = () => { setRole(roleOptions[0]?.value || ''); setOpen(true) }
@@ -968,6 +968,7 @@ function InvitationsPanel() {
                 <Table.Th>{t('email')}</Table.Th>
                 <Table.Th>{t('role')}</Table.Th>
                 <Table.Th>{t('expiresAt')}</Table.Th>
+                <Table.Th>{t('uses')}</Table.Th>
                 <Table.Th>{t('status')}</Table.Th>
                 <Table.Th />
               </Table.Tr>
@@ -978,7 +979,8 @@ function InvitationsPanel() {
                   <Table.Td><strong>{row.email}</strong></Table.Td>
                   <Table.Td>{roleOptions.find((option) => option.value === row.role_id)?.label || row.role_id}</Table.Td>
                   <Table.Td>{formatDate(row.expires_at)}</Table.Td>
-                  <Table.Td>{row.accepted_at ? t('accepted') : t('pending')}</Table.Td>
+                  <Table.Td>{t('usesProgress', { used: row.use_count, maximum: row.max_uses })}</Table.Td>
+                  <Table.Td>{row.expires_at <= Math.floor(Date.now() / 1000) ? t('invitationExpired') : row.use_count >= row.max_uses ? t('accepted') : t('pending')}</Table.Td>
                   <Table.Td>
                     <ActionIcon variant="subtle" color="red" aria-label={`${t('delete')} ${row.email}`} onClick={() => confirmAction({ title: t('deleteInvitationTitle', { email: row.email }), body: t('deleteInvitationBody'), onConfirm: () => remove.mutateAsync(row.id) })}>
                       <Trash2 size={16} />
@@ -1000,6 +1002,7 @@ function InvitationsPanel() {
               ? <InlineQueryError message={t('projectRolesUnavailable')} onRetry={() => void roles.refetch()} />
               : <SelectField label={t('role')} value={role} onValueChange={setRole} options={roleOptions} />}
             <NumberInput name="expires_in_seconds" label={t('expiresSeconds')} min={60} max={2592000} defaultValue={604800} required hideControls />
+            <NumberInput name="max_uses" label={t('maxUses')} min={1} max={100} defaultValue={1} required />
             <Button type="submit" disabled={!role || roles.isError}>{t('inviteUser')}</Button>
           </Stack>
         </form>

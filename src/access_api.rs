@@ -1711,6 +1711,7 @@ mod tests {
                 email: user.email,
                 role_id: access::SYSTEM_MEMBER_ROLE_ID.into(),
                 expires_in_seconds: Some(300),
+                max_uses: None,
             },
         )
         .await

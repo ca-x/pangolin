@@ -866,6 +866,15 @@ CREATE TABLE api_key_profile_templates (
 CREATE INDEX idx_api_key_profile_templates_project ON api_key_profile_templates(project_id,updated_at);
 "#;
 
+/// Invitation reuse stays finite and preserves the existing email-bound token.
+/// Existing accepted invitations remain exhausted; pending invitations retain
+/// the former single-use behavior.
+const V18_INVITATION_REUSE: &str = r#"
+ALTER TABLE project_invitations ADD COLUMN max_uses INTEGER NOT NULL DEFAULT 1 CHECK(max_uses BETWEEN 1 AND 100);
+ALTER TABLE project_invitations ADD COLUMN use_count INTEGER NOT NULL DEFAULT 0 CHECK(use_count BETWEEN 0 AND max_uses);
+UPDATE project_invitations SET use_count=1 WHERE accepted_at IS NOT NULL;
+"#;
+
 /// Associations gain a tag-regex selector and a versioned channel-exclusion
 /// document. Version 24 is reserved here because 18–23 belong to parallel
 /// parity migrations.
@@ -1229,6 +1238,25 @@ pub async fn migrate(db: &DatabaseConnection) -> Result<()> {
             .await?;
         transaction.commit().await?;
     }
+    let invitation_reuse_applied = Count::find_by_statement(statement(
+        "SELECT COUNT(*) AS count FROM schema_migrations WHERE version=18",
+    ))
+    .one(db)
+    .await?
+    .is_some_and(|row| row.count > 0);
+    if !invitation_reuse_applied {
+        let transaction = db.begin().await?;
+        transaction
+            .execute_unprepared(V18_INVITATION_REUSE)
+            .await
+            .context("failed to add bounded invitation reuse")?;
+        transaction
+            .execute(statement(
+                "INSERT INTO schema_migrations(version,applied_at) VALUES(18,unixepoch())",
+            ))
+            .await?;
+        transaction.commit().await?;
+    }
     let association_filters_applied = Count::find_by_statement(statement(
         "SELECT COUNT(*) AS count FROM schema_migrations WHERE version=24",
     ))
@@ -1286,6 +1314,14 @@ mod tests {
         assert_eq!(
             scalar(&db, "SELECT MAX(version) AS count FROM schema_migrations").await,
             24
+        );
+        assert_eq!(
+            scalar(
+                &db,
+                "SELECT COUNT(*) AS count FROM pragma_table_info('project_invitations') WHERE name IN ('max_uses','use_count')"
+            )
+            .await,
+            2
         );
         assert_eq!(
             scalar(
@@ -1547,7 +1583,7 @@ mod tests {
 
         assert_eq!(
             scalar(&db, "SELECT COUNT(*) AS count FROM schema_migrations").await,
-            17
+            18
         );
         assert_eq!(
             scalar(
@@ -2279,6 +2315,50 @@ mod tests {
             scalar(
                 &db,
                 "SELECT COUNT(*) AS count FROM schema_migrations WHERE version=16"
+            )
+            .await,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn invitation_reuse_migration_preserves_single_use_state() {
+        let db = memory_database().await;
+        migrate(&db).await.unwrap();
+        db.execute_unprepared(
+            "ALTER TABLE project_invitations DROP COLUMN use_count;
+             ALTER TABLE project_invitations DROP COLUMN max_uses;
+             DELETE FROM schema_migrations WHERE version=18;
+             INSERT INTO project_invitations(id,project_id,email,role_id,token_hash,expires_at,accepted_at,created_at)
+             VALUES
+               ('pending-invite','00000000-0000-0000-0000-000000000001','pending@example.com','00000000-0000-0000-0000-000000000012','pending-hash',9999999999,NULL,1),
+               ('accepted-invite','00000000-0000-0000-0000-000000000001','accepted@example.com','00000000-0000-0000-0000-000000000012','accepted-hash',9999999999,2,1);",
+        )
+        .await
+        .unwrap();
+
+        migrate(&db).await.unwrap();
+
+        let pending = one(
+            &db,
+            "SELECT max_uses,use_count FROM project_invitations WHERE id='pending-invite'",
+        )
+        .await;
+        assert_eq!(pending.try_get::<i64>("", "max_uses").unwrap(), 1);
+        assert_eq!(pending.try_get::<i64>("", "use_count").unwrap(), 0);
+        let accepted = one(
+            &db,
+            "SELECT max_uses,use_count FROM project_invitations WHERE id='accepted-invite'",
+        )
+        .await;
+        assert_eq!(accepted.try_get::<i64>("", "max_uses").unwrap(), 1);
+        assert_eq!(accepted.try_get::<i64>("", "use_count").unwrap(), 1);
+
+        migrate(&db).await.unwrap();
+        assert_eq!(
+            scalar(
+                &db,
+                "SELECT COUNT(*) AS count FROM schema_migrations WHERE version=18"
             )
             .await,
             1
