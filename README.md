@@ -119,7 +119,7 @@ pnpm --dir web dev
 - `master.key`: generated automatically when `PANGOLIN_MASTER_KEY` is not set, with Unix mode `0600`. Back it up securely alongside any database backup.
 - Upstream API keys are encrypted with XChaCha20-Poly1305; passwords and virtual API keys are hashed with Argon2id.
 - Request and response body capture is off by default. Assess privacy, compliance and disk usage before setting `PANGOLIN_CAPTURE_PAYLOADS=true`.
-- v0.1 targets single-node deployment. The SQLite and DuckDB files must not be shared for writing between multiple Pangolin processes.
+- The current supported release targets single-node deployment. The SQLite and DuckDB files must not be shared for writing between multiple Pangolin processes.
 - A budgeted virtual key re-checks and settles its balance serially per key; streaming requests are not allowed for budget keys because streamed consumption cannot be settled reliably. A single non-streaming request can still overshoot a very small remaining balance — budgets are a cost guardrail, not a prepaid ledger.
 - Request events are retained for 30 days by default and can be adjusted with `PANGOLIN_OBSERVATION_RETENTION_DAYS`; when DuckDB is unavailable the gateway keeps proxying and reports `degraded` in health checks and metrics.
 

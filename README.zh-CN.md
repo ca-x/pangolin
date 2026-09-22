@@ -119,7 +119,7 @@ pnpm --dir web dev
 - `master.key`：未配置 `PANGOLIN_MASTER_KEY` 时自动生成，Unix 权限为 `0600`。备份数据库时必须同时安全备份该文件。
 - 上游 API Key 使用 XChaCha20-Poly1305 加密；密码和虚拟 API Key 使用 Argon2id 哈希。
 - 请求/响应正文采集默认关闭。设置 `PANGOLIN_CAPTURE_PAYLOADS=true` 前请评估隐私、合规和磁盘占用。
-- v0.1 面向单节点部署。SQLite/DuckDB 文件不能由多个 Pangolin 进程共享写入。
+- 当前支持版本面向单节点部署。SQLite/DuckDB 文件不能由多个 Pangolin 进程共享写入。
 - 带预算的虚拟 Key 会按 Key 串行执行余额复查与结算；为了避免无法可靠结算的流式消耗，预算 Key 不允许流式请求。单个非流式请求仍可能超过极小的剩余余额，预算用于成本护栏而非预付费硬账本。
 - 请求事件默认保留 30 天，可用 `PANGOLIN_OBSERVATION_RETENTION_DAYS` 调整；DuckDB 不可用时网关继续提供代理服务，并在健康检查与指标中报告 degraded。
 
