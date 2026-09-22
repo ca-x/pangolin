@@ -245,6 +245,7 @@ fn axonhub_cached_and_write_cached_tokens_are_not_double_charged() {
         unit_size: 1,
         unit_price_micros: price,
         tiers: vec![],
+        tier_mode: TierMode::Marginal,
         cache_ttl: None,
     })
     .collect();
@@ -378,6 +379,7 @@ fn integer_cost_tiers_cache_ttls_rounding_and_overflow() {
                     unit_price_micros: 5,
                 },
             ],
+            tier_mode: TierMode::Marginal,
             cache_ttl: None,
         }],
     };
@@ -398,6 +400,7 @@ fn integer_cost_tiers_cache_ttls_rounding_and_overflow() {
             unit_size: 1000000,
             unit_price_micros: 1,
             tiers: vec![],
+            tier_mode: TierMode::Marginal,
             cache_ttl: None,
         }],
         ..price.clone()
@@ -422,6 +425,143 @@ fn integer_cost_tiers_cache_ttls_rounding_and_overflow() {
                 ..Default::default()
             })
             .is_err()
+    );
+}
+
+#[test]
+fn b36_pricing_volume_tiers_charge_every_unit_at_the_matched_rate() {
+    use super::pricing::*;
+
+    let component = |tier_mode| Component {
+        id: "input".into(),
+        kind: "input".into(),
+        unit_size: 1,
+        unit_price_micros: 10,
+        tiers: vec![
+            Tier {
+                up_to: Some(100),
+                unit_price_micros: 10,
+            },
+            Tier {
+                up_to: None,
+                unit_price_micros: 5,
+            },
+        ],
+        tier_mode,
+        cache_ttl: None,
+    };
+    let price = |tier_mode| Price {
+        id: None,
+        model_id: "tiered".into(),
+        ratio_millionths: 1_000_000,
+        components: vec![component(tier_mode)],
+    };
+
+    let marginal = price(TierMode::Marginal);
+    let volume = price(TierMode::Volume);
+    let usage = |input| Usage {
+        input,
+        ..Default::default()
+    };
+
+    assert_eq!(marginal.calculate(&usage(100)).unwrap().0, 1_000);
+    assert_eq!(marginal.calculate(&usage(101)).unwrap().0, 1_005);
+    assert_eq!(volume.calculate(&usage(100)).unwrap().0, 1_000);
+    assert_eq!(volume.calculate(&usage(101)).unwrap().0, 505);
+    assert_eq!(
+        volume
+            .upper_bound(150, &json!({}), "/v1/chat/completions")
+            .unwrap(),
+        750
+    );
+}
+
+#[tokio::test]
+async fn b37_pricing_channel_scope_wins_only_for_the_matching_channel() {
+    use crate::{
+        models::RouteTarget,
+        orchestration::{
+            Candidate,
+            policy::{CircuitPolicy, Limits, Retry},
+        },
+    };
+    use sea_orm::ConnectionTrait;
+
+    let db = crate::db::connect("sqlite::memory:").await.unwrap();
+    db.execute_unprepared(
+        "INSERT INTO providers(id,project_id,name,kind,base_url,enabled,created_at,updated_at) VALUES
+         ('price-channel-a','00000000-0000-0000-0000-000000000001','A','openai','https://a.invalid',1,0,0),
+         ('price-channel-b','00000000-0000-0000-0000-000000000001','B','openai','https://b.invalid',1,0,0);
+         INSERT INTO models(id,provider_id,public_name,upstream_name,created_at) VALUES
+         ('price-model','price-channel-a','public','upstream',0);
+         INSERT INTO model_prices(id,model_id,provider_id,version,valid_from,created_at) VALUES
+         ('price-global','price-model',NULL,1,0,0),
+         ('price-channel','price-model','price-channel-a',1,0,0);
+         INSERT INTO model_price_components(id,price_id,kind,unit_size,unit_price_micros) VALUES
+         ('component-global','price-global','input',1,10),
+         ('component-channel','price-channel','input',1,3);",
+    )
+    .await
+    .unwrap();
+    let candidate = |provider_id: &str| Candidate {
+        target: RouteTarget {
+            public_name: "public".into(),
+            upstream_name: "upstream".into(),
+            provider_name: provider_id.into(),
+            provider_kind: "openai".into(),
+            base_url: "https://example.invalid".into(),
+            credential_type: "api_key".into(),
+            secret_envelope: String::new(),
+            proxy_url: None,
+            proxy_username: None,
+            proxy_secret_envelope: None,
+            proxy_reuse_connections: true,
+            input_price_micros: 0,
+            output_price_micros: 0,
+        },
+        provider_id: provider_id.into(),
+        model_id: "price-model".into(),
+        credential_id: "credential".into(),
+        priority: 0,
+        credential_priority: 0,
+        weight: 1,
+        limits: Limits::default(),
+        retry: Retry::default(),
+        circuit: CircuitPolicy::default(),
+        overrides: "{}".into(),
+        model_rules: json!({}),
+        pass_user_agent: false,
+        endpoint: "/v1/chat/completions".into(),
+        protocol_endpoint: "/v1/chat/completions".into(),
+    };
+
+    let scoped = pricing::snapshot(&db, &candidate("price-channel-a"), 1_000_000)
+        .await
+        .unwrap();
+    let global = pricing::snapshot(&db, &candidate("price-channel-b"), 1_000_000)
+        .await
+        .unwrap();
+    assert_eq!(scoped.id.as_deref(), Some("price-channel"));
+    assert_eq!(global.id.as_deref(), Some("price-global"));
+    assert_eq!(
+        scoped
+            .calculate(&pricing::Usage {
+                input: 1,
+                ..Default::default()
+            })
+            .unwrap()
+            .0,
+        3
+    );
+    assert_eq!(
+        global
+            .calculate(&pricing::Usage {
+                input: 1,
+                ..Default::default()
+            })
+            .unwrap()
+            .0,
+        10
     );
 }
 

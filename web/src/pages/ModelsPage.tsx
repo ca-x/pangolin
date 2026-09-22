@@ -435,8 +435,145 @@ function RoutingEditor() {
 
 function PricesPanel() {
   const { t } = useTranslation()
-  const { models, modelsError, retryModels } = useModelRelations()
-  return <ResourcePage resource="prices" title={t('prices')} description={t('pricesDescription')} empty={t('priceEmpty')} createLabel={t('addPrice')} appendOnly columns={[{ key: 'model_name', label: t('model') }, { key: 'version', label: t('version') }, { key: 'valid_from', label: t('validFrom'), render: formatDate }, { key: 'valid_until', label: t('validUntil'), render: formatDate }, { key: 'schedule', label: t('schedule') }]} fields={[{ key: 'model_id', label: t('model'), kind: 'select', required: true, options: models, error: modelsError ? t('optionsUnavailable') : undefined, onRetry: retryModels }, { key: 'components', label: t('priceComponents'), kind: 'json', required: true, defaultValue: [{ kind: 'input', unit_size: 1000000, unit_price_micros: 0 }] }, { key: 'schedule', label: t('schedule'), kind: 'json', defaultValue: { version: 1, rules: [] } }]} />
+  const [open, setOpen] = useState(false)
+  const action = <Button leftSection={<Plus size={17} />} onClick={() => setOpen(true)}>{t('addPrice')}</Button>
+  return <>
+    <ResourcePage resource="prices" title={t('prices')} description={t('pricesDescription')} empty={t('priceEmpty')} immutable headerAction={action} emptyAction={action} tableMinWidth={1000} mobileColumnLimit={6} columns={[{ key: 'model_name', label: t('model') }, { key: 'provider_name', label: t('channel') }, { key: 'version', label: t('version') }, { key: 'valid_from', label: t('validFrom'), render: formatDate }, { key: 'valid_until', label: t('validUntil'), render: formatDate }, { key: 'components', label: t('priceComponents'), render: (value) => <PriceComponentsSummary value={value} /> }, { key: 'schedule', label: t('schedule'), render: (value) => <PriceScheduleSummary value={value} /> }]} />
+    {open && <PriceEditor onClose={() => setOpen(false)} />}
+  </>
+}
+
+type PriceTierDraft = { id: number; upTo: string; unitPriceMicros: string }
+type PriceComponentDraft = { id: number; kind: string; unitSize: string; unitPriceMicros: string; tierMode: 'marginal' | 'volume'; cacheTtl: 'none' | '5m' | '1h'; tiers: PriceTierDraft[] }
+type PriceOverrideDraft = { id: number; kind: string; unitPriceMicros: string }
+type PriceRuleDraft = { id: number; priority: string; timezone: string; start: string; end: string; weekdays: number[]; from: string; until: string; prices: PriceOverrideDraft[] }
+
+let priceDraftId = 0
+const nextPriceDraftId = () => ++priceDraftId
+const newPriceComponent = (): PriceComponentDraft => ({ id: nextPriceDraftId(), kind: 'input', unitSize: '1000000', unitPriceMicros: '0', tierMode: 'marginal', cacheTtl: 'none', tiers: [] })
+const newPriceRule = (): PriceRuleDraft => ({ id: nextPriceDraftId(), priority: '100', timezone: 'UTC', start: '00:00', end: '00:00', weekdays: [], from: '', until: '', prices: [{ id: nextPriceDraftId(), kind: 'input', unitPriceMicros: '0' }] })
+const PRICE_KINDS = ['input', 'output', 'cache_read', 'cache_write', 'reasoning', 'flat', 'unit'] as const
+const WEEKDAYS = [1, 2, 3, 4, 5, 6, 7] as const
+
+function integer(value: string, minimum: number, label: string) {
+  const parsed = Number(value)
+  if (!Number.isSafeInteger(parsed) || parsed < minimum) throw new Error(label)
+  return parsed
+}
+
+function minute(value: string, label: string, allowEndOfDay = false) {
+  const match = /^(\d{2}):(\d{2})$/.exec(value)
+  if (!match) throw new Error(label)
+  const hours = Number(match[1]); const minutes = Number(match[2])
+  if (hours === 24 && minutes === 0 && allowEndOfDay) return 1440
+  if (hours > 23 || minutes > 59) throw new Error(label)
+  return hours * 60 + minutes
+}
+
+function epoch(value: string, label: string) {
+  if (!value) return null
+  const milliseconds = new Date(value).getTime()
+  if (!Number.isFinite(milliseconds)) throw new Error(label)
+  return Math.floor(milliseconds / 1000)
+}
+
+function priceDocument(modelId: string, providerId: string, validFrom: string, validUntil: string, components: PriceComponentDraft[], rules: PriceRuleDraft[], t: (key: string) => string) {
+  if (!modelId) throw new Error(t('priceModelRequired'))
+  if (components.length === 0 || components.length > 64) throw new Error(t('priceComponentRequired'))
+  const seen = new Set<string>()
+  const normalizedComponents = components.map((component) => {
+    const unitSize = integer(component.unitSize, 1, t('priceIntegerInvalid'))
+    const unitPriceMicros = integer(component.unitPriceMicros, 0, t('priceIntegerInvalid'))
+    if (component.cacheTtl !== 'none' && component.kind !== 'cache_write') throw new Error(t('priceCacheTtlInvalid'))
+    const identity = `${component.kind}:${component.cacheTtl}`
+    if (seen.has(identity)) throw new Error(t('priceComponentDuplicate'))
+    seen.add(identity)
+    let prior = 0
+    const tiers = component.tiers.map((tier, index) => {
+      const upTo = tier.upTo ? integer(tier.upTo, 1, t('priceTierInvalid')) : null
+      if (upTo !== null && upTo <= prior) throw new Error(t('priceTierInvalid'))
+      if (upTo === null && index !== component.tiers.length - 1) throw new Error(t('priceTierInvalid'))
+      if (upTo !== null) prior = upTo
+      return { up_to: upTo, unit_price_micros: integer(tier.unitPriceMicros, 0, t('priceIntegerInvalid')) }
+    })
+    if (tiers.length && tiers[tiers.length - 1].up_to !== null) throw new Error(t('priceTierOpenEnded'))
+    return { kind: component.kind, unit_size: unitSize, unit_price_micros: unitPriceMicros, tiers, tier_mode: component.tierMode, cache_ttl: component.cacheTtl === 'none' ? null : component.cacheTtl }
+  })
+  const normalizedRules = rules.map((rule) => {
+    try { new Intl.DateTimeFormat('en', { timeZone: rule.timezone }).format() } catch { throw new Error(t('priceTimezoneInvalid')) }
+    const from = epoch(rule.from, t('priceDateInvalid')); const until = epoch(rule.until, t('priceDateInvalid'))
+    if (from !== null && until !== null && from >= until) throw new Error(t('priceDateRangeInvalid'))
+    const prices: Record<string, number> = {}
+    for (const override of rule.prices) {
+      if (prices[override.kind] !== undefined) throw new Error(t('priceOverrideDuplicate'))
+      prices[override.kind] = integer(override.unitPriceMicros, 0, t('priceIntegerInvalid'))
+    }
+    const priority = integer(rule.priority, -2147483648, t('pricePriorityInvalid'))
+    if (priority > 2147483647) throw new Error(t('pricePriorityInvalid'))
+    return { priority, timezone: rule.timezone, start_minute: minute(rule.start, t('priceTimeInvalid')), end_minute: minute(rule.end, t('priceTimeInvalid'), true), weekdays: [...rule.weekdays].sort(), from, until, prices }
+  })
+  const from = epoch(validFrom, t('priceDateInvalid')); const until = epoch(validUntil, t('priceDateInvalid'))
+  if (from !== null && until !== null && from >= until) throw new Error(t('priceDateRangeInvalid'))
+  return { model_id: modelId, provider_id: providerId || null, ...(from === null ? {} : { valid_from: from }), valid_until: until, components: normalizedComponents, schedule: { version: 1, rules: normalizedRules } }
+}
+
+function PriceEditor({ onClose }: { onClose: () => void }) {
+  const { t } = useTranslation()
+  const { project } = useProject()
+  const client = useQueryClient()
+  const { models, channels, modelsError, channelsError, retryModels, retryChannels } = useModelRelations()
+  const [modelId, setModelId] = useState('')
+  const [providerId, setProviderId] = useState('')
+  const [validFrom, setValidFrom] = useState('')
+  const [validUntil, setValidUntil] = useState('')
+  const [components, setComponents] = useState<PriceComponentDraft[]>([newPriceComponent()])
+  const [rules, setRules] = useState<PriceRuleDraft[]>([])
+  const [error, setError] = useState<string | null>(null)
+  const save = useMutation({ mutationFn: (body: unknown) => api(`/api/admin/v1/projects/${project.id}/operations/prices`, { method: 'POST', body: JSON.stringify(body) }), onSuccess: () => { void client.invalidateQueries({ queryKey: ['resource', project.id, 'prices'] }); onClose(); toast.success(t('saved')) }, onError: (cause: Error) => setError(cause.message) })
+  const updateComponent = (id: number, change: Partial<PriceComponentDraft>) => setComponents((current) => current.map((component) => component.id === id ? { ...component, ...change } : component))
+  const updateRule = (id: number, change: Partial<PriceRuleDraft>) => setRules((current) => current.map((rule) => rule.id === id ? { ...rule, ...change } : rule))
+  const submit = (event: FormEvent) => { event.preventDefault(); setError(null); try { save.mutate(priceDocument(modelId, providerId, validFrom, validUntil, components, rules, t)) } catch (cause) { setError(cause instanceof Error ? cause.message : t('formError')) } }
+  const kindOptions = PRICE_KINDS.map((kind) => ({ value: kind, label: t(`priceKind_${kind}`) }))
+  return <Modal open onOpenChange={(next) => { if (!next && !save.isPending) onClose() }} title={t('addPrice')} description={t('priceEditorHint')}>
+    <form onSubmit={submit}><Stack gap="lg">
+      {(modelsError || channelsError) && <Alert color="red" role="alert"><Stack gap="xs"><Text size="sm">{t('optionsUnavailable')}</Text><Group gap="xs">{modelsError && <Button size="compact-sm" variant="outline" onClick={retryModels}>{t('retry')}</Button>}{channelsError && <Button size="compact-sm" variant="outline" onClick={retryChannels}>{t('retry')}</Button>}</Group></Stack></Alert>}
+      <Select label={t('model')} required value={modelId} onChange={(value) => setModelId(value || '')} data={models} />
+      <Select label={t('priceChannelScope')} value={providerId || '__global__'} onChange={(value) => setProviderId(value === '__global__' ? '' : value || '')} data={[{ value: '__global__', label: t('priceGlobal') }, ...channels]} />
+      <Group grow align="flex-start"><TextInput type="datetime-local" label={t('validFrom')} value={validFrom} onChange={(event) => setValidFrom(event.currentTarget.value)} /><TextInput type="datetime-local" label={t('validUntil')} value={validUntil} onChange={(event) => setValidUntil(event.currentTarget.value)} /></Group>
+      <Stack gap="sm"><Group justify="space-between"><Title order={3}>{t('priceComponents')}</Title><Button type="button" variant="default" size="compact-sm" onClick={() => setComponents((current) => [...current, newPriceComponent()])}>{t('priceAddComponent')}</Button></Group>{components.map((component, componentIndex) => <Paper key={component.id} p="md" withBorder>
+        <Stack gap="sm"><Group justify="space-between"><Text fw={600}>{t('priceComponentNumber', { count: componentIndex + 1 })}</Text><ActionIcon type="button" variant="subtle" color="red" aria-label={`${t('priceRemoveComponent')} ${componentIndex + 1}`} onClick={() => setComponents((current) => current.filter((item) => item.id !== component.id))}><Trash2 size={16} /></ActionIcon></Group>
+          <Group grow align="flex-start"><Select label={t('priceKind')} value={component.kind} onChange={(value) => updateComponent(component.id, { kind: value || 'input', cacheTtl: value === 'cache_write' ? component.cacheTtl : 'none' })} data={kindOptions} /><TextInput inputMode="numeric" label={t('priceUnitSize')} value={component.unitSize} onChange={(event) => updateComponent(component.id, { unitSize: event.currentTarget.value })} /><TextInput inputMode="numeric" label={t('priceUnitPrice')} value={component.unitPriceMicros} onChange={(event) => updateComponent(component.id, { unitPriceMicros: event.currentTarget.value })} /></Group>
+          <Group grow align="flex-start"><Select label={t('priceTierMode')} value={component.tierMode} onChange={(value) => updateComponent(component.id, { tierMode: value === 'volume' ? 'volume' : 'marginal' })} data={[{ value: 'marginal', label: t('priceTierMarginal') }, { value: 'volume', label: t('priceTierVolume') }]} /><Select label={t('priceCacheTtl')} disabled={component.kind !== 'cache_write'} value={component.cacheTtl} onChange={(value) => updateComponent(component.id, { cacheTtl: value === '5m' || value === '1h' ? value : 'none' })} data={[{ value: 'none', label: t('none') }, { value: '5m', label: '5m' }, { value: '1h', label: '1h' }]} /></Group>
+          <Stack gap="xs"><Group justify="space-between"><Text size="sm" fw={600}>{t('priceTiers')}</Text><Button type="button" variant="subtle" size="compact-sm" onClick={() => updateComponent(component.id, { tiers: [...component.tiers, { id: nextPriceDraftId(), upTo: '', unitPriceMicros: component.unitPriceMicros }] })}>{t('priceAddTier')}</Button></Group>{component.tiers.map((tier, tierIndex) => <Group key={tier.id} align="flex-end"><TextInput style={{ flex: 1 }} inputMode="numeric" label={t('priceTierUpTo')} description={tierIndex === component.tiers.length - 1 ? t('priceTierFinalHint') : undefined} value={tier.upTo} onChange={(event) => updateComponent(component.id, { tiers: component.tiers.map((item) => item.id === tier.id ? { ...item, upTo: event.currentTarget.value } : item) })} /><TextInput style={{ flex: 1 }} inputMode="numeric" label={t('priceUnitPrice')} value={tier.unitPriceMicros} onChange={(event) => updateComponent(component.id, { tiers: component.tiers.map((item) => item.id === tier.id ? { ...item, unitPriceMicros: event.currentTarget.value } : item) })} /><ActionIcon type="button" variant="subtle" color="red" aria-label={`${t('priceRemoveTier')} ${tierIndex + 1}`} onClick={() => updateComponent(component.id, { tiers: component.tiers.filter((item) => item.id !== tier.id) })}><Trash2 size={16} /></ActionIcon></Group>)}</Stack>
+        </Stack></Paper>)}</Stack>
+      <Stack gap="sm"><Group justify="space-between"><Title order={3}>{t('priceScheduleRules')}</Title><Button type="button" variant="default" size="compact-sm" onClick={() => setRules((current) => [...current, newPriceRule()])}>{t('priceAddRule')}</Button></Group>{rules.length === 0 && <Text size="sm" c="dimmed">{t('priceScheduleEmpty')}</Text>}{rules.map((rule, ruleIndex) => <Paper key={rule.id} p="md" withBorder><Stack gap="sm">
+        <Group justify="space-between"><Text fw={600}>{t('priceRuleNumber', { count: ruleIndex + 1 })}</Text><ActionIcon type="button" variant="subtle" color="red" aria-label={`${t('priceRemoveRule')} ${ruleIndex + 1}`} onClick={() => setRules((current) => current.filter((item) => item.id !== rule.id))}><Trash2 size={16} /></ActionIcon></Group>
+        <Group grow align="flex-start"><TextInput inputMode="numeric" label={t('priority')} value={rule.priority} onChange={(event) => updateRule(rule.id, { priority: event.currentTarget.value })} /><TextInput label={t('priceTimezone')} value={rule.timezone} onChange={(event) => updateRule(rule.id, { timezone: event.currentTarget.value })} /></Group>
+        <Group grow align="flex-start"><TextInput type="time" label={t('priceDailyStart')} value={rule.start} onChange={(event) => updateRule(rule.id, { start: event.currentTarget.value })} /><TextInput label={t('priceDailyEnd')} placeholder="HH:MM" value={rule.end} onChange={(event) => updateRule(rule.id, { end: event.currentTarget.value })} /></Group>
+        <div><Text size="sm" fw={500} mb={6}>{t('priceWeekdays')}</Text><Group gap="sm">{WEEKDAYS.map((weekday) => <Checkbox key={weekday} label={t(`weekday${weekday}`)} checked={rule.weekdays.includes(weekday)} onChange={(event) => updateRule(rule.id, { weekdays: event.currentTarget.checked ? [...rule.weekdays, weekday] : rule.weekdays.filter((value) => value !== weekday) })} />)}</Group></div>
+        <Group grow align="flex-start"><TextInput type="datetime-local" label={t('priceRuleFrom')} value={rule.from} onChange={(event) => updateRule(rule.id, { from: event.currentTarget.value })} /><TextInput type="datetime-local" label={t('priceRuleUntil')} value={rule.until} onChange={(event) => updateRule(rule.id, { until: event.currentTarget.value })} /></Group>
+        <Stack gap="xs"><Group justify="space-between"><Text size="sm" fw={600}>{t('priceOverrides')}</Text><Button type="button" variant="subtle" size="compact-sm" onClick={() => updateRule(rule.id, { prices: [...rule.prices, { id: nextPriceDraftId(), kind: 'input', unitPriceMicros: '0' }] })}>{t('priceAddOverride')}</Button></Group>{rule.prices.map((override, overrideIndex) => <Group key={override.id} align="flex-end"><Select style={{ flex: 1 }} label={t('priceKind')} value={override.kind} onChange={(value) => updateRule(rule.id, { prices: rule.prices.map((item) => item.id === override.id ? { ...item, kind: value || 'input' } : item) })} data={kindOptions} /><TextInput style={{ flex: 1 }} inputMode="numeric" label={t('priceUnitPrice')} value={override.unitPriceMicros} onChange={(event) => updateRule(rule.id, { prices: rule.prices.map((item) => item.id === override.id ? { ...item, unitPriceMicros: event.currentTarget.value } : item) })} /><ActionIcon type="button" variant="subtle" color="red" aria-label={`${t('priceRemoveOverride')} ${overrideIndex + 1}`} onClick={() => updateRule(rule.id, { prices: rule.prices.filter((item) => item.id !== override.id) })}><Trash2 size={16} /></ActionIcon></Group>)}</Stack>
+      </Stack></Paper>)}</Stack>
+      {error && <Alert color="red" role="alert">{error}</Alert>}
+      <Group justify="flex-end"><Button type="button" variant="default" disabled={save.isPending} onClick={onClose}>{t('cancel')}</Button><Button type="submit" loading={save.isPending} disabled={modelsError || channelsError}>{t('save')}</Button></Group>
+    </Stack></form>
+  </Modal>
+}
+
+function PriceComponentsSummary({ value }: { value: unknown }) {
+  const { t } = useTranslation()
+  if (!Array.isArray(value) || value.length === 0) return <>—</>
+  return <Stack gap={6}>{value.map((raw, index) => {
+    const component = raw && typeof raw === 'object' ? raw as Record<string, unknown> : {}
+    const tiers = Array.isArray(component.tiers) && component.tiers.length ? component.tiers.map((rawTier) => { const tier = rawTier as Record<string, unknown>; return `${typeof tier.up_to === 'number' ? tier.up_to : '∞'} @ ${typeof tier.unit_price_micros === 'number' ? tier.unit_price_micros : '—'}` }).join(', ') : '—'
+    return <Text key={String(component.id || index)} size="sm"><strong>{t(`priceKind_${String(component.kind)}`)}</strong> · {t('priceRateSummary', { price: typeof component.unit_price_micros === 'number' ? component.unit_price_micros : '—', size: typeof component.unit_size === 'number' ? component.unit_size : '—' })} · {t(component.tier_mode === 'volume' ? 'priceTierVolume' : 'priceTierMarginal')} · {t('priceCacheTtl')}: {typeof component.cache_ttl === 'string' ? component.cache_ttl : '—'} · {t('priceTiers')}: {tiers}</Text>
+  })}</Stack>
+}
+
+function PriceScheduleSummary({ value }: { value: unknown }) {
+  const { t } = useTranslation()
+  const rules = value && typeof value === 'object' && Array.isArray((value as { rules?: unknown }).rules) ? (value as { rules: unknown[] }).rules : []
+  return <>{rules.length ? t('priceScheduleCount', { count: rules.length }) : '—'}</>
 }
 
 type Preview = { candidates: Document[]; decisions: Array<{ stage: string; candidate: string | null; reason: string }>; estimated_tokens: number }

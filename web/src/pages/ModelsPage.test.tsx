@@ -29,3 +29,87 @@ describe('routing association editor',()=>{
 })
 
 describe('model catalog card columns',()=>{it('renders typed card values, bundled icons, fallbacks, and unmeasured facts',async()=>{const models=[{id:'known',provider_id:'channel-1',provider_name:'Primary',public_name:'gpt-public',upstream_name:'gpt-upstream',capabilities:['chat','responses'],enabled:1,catalog_developer:'OpenAI',catalog_model_type:'chat',catalog_logo_key:'lobehub:OpenAI',catalog_context_limit_tokens:128000,catalog_output_limit_tokens:16384,catalog_input_cost:2.5,catalog_output_cost:10,catalog_cost_currency:'USD',catalog_cost_unit:'per_million_tokens'},{id:'fallback',provider_id:'channel-1',provider_name:'Primary',public_name:'acme-public',upstream_name:'acme-upstream',capabilities:['chat'],enabled:1,catalog_developer:'Acme Labs',catalog_model_type:'chat',catalog_logo_key:'catalog:missing',catalog_context_limit_tokens:null,catalog_output_limit_tokens:null,catalog_input_cost:null,catalog_output_cost:null,catalog_cost_currency:null,catalog_cost_unit:null},{id:'manual',provider_id:'channel-1',provider_name:'Primary',public_name:'manual-public',upstream_name:'manual-upstream',capabilities:['chat'],enabled:1,catalog_developer:null,catalog_model_type:null,catalog_logo_key:null,catalog_context_limit_tokens:null,catalog_output_limit_tokens:null,catalog_input_cost:null,catalog_output_cost:null,catalog_cost_currency:null,catalog_cost_unit:null}];const fetchMock=vi.fn((input:RequestInfo|URL)=>{const path=String(input);if(path.endsWith('/projects'))return reply([{id:'p1',name:'P',slug:'p',owner_user_id:'u',is_default:true,enabled:true}]);if(path.includes('/permissions'))return reply(['*']);if(path.includes('/operations/models'))return reply({data:models,total:models.length});if(path.includes('/operations/channels'))return reply({data:[{id:'channel-1',name:'Primary'}],total:1});if(path.includes('/catalog/models'))return reply({data:[],total:0});return reply({data:[],total:0})});vi.stubGlobal('fetch',fetchMock);const client=new QueryClient({defaultOptions:{queries:{retry:false}}});const view=render(<QueryClientProvider client={client}><MemoryRouter><ProjectProvider><ModelsPage/></ProjectProvider></MemoryRouter></QueryClientProvider>);await screen.findAllByText('gpt-public');const table=view.container.querySelector('.desktop-resource-table') as HTMLElement;expect(within(table).getByLabelText('OpenAI')).toBeInTheDocument();expect(within(table).getByLabelText('Acme Labs')).toHaveTextContent('AL');expect(within(table).getByText('128,000 tokens')).toBeInTheDocument();expect(within(table).getByText('16,384 tokens')).toBeInTheDocument();expect(within(table).getByText('2.5 USD / million tokens')).toBeInTheDocument();expect(within(table).getByText('10 USD / million tokens')).toBeInTheDocument();expect(within(within(table).getByRole('row',{name:/manual-public/})).getAllByText('—').length).toBeGreaterThanOrEqual(4);const cards=view.container.querySelector('.mobile-resource-list') as HTMLElement;expect(within(cards).getByText('gpt-upstream')).toBeInTheDocument();expect(within(cards).getAllByText('OpenAI').length).toBeGreaterThan(0);expect(within(cards).getByText('128,000 tokens')).toBeInTheDocument();expect(within(cards).getByText('2.5 USD / million tokens')).toBeInTheDocument()})})
+
+function priceFetch(prices: unknown[] = []) {
+  return vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+    const path = String(input)
+    if (path.endsWith('/projects')) return reply([{ id: 'p1', name: 'P', slug: 'p', owner_user_id: 'u', is_default: true, enabled: true }])
+    if (path.includes('/permissions')) return reply(['*'])
+    if (path.includes('/api-keys')) return reply([])
+    if (path.includes('/operations/models')) return reply({ data: [{ id: 'model-1', public_name: 'Model 1', provider_id: 'channel-1', provider_name: 'Primary', upstream_name: 'upstream', capabilities: ['chat'], enabled: 1 }], total: 1 })
+    if (path.includes('/operations/channels')) return reply({ data: [{ id: 'channel-1', name: 'Primary' }, { id: 'channel-2', name: 'Secondary' }], total: 2 })
+    if (path.includes('/catalog/models')) return reply({ data: [], total: 0 })
+    if (path.includes('/operations/prices') && init?.method === 'POST') return reply({ id: 'price-new' })
+    if (path.includes('/operations/prices')) return reply({ data: prices, total: prices.length })
+    return reply({ data: [], total: 0 })
+  })
+}
+
+function renderModelsPage(fetchMock: ReturnType<typeof vi.fn>) {
+  vi.stubGlobal('fetch', fetchMock)
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+  return render(<QueryClientProvider client={client}><MemoryRouter><ProjectProvider><ModelsPage /></ProjectProvider></MemoryRouter></QueryClientProvider>)
+}
+
+describe('structured prices', () => {
+  it('renders projected channel, rates, tiers, cache TTL, and unmeasured values', async () => {
+    const fetchMock = priceFetch([{ id: 'price-1', model_id: 'model-1', model_name: 'Model 1', provider_id: 'channel-2', provider_name: 'Secondary', version: 1, valid_from: 1_800_000_000, valid_until: null, schedule: { version: 1, rules: [] }, components: [{ id: 'component-1', kind: 'cache_write', unit_size: 1_000_000, unit_price_micros: 8, tier_mode: 'volume', cache_ttl: '1h', tiers: [{ up_to: 1_000_000, unit_price_micros: 8 }, { up_to: null, unit_price_micros: 6 }] }] }])
+    renderModelsPage(fetchMock)
+    await userEvent.click(await screen.findByRole('tab', { name: 'Prices' }))
+    expect(await screen.findAllByText('Secondary')).not.toHaveLength(0)
+    const summary = screen.getAllByText('Cache write')[0].closest('p')
+    expect(summary).toHaveTextContent('8 micro-USD / 1000000')
+    expect(summary).toHaveTextContent('Volume')
+    expect(summary).toHaveTextContent('Cache TTL: 1h')
+    expect(summary).toHaveTextContent('1000000 @ 8, ∞ @ 6')
+    expect(screen.getAllByText('—').length).toBeGreaterThan(0)
+  })
+
+  it('builds the accepted append-only document and refuses an invalid timezone inline', async () => {
+    const fetchMock = priceFetch()
+    renderModelsPage(fetchMock)
+    await userEvent.click(await screen.findByRole('tab', { name: 'Prices' }))
+    await userEvent.click(await screen.findByRole('button', { name: 'Add price' }))
+    const dialog = await screen.findByRole('dialog')
+    await userEvent.click(within(dialog).getByRole('combobox', { name: 'Model' }))
+    await userEvent.click(await screen.findByRole('option', { name: 'Model 1' }))
+    await userEvent.click(within(dialog).getByRole('combobox', { name: 'Channel scope' }))
+    await userEvent.click(await screen.findByRole('option', { name: 'Secondary' }))
+    await userEvent.click(within(dialog).getByRole('combobox', { name: 'Kind' }))
+    await userEvent.click(await screen.findByRole('option', { name: 'Cache write' }))
+    const componentPrice = within(dialog).getByLabelText('Unit price (micro-USD)')
+    await userEvent.clear(componentPrice); await userEvent.type(componentPrice, '12')
+    await userEvent.click(within(dialog).getByRole('combobox', { name: 'Tier mode' }))
+    await userEvent.click(await screen.findByRole('option', { name: 'Volume' }))
+    await userEvent.click(within(dialog).getByRole('combobox', { name: 'Cache TTL' }))
+    await userEvent.click(await screen.findByRole('option', { name: '1h' }))
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Add tier' }))
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Add tier' }))
+    const limits = within(dialog).getAllByLabelText('Up to (blank is unlimited)')
+    await userEvent.type(limits[0], '100')
+    const prices = within(dialog).getAllByLabelText('Unit price (micro-USD)')
+    await userEvent.clear(prices[1]); await userEvent.type(prices[1], '10')
+    await userEvent.clear(prices[2]); await userEvent.type(prices[2], '5')
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Add rule' }))
+    const timezone = within(dialog).getByLabelText('IANA timezone')
+    await userEvent.clear(timezone); await userEvent.type(timezone, 'Mars/Olympus')
+    await userEvent.click(within(dialog).getByLabelText('Mon'))
+    const starts = within(dialog).getByLabelText('Rule starts'); const ends = within(dialog).getByLabelText('Rule ends')
+    await userEvent.type(starts, '2026-09-22T00:00'); await userEvent.type(ends, '2026-09-23T00:00')
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Save' }))
+    expect(await within(dialog).findByRole('alert')).toHaveTextContent('valid IANA timezone')
+    expect(fetchMock.mock.calls.filter(([, init]) => init?.method === 'POST')).toHaveLength(0)
+    await userEvent.clear(timezone); await userEvent.type(timezone, 'America/New_York')
+    const overrides = within(dialog).getAllByLabelText('Unit price (micro-USD)')
+    await userEvent.clear(overrides[3]); await userEvent.type(overrides[3], '7')
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Save' }))
+    await vi.waitFor(() => expect(fetchMock.mock.calls.filter(([, init]) => init?.method === 'POST')).toHaveLength(1))
+    const call = fetchMock.mock.calls.find(([, init]) => init?.method === 'POST')
+    const body = JSON.parse(String(call?.[1]?.body))
+    expect(body).toEqual({
+      model_id: 'model-1', provider_id: 'channel-2', valid_until: null,
+      components: [{ kind: 'cache_write', unit_size: 1_000_000, unit_price_micros: 12, tiers: [{ up_to: 100, unit_price_micros: 10 }, { up_to: null, unit_price_micros: 5 }], tier_mode: 'volume', cache_ttl: '1h' }],
+      schedule: { version: 1, rules: [{ priority: 100, timezone: 'America/New_York', start_minute: 0, end_minute: 0, weekdays: [1], from: Math.floor(new Date('2026-09-22T00:00').getTime() / 1000), until: Math.floor(new Date('2026-09-23T00:00').getTime() / 1000), prices: { input: 7 } }] },
+    })
+  }, 30_000)
+})

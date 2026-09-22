@@ -1,4 +1,4 @@
-//! Immutable integer micro-USD prices, including cache accounting and marginal tiers.
+//! Immutable integer micro-USD prices, including cache accounting and tier modes.
 use super::sql;
 use crate::{api::ApiError, db, orchestration::Candidate};
 use sea_orm::{ConnectionTrait, DatabaseConnection, TransactionTrait};
@@ -196,6 +196,13 @@ pub struct Tier {
     pub up_to: Option<i64>,
     pub unit_price_micros: i64,
 }
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TierMode {
+    #[default]
+    Marginal,
+    Volume,
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Component {
@@ -206,6 +213,8 @@ pub struct Component {
     pub unit_price_micros: i64,
     #[serde(default)]
     pub tiers: Vec<Tier>,
+    #[serde(default)]
+    pub tier_mode: TierMode,
     #[serde(default)]
     pub cache_ttl: Option<String>,
 }
@@ -309,6 +318,14 @@ impl Price {
             let mut numerator = 0i128;
             if c.tiers.is_empty() {
                 numerator = i128::from(quantity) * i128::from(c.unit_price_micros)
+            } else if c.tier_mode == TierMode::Volume {
+                let rate = c
+                    .tiers
+                    .iter()
+                    .find(|tier| tier.up_to.is_none_or(|upper| quantity <= upper))
+                    .ok_or_else(invalid)?
+                    .unit_price_micros;
+                numerator = i128::from(quantity) * i128::from(rate);
             } else {
                 let mut lower = 0;
                 for tier in &c.tiers {
@@ -371,15 +388,22 @@ impl Price {
         // Use the maximum configured tier rate, even when actual billing is marginal.
         let mut total = 0i128;
         for c in &self.components {
-            let rate = c
-                .tiers
-                .iter()
-                .map(|t| t.unit_price_micros)
-                .fold(c.unit_price_micros, i64::max);
             let q = if c.kind == "flat" {
                 1
             } else {
                 i64::from(tokens)
+            };
+            let rate = if c.tier_mode == TierMode::Volume && !c.tiers.is_empty() {
+                c.tiers
+                    .iter()
+                    .find(|tier| tier.up_to.is_none_or(|upper| q <= upper))
+                    .ok_or_else(invalid)?
+                    .unit_price_micros
+            } else {
+                c.tiers
+                    .iter()
+                    .map(|t| t.unit_price_micros)
+                    .fold(c.unit_price_micros, i64::max)
             };
             let denominator = i128::from(c.unit_size) * 1_000_000;
             let numerator = i128::from(q) * i128::from(rate) * i128::from(self.ratio_millionths);
@@ -448,6 +472,13 @@ pub async fn snapshot(
                 unit_price_micros: row.try_get("", "unit_price_micros")?,
                 tiers: serde_json::from_value(document.get("tiers").cloned().unwrap_or(json!([])))
                     .map_err(|_| invalid())?,
+                tier_mode: serde_json::from_value(
+                    document
+                        .get("tier_mode")
+                        .cloned()
+                        .unwrap_or(json!("marginal")),
+                )
+                .map_err(|_| invalid())?,
                 cache_ttl: document
                     .get("cache_ttl")
                     .and_then(Value::as_str)
@@ -463,6 +494,7 @@ pub async fn snapshot(
                 unit_size: 1_000_000,
                 unit_price_micros: candidate.target.input_price_micros,
                 tiers: vec![],
+                tier_mode: TierMode::Marginal,
                 cache_ttl: None,
             },
             Component {
@@ -471,6 +503,7 @@ pub async fn snapshot(
                 unit_size: 1_000_000,
                 unit_price_micros: candidate.target.output_price_micros,
                 tiers: vec![],
+                tier_mode: TierMode::Marginal,
                 cache_ttl: None,
             },
         ]

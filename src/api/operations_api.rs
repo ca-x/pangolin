@@ -1497,7 +1497,7 @@ fn query(resource: &str) -> Result<(&'static str, &'static str, &'static str), A
         "prices" => (
             "model_prices",
             "model_id IN (SELECT m.id FROM models m JOIN providers p ON p.id=m.provider_id WHERE p.project_id=?)",
-            "json_object('id',id,'model_id',model_id,'model_name',(SELECT public_name FROM models WHERE id=model_prices.model_id),'provider_id',provider_id,'version',version,'valid_from',valid_from,'valid_until',valid_until,'schedule',json(schedule_json))",
+            "json_object('id',id,'model_id',model_id,'model_name',(SELECT public_name FROM models WHERE id=model_prices.model_id),'provider_id',provider_id,'provider_name',(SELECT name FROM providers WHERE id=model_prices.provider_id),'version',version,'valid_from',valid_from,'valid_until',valid_until,'schedule',json(schedule_json),'components',json(COALESCE((SELECT json_group_array(json(component)) FROM (SELECT json_object('id',c.id,'kind',c.kind,'unit_size',c.unit_size,'unit_price_micros',c.unit_price_micros,'tiers',json(COALESCE(json_extract(c.tiers_json,'$.tiers'),'[]')),'tier_mode',COALESCE(json_extract(c.tiers_json,'$.tier_mode'),'marginal'),'cache_ttl',json_extract(c.tiers_json,'$.cache_ttl')) AS component FROM model_price_components c WHERE c.price_id=model_prices.id ORDER BY c.id)),'[]')))",
         ),
         "probes" => (
             "channel_probes",
@@ -4371,6 +4371,23 @@ async fn mutate(
         "prices" => {
             let model = text(&value, "model_id")?;
             if transaction.query_one(sql("SELECT m.id FROM models m JOIN providers p ON p.id=m.provider_id WHERE m.id=? AND p.project_id=?",vec![model.into(),project.clone().into()])).await?.is_none(){return Err(ApiError::NotFound)}
+            let provider = match value.get("provider_id") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(provider)) if !provider.is_empty() && provider.len() <= 2048 => {
+                    if transaction
+                        .query_one(sql(
+                            "SELECT id FROM providers WHERE id=? AND project_id=?",
+                            vec![provider.clone().into(), project.clone().into()],
+                        ))
+                        .await?
+                        .is_none()
+                    {
+                        return Err(ApiError::NotFound);
+                    }
+                    Some(provider.clone())
+                }
+                _ => return Err(ApiError::BadRequest("invalid provider_id".into())),
+            };
             let components: Vec<pricing::Component> =
                 serde_json::from_value(value["components"].clone())
                     .map_err(|_| ApiError::BadRequest("invalid price components".into()))?;
@@ -4395,9 +4412,9 @@ async fn mutate(
             .map_err(|_| ApiError::BadRequest("invalid price schedule".into()))?;
             schedule.validate()?;
             let tx = &transaction;
-            tx.execute(sql("INSERT INTO model_prices(id,model_id,version,valid_from,valid_until,created_at,schedule_json) SELECT ?,?,COALESCE(MAX(version),0)+1,?,?,?,? FROM model_prices WHERE model_id=?",vec![resource_id.clone().into(),model.into(),value["valid_from"].as_i64().unwrap_or(db::now()).into(),value["valid_until"].as_i64().into(),db::now().into(),serde_json::to_string(&schedule).unwrap().into(),model.into()])).await?;
+            tx.execute(sql("INSERT INTO model_prices(id,model_id,provider_id,version,valid_from,valid_until,created_at,schedule_json) SELECT ?,?,?,COALESCE(MAX(version),0)+1,?,?,?,? FROM model_prices WHERE model_id=? AND provider_id IS ?",vec![resource_id.clone().into(),model.into(),provider.clone().into(),value["valid_from"].as_i64().unwrap_or(db::now()).into(),value["valid_until"].as_i64().into(),db::now().into(),serde_json::to_string(&schedule).unwrap().into(),model.into(),provider.into()])).await?;
             for c in components {
-                tx.execute(sql("INSERT INTO model_price_components(id,price_id,kind,unit_size,unit_price_micros,tiers_json) VALUES(?,?,?,?,?,?)",vec![id().into(),resource_id.clone().into(),c.kind.into(),c.unit_size.into(),c.unit_price_micros.into(),json!({"version":1,"tiers":c.tiers,"cache_ttl":c.cache_ttl}).to_string().into()])).await?;
+                tx.execute(sql("INSERT INTO model_price_components(id,price_id,kind,unit_size,unit_price_micros,tiers_json) VALUES(?,?,?,?,?,?)",vec![id().into(),resource_id.clone().into(),c.kind.into(),c.unit_size.into(),c.unit_price_micros.into(),json!({"version":1,"tiers":c.tiers,"tier_mode":c.tier_mode,"cache_ttl":c.cache_ttl}).to_string().into()])).await?;
             }
         }
         "groups" => {

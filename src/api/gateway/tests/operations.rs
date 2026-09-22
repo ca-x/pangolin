@@ -3228,6 +3228,71 @@ async fn task5_management_api_prices_groups_logs_csrf_and_scope() {
     assert_eq!(json_body(summary).await["data"][0]["cost_micros"], 510);
     assert_eq!(admin(&f,&cookie,http::Method::POST,"/api/admin/v1/projects/other/operations/storage",json!({"id":target,"name":"stolen","revision":1,"config":{"kind":"local","directory":"other"}}),true).await.status(),StatusCode::FORBIDDEN);
 }
+
+#[tokio::test]
+async fn b37_b38_pricing_channel_versions_and_component_projection() {
+    let f = fixture(success()).await;
+    let cookie = owner(&f).await;
+    let project = db::DEFAULT_PROJECT_ID;
+    let base = format!("/api/admin/v1/projects/{project}/operations/prices");
+    let model = f
+        .state
+        .db
+        .query_one(ops::sql(
+            "SELECT id FROM models WHERE provider_id=?",
+            vec![f.providers[0].clone().into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get::<String>("", "id")
+        .unwrap();
+    let components = json!([{
+        "kind": "cache_write",
+        "unit_size": 1_000_000,
+        "unit_price_micros": 8,
+        "tiers": [
+            {"up_to": 1_000_000, "unit_price_micros": 8},
+            {"up_to": null, "unit_price_micros": 6}
+        ],
+        "tier_mode": "volume",
+        "cache_ttl": "1h"
+    }]);
+
+    for document in [
+        json!({"model_id":model,"components":components}),
+        json!({"model_id":model,"components":[{"kind":"input","unit_size":1_000_000,"unit_price_micros":4}]}),
+        json!({"model_id":model,"provider_id":f.providers[1],"components":components}),
+    ] {
+        assert_eq!(
+            admin(&f, &cookie, http::Method::POST, &base, document, true)
+                .await
+                .status(),
+            StatusCode::OK
+        );
+    }
+
+    let listing =
+        json_body(admin(&f, &cookie, http::Method::GET, &base, Value::Null, false).await).await;
+    let rows = listing["data"].as_array().unwrap();
+    let mut global_versions = rows
+        .iter()
+        .filter(|row| row["provider_id"].is_null())
+        .map(|row| row["version"].as_i64().unwrap())
+        .collect::<Vec<_>>();
+    global_versions.sort_unstable();
+    assert_eq!(global_versions, [1, 2]);
+    let scoped = rows
+        .iter()
+        .find(|row| row["provider_id"] == f.providers[1])
+        .unwrap();
+    assert_eq!(scoped["version"], 1);
+    assert_eq!(scoped["provider_name"], "b");
+    assert_eq!(scoped["components"][0]["kind"], "cache_write");
+    assert_eq!(scoped["components"][0]["tier_mode"], "volume");
+    assert_eq!(scoped["components"][0]["cache_ttl"], "1h");
+    assert_eq!(scoped["components"][0]["tiers"], components[0]["tiers"]);
+}
 #[tokio::test]
 async fn task5_affinity_switches_only_on_success_and_disabled_channel_is_invalidated() {
     let seen = Arc::new(Mutex::new(Vec::<String>::new()));
