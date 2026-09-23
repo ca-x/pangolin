@@ -113,7 +113,7 @@ function ConfidenceFact({ row, compact = false }: { row: AnalyticsRow; compact?:
   if (typeof row.sample_count !== 'number' || !row.confidence_level) return <>{UNMEASURED}</>
   const sample = t('analyticsSampleCount', { count: row.sample_count })
   if (compact) return <Text size="xs" c={row.confidence_level === 'low' ? 'yellow' : 'dimmed'}>{sample} · {confidenceLabel(row.confidence_level, t)}</Text>
-  return <Group gap="xs" wrap="nowrap"><Text size="sm" className="analytics-bar-value">{sample}</Text><Badge variant="light" color={{ low: 'yellow', medium: 'blue', high: 'green' }[row.confidence_level]}>{confidenceLabel(row.confidence_level, t)}</Badge></Group>
+  return <Group gap="xs" wrap="nowrap"><Text size="sm" className="analytics-bar-value">{sample}</Text><Badge variant="light" color={{ low: 'gray', medium: 'yellow', high: 'green' }[row.confidence_level]}>{confidenceLabel(row.confidence_level, t)}</Badge></Group>
 }
 
 function MetricBars({ title, rows, label, value, format, showConfidence = false }: { title: string; rows: AnalyticsRow[]; label: (value: string | null) => { text: string; opaque: boolean }; value: (row: AnalyticsRow) => number | null | undefined; format: (value: number) => string; showConfidence?: boolean }) {

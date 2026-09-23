@@ -131,7 +131,7 @@ function ChartLegend() {
   // no second accent hue — the console keeps one accent per screen.
   const entries: Array<[string, string, boolean]> = [
     [t('requests'), 'var(--accent)', false],
-    [t('errorsLabel'), 'var(--mantine-color-red-6)', true],
+    [t('errorsLabel'), 'var(--danger)', true],
   ]
   return <Group gap="sm" wrap="nowrap" aria-hidden="true">
     {entries.map(([label, color, dashed]) => <Group gap={6} wrap="nowrap" key={label}>
@@ -230,7 +230,7 @@ function TrendChart({ series }: { series: SeriesPoint[] }) {
           {gridlines.map((ratio) => <line key={ratio} className="chart-grid-line" x1="0" x2={CHART_WIDTH} y1={ratio * CHART_HEIGHT} y2={ratio * CHART_HEIGHT} vectorEffect="non-scaling-stroke"/>)}
           <path className="chart-area" d={area} vectorEffect="non-scaling-stroke"/>
           <path className="chart-line" d={line} vectorEffect="non-scaling-stroke"/>
-          <path className="chart-line" d={errorLine} vectorEffect="non-scaling-stroke" stroke="var(--mantine-color-red-6)" strokeDasharray="4 3" fill="none"/>
+          <path className="chart-line" d={errorLine} vectorEffect="non-scaling-stroke" stroke="var(--danger)" strokeDasharray="4 3" fill="none"/>
           {/* deslop-ignore-next-line 24 — chart marks, not icons */}
           {series.length <= 14 && series.map((point, index) => <circle key={point.bucket} className="chart-dot" cx={x(index)} cy={y(point.requests)} r="3" vectorEffect="non-scaling-stroke"/>)}
           {focus && <line className="chart-crosshair" x1={focus.x} x2={focus.x} y1="0" y2={CHART_HEIGHT} vectorEffect="non-scaling-stroke"/>}

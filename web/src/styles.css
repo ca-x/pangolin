@@ -190,6 +190,9 @@ code { overflow-wrap: anywhere; }
 .button { min-height: var(--control-height); gap: 8px; padding: 0 14px; border-radius: var(--radius-control); font-size: 14px; font-weight: 560; }
 .button:disabled { cursor: not-allowed; opacity: .55; }
 .button:active { transform: scale(.97); }
+/* Mantine buttons are the live surface: give them the same response-on-press
+   the contract promises, without animating layout properties. */
+.mantine-Button-root:active { transform: scale(.97); }
 .sidebar-close { display: none; }
 .icon-button.danger { color: var(--muted); }
 .icon-button.danger:hover, .icon-button.danger:focus-visible { color: var(--danger); }
@@ -548,7 +551,7 @@ input:not([type='checkbox']):not([type='radio']):not(.mantine-Input-input):focus
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
-  .button:active { transform: none; }
+  .button:active, .mantine-Button-root:active { transform: none; }
   .sidebar, .request-drawer, .select-content { transform: none; }
   /* The skeleton stays as a static placeholder rather than sweeping. */
   .skeleton::after { animation: none; }

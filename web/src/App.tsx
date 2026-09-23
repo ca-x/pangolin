@@ -3,6 +3,7 @@ import { useQuery } from '@tanstack/react-query'
 import { lazy, Suspense, useEffect } from 'react'
 import { Navigate, Route, Routes, useLocation } from 'react-router'
 import { api, type Bootstrap } from './api'
+import i18n from './i18n'
 import { InvitationAccept, Login, Setup } from './Auth'
 import Shell from './Shell'
 import { SkeletonRows } from './components'
@@ -19,17 +20,34 @@ const PlaygroundPage = lazy(() => import('./pages/PlaygroundPage'))
 const PromptsPage = lazy(() => import('./pages/PromptsPage'))
 const SystemPage = lazy(() => import('./pages/SystemPage'))
 
+/** First path segment → the i18n key naming that screen for the tab title. */
+const ROUTE_TITLES: Record<string, string> = {
+  '': 'overview',
+  channels: 'channels',
+  models: 'models',
+  access: 'access',
+  account: 'account',
+  prompts: 'prompts',
+  operations: 'operations',
+  analytics: 'analytics',
+  playground: 'playground',
+  system: 'systemSettings',
+}
+
 export default function App() {
   const location = useLocation()
   const bootstrap = useQuery({ queryKey: ['bootstrap'], queryFn: () => api<Bootstrap>('/api/v1/bootstrap'), retry: false })
   useEffect(() => {
     const branding = bootstrap.data?.branding
     if (!branding) return
-    document.title = branding.branding_name
+    // The browser tab is a navigation surface: name the screen the operator is
+    // on instead of showing the instance label on every one of them.
+    const section = ROUTE_TITLES[location.pathname.split('/').filter(Boolean)[0] || '']
+    document.title = section ? `${i18n.t(section)} · ${branding.branding_name}` : branding.branding_name
     let link = document.querySelector<HTMLLinkElement>("link[rel='icon']")
     if (!link) { link = document.createElement('link'); link.rel = 'icon'; document.head.append(link) }
     link.href = branding.favicon_url
-  }, [bootstrap.data?.branding])
+  }, [bootstrap.data?.branding, location.pathname])
 
   if (bootstrap.isLoading) return (
     <Center h="100vh">

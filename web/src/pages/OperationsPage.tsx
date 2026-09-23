@@ -513,7 +513,7 @@ function TraceTimeline({ trace, requests, executions, from }: { trace: TraceBund
           </Group>
         </Stack>
         <div style={{ position: 'relative', height: 26, background: 'var(--mantine-color-default-border)', borderRadius: 4, overflow: 'hidden' }}>
-          <div style={{ position: 'absolute', left: `${(row.start - start) / span * 100}%`, width: `${width(row)}%`, top: 5, height: 16, borderRadius: 3, background: row.status === 'succeeded' ? 'var(--accent)' : 'var(--mantine-color-red-5)' }} />
+          <div style={{ position: 'absolute', left: `${(row.start - start) / span * 100}%`, width: `${width(row)}%`, top: 5, height: 16, borderRadius: 3, background: row.status === 'succeeded' ? 'var(--accent)' : 'var(--danger)' }} />
           <Text size="xs" c="dimmed" style={{ position: 'absolute', right: 6, top: 5 }}>{row.latencyMs == null ? UNMEASURED : `${row.latencyMs} ms`}</Text>
         </div>
       </div>)}
