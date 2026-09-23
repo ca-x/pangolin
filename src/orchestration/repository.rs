@@ -96,6 +96,7 @@ struct Row {
     output_price_micros: i64,
     priority: i32,
     credential_priority: i32,
+    provider_priority: i32,
     model_enabled: bool,
     provider_enabled: bool,
     settings_json: String,
@@ -137,6 +138,7 @@ pub async fn candidates(
     let rows = Row::find_by_statement(statement(r#"
         SELECT m.id AS model_id,p.id AS provider_id,c.id AS credential_id,m.public_name,m.upstream_name,m.capabilities,
         p.name AS provider_name,p.kind AS provider_kind,p.base_url,c.credential_type,c.secret_envelope,m.input_price_micros,m.output_price_micros,m.priority,
+        p.priority AS provider_priority,
         m.enabled AS model_enabled,p.enabled AS provider_enabled,p.settings_json,
         m.catalog_metadata_json,m.disable_developer_settings_inheritance,
         COALESCE(s.endpoint_mappings_json,'{"version":1}') AS endpoint_mappings_json,
@@ -449,6 +451,7 @@ pub async fn candidates(
             credential_id: row.credential_id,
             priority: rank.0,
             credential_priority: row.credential_priority,
+            provider_priority: row.provider_priority,
             weight: rank.1,
             limits,
             retry: instance.effective_retry(&row.retry_statuses_json)?,
@@ -466,6 +469,9 @@ pub async fn candidates(
     result.sort_by(|a, b| {
         a.priority
             .cmp(&b.priority)
+            // A channel's own weight orders equal-rank candidates before the
+            // UUID tiebreak: operator intent beats row-id lottery.
+            .then(a.provider_priority.cmp(&b.provider_priority))
             .then(a.id().cmp(&b.id()))
             .then(a.model_id.cmp(&b.model_id))
     });

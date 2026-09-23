@@ -525,6 +525,7 @@ async fn b37_pricing_channel_scope_wins_only_for_the_matching_channel() {
         credential_id: "credential".into(),
         priority: 0,
         credential_priority: 0,
+        provider_priority: 100,
         weight: 1,
         limits: Limits::default(),
         retry: Retry::default(),

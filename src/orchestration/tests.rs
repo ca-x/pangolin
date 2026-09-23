@@ -112,6 +112,7 @@ pub(super) fn candidate(id: &str, weight: u32) -> Candidate {
         credential_id: id.into(),
         priority: 100,
         credential_priority: 100,
+        provider_priority: 100,
         weight,
         limits: Limits::default(),
         retry: Retry::default(),

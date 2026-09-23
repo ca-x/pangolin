@@ -1457,7 +1457,7 @@ fn query(resource: &str) -> Result<(&'static str, &'static str, &'static str), A
         "channels" => (
             "providers",
             "project_id=?",
-            "json_object('id',id,'name',name,'kind',kind,'base_url',base_url,'enabled',enabled,'settings',json(settings_json),'created_at',created_at,'updated_at',updated_at)",
+            "json_object('id',id,'name',name,'kind',kind,'base_url',base_url,'priority',priority,'enabled',enabled,'settings',json(settings_json),'created_at',created_at,'updated_at',updated_at)",
         ),
         "credentials" => (
             "channel_credentials",
@@ -3916,7 +3916,16 @@ async fn mutate(
                 .map(Value::to_string)
                 .or(current_settings)
                 .unwrap_or_else(|| json!({"version":1}).to_string());
-            let changed = transaction.execute(sql("INSERT INTO providers(id,name,kind,base_url,enabled,created_at,updated_at,project_id,settings_json) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,kind=excluded.kind,base_url=excluded.base_url,enabled=excluded.enabled,updated_at=excluded.updated_at,settings_json=excluded.settings_json WHERE providers.project_id=excluded.project_id",vec![resource_id.clone().into(),text(&value,"name")?.into(),kind.into(),base_url.into(),value["enabled"].as_bool().unwrap_or(true).into(),db::now().into(),db::now().into(),project.clone().into(),settings.into()])).await?.rows_affected();
+            // The column CHECK would reject a negative weight with a raw
+            // constraint error; the write boundary owns a named refusal so the
+            // console can show the offending field instead of a 500.
+            let priority = value.get("priority").and_then(Value::as_i64).unwrap_or(100);
+            if !(0..=100_000).contains(&priority) {
+                return Err(ApiError::BadRequest(
+                    "channel priority must be between 0 and 100000".into(),
+                ));
+            }
+            let changed = transaction.execute(sql("INSERT INTO providers(id,name,kind,base_url,priority,enabled,created_at,updated_at,project_id,settings_json) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,kind=excluded.kind,base_url=excluded.base_url,priority=excluded.priority,enabled=excluded.enabled,updated_at=excluded.updated_at,settings_json=excluded.settings_json WHERE providers.project_id=excluded.project_id",vec![resource_id.clone().into(),text(&value,"name")?.into(),kind.into(),base_url.into(),priority.into(),value["enabled"].as_bool().unwrap_or(true).into(),db::now().into(),db::now().into(),project.clone().into(),settings.into()])).await?.rows_affected();
             if changed != 1 {
                 return Err(ApiError::Forbidden);
             }

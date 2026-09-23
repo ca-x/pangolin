@@ -10418,3 +10418,91 @@ async fn session_playground_reuses_gateway_policy_and_accounting_without_a_token
         StatusCode::FORBIDDEN
     );
 }
+
+/// Channel priority is the tiebreaker between equal-rank candidates for the
+/// same public model name. With both model rows at the same priority the
+/// attempt order would otherwise fall through to the provider UUID lottery:
+/// the channel with the lower (preferred) weight must serve the request.
+#[tokio::test]
+async fn channel_priority_orders_equal_rank_candidates_before_the_id_tiebreak() {
+    let f = fixture(Router::new().route(
+        "/v1/chat/completions",
+        post(|| async { Json(json!({"choices":[{"message":{"content":"ok"}}]})) }),
+    ))
+    .await;
+    sql(&f, "UPDATE models SET priority=100", vec![]).await;
+    sql(
+        &f,
+        "UPDATE providers SET priority=200 WHERE name='a'",
+        vec![],
+    )
+    .await;
+    sql(
+        &f,
+        "UPDATE providers SET priority=50 WHERE name='b'",
+        vec![],
+    )
+    .await;
+    let response = request(&f, "/v1/chat/completions", chat()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    // Raw SQL bypasses the control-plane mutation path, so the derived caches a
+    // config write would have dropped are dropped here the same way.
+    f.state.orchestrator.reset_derived();
+    let row = f
+        .state
+        .db
+        .query_one(ops::sql(
+            "SELECT (SELECT name FROM providers WHERE id=e.provider_id) AS served,status FROM request_executions e ORDER BY attempt",
+            vec![],
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    // Provider "b" carries the lower channel weight, so it wins the tie.
+    assert_eq!(
+        row.try_get::<String>("", "served").unwrap(),
+        "b".to_string()
+    );
+    assert_eq!(
+        row.try_get::<String>("", "status").unwrap(),
+        "succeeded".to_string()
+    );
+    assert_eq!(
+        count(&f, "SELECT COUNT(*) AS n FROM request_executions").await,
+        1
+    );
+}
+
+/// The default weight preserves the pre-column behaviour for existing rows and
+/// the write boundary refuses an out-of-range weight instead of surfacing the
+/// raw CHECK constraint.
+#[tokio::test]
+async fn channel_priority_defaults_to_100_and_rejects_negative_values() {
+    let f = fixture(Router::new()).await;
+    let cookie = owner(&f).await;
+    let project = db::DEFAULT_PROJECT_ID;
+    assert_eq!(
+        count(&f, "SELECT COUNT(*) AS n FROM providers WHERE priority=100").await,
+        2
+    );
+    let refusal = admin(
+        &f,
+        &cookie,
+        http::Method::POST,
+        &format!("/api/admin/v1/projects/{project}/operations/channels"),
+        json!({"name":"weighted","kind":"openai","base_url":"https://example.invalid","priority":-1}),
+        true,
+    )
+    .await;
+    assert_eq!(refusal.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        count(
+            &f,
+            "SELECT COUNT(*) AS n FROM providers WHERE name='weighted'"
+        )
+        .await,
+        0
+    );
+}
+
+

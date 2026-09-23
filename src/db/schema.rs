@@ -1041,6 +1041,17 @@ CREATE INDEX IF NOT EXISTS idx_audit_auth_failure_created_at ON audit_events(cre
 WHERE actor_user_id IS NULL AND action='login_failed' AND resource_type='authentication';
 "#;
 
+/// Channel-level routing weight. A channel's position among equal-rank
+/// candidates for the same public model name is its own configuration, not a
+/// property of one model row: the column mirrors `models.priority` and
+/// `channel_credentials.priority` (smaller wins, default 100) so one mental
+/// model orders all three tiers. Existing rows read 100, which is exactly the
+/// previous UUID-tiebreak behaviour until an operator expresses a preference.
+const V28_PROVIDER_PRIORITY: &str = r#"
+ALTER TABLE providers ADD COLUMN priority INTEGER NOT NULL DEFAULT 100 CHECK(priority >= 0);
+CREATE INDEX IF NOT EXISTS idx_providers_project_priority ON providers(project_id,enabled,priority);
+"#;
+
 #[derive(FromQueryResult)]
 struct Count {
     count: i64,
@@ -1528,6 +1539,25 @@ pub async fn migrate(db: &DatabaseConnection) -> Result<()> {
             .await?;
         transaction.commit().await?;
     }
+    let provider_priority_applied = Count::find_by_statement(statement(
+        "SELECT COUNT(*) AS count FROM schema_migrations WHERE version=28",
+    ))
+    .one(db)
+    .await?
+    .is_some_and(|row| row.count > 0);
+    if !provider_priority_applied {
+        let transaction = db.begin().await?;
+        transaction
+            .execute_unprepared(V28_PROVIDER_PRIORITY)
+            .await
+            .context("failed to add channel routing priority")?;
+        transaction
+            .execute(statement(
+                "INSERT INTO schema_migrations(version,applied_at) VALUES(28,unixepoch())",
+            ))
+            .await?;
+        transaction.commit().await?;
+    }
     Ok(())
 }
 
@@ -1565,7 +1595,7 @@ mod tests {
 
         assert_eq!(
             scalar(&db, "SELECT MAX(version) AS count FROM schema_migrations").await,
-            27
+            28
         );
         assert_eq!(
             scalar(
@@ -1891,7 +1921,7 @@ mod tests {
 
         assert_eq!(
             scalar(&db, "SELECT COUNT(*) AS count FROM schema_migrations").await,
-            24
+            25
         );
         assert_eq!(
             scalar(
@@ -2333,7 +2363,7 @@ mod tests {
 
         assert_eq!(
             scalar(&db, "SELECT MAX(version) AS count FROM schema_migrations").await,
-            27
+            28
         );
         assert_eq!(
             scalar(
@@ -2453,7 +2483,7 @@ mod tests {
 
         assert_eq!(
             scalar(&db, "SELECT MAX(version) AS count FROM schema_migrations").await,
-            27
+            28
         );
         assert_eq!(
             scalar(

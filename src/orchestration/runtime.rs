@@ -311,10 +311,13 @@ impl Runtime {
             return;
         }
         // Priority tiers remain strict for every strategy. Inside a tier the
-        // credential's own priority decides, and IDs break what is still tied.
+        // channel's own weight orders channels, then the credential's priority
+        // orders credentials inside one channel, and IDs break what is still
+        // tied — the same three-tier model the columns encode.
         candidates.sort_by(|a, b| {
             a.priority
                 .cmp(&b.priority)
+                .then(a.provider_priority.cmp(&b.provider_priority))
                 .then(a.credential_priority.cmp(&b.credential_priority))
                 .then(a.id().cmp(&b.id()))
         });

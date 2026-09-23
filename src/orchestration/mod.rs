@@ -150,6 +150,10 @@ pub struct Candidate {
     /// then by id; without it a priority-100 credential could be tried before a
     /// priority-10 one purely because of its UUID.
     pub credential_priority: i32,
+    /// The channel's own routing weight, applied after model rank and before
+    /// the id tiebreak: two channels offering the same public name at the same
+    /// model priority are ordered by operator-expressed channel preference.
+    pub provider_priority: i32,
     pub weight: u32,
     pub limits: Limits,
     pub retry: Retry,
