@@ -10505,4 +10505,99 @@ async fn channel_priority_defaults_to_100_and_rejects_negative_values() {
     );
 }
 
+/// One custom model may be published on several channels in a single atomic
+/// create: the endpoint takes a `provider_ids` array, every channel gets its
+/// own binding row, and a collision on any channel rolls the whole create back.
+#[tokio::test]
+async fn a_model_can_be_created_on_several_channels_atomically() {
+    let f = fixture(Router::new()).await;
+    let cookie = owner(&f).await;
+    let project = db::DEFAULT_PROJECT_ID;
+    let path = format!("/api/admin/v1/projects/{project}/operations/models");
+    let create = admin(
+        &f,
+        &cookie,
+        http::Method::POST,
+        &path,
+        json!({
+            "provider_ids": f.providers,
+            "public_name": "shared-public",
+            "upstream_name": "shared-upstream",
+            "capabilities": ["chat"],
+            "input_price_micros": 0,
+            "output_price_micros": 0,
+            "priority": 100,
+        }),
+        true,
+    )
+    .await;
+    assert_eq!(create.status(), StatusCode::OK);
+    assert_eq!(
+        count(
+            &f,
+            "SELECT COUNT(*) AS n FROM models WHERE public_name='shared-public'"
+        )
+        .await,
+        2,
+        "each channel keeps its own binding row"
+    );
 
+    // A collision on the second channel refuses the whole create: no partial
+    // state may survive.
+    let collision = admin(
+        &f,
+        &cookie,
+        http::Method::POST,
+        &path,
+        json!({
+            "provider_ids": f.providers,
+            "public_name": "shared-public",
+            "upstream_name": "shared-upstream",
+        }),
+        true,
+    )
+    .await;
+    assert_eq!(collision.status(), StatusCode::CONFLICT);
+    let envelope = json_body(collision).await;
+    assert_eq!(envelope["error"]["type"], "duplicate_model");
+    assert_eq!(
+        count(
+            &f,
+            "SELECT COUNT(*) AS n FROM models WHERE public_name='shared-public'"
+        )
+        .await,
+        2,
+        "a refused multi-channel create leaves no rows behind"
+    );
+
+    // The array is create-only: an edit addresses one binding row.
+    let model_id = {
+        let row = f
+            .state
+            .db
+            .query_one(ops::sql(
+                "SELECT id FROM models WHERE public_name='shared-public' LIMIT 1",
+                vec![],
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        row.try_get::<String>("", "id").unwrap()
+    };
+    let edit = admin(
+        &f,
+        &cookie,
+        http::Method::POST,
+        &path,
+        json!({
+            "id": model_id,
+            "provider_ids": f.providers,
+            "provider_id": f.providers[0],
+            "public_name": "shared-public",
+            "upstream_name": "renamed-upstream",
+        }),
+        true,
+    )
+    .await;
+    assert_eq!(edit.status(), StatusCode::BAD_REQUEST);
+}

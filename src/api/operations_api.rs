@@ -4063,6 +4063,119 @@ async fn mutate(
                 return Err(ApiError::NotFound);
             }
         }
+        "models" if value.get("provider_ids").is_some() => {
+            // One public model published on several channels at once. The rows
+            // are independent per-channel bindings, so this is a bounded loop of
+            // the batch insert in one transaction: either every channel gets the
+            // model or none does. Editing stays single-channel — a binding row is
+            // edited on its own channel, never moved wholesale.
+            if existing_model {
+                return Err(ApiError::BadRequest(
+                    "provider_ids is a create-only field".into(),
+                ));
+            }
+            let providers: Vec<String> = value["provider_ids"]
+                .as_array()
+                .map(|list| {
+                    list.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default();
+            if providers.is_empty()
+                || providers.len() > 100
+                || providers.iter().any(|id| id.is_empty() || id.len() > 256)
+                || providers.iter().collect::<HashSet<_>>().len() != providers.len()
+            {
+                return Err(ApiError::BadRequest(
+                    "provider_ids must contain 1–100 unique non-empty channel ids".into(),
+                ));
+            }
+            let public_name = text(&value, "public_name")?;
+            let upstream_name = text(&value, "upstream_name")?;
+            if public_name.trim().is_empty()
+                || public_name.trim().len() > 256
+                || upstream_name.trim().is_empty()
+                || upstream_name.trim().len() > 256
+            {
+                return Err(ApiError::BadRequest("invalid model identity".into()));
+            }
+            // Card defaults win over the form when a card backs the create, the
+            // same precedence the single-channel path applies.
+            let manual = db::ModelCatalogDefaults::manual();
+            let resolved = catalog_defaults.as_ref().unwrap_or(&manual);
+            let input_price = catalog_defaults
+                .as_ref()
+                .map(|defaults| defaults.input_price_micros)
+                .unwrap_or_else(|| value["input_price_micros"].as_i64().unwrap_or(0).max(0));
+            let output_price = catalog_defaults
+                .as_ref()
+                .map(|defaults| defaults.output_price_micros)
+                .unwrap_or_else(|| value["output_price_micros"].as_i64().unwrap_or(0).max(0));
+            let capabilities = value["capabilities"].as_array().map(|list| {
+                list.iter()
+                    .filter_map(|item| item.as_str().map(str::to_owned))
+                    .collect::<Vec<String>>()
+            });
+            let priority = value["priority"]
+                .as_i64()
+                .filter(|value| (0..=i32::MAX as i64).contains(value))
+                .map(|value| value as i32);
+            let mut first_created: Option<String> = None;
+            for provider in &providers {
+                if transaction
+                    .query_one(sql(
+                        "SELECT id FROM providers WHERE id=? AND project_id=?",
+                        vec![provider.clone().into(), project.clone().into()],
+                    ))
+                    .await?
+                    .is_none()
+                {
+                    return Err(ApiError::NotFound);
+                }
+                let duplicate = transaction
+                    .query_one(sql(
+                        "SELECT m.id FROM models m JOIN providers p ON p.id=m.provider_id WHERE m.provider_id=? AND m.public_name=? AND m.upstream_name=? AND p.project_id=?",
+                        vec![
+                            provider.clone().into(),
+                            public_name.trim().into(),
+                            upstream_name.trim().into(),
+                            project.clone().into(),
+                        ],
+                    ))
+                    .await?;
+                if duplicate.is_some() {
+                    return Err(ApiError::ConflictNamed(
+                        "duplicate_model",
+                        format!("this channel already has that model: {provider}"),
+                    ));
+                }
+                let model = db::create_model_in(
+                    &transaction,
+                    &ModelInput {
+                        provider_id: provider.clone(),
+                        public_name: public_name.trim().to_owned(),
+                        upstream_name: upstream_name.trim().to_owned(),
+                        capabilities: capabilities.clone(),
+                        input_price_micros: Some(input_price),
+                        output_price_micros: Some(output_price),
+                        priority,
+                    },
+                    &project,
+                    resolved,
+                )
+                .await?;
+                if first_created.is_none() {
+                    first_created = Some(model.id);
+                }
+            }
+            // The audit entry and the response name a real created row, not the
+            // throwaway request uuid.
+            if let Some(first) = first_created {
+                resource_id = first;
+            }
+        }
         "models" => {
             let provider = text(&value, "provider_id")?;
             if transaction
