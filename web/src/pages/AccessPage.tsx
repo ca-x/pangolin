@@ -6,6 +6,7 @@ import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 import { api, type AnalyticsRow, type Document } from '../api'
 import { confirmAction, EmptyState, EnabledPill, InlineQueryError, Modal, SecretInput, SelectField, SkeletonRows } from '../components'
+import { AllowedModelsEditor, ProfileMappingsEditor, RoutingPolicyEditor } from './documentEditors'
 import { UNMEASURED, formatCount, formatMicros } from '../observability'
 import { projectOperationPath, useProject } from '../project'
 import { PageHeader, QueryError, ResourcePage, displayValue, formatDate } from './shared'
@@ -299,7 +300,7 @@ function ProfilesPanel() {
       empty={t('profileEmpty')}
       createLabel={t('addProfile')}
       columns={[{ key: 'name', label: t('name') }, { key: 'rpm_limit', label: 'RPM' }, { key: 'tpm_limit', label: 'TPM' }, { key: 'budget_micros', label: t('budget') }, { key: 'routing_policy', label: t('routingPolicy') }]}
-      fields={[{ key: 'name', label: t('name'), required: true }, { key: 'rpm_limit', label: 'RPM', kind: 'number' }, { key: 'tpm_limit', label: 'TPM', kind: 'number' }, { key: 'budget_micros', label: t('budgetMicros'), kind: 'number' }, { key: 'routing_policy', label: t('routingPolicy'), kind: 'json', defaultValue: { version: 1 } }, { key: 'mappings', label: t('modelMappings'), kind: 'json', defaultValue: [] }, { key: 'allowed_models', label: t('allowedModels'), kind: 'json', defaultValue: [] }]}
+      fields={[{ key: 'name', label: t('name'), required: true }, { key: 'rpm_limit', label: 'RPM', kind: 'number' }, { key: 'tpm_limit', label: 'TPM', kind: 'number' }, { key: 'budget_micros', label: t('budgetMicros'), kind: 'number' }, { key: 'routing_policy', label: t('routingPolicy'), kind: 'json', defaultValue: { version: 1 }, render: ({ name, label, value, setValid }) => <RoutingPolicyEditor name={name} label={label} value={value} setValid={setValid} /> }, { key: 'mappings', label: t('modelMappings'), kind: 'json', defaultValue: [], render: ({ name, label, value, setValid }) => <ProfileMappingsEditor name={name} label={label} value={value} setValid={setValid} /> }, { key: 'allowed_models', label: t('allowedModels'), kind: 'json', defaultValue: [], render: ({ name, label, value, setValid }) => <AllowedModelsEditor name={name} label={label} value={value} setValid={setValid} /> }]}
       rowActions={(row) => <Button variant="subtle" size="compact-sm" onClick={() => beginSave(row)}>{t('profileTemplateSaveAs')}</Button>}
     />
     <section aria-labelledby="profile-templates-heading">
@@ -461,7 +462,7 @@ function KeysPanel() {
     onSuccess: (data, variables) => { void client.invalidateQueries({ queryKey: ['keys', variables.projectId] }); setOpen(false); if (data.token) setToken({ value: data.token, title: t('keyCreated'), description: t('keyCreatedHint') }); else toast.success(t('importComplete')) },
     onError: (error: Error) => setCreateError(error.message),
   })
-  const update = useMutation({ mutationFn: ({ projectId, id, body }: { projectId: string; id: string; body: unknown }) => api(`${keysPath(projectId)}/${id}`, { method: 'PATCH', body: JSON.stringify(body) }), onSuccess: (_, variables) => void client.invalidateQueries({ queryKey: ['keys', variables.projectId] }), onError: (error: Error) => toast.error(error.message) })
+  const update = useMutation({ mutationFn: ({ projectId, id, body }: { projectId: string; id: string; body: unknown }) => api(`${keysPath(projectId)}/${id}`, { method: 'PATCH', body: JSON.stringify(body) }), onSuccess: (_, variables) => { setEditing(null); setEditProfile('__none__'); void client.invalidateQueries({ queryKey: ['keys', variables.projectId] }) }, onError: (error: Error) => toast.error(error.message) })
   type KeyAction = { projectId: string; projectName: string; keyId: string; keyName: string }
   const rotate = useMutation({
     mutationFn: ({ projectId, keyId }: KeyAction) => api<{ key: ScopedKey; token: string }>(`${keysPath(projectId)}/${keyId}/rotate`, { method: 'POST' }),
@@ -519,7 +520,7 @@ function KeysPanel() {
       },
     })
   }
-  const submitEdit = (event: FormEvent<HTMLFormElement>) => { event.preventDefault(); if (!editing) return; const data = new FormData(event.currentTarget); update.mutate({ projectId: project.id, id: editing.id, body: { name: data.get('name'), profile_id: data.get('profile_id') === '__none__' ? null : data.get('profile_id') || null, budget_micros: data.get('budget_micros') ? Number(data.get('budget_micros')) : null, expires_at: data.get('expires_at') ? Number(data.get('expires_at')) : null, allowed_ips: String(data.get('allowed_ips') || '').split(',').map((v) => v.trim()).filter(Boolean), denied_ips: String(data.get('denied_ips') || '').split(',').map((v) => v.trim()).filter(Boolean) } }); setEditing(null); setEditProfile('__none__') }
+  const submitEdit = (event: FormEvent<HTMLFormElement>) => { event.preventDefault(); if (!editing) return; const data = new FormData(event.currentTarget); update.mutate({ projectId: project.id, id: editing.id, body: { name: data.get('name'), profile_id: data.get('profile_id') === '__none__' ? null : data.get('profile_id') || null, budget_micros: data.get('budget_micros') ? Number(data.get('budget_micros')) : null, expires_at: data.get('expires_at') ? Number(data.get('expires_at')) : null, allowed_ips: String(data.get('allowed_ips') || '').split(',').map((v) => v.trim()).filter(Boolean), denied_ips: String(data.get('denied_ips') || '').split(',').map((v) => v.trim()).filter(Boolean) } }) }
   type BulkKeyAction = { projectId: string; ids: string[]; action: 'enable' | 'disable' | 'archive' }
   const bulk = useMutation({
     mutationFn: ({ projectId, ids, action }: BulkKeyAction) => action === 'archive'
@@ -681,7 +682,10 @@ function KeysPanel() {
               <TextInput name="allowed_ips" label={t('allowedIps')} defaultValue={editing ? JSON.parse(editing.allowed_ips_json).join(', ') : ''} />
               <TextInput name="denied_ips" label={t('deniedIps')} defaultValue={editing ? JSON.parse(editing.denied_ips_json).join(', ') : ''} />
             </Group>
-            <Button type="submit">{t('save')}</Button>
+            <Group justify="flex-end" gap="xs">
+              <Button variant="default" type="button" onClick={() => { setEditing(null); setEditProfile('__none__') }}>{t('cancel')}</Button>
+              <Button type="submit" loading={update.isPending}>{t('save')}</Button>
+            </Group>
           </Stack>
         </form>
       </Modal>

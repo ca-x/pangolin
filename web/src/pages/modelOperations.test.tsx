@@ -74,6 +74,9 @@ describe('B40-B42 model operations', () => {
 
     await userEvent.click(await screen.findByRole('button', { name: 'Import catalog models' }))
     const dialog = screen.getByRole('dialog', { name: 'Import catalog models' })
+    // The catalog is grouped by developer with collapsed groups; searching
+    // flattens it to the matching cards.
+    await userEvent.type(within(dialog).getByRole('textbox', { name: 'Search' }), 'Acme')
     await userEvent.click(within(dialog).getByRole('checkbox', { name: /Acme Chat V2/ }))
     await userEvent.click(within(dialog).getByRole('combobox', { name: 'Target channel' }))
     await userEvent.click(screen.getByRole('option', { name: 'Primary' }))

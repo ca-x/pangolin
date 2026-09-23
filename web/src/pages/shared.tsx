@@ -50,6 +50,8 @@ export type FormField = {
   onRetry?: () => void
   /** Keep create-time provenance choices out of edit payloads. */
   createOnly?: boolean
+  /** Rendered only while editing an existing row — the create form omits it. */
+  editOnly?: boolean
   /** Auxiliary option lists retain a manual choice while these states are shown. */
   loading?: boolean
   emptyMessage?: string
@@ -167,7 +169,7 @@ export function ResourcePage({ resource, title, description, empty, columns, fie
   const total = Array.isArray(query.data) ? allRows.length : query.data?.total ?? rows.length
   const totalPages = Math.max(1, Math.ceil(total / limit))
   const currentPage = Math.floor(offset / limit) + 1
-  const activeFields = fields.filter((field) => !editing || !field.createOnly)
+  const activeFields = fields.filter((field) => (!editing || !field.createOnly) && (editing || !field.editOnly))
   const save = useMutation({
     mutationFn: ({ body, current }: { body: Record<string, unknown>; current: Document | null }) => api(current && itemEndpoint ? itemEndpoint(current.id, project.id) : path, { method: current ? updateMethod : createMethod, body: JSON.stringify(body) }),
     onSuccess: () => { toast.success(t('saved')); setOpen(false); setEditing(null); requestAnimationFrame(() => lastTrigger.current?.focus()); void client.invalidateQueries({ queryKey: ['resource', project.id, resource] }) },

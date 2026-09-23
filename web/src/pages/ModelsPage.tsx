@@ -1,14 +1,15 @@
 import { ActionIcon, Alert, Badge, Button, Checkbox, Collapse, Group, Loader, NumberInput, Pagination, Paper, Select, SimpleGrid, Stack, Table, TableScrollContainer, Tabs, Text, Textarea, TextInput, Title, Tooltip, UnstyledButton } from '@mantine/core'
 import { useMediaQuery } from '@mantine/hooks'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Archive, Copy, Download, Inbox, Layers3, Plus, RefreshCw, RotateCcw, Search, Trash2, Upload } from 'lucide-react'
-import { useEffect, useState, type FormEvent } from 'react'
+import { Archive, ChevronRight, Copy, Download, Inbox, Layers3, Plus, RefreshCw, RotateCcw, Search, Trash2, Upload } from 'lucide-react'
+import { useEffect, useMemo, useState, type FormEvent } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 import { api, type Document, type Paged } from '../api'
 import { CapabilityTags, capabilityList, confirmAction, describeFailure, EmptyState, EnabledPill, Modal, SelectField, SkeletonRows, useCapabilityLabel } from '../components'
 import { useProject } from '../project'
 import { ProviderIcon } from '../ProviderIcon'
+import { ExclusionsEditor } from './documentEditors'
 import { AutoRefreshControl, useAutoRefreshInterval } from './autoRefresh'
 import { PageHeader, QueryError, ResourcePage, displayValue, formatDate } from './shared'
 
@@ -75,13 +76,17 @@ function ModelsPanel() {
   const modelIdentity = (row: Document) => <span className="provider-cell"><ProviderIcon logoKey={typeof row.catalog_logo_key === 'string' ? row.catalog_logo_key : undefined} name={typeof row.catalog_developer === 'string' ? row.catalog_developer : String(row.public_name)} /><strong>{String(row.public_name)}</strong></span>
   return <>
     <DeveloperSettingsEditor />
-    <ResourcePage key={project.id} resource="models" endpoint={(projectId) => `/api/admin/v1/projects/${projectId}/operations/models?lifecycle=${lifecycle}`} title={t('models')} description={t('modelsDescription')} selectable={lifecycle === 'all' ? undefined : 'models'} bulkActions={(selected, clear) => <ModelBulkActions ids={selected} lifecycle={lifecycle as 'active' | 'archived'} clear={clear} />} secondaryAction={<BatchModelImport cards={catalog.data?.data || []} cardsLoading={catalog.isLoading} cardsError={catalog.isError} retryCards={() => void catalog.refetch()} channels={channels} channelsError={channelsError} retryChannels={retryChannels} />} empty={t('modelEmpty')} createLabel={t('addModel')} tableMinWidth={1540} mobileColumnLimit={8} mobilePrimary={modelIdentity} mobilePrimaryKey="public_name" mobileHiddenKeys={['enabled', 'lifecycle']} mobileStatus={(row) => <Stack gap={4} align="flex-end"><LifecyclePill lifecycle={row.lifecycle} /><EnabledPill enabled={row.enabled} /></Stack>} filters={<Select label={t('modelLifecycle')} value={lifecycle} onChange={(value) => setLifecycle(value || 'active')} allowDeselect={false} data={[{ value: 'active', label: t('modelLifecycleActive') }, { value: 'archived', label: t('modelLifecycleArchived') }, { value: 'all', label: t('modelLifecycleAll') }]} w={{ base: '100%', sm: 220 }} />} editDisabled={(row) => row.lifecycle === 'archived'} canDelete={false} rowActions={(row) => <ModelLifecycleActions row={row} />} columns={[{ key: 'public_name', label: t('publicModel'), mono: true, render: (_value, row) => modelIdentity(row) }, { key: 'provider_name', label: t('channel') }, { key: 'upstream_name', label: t('upstreamModel'), mono: true }, { key: 'catalog_developer', label: t('modelDeveloper') }, { key: 'catalog_model_type', label: t('modelType') }, { key: 'catalog_context_limit_tokens', label: t('modelLimits'), render: (_value, row) => <ModelLimits row={row} /> }, { key: 'catalog_input_cost', label: t('catalogCostDefaults'), render: (_value, row) => <CatalogCosts row={row} /> }, { key: 'capabilities', label: t('capabilities'), render: (value) => <CapabilityTags value={value} /> }, { key: 'enabled', label: t('status'), render: (value) => <EnabledPill enabled={value} /> }, { key: 'lifecycle', label: t('modelLifecycle'), render: (value) => <LifecyclePill lifecycle={value} /> }]} fields={[{ key: 'catalog_model_id', label: t('catalogModel'), hint: t('catalogModelHint'), kind: 'select', createOnly: true, defaultValue: '__manual__', options: catalogOptions, loading: catalog.isLoading, error: catalog.isError ? t('catalogModelUnavailable') : undefined, emptyMessage: t('catalogModelEmpty'), allowManualOnError: true, onRetry: () => void catalog.refetch() }, { key: 'provider_id', label: t('channel'), kind: 'select', required: true, options: channels, error: optionsError, onRetry: retryChannels }, { key: 'public_name', label: t('publicModel'), required: true }, { key: 'upstream_name', label: t('upstreamModel'), required: true }, { key: 'capabilities', label: t('capabilities'), kind: 'json', defaultValue: ['chat', 'responses'] }, { key: 'input_price_micros', label: t('inputPrice'), kind: 'number', defaultValue: 0 }, { key: 'output_price_micros', label: t('outputPrice'), kind: 'number', defaultValue: 0 }, { key: 'priority', label: t('priority'), kind: 'number', defaultValue: 100 }, { key: 'disable_developer_settings_inheritance', label: t('disableDeveloperInheritance'), hint: t('disableDeveloperInheritanceHint'), kind: 'checkbox', defaultValue: false }, { key: 'enabled', label: t('status'), kind: 'checkbox' }]} normalize={(values, editing) => {
-    if (editing || values.catalog_model_id === '__manual__') {
-      const manual = { ...values }
-      delete manual.catalog_model_id
-      return editing ? { ...manual, id: editing.id } : manual
+    <ResourcePage key={project.id} resource="models" endpoint={(projectId) => `/api/admin/v1/projects/${projectId}/operations/models?lifecycle=${lifecycle}`} title={t('models')} description={t('modelsDescription')} selectable={lifecycle === 'all' ? undefined : 'models'} bulkActions={(selected, clear) => <ModelBulkActions ids={selected} lifecycle={lifecycle as 'active' | 'archived'} clear={clear} />} secondaryAction={<BatchModelImport cards={catalog.data?.data || []} cardsLoading={catalog.isLoading} cardsError={catalog.isError} retryCards={() => void catalog.refetch()} channels={channels} channelsError={channelsError} retryChannels={retryChannels} />} empty={t('modelEmpty')} createLabel={t('addModel')} tableMinWidth={1540} mobileColumnLimit={8} mobilePrimary={modelIdentity} mobilePrimaryKey="public_name" mobileHiddenKeys={['enabled', 'lifecycle']} mobileStatus={(row) => <Stack gap={4} align="flex-end"><LifecyclePill lifecycle={row.lifecycle} /><EnabledPill enabled={row.enabled} /></Stack>} filters={<Select label={t('modelLifecycle')} value={lifecycle} onChange={(value) => setLifecycle(value || 'active')} allowDeselect={false} data={[{ value: 'active', label: t('modelLifecycleActive') }, { value: 'archived', label: t('modelLifecycleArchived') }, { value: 'all', label: t('modelLifecycleAll') }]} w={{ base: '100%', sm: 220 }} />} editDisabled={(row) => row.lifecycle === 'archived'} canDelete={false} rowActions={(row) => <ModelLifecycleActions row={row} />} columns={[{ key: 'public_name', label: t('publicModel'), mono: true, render: (_value, row) => modelIdentity(row) }, { key: 'provider_name', label: t('channel') }, { key: 'upstream_name', label: t('upstreamModel'), mono: true }, { key: 'catalog_developer', label: t('modelDeveloper') }, { key: 'catalog_model_type', label: t('modelType') }, { key: 'catalog_context_limit_tokens', label: t('modelLimits'), render: (_value, row) => <ModelLimits row={row} /> }, { key: 'catalog_input_cost', label: t('catalogCostDefaults'), render: (_value, row) => <CatalogCosts row={row} /> }, { key: 'capabilities', label: t('capabilities'), render: (value) => <CapabilityTags value={value} /> }, { key: 'enabled', label: t('status'), render: (value) => <EnabledPill enabled={value} /> }, { key: 'lifecycle', label: t('modelLifecycle'), render: (value) => <LifecyclePill lifecycle={value} /> }]} fields={[{ key: 'catalog_model_id', label: t('catalogModel'), hint: t('catalogModelHint'), kind: 'select', createOnly: true, defaultValue: '__manual__', options: catalogOptions, loading: catalog.isLoading, error: catalog.isError ? t('catalogModelUnavailable') : undefined, emptyMessage: t('catalogModelEmpty'), allowManualOnError: true, onRetry: () => void catalog.refetch() }, { key: 'provider_ids', label: t('channels'), kind: 'multi-checkbox', createOnly: true, required: true, options: channels, error: optionsError, onRetry: retryChannels, emptyMessage: t('channelRequiredForImport'), hint: t('multiChannelCreateHint') }, { key: 'provider_id', label: t('channel'), kind: 'select', editOnly: true, required: true, options: channels, error: optionsError, onRetry: retryChannels }, { key: 'public_name', label: t('publicModel'), required: true }, { key: 'upstream_name', label: t('upstreamModel'), required: true }, { key: 'capabilities', label: t('capabilities'), kind: 'json', defaultValue: ['chat', 'responses'] }, { key: 'input_price_micros', label: t('inputPrice'), kind: 'number', defaultValue: 0 }, { key: 'output_price_micros', label: t('outputPrice'), kind: 'number', defaultValue: 0 }, { key: 'priority', label: t('priority'), kind: 'number', defaultValue: 100 }, { key: 'disable_developer_settings_inheritance', label: t('disableDeveloperInheritance'), hint: t('disableDeveloperInheritanceHint'), kind: 'checkbox', defaultValue: false }, { key: 'enabled', label: t('status'), kind: 'checkbox' }]} normalize={(values, editing) => {
+    const payload = { ...values }
+    if (editing || payload.catalog_model_id === '__manual__') delete payload.catalog_model_id
+    if (editing) {
+      // A binding row is edited on its own channel; the multi-channel array is
+      // a create-only field the backend refuses on update.
+      delete payload.provider_ids
+      return { ...payload, id: editing.id }
     }
-    return values
+    delete payload.provider_id
+    return payload
     }} />
   </>
 }
@@ -94,23 +99,104 @@ function BatchModelImport({ cards, cardsLoading, cardsError, retryCards, channel
   const [provider, setProvider] = useState<string | null>(null)
   const [selected, setSelected] = useState<string[]>([])
   const [error, setError] = useState<string | null>(null)
+  // The catalog carries hundreds of cards; a flat checkbox list put the action
+  // buttons below a very long scroll. Search filters by name, upstream id or
+  // developer, and the rest is grouped by developer with collapsed groups, so
+  // the dialog opens short and the actions stay in reach.
+  const [query, setQuery] = useState('')
+  const [openGroups, setOpenGroups] = useState<Set<string>>(() => new Set())
+  const groups = useMemo(() => {
+    const byDeveloper = new Map<string, Document[]>()
+    for (const card of cards) {
+      const developer = String(card.developer || 'other')
+      const list = byDeveloper.get(developer) || []
+      list.push(card)
+      byDeveloper.set(developer, list)
+    }
+    return [...byDeveloper.entries()]
+      .map(([developer, items]) => ({ developer, items }))
+      .sort((a, b) => a.developer.localeCompare(b.developer))
+  }, [cards])
+  const normalized = query.trim().toLowerCase()
+  const searching = normalized.length > 0
+  const matches = (card: Document) => !searching
+    || String(card.name || card.id).toLowerCase().includes(normalized)
+    || String(card.upstream_id || card.id).toLowerCase().includes(normalized)
+    || String(card.developer || '').toLowerCase().includes(normalized)
+  const visibleGroups = groups
+    .map((group) => ({ ...group, items: group.items.filter(matches) }))
+    .filter((group) => group.items.length > 0)
+  const searchingFlat = searching ? visibleGroups.flatMap((group) => group.items) : []
   const create = useMutation({
     mutationFn: () => api(`/api/admin/v1/projects/${project.id}/models/batch`, { method: 'POST', body: JSON.stringify({ models: selected.map((cardId) => { const card = cards.find((item) => String(item.id) === cardId)!; return { catalog_model_id: cardId, provider_id: provider, public_name: String(card.name || card.id), upstream_name: String(card.upstream_id || card.id) } }) }) }),
-    onSuccess: () => { toast.success(t('modelsImported', { count: selected.length })); setOpen(false); setProvider(null); setSelected([]); void client.invalidateQueries({ queryKey: ['resource', project.id, 'models'] }) },
+    onSuccess: () => { toast.success(t('modelsImported', { count: selected.length })); setOpen(false); setProvider(null); setSelected([]); setQuery(''); setOpenGroups(new Set()); void client.invalidateQueries({ queryKey: ['resource', project.id, 'models'] }) },
     onError: (cause: unknown) => setError(describeFailure(cause, t)),
   })
   const toggle = (cardId: string, checked: boolean) => setSelected((current) => checked ? [...current, cardId] : current.filter((id) => id !== cardId))
+  const toggleGroup = (developer: string) => setOpenGroups((current) => { const next = new Set(current); if (next.has(developer)) next.delete(developer); else next.add(developer); return next })
+  const groupSelection = (items: Document[]) => {
+    const ids = items.map((card) => String(card.id))
+    const all = ids.every((id) => selected.includes(id))
+    return { all, some: ids.some((id) => selected.includes(id)) && !all }
+  }
+  const toggleGroupSelection = (items: Document[], checked: boolean) => {
+    const ids = items.map((card) => String(card.id))
+    setSelected((current) => checked ? [...new Set([...current, ...ids])] : current.filter((id) => !ids.includes(id)))
+  }
+  const cardRow = (card: Document) => <Checkbox key={String(card.id)} checked={selected.includes(String(card.id))} onChange={(event) => toggle(String(card.id), event.currentTarget.checked)} label={<Stack gap={0}><Text size="sm" fw={540}>{String(card.name || card.id)}</Text><Text size="xs" c="dimmed" className="mono-cell">{String(card.upstream_id || card.id)}</Text></Stack>} />
   const close = () => { if (!create.isPending) { setOpen(false); setError(null) } }
   return <>
     <Button variant="default" leftSection={<Layers3 size={17} />} onClick={() => setOpen(true)}>{t('importCatalogModels')}</Button>
     <Modal open={open} onOpenChange={(value) => value ? setOpen(true) : close()} title={t('importCatalogModels')} description={t('importCatalogModelsHint')}>
       <form onSubmit={(event) => { event.preventDefault(); setError(null); create.mutate() }}>
         <Stack gap="md">
-          {cardsError ? <QueryError retry={retryCards} /> : cardsLoading ? <Group role="status" gap="xs"><Loader size={16} /><Text size="sm">{t('loading')}</Text></Group> : cards.length === 0 ? <Text size="sm" c="dimmed">{t('catalogModelEmpty')}</Text> : <fieldset className="permission-picker">
-            <legend>{t('catalogModels')}</legend>
-            <Stack gap="xs" className="permission-options">{cards.map((card) => <Checkbox key={String(card.id)} checked={selected.includes(String(card.id))} onChange={(event) => toggle(String(card.id), event.currentTarget.checked)} label={<Stack gap={0}><Text size="sm" fw={540}>{String(card.name || card.id)}</Text><Text size="xs" c="dimmed" className="mono-cell">{String(card.upstream_id || card.id)}</Text></Stack>} />)}</Stack>
-          </fieldset>}
-          {channelsError ? <Stack gap={4}><Text size="sm" fw={500}>{t('channel')}</Text><QueryError retry={retryChannels} /></Stack> : <Select label={t('targetModelChannel')} data={channels} value={provider} onChange={setProvider} required disabled={channels.length === 0} description={channels.length === 0 ? t('channelRequiredForImport') : undefined} />}
+          {/* The target channel is a decision, not the last step: it stays above
+              the list so a long catalog never buries it. */}
+          {channelsError ? <Stack gap={4}><Text size="sm" fw={500}>{t('channel')}</Text><QueryError retry={retryChannels} /></Stack> : <Select label={t('targetModelChannel')} data={channels} value={provider} onChange={setProvider} required disabled={channels.length === 0} description={channels.length === 0 ? t('channelRequiredForImport') : undefined} searchable />}
+          {cardsError ? <QueryError retry={retryCards} /> : cardsLoading ? <Group role="status" gap="xs"><Loader size={16} /><Text size="sm">{t('loading')}</Text></Group> : cards.length === 0 ? <Text size="sm" c="dimmed">{t('catalogModelEmpty')}</Text> : <>
+            <TextInput leftSection={<Search size={17} />} placeholder={t('importSearchPlaceholder')} value={query} onChange={(event) => setQuery(event.currentTarget.value)} aria-label={t('search')} />
+            {searching ? (
+              <fieldset className="permission-picker">
+                <legend>{t('catalogModels')}</legend>
+                <Stack gap="xs" className="permission-options" style={{ maxHeight: 'min(44vh, 420px)', overflowY: 'auto' }}>
+                  {searchingFlat.length === 0 && <Text size="sm" c="dimmed">{t('noSearchResults')}</Text>}
+                  {searchingFlat.map(cardRow)}
+                </Stack>
+              </fieldset>
+            ) : (
+              <Stack gap="xs" style={{ maxHeight: 'min(44vh, 420px)', overflowY: 'auto' }}>
+                {visibleGroups.map((group) => {
+                  const { all, some } = groupSelection(group.items)
+                  const isOpen = openGroups.has(group.developer)
+                  const selectedCount = group.items.filter((card) => selected.includes(String(card.id))).length
+                  return <Paper key={group.developer} withBorder radius="md" style={{ overflow: 'hidden' }}>
+                    <Group gap="sm" align="center" wrap="nowrap" px="sm" py="xs">
+                      <Checkbox
+                        aria-label={`${t('selectAll')} ${group.developer}`}
+                        checked={all}
+                        indeterminate={some}
+                        onChange={(event) => toggleGroupSelection(group.items, event.currentTarget.checked)}
+                      />
+                      <UnstyledButton onClick={() => toggleGroup(group.developer)} aria-expanded={isOpen} style={{ flex: 1, minWidth: 0, textAlign: 'left' }}>
+                        <Group justify="space-between" gap="xs" wrap="nowrap">
+                          <Text size="sm" fw={600} truncate="end">{group.developer}</Text>
+                          <Text size="xs" c="dimmed">{group.items.length}{selectedCount > 0 ? ` · ${t('selectedCount', { count: selectedCount })}` : ''}</Text>
+                        </Group>
+                      </UnstyledButton>
+                      <UnstyledButton onClick={() => toggleGroup(group.developer)} aria-label={`${t('selectAll')} ${group.developer}`} aria-expanded={isOpen} aria-hidden="true" tabIndex={-1}>
+                        <ChevronRight size={15} style={{ transform: isOpen ? 'rotate(90deg)' : 'none', transition: 'transform 150ms var(--ease-out, ease-out)' }} />
+                      </UnstyledButton>
+                    </Group>
+                    <Collapse expanded={isOpen}>
+                      <Stack gap="xs" px="sm" pb="sm" className="permission-options">
+                        {group.items.map(cardRow)}
+                      </Stack>
+                    </Collapse>
+                  </Paper>
+                })}
+              </Stack>
+            )}
+          </>}
           {error && <Alert color="red" role="alert">{error}</Alert>}
           <Group justify="flex-end" gap="xs"><Button type="button" variant="default" disabled={create.isPending} onClick={close}>{t('cancel')}</Button><Button type="submit" loading={create.isPending} disabled={cardsLoading || cardsError || channelsError || !provider || selected.length === 0}>{t('importSelected', { count: selected.length })}</Button></Group>
         </Stack>
@@ -430,7 +516,7 @@ function RoutingEditor() {
   const { channels, models, channelsError, modelsError, retryChannels, retryModels } = useModelRelations()
   const any = { value: '__any__', label: t('unrestricted') }
   const matchTypes = [{ value: 'exact', label: t('matchExact') }, { value: 'regex', label: t('matchRegex') }, { value: 'tag', label: t('matchTag') }, { value: 'channel_tags_regex', label: t('matchChannelTagsRegex') }]
-  return <ResourcePage resource="associations" title={t('routing')} description={t('routingDescription')} empty={t('routingEmpty')} createLabel={t('addRoute')} columns={[{ key: 'pattern', label: t('pattern'), mono: true }, { key: 'match_type', label: t('matchType'), render: (value) => matchTypes.find((option) => option.value === value)?.label || displayValue(value) }, { key: 'model_name', label: t('model'), render: (value) => value ? String(value) : t('unrestricted') }, { key: 'provider_name', label: t('channel'), render: (value) => value ? String(value) : t('unrestricted') }, { key: 'priority', label: t('priority') }, { key: 'enabled', label: t('status'), render: (value) => <EnabledPill enabled={value} /> }]} fields={[{ key: 'model_id', label: t('model'), kind: 'select', defaultValue: '__any__', options: [any, ...models], error: modelsError ? t('optionsUnavailable') : undefined, onRetry: retryModels }, { key: 'provider_id', label: t('channel'), kind: 'select', defaultValue: '__any__', options: [any, ...channels], error: channelsError ? t('optionsUnavailable') : undefined, onRetry: retryChannels }, { key: 'match_type', label: t('matchType'), kind: 'select', options: matchTypes }, { key: 'pattern', label: t('pattern'), required: true }, { key: 'conditions', label: t('conditions'), kind: 'json', defaultValue: { version: 1 }, render: ({ name, value, setValid }) => <ConditionEditor name={name} value={value} setValid={setValid} /> }, { key: 'exclude_name_patterns', label: t('excludeChannelNames'), kind: 'text', hint: t('excludeChannelNamesHint'), fromRow: (row) => ((row.exclusions as Document | undefined)?.channel_name_patterns as string[] | undefined)?.join(', ') || '' }, { key: 'exclude_channel_ids', label: t('excludeChannelIds'), kind: 'text', hint: t('commaSeparated'), fromRow: (row) => ((row.exclusions as Document | undefined)?.channel_ids as string[] | undefined)?.join(', ') || '' }, { key: 'exclude_channel_tags', label: t('excludeChannelTags'), kind: 'text', hint: t('commaSeparated'), fromRow: (row) => ((row.exclusions as Document | undefined)?.channel_tags as string[] | undefined)?.join(', ') || '' }, { key: 'priority', label: t('priority'), kind: 'number', defaultValue: 100 }, { key: 'weight', label: t('weight'), kind: 'number', defaultValue: 1 }, { key: 'enabled', label: t('status'), kind: 'checkbox' }]} normalize={(values, editing) => { const { exclude_name_patterns, exclude_channel_ids, exclude_channel_tags, ...payload } = values; return { ...payload, ...(editing ? { id: editing.id } : {}), model_id: values.model_id === '__any__' ? null : values.model_id, provider_id: values.provider_id === '__any__' ? null : values.provider_id, exclusions: { version: 1, channel_name_patterns: commaList(exclude_name_patterns), channel_ids: commaList(exclude_channel_ids), channel_tags: commaList(exclude_channel_tags) } } }} />
+  return <ResourcePage resource="associations" title={t('routing')} description={t('routingDescription')} empty={t('routingEmpty')} createLabel={t('addRoute')} columns={[{ key: 'pattern', label: t('pattern'), mono: true }, { key: 'match_type', label: t('matchType'), render: (value) => matchTypes.find((option) => option.value === value)?.label || displayValue(value) }, { key: 'model_name', label: t('model'), render: (value) => value ? String(value) : t('unrestricted') }, { key: 'provider_name', label: t('channel'), render: (value) => value ? String(value) : t('unrestricted') }, { key: 'priority', label: t('priority') }, { key: 'enabled', label: t('status'), render: (value) => <EnabledPill enabled={value} /> }]} fields={[{ key: 'model_id', label: t('model'), kind: 'select', defaultValue: '__any__', options: [any, ...models], error: modelsError ? t('optionsUnavailable') : undefined, onRetry: retryModels }, { key: 'provider_id', label: t('channel'), kind: 'select', defaultValue: '__any__', options: [any, ...channels], error: channelsError ? t('optionsUnavailable') : undefined, onRetry: retryChannels }, { key: 'match_type', label: t('matchType'), kind: 'select', options: matchTypes }, { key: 'pattern', label: t('pattern'), required: true }, { key: 'conditions', label: t('conditions'), kind: 'json', defaultValue: { version: 1 }, render: ({ name, value, setValid }) => <ConditionEditor name={name} value={value} setValid={setValid} /> }, { key: 'exclusions', label: t('exclusions'), kind: 'json', defaultValue: { version: 1 }, fromRow: (row) => row.exclusions, render: ({ name, value, setValid }) => <ExclusionsEditor name={name} label={t('exclusions')} value={value} setValid={setValid} channels={channels} channelsError={channelsError} retryChannels={retryChannels} /> }, { key: 'priority', label: t('priority'), kind: 'number', defaultValue: 100 }, { key: 'weight', label: t('weight'), kind: 'number', defaultValue: 1 }, { key: 'enabled', label: t('status'), kind: 'checkbox' }]} normalize={(values, editing) => ({ ...values, ...(editing ? { id: editing.id } : {}), model_id: values.model_id === '__any__' ? null : values.model_id, provider_id: values.provider_id === '__any__' ? null : values.provider_id })} />
 }
 
 function PricesPanel() {
