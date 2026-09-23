@@ -248,6 +248,7 @@ function HealthPill({ health, kind = 'channel' }: { health?: HealthRow; kind?: '
 function CredentialsPanel() {
   const { t } = useTranslation()
   const credentialType = useCredentialTypeLabel()
+  const [oauthOpen, setOauthOpen] = useState(false)
   const { options, query } = useChannelOptions()
   // A picker fed by a failed lookup offers an empty choice that reads as a real
   // one, so the field carries the failure and its retry instead.
@@ -255,8 +256,10 @@ function CredentialsPanel() {
   const retryOptions = () => void query.refetch()
   return (
     <>
-      <OAuthCredentialPanel options={options} optionsError={optionsError} retryOptions={retryOptions} />
-      <ResourcePage resource="credentials" title={t('credentials')} description={t('credentialsDescription')} empty={t('credentialEmpty')} selectable="credentials" createLabel={t('addCredential')} notice={<HealthNotice kind="credential" />} columns={[{ key: 'provider_name', label: t('channel') }, { key: 'suffix', label: t('suffix'), mono: true }, { key: 'credential_type', label: t('credentialType'), render: (value) => credentialType(value) }, { key: 'state', label: t('credentialState'), render: (value) => <Badge variant="light" color={value === 'unrecoverable' ? 'red' : 'green'}>{t(value === 'unrecoverable' ? 'credentialUnrecoverable' : 'credentialReady')}</Badge> }, { key: 'priority', label: t('priority') }, { key: 'health', label: t('credentialHealth'), render: (_value, row) => <HealthCell kind="credential" id={String(row.id)} /> }, { key: 'enabled', label: t('status'), render: (value) => <EnabledPill enabled={value} /> }]} rowActions={(row) => row.state === 'unrecoverable' ? <CredentialRecoveryAction row={row} /> : null} fields={[{ key: 'provider_id', label: t('channel'), kind: 'select', required: true, options, error: optionsError, onRetry: retryOptions }, { key: 'credential_type', label: t('credentialType'), defaultValue: 'api_key', required: true }, { key: 'secret', label: t('secret'), kind: 'secret', hint: t('secretUpdateHint'), omitWhenBlank: true }, { key: 'priority', label: t('priority'), kind: 'number', defaultValue: 100 }, { key: 'enabled', label: t('status'), kind: 'checkbox' }, { key: 'settings', label: t('advancedSettings'), kind: 'json', defaultValue: { version: 1 } }]} />
+      <ResourcePage resource="credentials" title={t('credentials')} description={t('credentialsDescription')} empty={t('credentialEmpty')} selectable="credentials" createLabel={t('addApiKey')} secondaryAction={<Button variant="default" onClick={() => setOauthOpen(true)}>{t('addOauth')}</Button>} notice={<HealthNotice kind="credential" />} columns={[{ key: 'provider_name', label: t('channel') }, { key: 'suffix', label: t('suffix'), mono: true }, { key: 'credential_type', label: t('credentialType'), render: (value) => credentialType(value) }, { key: 'state', label: t('credentialState'), render: (value) => <Badge variant="light" color={value === 'unrecoverable' ? 'red' : 'green'}>{t(value === 'unrecoverable' ? 'credentialUnrecoverable' : 'credentialReady')}</Badge> }, { key: 'priority', label: t('priority') }, { key: 'health', label: t('credentialHealth'), render: (_value, row) => <HealthCell kind="credential" id={String(row.id)} /> }, { key: 'enabled', label: t('status'), render: (value) => <EnabledPill enabled={value} /> }]} rowActions={(row) => row.state === 'unrecoverable' ? <CredentialRecoveryAction row={row} /> : null} normalize={(values, editing) => ({ ...values, credential_type: editing?.credential_type ?? 'api_key', ...(editing ? { id: editing.id } : {}) })} fields={[{ key: 'provider_id', label: t('channel'), kind: 'select', required: true, options, error: optionsError, onRetry: retryOptions }, { key: 'secret', label: t('secret'), kind: 'secret', hint: t('secretUpdateHint'), omitWhenBlank: true }, { key: 'priority', label: t('priority'), kind: 'number', defaultValue: 100 }, { key: 'enabled', label: t('status'), kind: 'checkbox' }, { key: 'settings', label: t('advancedSettings'), kind: 'json', defaultValue: { version: 1 } }]} />
+      <Modal opened={oauthOpen} onClose={() => setOauthOpen(false)} title={t('providerOauth')} size="lg" closeOnClickOutside={false} closeButtonProps={{ 'aria-label': t('close') }}>
+        {oauthOpen && <OAuthCredentialPanel options={options} optionsError={optionsError} retryOptions={retryOptions} onComplete={() => setOauthOpen(false)} />}
+      </Modal>
       <BulkToggle resource="credentials" />
     </>
   )
@@ -277,7 +280,7 @@ function ChannelSyncAction({ id, name }: { id: string; name: string }) {
 type OAuthStart = { state: string; authorization_url?: string; verification_uri?: string; user_code?: string; expires_in?: number; interval?: number }
 const OAUTH_FLOWS = ['codex', 'xai', 'claude_code'] as const
 
-function OAuthCredentialPanel({ options, optionsError, retryOptions }: { options: { value: string; label: string }[]; optionsError?: string; retryOptions: () => void }) {
+function OAuthCredentialPanel({ options, optionsError, retryOptions, onComplete }: { options: { value: string; label: string }[]; optionsError?: string; retryOptions: () => void; onComplete: () => void }) {
   const { t } = useTranslation()
   const { project } = useProject()
   const client = useQueryClient()
@@ -302,17 +305,14 @@ function OAuthCredentialPanel({ options, optionsError, retryOptions }: { options
       setStarted(null)
       setCode('')
       void client.invalidateQueries({ queryKey: ['resource', project.id, 'credentials'] })
+      onComplete()
     },
     onError: (error: Error) => toast.error(error.message),
   })
   const resetFlow = (value: string | null) => { setFlow((value || 'codex') as (typeof OAUTH_FLOWS)[number]); setStarted(null); setCode('') }
   return (
-    <Paper withBorder p="lg" mb="lg">
-      <Stack gap="md">
-        <Stack gap={2}>
-          <Title order={2}>{t('providerOauth')}</Title>
-          <Text size="sm" c="dimmed">{t('providerOauthHint')}</Text>
-        </Stack>
+    <Stack gap="md">
+        <Text size="sm" c="dimmed">{t('providerOauthHint')}</Text>
         {optionsError ? (
           <Alert variant="light" color="red">
             <Group justify="space-between" align="center">
@@ -341,8 +341,7 @@ function OAuthCredentialPanel({ options, optionsError, retryOptions }: { options
             </Stack>
           </Alert>
         )}
-      </Stack>
-    </Paper>
+    </Stack>
   )
 }
 

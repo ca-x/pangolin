@@ -184,7 +184,7 @@ describe('a picker whose option list failed says so', () => {
     const fetchMock = mockApi({ channelOptionsFail: true })
     renderPage()
     await userEvent.click(await screen.findByRole('tab', { name: 'Credentials' }))
-    await userEvent.click(await screen.findByRole('button', { name: 'Add credential' }))
+    await userEvent.click(await screen.findByRole('button', { name: 'Add API key' }))
 
     expect(await screen.findByText('The option list could not be loaded.')).toBeInTheDocument()
     const before = fetchMock.mock.calls.filter(([path]) => String(path).includes('limit=500')).length
@@ -196,7 +196,7 @@ describe('a picker whose option list failed says so', () => {
     mockApi()
     renderPage()
     await userEvent.click(await screen.findByRole('tab', { name: 'Credentials' }))
-    await userEvent.click(await screen.findByRole('button', { name: 'Add credential' }))
+    await userEvent.click(await screen.findByRole('button', { name: 'Add API key' }))
     expect(await screen.findByRole('combobox', { name: /Channel/ })).toBeInTheDocument()
     expect(screen.queryByText('The option list could not be loaded.')).not.toBeInTheDocument()
   })
