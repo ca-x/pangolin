@@ -51,6 +51,7 @@ describe('B40-B42 model operations', () => {
     const table = await screen.findByRole('region', { name: 'Service groups' })
     await userEvent.click(within(table).getByRole('button', { name: 'Edit' }))
     const dialog = screen.getByRole('dialog', { name: 'Edit Service groups' })
+    expect(within(dialog).getByText(/standard is the default label; it does not change routing or pricing/)).toBeInTheDocument()
     expect(within(dialog).getByRole('textbox', { name: 'Per-request cost ratio' })).toHaveValue('1.25')
     expect(within(dialog).getByRole('checkbox', { name: 'Primary' })).toBeChecked()
     fireEvent.change(within(dialog).getByRole('textbox', { name: 'Per-request cost ratio' }), { target: { value: '1.5' } })
@@ -77,12 +78,63 @@ describe('B40-B42 model operations', () => {
     // The catalog is grouped by developer with collapsed groups; searching
     // flattens it to the matching cards.
     await userEvent.type(within(dialog).getByRole('textbox', { name: 'Search' }), 'Acme')
-    await userEvent.click(within(dialog).getByRole('checkbox', { name: /Acme Chat V2/ }))
+    await userEvent.click(await within(dialog).findByRole('checkbox', { name: /Acme Chat V2/ }))
     await userEvent.click(within(dialog).getByRole('combobox', { name: 'Target channel' }))
     await userEvent.click(screen.getByRole('option', { name: 'Primary' }))
     await userEvent.click(within(dialog).getByRole('button', { name: 'Import selected (1)' }))
 
     await waitFor(() => expect(batch).toEqual({ models: [{ catalog_model_id: card.id, provider_id: channel.id, public_name: card.name, upstream_name: card.upstream_id }] }))
+  })
+
+  it('lets operators review and clear their catalog selection', async () => {
+    vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
+      const path = String(input)
+      const shared = common(path)
+      if (shared) return shared
+      return paged([])
+    }))
+    renderPage()
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Import catalog models' }))
+    const dialog = screen.getByRole('dialog', { name: 'Import catalog models' })
+    fireEvent.click(await within(dialog).findByRole('checkbox', { name: /acme/ }))
+    fireEvent.click(within(dialog).getByRole('button', { name: '1 selected' }))
+    expect(within(dialog).getByRole('region', { name: 'Selected models' })).toHaveTextContent('Acme Chat V2')
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Clear' }))
+    expect(within(dialog).getByRole('button', { name: '0 selected' })).toBeInTheDocument()
+  })
+
+  it('finds a model beyond the first catalog page and keeps earlier selections', async () => {
+    const first = { id: 'acme/first', upstream_id: 'first-upstream', name: 'First Model', developer: 'acme' }
+    const later = { id: 'late/model-1001', upstream_id: 'late-upstream', name: 'Late Model', developer: 'late' }
+    let batch: Record<string, unknown> | undefined
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input)
+      if (path.includes('/catalog/models')) return path.includes('q=late') ? paged([later]) : response({ data: [first], total: 1001 })
+      const shared = common(path)
+      if (shared) return shared
+      if (path.endsWith('/models/batch') && init?.method === 'POST') { batch = JSON.parse(String(init.body)); return response({ created_count: 2, created_ids: ['one', 'two'] }) }
+      return paged([])
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    renderPage()
+
+    await userEvent.click(await screen.findByRole('button', { name: 'Import catalog models' }))
+    const dialog = screen.getByRole('dialog', { name: 'Import catalog models' })
+    fireEvent.click(await within(dialog).findByRole('checkbox', { name: /acme/ }))
+    expect(within(dialog).getByText(/1001 models/)).toBeInTheDocument()
+    fireEvent.change(within(dialog).getByRole('textbox', { name: 'Search' }), { target: { value: 'late' } })
+    fireEvent.click(await within(dialog).findByRole('checkbox', { name: /Late Model/ }))
+    expect(within(dialog).getByRole('button', { name: '2 selected' })).toBeInTheDocument()
+    await userEvent.click(within(dialog).getByRole('combobox', { name: 'Target channel' }))
+    await userEvent.click(screen.getByRole('option', { name: 'Primary' }))
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Import selected (2)' }))
+
+    await waitFor(() => expect(batch).toEqual({ models: [
+      { catalog_model_id: first.id, provider_id: channel.id, public_name: first.name, upstream_name: first.upstream_id },
+      { catalog_model_id: later.id, provider_id: channel.id, public_name: later.name, upstream_name: later.upstream_id },
+    ] }))
+    expect(fetchMock.mock.calls.some(([path]) => String(path).includes('/catalog/models?offset=0&limit=100&q=late'))).toBe(true)
   })
 
   it('uses the safe bulk endpoint for active archive and archived delete', async () => {

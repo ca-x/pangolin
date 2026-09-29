@@ -375,6 +375,54 @@ input:not([type='checkbox']):not([type='radio']):not(.mantine-Input-input):focus
 .permission-picker { min-width: 0; margin: 0; padding: 0; border: 0; }
 .permission-picker legend { margin-bottom: 4px; padding: 0; color: var(--ink); font-size: 14px; font-weight: 500; }
 .permission-options { min-width: 0; margin-top: 8px; }
+
+/* The catalog can contain hundreds of models. Keep selection and commit controls
+   outside its scroll region, and give every collapsed developer row its full height. */
+.pm-import-modal { display: flex; flex-direction: column; height: min(760px, calc(100dvh - 32px)); max-height: calc(100dvh - 32px); overflow: hidden; }
+.pm-import-modal .mantine-Modal-header { flex: none; }
+.pm-import-modal .mantine-Modal-close { min-width: 40px; min-height: 40px; }
+.pm-import-modal-body { display: flex; flex: 1; min-height: 0; overflow: hidden; }
+.pm-import-form { display: flex; flex: 1; flex-direction: column; gap: 12px; min-width: 0; min-height: 0; }
+.pm-import-intro, .pm-import-target { flex: none; }
+.pm-import-panes { display: grid; grid-template-columns: minmax(0, 1fr) minmax(240px, 280px); flex: 1; gap: 16px; min-height: 0; }
+.pm-import-browser, .pm-import-selection { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+.pm-import-selection { padding: 14px; border: 1px solid var(--border); border-radius: var(--radius-panel); background: var(--surface-muted); }
+.pm-import-results, .pm-import-selected-list { flex: 1; min-height: 0; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; }
+.pm-import-results { padding-right: 4px; }
+.pm-import-pagination { flex: none; margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--border-subtle); }
+.pm-import-results > .mantine-Stack-root { min-width: 0; }
+.pm-import-group { flex: none; overflow: hidden; }
+.pm-import-group-header { min-height: 46px; }
+.pm-import-group-check { position: relative; flex: none; width: 44px; height: 44px; }
+.pm-import-group-check .mantine-Checkbox-body { width: 44px; height: 44px; }
+.pm-import-group-check .mantine-Checkbox-inner { position: absolute; top: 12px; left: 12px; }
+.pm-import-group-check .mantine-Checkbox-labelWrapper { position: absolute; inset: 0; }
+.pm-import-group-check .mantine-Checkbox-label { display: block; width: 100%; height: 100%; padding: 0; font-size: 0; cursor: pointer; }
+.pm-import-group-toggle { flex: 1; min-width: 0; text-align: left; }
+.pm-import-model-option { min-height: 44px; }
+.pm-import-model-option .mantine-Checkbox-labelWrapper, .pm-import-model-option .mantine-Checkbox-label { min-width: 0; width: 100%; }
+.pm-import-selected-item { min-height: 54px; padding: 8px 0; border-bottom: 1px solid var(--border-subtle); }
+.pm-import-selected-item:last-child { border-bottom: 0; }
+.pm-import-view-switch { display: none; }
+.pm-import-footer { flex: none; padding-top: 12px; border-top: 1px solid var(--border); }
+.pm-key-type-guide { font-size: 14px; }
+.pm-key-type-guide summary { width: max-content; max-width: 100%; padding: 7px 0; color: var(--accent-strong); cursor: pointer; }
+.pm-key-type-guide summary:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; border-radius: 4px; }
+.pm-key-type-guide[open] { padding-bottom: 8px; }
+
+@media (max-width: 900px) {
+  .pm-import-panes { display: flex; flex-direction: column; }
+  .pm-import-view-switch { display: flex; flex: none; }
+  .pm-import-view-switch .mantine-Button-root { flex: 1; }
+  .pm-import-browser[data-active='false'], .pm-import-selection[data-active='false'] { display: none; }
+}
+
+@media (max-width: 767px) {
+  .pm-import-modal { height: 100dvh; max-height: 100dvh; border-radius: 0; }
+  .pm-import-modal .mantine-Modal-close { min-width: 44px; min-height: 44px; }
+  .pm-import-modal-body { padding-bottom: max(16px, env(safe-area-inset-bottom)); }
+  .pm-import-footer .mantine-Button-root { flex: 1; min-height: 44px; }
+}
 .permission-option { min-width: 0; padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--radius-control); background: var(--surface-muted); }
 .permission-option .mantine-Checkbox-body, .permission-option .mantine-Checkbox-labelWrapper { min-width: 0; width: 100%; }
 .permission-copy { display: grid; min-width: 0; gap: 2px; font-size: 14px; line-height: 1.45; }

@@ -20,7 +20,8 @@ const ACCESS_TAB_VALUES = ACCESS_TABS.map(([value]) => value)
  * this build does not know is shown verbatim: it is data, not copy.
  */
 const KEY_TYPE_KEYS: Record<string, string> = { service: 'keyTypeService', user: 'keyTypeUser', personal: 'keyTypePersonal', no_auth: 'keyTypeNoAuth' }
-const KEY_TYPES = ['user', 'service', 'personal', 'no_auth'] as const
+const KEY_TYPE_HINT_KEYS: Record<string, string> = { service: 'keyTypeServiceHint', user: 'keyTypeUserHint', personal: 'keyTypePersonalHint', no_auth: 'keyTypeNoAuthHint' }
+const KEY_TYPES = ['service', 'user', 'personal', 'no_auth'] as const
 // The complete `level='project'` seed set used by the API-key form. Role editing
 // uses the actor-filtered server catalog below; key writes still enforce this
 // independently on the server.
@@ -634,7 +635,14 @@ function KeysPanel() {
             <SelectField label={t('tokenMode')} value={mode} onValueChange={setMode} options={[{ value: 'generated', label: t('generateToken') }, { value: 'import_existing', label: t('importExisting') }]} />
             {mode === 'import_existing' && <SecretInput name="token" label={t('existingToken')} description={t('importTokenHint')} minLength={32} maxLength={1024} autoComplete="off" required />}
             <TextInput name="name" label={t('keyName')} required autoFocus />
-            <SelectField label={t('keyType')} value={keyType} onValueChange={(value) => { setKeyType(value); setOwner(''); setOwnerError(null); setCreateError(null) }} options={KEY_TYPES.map((value) => ({ value, label: keyTypeLabel(value) }))} />
+            <Stack gap={6}>
+              <SelectField label={t('keyType')} value={keyType} onValueChange={(value) => { setKeyType(value); setOwner(''); setOwnerError(null); setCreateError(null) }} options={KEY_TYPES.map((value) => ({ value, label: keyTypeLabel(value) }))} />
+              <Text size="sm" c="dimmed" role="status">{t(KEY_TYPE_HINT_KEYS[keyType])}</Text>
+              <details className="pm-key-type-guide">
+                <summary>{t('keyTypeCompare')}</summary>
+                <Stack gap="sm" mt="xs">{KEY_TYPES.map((value) => <div key={value}><Text size="sm" fw={600}>{keyTypeLabel(value)}</Text><Text size="sm" c="dimmed">{t(KEY_TYPE_HINT_KEYS[value])}</Text></div>)}</Stack>
+              </details>
+            </Stack>
             {ownerRequired && (owners.isLoading
               ? <Stack gap={4}><Text size="sm" fw={500}>{t('keyOwner')}</Text><SkeletonRows count={1} /></Stack>
               : owners.isError

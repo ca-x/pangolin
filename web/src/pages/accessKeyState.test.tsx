@@ -115,18 +115,29 @@ describe('the key table reports the state admission enforces', () => {
 
     await userEvent.click(within(dialog).getByRole('combobox', { name: 'Key type' }))
     expect((await screen.findAllByRole('option')).map((option) => option.textContent)).toEqual([
-      'User key',
       'Service key',
+      'User key',
       'Personal key',
-      'No-auth key',
+      'Compatibility key (token required)',
     ])
+  })
+
+  it('explains ownership and makes the compatibility type token requirement explicit', async () => {
+    renderPage()
+    const dialog = await openCreate()
+    expect(within(dialog).getByRole('status')).toHaveTextContent('No member owner; scopes, budget, and network policy still apply.')
+    await choose(dialog, 'Key type', 'Compatibility key (token required)')
+    expect(within(dialog).getByRole('status')).toHaveTextContent('Requests still need the token')
+    await userEvent.click(within(dialog).getByText('Compare all four types'))
+    expect(within(dialog).getByText(/It stops working when that member is disabled or removed/)).toBeInTheDocument()
+    expect(within(dialog).getByText(/same revocation rules as a user key/)).toBeInTheDocument()
   })
 
   it.each([
     ['User key', 'user', true],
     ['Service key', 'service', false],
     ['Personal key', 'personal', true],
-    ['No-auth key', 'no_auth', false],
+    ['Compatibility key (token required)', 'no_auth', false],
   ])('submits the %s type and its applicable owner', async (label, keyType, needsOwner) => {
     const { fetchMock } = renderPage()
     const dialog = await openCreate()

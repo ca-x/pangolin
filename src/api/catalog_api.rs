@@ -116,6 +116,17 @@ fn page(values: Vec<Value>, filter: &Filter, version: &str) -> Json<Value> {
     Json(json!({"schema_version":1,"version":version,"total":total,"data":data}))
 }
 
+fn model_matches_query(model: &catalog::Model, query: &str) -> bool {
+    model.id.to_lowercase().contains(query)
+        || model.upstream_id.to_lowercase().contains(query)
+        || model.name.to_lowercase().contains(query)
+        || model.developer.to_lowercase().contains(query)
+        || model
+            .aliases
+            .iter()
+            .any(|alias| alias.to_lowercase().contains(query))
+}
+
 async fn providers(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -180,9 +191,7 @@ async fn models(
                     serde_json::to_value(&model.capabilities)
                         .is_ok_and(|value| value.get(v).and_then(Value::as_bool) == Some(true))
                 })
-                && (model.id.to_lowercase().contains(&q)
-                    || model.name.to_lowercase().contains(&q)
-                    || model.aliases.iter().any(|a| a.to_lowercase().contains(&q)))
+                && model_matches_query(model, &q)
         })
         .map(serde_json::to_value)
         .collect::<Result<Vec<_>, _>>()
@@ -414,4 +423,23 @@ async fn rollback(
     )
     .await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod search_tests {
+    use super::*;
+
+    #[test]
+    fn model_search_includes_upstream_id_and_developer() {
+        let mut model = catalog::builtin().models[0].clone();
+        model.id = "opaque/card".into();
+        model.name = "Friendly name".into();
+        model.aliases.clear();
+        model.upstream_id = "upstream-only".into();
+        model.developer = "developer-only".into();
+
+        assert!(model_matches_query(&model, "upstream-only"));
+        assert!(model_matches_query(&model, "developer-only"));
+        assert!(!model_matches_query(&model, "unrelated"));
+    }
 }
