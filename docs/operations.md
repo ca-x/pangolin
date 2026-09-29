@@ -89,6 +89,8 @@ Interactive requests use the existing session cookie. Mutations also require `X-
 | `webhook-echo` | Emits a `test` event to subscribers |
 | `retention` | `resource_type` (`requests`, `payloads`, `probes`, `quota`), `retention_days` |
 
+For service groups, `tier` is an operator label only (`standard` is the default label). It does not select a built-in plan or change routing or pricing by itself. The enabled state, assigned channels and cost ratio determine the enforced behavior. API-key `no_auth` is likewise a compatibility type label: the gateway still requires the token and applies its scopes, budget, expiry and IP policy.
+
 Storage, schedules, webhooks, retention policies and groups support DELETE. Price versions and accounting facts are immutable through these APIs. Referenced historical prices also prevent destructive model/channel deletion; disable the resource instead.
 
 Price schedule rules have `priority`, IANA `timezone`, `start_minute`, `end_minute`, optional ISO weekday numbers (Monday=1), epoch `from`/`until`, and a `prices` map keyed by component kind. Lower priority wins; midnight-crossing windows belong to their starting weekday. Components have `kind`, `unit_size`, `unit_price_micros`, optional marginal `tiers` and cache-write `cache_ttl`.
