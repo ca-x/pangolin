@@ -180,7 +180,10 @@ export function ResourcePage({ resource, title, description, empty, columns, fie
   const queryPath = `${path}${path.includes('?') ? '&' : '?'}${queryParams}`
   const query = useQuery({ queryKey: ['resource', project.id, resource, path, offset, limit, filter, facets], queryFn: () => api<Paged<Document> | Document[]>(queryPath) })
   const allRows = useMemo(() => Array.isArray(query.data) ? query.data.filter((row) => !filter.trim() || JSON.stringify(row).toLowerCase().includes(filter.trim().toLowerCase())) : query.data?.data || [], [filter, query.data])
-  const rows = Array.isArray(query.data) ? allRows.slice(offset, offset + limit) : allRows
+  // Global resources return a bare array. Keep the paged slice stable across
+  // local dialog state changes so TanStack Table does not reprocess new data on
+  // every render (which can repeatedly detach floating action refs in browsers).
+  const rows = useMemo(() => Array.isArray(query.data) ? allRows.slice(offset, offset + limit) : allRows, [allRows, limit, offset, query.data])
   const total = Array.isArray(query.data) ? allRows.length : query.data?.total ?? rows.length
   const totalPages = Math.max(1, Math.ceil(total / limit))
   const currentPage = Math.floor(offset / limit) + 1
@@ -279,9 +282,15 @@ export function ResourcePage({ resource, title, description, empty, columns, fie
       if (control === 'next') return { 'aria-label': t('next') }
       return {}
     }} /><Text size="sm" c="dimmed">{offset + 1}–{Math.min(offset + limit, total)} / {total}</Text><Select aria-label={t('pageSize')} data={['10', '25', '50']} value={String(limit)} onChange={(value) => { value && setLimit(Number(value)); setOffset(0) }} size="sm" style={{ width: 80 }} /></Group>}
-    <Modal opened={open} onClose={handleClose} title={editing ? `${t('edit')} ${title}` : createLabel || `${t('add')} ${title}`} closeButtonProps={{ 'aria-label': t('close') }}>
-      <form ref={formRef} onSubmit={submit}><Stack gap="md">{activeFields.map((field) => <ResourceField key={`${editing?.id ?? 'create'}:${field.key}`} field={field} value={fieldValue(field, editing)} editing={Boolean(editing)} onProviderChange={applyProviderDefault} onValidityChange={(valid) => setInvalidFields((current) => { const alreadyValid = !current.has(field.key); if (valid === alreadyValid) return current; const next = new Set(current); if (valid) next.delete(field.key); else next.add(field.key); return next })} />)}<Group justify="flex-end" gap="xs" pt="xs"><Button variant="default" type="button" onClick={handleClose}>{t('cancel')}</Button>{/* Required lookups fail closed. Optional provenance pickers retain their explicit manual fallback. */}<Button type="submit" loading={save.isPending} disabled={invalidFields.size > 0 || activeFields.some((field) => field.error && !field.allowManualOnError)}>{t('save')}</Button></Group></Stack></form>
-    </Modal>
+    <Modal.Root opened={open} onClose={handleClose}>
+      <Modal.Overlay />
+      <Modal.Content>
+        <Modal.Header role="presentation"><Modal.Title>{editing ? `${t('edit')} ${title}` : createLabel || `${t('add')} ${title}`}</Modal.Title><Modal.CloseButton aria-label={t('close')} /></Modal.Header>
+        <Modal.Body>
+          <form ref={formRef} onSubmit={submit}><Stack gap="md">{activeFields.map((field) => <ResourceField key={`${editing?.id ?? 'create'}:${field.key}`} field={field} value={fieldValue(field, editing)} editing={Boolean(editing)} onProviderChange={applyProviderDefault} onValidityChange={(valid) => setInvalidFields((current) => { const alreadyValid = !current.has(field.key); if (valid === alreadyValid) return current; const next = new Set(current); if (valid) next.delete(field.key); else next.add(field.key); return next })} />)}<Group justify="flex-end" gap="xs" pt="xs"><Button variant="default" type="button" onClick={handleClose}>{t('cancel')}</Button>{/* Required lookups fail closed. Optional provenance pickers retain their explicit manual fallback. */}<Button type="submit" loading={save.isPending} disabled={invalidFields.size > 0 || activeFields.some((field) => field.error && !field.allowManualOnError)}>{t('save')}</Button></Group></Stack></form>
+        </Modal.Body>
+      </Modal.Content>
+    </Modal.Root>
   </>
 }
 

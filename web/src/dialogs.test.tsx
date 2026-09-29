@@ -39,11 +39,18 @@ describe('dialogs', () => {
         .flatMap((match) => match[1].split(',').map((part) => part.trim()))
         .filter((part) => /^Modal(\s+as\s+\w+)?$/.test(part))
         .map((part) => part.split(/\s+as\s+/)[1] ?? 'Modal')
-      return aliases.flatMap((alias) =>
-        [...source.matchAll(new RegExp(`<${alias}\\b[^>]*>`, 'g'))]
+      return aliases.flatMap((alias) => {
+        // Compound Modal.Root/Header/CloseButton markup names the close button
+        // on CloseButton itself. The dot must not be mistaken for a plain Modal.
+        const plain = [...source.matchAll(new RegExp(`<${alias}(?=\\s|>)[^>]*>`, 'g'))]
           .filter((match) => !match[0].includes('closeButtonProps'))
-          .map((match) => `${path}: ${match[0].slice(0, 80)}`),
-      )
+          .map((match) => `${path}: ${match[0].slice(0, 80)}`)
+        const compound = source.includes(`<${alias}.Root`)
+          && !new RegExp(`<${alias}\\.CloseButton\\b[^>]*aria-label`).test(source)
+          ? [`${path}: <${alias}.CloseButton> needs an accessible name`]
+          : []
+        return [...plain, ...compound]
+      })
     })
     expect(offenders).toEqual([])
   })
