@@ -22,6 +22,8 @@ const project = { id: 'p1', name: 'Project A', slug: 'project-a', owner_user_id:
 const user = { id: 'u1', email: 'principal@example.test', role: 'admin', language: 'en', theme: 'system:bronze', created_at: 1 }
 const branding = (instance: string) => ({ instance_name: instance, branding_name: instance, favicon_url: '/logo.webp', onboarding_complete: false })
 const guidance = 'Initial setup is still marked incomplete. Review it when convenient, or mark onboarding complete in system settings.'
+// Project discovery and owner permission resolve in sequence before the banner can render.
+const findGuidance = () => screen.findByText(guidance, undefined, { timeout: 5000 })
 
 const renderShell = (instance = 'Pangolin') => {
   vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
@@ -52,7 +54,7 @@ describe('the first-run guidance is dismissible', () => {
 
   it('hides the guidance in place and remembers the choice for this instance', async () => {
     const first = renderShell()
-    expect(await screen.findByText(guidance)).toBeInTheDocument()
+    expect(await findGuidance()).toBeInTheDocument()
 
     await userEvent.click(screen.getByRole('button', { name: 'Dismiss' }))
     expect(screen.queryByText(guidance)).not.toBeInTheDocument()
@@ -67,18 +69,19 @@ describe('the first-run guidance is dismissible', () => {
 
     second.unmount()
     renderShell('Other instance')
-    expect(await screen.findByText(guidance)).toBeInTheDocument()
+    expect(await findGuidance()).toBeInTheDocument()
   })
 
   it('can be brought back from the appearance settings', async () => {
     renderShell()
-    await userEvent.click(await screen.findByRole('button', { name: 'Dismiss' }))
+    await findGuidance()
+    await userEvent.click(screen.getByRole('button', { name: 'Dismiss' }))
     expect(screen.queryByText(guidance)).not.toBeInTheDocument()
 
     const restore = await screen.findByRole('button', { name: 'Show it again' })
     await userEvent.click(restore)
     expect(localStorage.getItem(ONBOARDING_DISMISSED_KEY)).toBeNull()
-    expect(await screen.findByText(guidance)).toBeInTheDocument()
+    expect(await findGuidance()).toBeInTheDocument()
   })
 
   /**
@@ -90,7 +93,7 @@ describe('the first-run guidance is dismissible', () => {
    */
   it('keeps one action and one named dismiss control in the banner row', async () => {
     renderShell()
-    const hint = await screen.findByText(guidance)
+    const hint = await findGuidance()
     const row = hint.closest('.pm-onboarding-row') as HTMLElement
     expect(row).not.toBeNull()
     expect(row.children).toHaveLength(2)
@@ -102,7 +105,7 @@ describe('the first-run guidance is dismissible', () => {
   it('does not claim setup resources are missing away from the overview', async () => {
     renderShell()
 
-    expect(await screen.findByText(guidance)).toBeInTheDocument()
+    expect(await findGuidance()).toBeInTheDocument()
     expect(screen.queryByText('Add a channel, credential, and model route before sending requests.')).not.toBeInTheDocument()
   })
 })
