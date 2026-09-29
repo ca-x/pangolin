@@ -142,12 +142,13 @@ Protocol and provider adaptation runs through one orchestrator, and fields a cro
 
 These open source projects were studied deliberately during design and implementation:
 
-- [looplj/axonhub](https://github.com/looplj/axonhub) (Apache-2.0 as scoped by its LICENSE; evaluated at commit `cb29b65d9adfb06f89bb1b467418e0816988f36c`): reference for enterprise access control, channel/model routing, observability, cost and backup product behaviour and test invariants.
+- [looplj/axonhub](https://github.com/looplj/axonhub) (Apache/LGPL as scoped by its LICENSE; evaluated at commit `276ee9fcc84f8d519e3ef5c2b31f5c5451efeaf4`): reference for enterprise access control, channel/model routing, observability, cost and backup product behaviour and test invariants.
 - [BerriAI/litellm's litellm-rust](https://github.com/BerriAI/litellm/tree/main/litellm-rust) (MIT; evaluated at commit `8c4c394ecc82c4d6acb5eb371d8781e487894a17`): compatible types, core, llms, framing, auth, HTTP, token counter and cache crates are reused directly, with Pangolin adapter boundaries covering orchestration and the missing protocols.
 - [traceloop/hub](https://github.com/traceloop/hub) (Apache-2.0; evaluated at commit `e1be468f87de077ce066fbdebc858e913dc889a1`): reference for Rust gateway provider registry, pipeline, Prometheus and OpenTelemetry organisation.
 - [ca-x/raindrop](https://github.com/ca-x/raindrop) (MIT; evaluated at commit `73948bd650d2aa6b117b4ad63af6aff8b24e2938`): reference for embedded React, native multi-platform binaries, immutable backup target snapshots, fencing, retention policies and the GitHub Actions release chain.
 - [QuantumNous/new-api](https://github.com/QuantumNous/new-api) (AGPL-3.0; evaluated at commit `972aed1972820389ea0b603ca58f03f846fbf790`): studied channel/model presets, group multipliers, token management, affinity rules and operational interactions only; no AGPL source code or assets were copied.
 - [farion1231/cc-switch](https://github.com/farion1231/cc-switch/tree/main/src-tauri/src/proxy) (MIT; evaluated at commit `06082e189d65e6d6dbadc35dacdac1ce6c79d89a`): reference for Rust proxy pipeline, failover, usage, media and session handling design.
+- [yetone/magpie](https://github.com/yetone/magpie) (MIT; evaluated at commit `ea20c2db594187540b11c3a4c1821eab8dd571f2`): reference for explaining model routing and conversion as a visible path, and for brief, purposeful route feedback. Pangolin's implementation uses its own components and motion rules.
 
 Pangolin is an independent implementation and is not affiliated with, or endorsed by, any of these projects or their maintainers. Third-party trademarks, copyrights and licences remain with their respective owners.
 

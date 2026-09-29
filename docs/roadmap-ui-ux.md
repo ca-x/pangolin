@@ -6,7 +6,9 @@
 > [new-api](https://github.com/QuantumNous/new-api)（AGPL，仅研究产品行为，不抄代码）
 > 的前端清单审计，以及 `docs/refactoring-ui-audit.md` 的既有结论。
 > v0.5.0 已交付：九个结构化文档编辑器、目录导入分组重构、多渠道原子建模型、
-> 渠道权重、按压反馈/语义色/按路由标题。本文件只列**未做**的部分。
+> 渠道权重、按压反馈/语义色/按路由标题。
+> v0.6.0 本轮交付：六个管理页的 URL 标签、渐进式导航、渠道行选择与服务端筛选、
+> 探测历史、移动端资源卡片、模型转换路径和路由预览反馈。余下条目仍按优先级列出。
 
 条目按优先级分组；每条含现状、目标、实现要点与验收标准。参照文件路径为
 外部仓库的相对路径，仅作行为参照。
@@ -27,7 +29,8 @@
 
 ### 2. 渠道健康火花条
 
-- **现状**：渠道表有健康徽标（`HealthCell`），无历史。
+- **现状**：v0.6.0 已显示渠道健康徽标与按渠道精确读取的最近 12 次探测结果；
+  15 根柱状微图及详细 tooltip 仍待完成。
 - **目标**：axonhub 的 15 根探测火花条（`frontend/src/features/channels/components/channel-health-cell.tsx`）：
   按成功率着色的柱状微图 + tooltip（探测时间/成功率/平均 TTFT/tok·s⁻¹）。
 - **要点**：数据源是已有的 `channel_probes`（`operations_api` 已有投影）；
@@ -45,9 +48,9 @@
 
 ### 4. URL 可寻址的 Tabs（深链）
 
-- **现状**：v0.5.0 已做按路由的浏览器标题；但 6 个页面的 tab 仍是组件内 state
-  （`ChannelsPage`/`ModelsPage`/`SystemPage`/`AccessPage`/`PromptsPage`/`OperationsPage`），
-  刷新即丢。
+- **状态**：v0.6.0 已完成。`ChannelsPage`、`ModelsPage`、`SystemPage`、`AccessPage`、
+  `PromptsPage` 和 `OperationsPage` 的 tab 已绑定 `?tab=`；浏览器标题跟随 tab 与语言变化，
+  无权限的深链会改写为实际可见的标签。
 - **目标**：tab 绑定 `?tab=`，仓库内已有模式（`OperationsPage` 的筛选、`AnalyticsPage`）。
 - **验收**：刷新/分享链接回到同一 tab；浏览器后退跨 tab 可用。
 
