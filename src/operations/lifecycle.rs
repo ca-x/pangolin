@@ -221,9 +221,10 @@ impl Request {
                 .unwrap_or(0)
         };
         let execution = id();
+        let started_at = db::now();
         let transaction = ctx.state.db.begin().await?;
         // This first write acquires SQLite's writer lock before reading shared budgets.
-        transaction.execute(sql("INSERT INTO execution_facts(id,request_id,provider_id,model_id,credential_id,attempt,price_json,reserved_micros,started_at) VALUES(?,?,?,?,?,?,?,?,?)",vec![execution.clone().into(),ctx.id.clone().into(),candidate.provider_id.clone().into(),candidate.model_id.clone().into(),candidate.credential_id.clone().into(),(number as i64).into(),serde_json::to_string(&price).map_err(|e|ApiError::Internal(e.into()))?.into(),bound.into(),db::now().into()])).await?;
+        transaction.execute(sql("INSERT INTO execution_facts(id,request_id,provider_id,model_id,credential_id,attempt,price_json,reserved_micros,started_at) VALUES(?,?,?,?,?,?,?,?,?)",vec![execution.clone().into(),ctx.id.clone().into(),candidate.provider_id.clone().into(),candidate.model_id.clone().into(),candidate.credential_id.clone().into(),(number as i64).into(),serde_json::to_string(&price).map_err(|e|ApiError::Internal(e.into()))?.into(),bound.into(),started_at.into()])).await?;
         let allowed=transaction.query_one(sql("SELECT k.id FROM api_keys k WHERE k.id=? AND k.enabled=1 AND (k.budget_micros IS NULL OR k.spent_micros+(SELECT COALESCE(SUM(e.reserved_micros),0) FROM execution_facts e JOIN request_facts r ON r.id=e.request_id WHERE r.api_key_id=k.id AND e.status='running')<=k.budget_micros) AND (k.profile_id IS NULL OR NOT EXISTS(SELECT 1 FROM api_key_profiles p WHERE p.id=k.profile_id AND p.budget_micros IS NOT NULL AND (SELECT COALESCE(SUM(spent_micros),0) FROM api_keys WHERE profile_id=p.id)+(SELECT COALESCE(SUM(e.reserved_micros),0) FROM execution_facts e JOIN request_facts r ON r.id=e.request_id WHERE r.profile_id=p.id AND e.status='running')>p.budget_micros))",vec![ctx.key.id.clone().into()])).await?;
         if allowed.is_none() {
             return Err(ApiError::RateLimited(
@@ -252,7 +253,7 @@ impl Request {
                 .await?;
         }
         if ctx.level != Level::Off {
-            transaction.execute(sql("INSERT INTO request_executions(id,request_id,provider_id,provider_name,credential_id,attempt,model,status,credential_suffix,started_at) SELECT ?,?,?,?,?,?,?,'running',suffix,? FROM channel_credentials WHERE id=?",vec![execution.clone().into(),ctx.id.clone().into(),candidate.provider_id.clone().into(),candidate.target.provider_name.clone().into(),candidate.credential_id.clone().into(),(number as i64).into(),candidate.target.upstream_name.clone().into(),db::now().into(),candidate.credential_id.clone().into()])).await?;
+            transaction.execute(sql("INSERT INTO request_executions(id,request_id,provider_id,provider_name,credential_id,attempt,model,status,credential_suffix,started_at) SELECT ?,?,?,?,?,?,?,'running',suffix,? FROM channel_credentials WHERE id=?",vec![execution.clone().into(),ctx.id.clone().into(),candidate.provider_id.clone().into(),candidate.target.provider_name.clone().into(),candidate.credential_id.clone().into(),(number as i64).into(),candidate.target.upstream_name.clone().into(),started_at.into(),candidate.credential_id.clone().into()])).await?;
         }
         transaction.commit().await?;
         Ok(Attempt {
@@ -268,6 +269,7 @@ impl Request {
             candidate_id: candidate.id(),
             model: candidate.target.upstream_name.clone(),
             started: Instant::now(),
+            started_at,
             ttft: None,
             body: None,
             settled: false,
@@ -298,6 +300,7 @@ pub struct Attempt {
     candidate_id: String,
     model: String,
     started: Instant,
+    started_at: i64,
     ttft: Option<i64>,
     body: Option<String>,
     settled: bool,
@@ -307,6 +310,11 @@ pub struct Attempt {
     http_status: Option<u16>,
     response_id: Option<String>,
 }
+
+fn first_token_at_ms(attempt_started_at: i64, ttft_ms: Option<i64>) -> Option<i64> {
+    ttft_ms.map(|duration| attempt_started_at * 1000 + duration)
+}
+
 impl Attempt {
     /// Records the upstream status this attempt actually saw. A rejection also
     /// releases the reservation; an accepted response does not, so a `2xx` that is
@@ -706,7 +714,7 @@ impl Attempt {
         .await?;
         let latency = self.started.elapsed().as_millis() as i64;
         if ctx.level != Level::Off {
-            txn.execute(sql("UPDATE request_executions SET status=?,finished_at=?,latency_ms=?,first_token_at=?,retry_reason=?,http_status=?,error_kind=? WHERE id=?",vec![status.into(),db::now().into(),latency.into(),self.ttft.map(|ms|ctx.started_at*1000+ms).into(),(status!="succeeded").then_some(status.to_owned()).into(),http_status.into(),error_kind.clone().into(),self.id.clone().into()])).await?;
+            txn.execute(sql("UPDATE request_executions SET status=?,finished_at=?,latency_ms=?,first_token_at=?,retry_reason=?,http_status=?,error_kind=? WHERE id=?",vec![status.into(),db::now().into(),latency.into(),first_token_at_ms(self.started_at,self.ttft).into(),(status!="succeeded").then_some(status.to_owned()).into(),http_status.into(),error_kind.clone().into(),self.id.clone().into()])).await?;
             txn.execute(sql(
                 "UPDATE requests SET status=?,finished_at=? WHERE id=?",
                 vec![status.into(), db::now().into(), ctx.id.clone().into()],
@@ -782,6 +790,7 @@ impl Drop for Attempt {
             candidate_id: self.candidate_id.clone(),
             model: self.model.clone(),
             started: self.started,
+            started_at: self.started_at,
             ttft: self.ttft,
             body: self.body.take(),
             settled: false,
@@ -803,5 +812,21 @@ impl Drop for Attempt {
         } else {
             cancelled.settled = true;
         }
+    }
+}
+
+#[cfg(test)]
+mod timestamp_tests {
+    use super::first_token_at_ms;
+
+    #[test]
+    fn first_token_timestamp_uses_attempt_start_across_request_second_boundary() {
+        let request_started_at = 1_000;
+        let attempt_started_at = request_started_at + 1;
+        let first_token_at = first_token_at_ms(attempt_started_at, Some(2));
+
+        assert_eq!(first_token_at, Some(1_001_002));
+        assert_eq!(first_token_at.unwrap() - attempt_started_at * 1000, 2);
+        assert_eq!(first_token_at_ms(attempt_started_at, None), None);
     }
 }
