@@ -568,7 +568,7 @@ export default function PlaygroundPage() {
                     the record's identity, which is the only unambiguous one. The id is
                     bounded — a client may send up to 128 characters — so it truncates
                     instead of pushing the panel wide at 375px. */}
-                {requestId && <Text size="xs" c="dimmed" className="mono-cell" aria-label={t('requestExternalId')} truncate>{requestId}</Text>}
+                {requestId && <Text size="xs" c="dimmed" className="mono-cell" truncate><span className="sr-only">{t('requestExternalId')}: </span>{requestId}</Text>}
                 {internalRequestId && <Anchor component={Link} to={`/operations/requests/${internalRequestId}`} size="sm">{t('viewRequest')}</Anchor>}
               </Group>
             </Group>

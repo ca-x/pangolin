@@ -309,7 +309,7 @@ function Breakdowns({ projectId, bounds, windowLabel }: { projectId: string; bou
           failed lookup degrades to the ids and offers the retry instead of
           hiding rows the operator asked for. */}
       {names.query.isError && <Stack mb="sm"><QueryError retry={() => void names.query.refetch()} /></Stack>}
-      <TableScrollContainer minWidth={860} role="region" aria-label={t('breakdowns')} tabIndex={0} style={{ maxHeight: 'min(60vh, 720px)' }}>
+      <TableScrollContainer minWidth={860} scrollAreaProps={{ viewportProps: { role: 'region', 'aria-label': t('breakdowns'), tabIndex: 0 } }} style={{ maxHeight: 'min(60vh, 720px)' }}>
         <Table stickyHeader highlightOnHover>
           <Table.Thead><Table.Tr><Table.Th>{t('dimension')}</Table.Th><Table.Th>{t('requests')}</Table.Th><Table.Th>{t('errorsLabel')}</Table.Th><Table.Th>{t('inputTokens')}</Table.Th><Table.Th>{t('outputTokens')}</Table.Th><Table.Th>{t('cacheTokens')}</Table.Th><Table.Th>{t('cost')}</Table.Th><Table.Th>{t('latency')}</Table.Th></Table.Tr></Table.Thead>
           <Table.Tbody>{rows.map((row, index) => {

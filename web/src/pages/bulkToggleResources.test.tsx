@@ -72,7 +72,7 @@ describe('bulk enable or disable covers prompts and protection rules', () => {
     expect(JSON.parse(String(init.body))).toEqual({ resource: 'protection', ids: ['rule1'], enabled: false })
   })
 
-  it('still sends the channel resource it always did', async () => {
+  it('sends selected channel ids through the same endpoint', async () => {
     const fetchMock = vi.fn((input: RequestInfo | URL) => {
       const path = String(input)
       if (path.endsWith('/projects')) return json([project])
@@ -83,7 +83,8 @@ describe('bulk enable or disable covers prompts and protection rules', () => {
     vi.stubGlobal('fetch', fetchMock)
     renderPage(<ChannelsPage />)
 
-    await bulk('c1')
+    await userEvent.click(await screen.findByRole('checkbox', { name: 'Select openai-prod' }))
+    await userEvent.click(screen.getByRole('button', { name: 'Disable' }))
 
     await waitFor(() => expect(posts(fetchMock)).toHaveLength(1))
     const [, init] = posts(fetchMock)[0] as [string, RequestInit]

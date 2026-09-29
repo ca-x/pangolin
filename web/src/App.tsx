@@ -2,8 +2,8 @@ import { Alert, Center, Code, Stack, Title } from '@mantine/core'
 import { useQuery } from '@tanstack/react-query'
 import { lazy, Suspense, useEffect } from 'react'
 import { Navigate, Route, Routes, useLocation } from 'react-router'
+import { useTranslation } from 'react-i18next'
 import { api, type Bootstrap } from './api'
-import i18n from './i18n'
 import { InvitationAccept, Login, Setup } from './Auth'
 import Shell from './Shell'
 import { SkeletonRows } from './components'
@@ -33,8 +33,17 @@ const ROUTE_TITLES: Record<string, string> = {
   playground: 'playground',
   system: 'systemSettings',
 }
+const ROUTE_TABS: Record<string, readonly string[]> = {
+  channels: ['channels', 'credentials', 'channelPolicies', 'probes', 'quotas', 'presets'],
+  models: ['models', 'routing', 'groups', 'prices', 'catalog', 'subscriptions'],
+  access: ['keys', 'profiles', 'projects', 'users', 'members', 'roles', 'invitations', 'oidc', 'identities'],
+  operations: ['requests', 'executions', 'threads', 'traces', 'usage', 'costItems', 'audit'],
+  prompts: ['prompts', 'protection', 'overrides'],
+  system: ['appearance', 'orchestrationSettings', 'storage', 'backups', 'webhooks', 'jobs', 'retention', 'modelSettings', 'requestLogging', 'proxyPresets', 'diagnostics', 'about'],
+}
 
 export default function App() {
+  const { i18n } = useTranslation()
   const location = useLocation()
   const bootstrap = useQuery({ queryKey: ['bootstrap'], queryFn: () => api<Bootstrap>('/api/v1/bootstrap'), retry: false })
   useEffect(() => {
@@ -42,12 +51,14 @@ export default function App() {
     if (!branding) return
     // The browser tab is a navigation surface: name the screen the operator is
     // on instead of showing the instance label on every one of them.
-    const section = ROUTE_TITLES[location.pathname.split('/').filter(Boolean)[0] || '']
+    const first = location.pathname.split('/').filter(Boolean)[0] || ''
+    const requestedTab = new URLSearchParams(location.search).get('tab')
+    const section = requestedTab && ROUTE_TABS[first]?.includes(requestedTab) ? requestedTab : ROUTE_TITLES[first]
     document.title = section ? `${i18n.t(section)} · ${branding.branding_name}` : branding.branding_name
     let link = document.querySelector<HTMLLinkElement>("link[rel='icon']")
     if (!link) { link = document.createElement('link'); link.rel = 'icon'; document.head.append(link) }
     link.href = branding.favicon_url
-  }, [bootstrap.data?.branding, location.pathname])
+  }, [bootstrap.data?.branding, location.pathname, location.search, i18n.language])
 
   if (bootstrap.isLoading) return (
     <Center h="100vh">

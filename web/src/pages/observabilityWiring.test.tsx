@@ -415,6 +415,18 @@ describe('the trace list names the client trace id, its requests and the first u
     // And no body was stored, so there is no question to preview.
     expect(cells[TRACE_COLUMN.firstUserQuery]).toHaveTextContent('—')
   })
+
+  it('keeps traces with a repeated client id distinct in mobile cards', async () => {
+    vi.stubGlobal('fetch', mockApi({ traces: [
+      traceRow({ id: 'internal-trace-1', external_id: 'shared-client-id' }),
+      traceRow({ id: 'internal-trace-2', external_id: 'shared-client-id' }),
+    ] }))
+    renderPage(<OperationsPage />)
+    await openTraces()
+    const mobile = document.querySelector('.mobile-resource-list') as HTMLElement
+    expect(within(mobile).getByText('internal-trace-1')).toBeInTheDocument()
+    expect(within(mobile).getByText('internal-trace-2')).toBeInTheDocument()
+  })
 })
 
 /**

@@ -5,11 +5,12 @@ import { MemoryRouter } from 'react-router'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import App from './App'
 import i18n from './i18n'
+import { ThemeProvider } from './theme'
 
 const response = (value: unknown, status = 200) => Promise.resolve(new Response(JSON.stringify(value), { status, headers: { 'Content-Type': 'application/json' } }))
 function renderApp(path: string) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-  return render(<QueryClientProvider client={client}><MemoryRouter initialEntries={[path]}><App/></MemoryRouter></QueryClientProvider>)
+  return render(<QueryClientProvider client={client}><ThemeProvider><MemoryRouter initialEntries={[path]}><App/></MemoryRouter></ThemeProvider></QueryClientProvider>)
 }
 
 describe('application routing', () => {
@@ -63,5 +64,20 @@ describe('application routing', () => {
 
   it('applies bootstrap branding to the document and shell',async()=>{
     vi.stubGlobal('fetch',vi.fn((input:RequestInfo|URL)=>{const path=String(input);if(path.includes('bootstrap'))return response({initialized:true,authenticated:true,user:{id:'u1',email:'owner@example.test',role:'admin',language:'en',theme:'system:bronze',created_at:1},capture_payloads:false,branding:{instance_name:'Meridian',branding_name:'Meridian Gateway',favicon_url:'/brand.ico',onboarding_complete:true}});if(path.endsWith('/projects'))return response([{id:'p1',name:'Project',slug:'project',owner_user_id:'u1',is_default:true,enabled:true}]);if(path.includes('/permissions'))return response(['*']);if(path.includes('summary'))return response({requests:0,errors:0,error_rate:null,p95_latency_ms:null,input_tokens:0,output_tokens:0,cost_micros:0,series:[]});return response({data:[],total:0})}));renderApp('/');expect((await screen.findAllByText('Meridian Gateway')).length).toBeGreaterThan(0);expect(document.title).toBe('Overview · Meridian Gateway');expect(document.querySelector<HTMLLinkElement>("link[rel='icon']")?.href).toContain('/brand.ico')
+  })
+
+  it('names a directly opened management tab in the browser title', async () => {
+    vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
+      const path = String(input)
+      if (path.includes('bootstrap')) return response({ initialized: true, authenticated: true, user: { id: 'u1', email: 'owner@example.test', role: 'admin', language: 'en', theme: 'system:bronze', created_at: 1 }, branding: { instance_name: 'Pangolin', branding_name: 'Pangolin', favicon_url: '/logo.webp', onboarding_complete: true } })
+      if (path.endsWith('/projects')) return response([{ id: 'p1', name: 'Project', slug: 'project', owner_user_id: 'u1', is_default: true, enabled: true }])
+      if (path.includes('/permissions')) return response(['*'])
+      return response({ data: [], total: 0 })
+    }))
+    renderApp('/channels?tab=credentials')
+    expect(await screen.findByRole('tab', { name: 'Credentials' })).toHaveAttribute('aria-selected', 'true')
+    await waitFor(() => expect(document.title).toBe('Credentials · Pangolin'))
+    await userEvent.click(screen.getByRole('button', { name: 'Language' }))
+    await waitFor(() => expect(document.title).toBe('凭据 · Pangolin'))
   })
 })

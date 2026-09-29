@@ -11,6 +11,7 @@ import { ObservabilityNotice, UNMEASURED, formatCount, formatMicros, usageMeasur
 import { projectOperationPath, useProject } from '../project'
 import { PageHeader, QueryError, ResourcePage, displayValue, formatDate } from './shared'
 import { PayloadViewer } from './PayloadViewer'
+import { useRoutedTab } from './useRoutedTab'
 
 const TAB_VALUES = ['requests', 'executions', 'threads', 'traces', 'usage', 'costItems', 'audit'] as const
 
@@ -75,11 +76,11 @@ export default function OperationsPage() {
   const { t } = useTranslation()
   const location = useLocation()
   const observability = useObservability()
-  const [tab, setTab] = useState<string>((location.state as { tab?: string } | null)?.tab || 'requests')
-  return <><LiveRequestsPanel /><ObservabilityNotice observability={observability} onRetry={observability.refresh} />
-    <Tabs keepMounted={false} value={tab} onChange={(value) => value && setTab(value)} mb="lg">
+  const [tab, setTab] = useRoutedTab(TAB_VALUES, 'requests', (location.state as { tab?: string } | null)?.tab)
+  return <><ObservabilityNotice observability={observability} onRetry={observability.refresh} />
+    <Tabs keepMounted={false} value={tab} onChange={setTab} mb="lg">
       <Tabs.List mb="lg">{TAB_VALUES.map(value => <Tabs.Tab key={value} value={value}>{t(value)}</Tabs.Tab>)}</Tabs.List>
-      <Tabs.Panel value="requests"><RequestList observability={observability} /></Tabs.Panel>
+      <Tabs.Panel value="requests"><LiveRequestsPanel /><RequestList observability={observability} /></Tabs.Panel>
       <Tabs.Panel value="executions"><ResourcePage resource="executions" title={t('executions')} description={t('executionsDescription')} empty={t('executionEmpty')} immutable columns={[{key:'status',label:t('status')},{key:'request_id',label:t('requestId'),mono:true},{key:'provider_id',label:t('provider'),mono:true},{key:'attempt',label:t('attempt')},{key:'latency_ms',label:t('latency')},{key:'retry_reason',label:t('retryReason')}]} /></Tabs.Panel>
       <Tabs.Panel value="threads"><ResourcePage resource="threads" title={t('threads')} description={t('threadsDescription')} empty={t('threadEmpty')} immutable columns={[{key:'id',label:t('threadId'),mono:true},{key:'external_id',label:t('externalId'),mono:true},{key:'api_key_id',label:t('key'),mono:true},{key:'created_at',label:t('time'),render:formatDate}]} /></Tabs.Panel>
       <Tabs.Panel value="traces"><TraceList /></Tabs.Panel>
@@ -104,7 +105,7 @@ function LiveRequestsPanel() {
   const rows = query.data.data
   return <Card p="lg" mb="lg">
     <Stack gap={2} mb="md"><Title order={2}>{t('liveRequests')}</Title><Text size="sm" c="dimmed">{t('liveRequestsHint')}</Text></Stack>
-    {!rows.length ? <EmptyState icon={<Activity />} title={t('liveRequests')} copy={t('liveRequestsEmpty')} /> : <TableScrollContainer minWidth={680} role="region" aria-label={t('liveRequests')} tabIndex={0}>
+    {!rows.length ? <EmptyState icon={<Activity />} title={t('liveRequests')} copy={t('liveRequestsEmpty')} /> : <TableScrollContainer minWidth={680} scrollAreaProps={{ viewportProps: { role: 'region', 'aria-label': t('liveRequests'), tabIndex: 0 } }}>
       <Table highlightOnHover>
         <Table.Thead><Table.Tr><Table.Th>{t('model')}</Table.Th><Table.Th>{t('channel')}</Table.Th><Table.Th>{t('key')}</Table.Th><Table.Th>{t('startedAt')}</Table.Th></Table.Tr></Table.Thead>
         <Table.Tbody>{rows.map((row, index) => <Table.Tr key={`${row.api_key_id}-${row.started_at}-${index}`}><Table.Td>{row.model}</Table.Td><Table.Td className="mono-cell">{row.channel_id}</Table.Td><Table.Td className="mono-cell">{row.api_key_id}</Table.Td><Table.Td>{formatDate(row.started_at)}</Table.Td></Table.Tr>)}</Table.Tbody>
@@ -184,6 +185,7 @@ function TraceLifecycleActions({ row, displayed }: { row: Document; displayed: {
 function TraceList() {
   const { t } = useTranslation()
   const { project } = useProject()
+  const location = useLocation()
   const [view, setView] = useState<TraceLifecycleView>('default')
   // The project on screen, tracked above the rows: a switch replaces every row
   // component, and the mutation a row started keeps the options it was given at
@@ -206,10 +208,13 @@ function TraceList() {
     filters={<Select aria-label={t('traceLifecycle')} value={view} allowDeselect={false} onChange={(value) => value && setView(value as TraceLifecycleView)} data={TRACE_LIFECYCLE_VIEWS.map((item) => ({ value: item.value, label: t(item.label) }))} w={{ base: '100%', sm: 220 }} />}
     rowActions={(row) => <TraceLifecycleActions row={row} displayed={displayed} />}
     mobileStatus={(row) => outcome(row.status)}
+    mobilePrimary={(row) => <Stack gap={2}><span title={String(row.external_id || row.id)}>{t('trace')} {String(row.external_id || row.id).slice(0, 12)}</span><Text size="xs" c="dimmed" className="mono-cell" style={{ overflowWrap: 'anywhere' }}>{String(row.id)}</Text></Stack>}
+    mobileHiddenKeys={['status', 'external_id']}
+    mobileColumnLimit={4}
     columns={[
       { key: 'status', label: t('status'), render: outcome },
       { key: 'lifecycle', label: t('traceLifecycle'), render: (value) => <TraceLifecycleBadge lifecycle={String(value ?? 'active')} /> },
-      { key: 'detail', label: t('trace'), render: (_value, row) => <Button variant="subtle" size="compact-sm" component={Link} to={`/operations/traces/${row.id}`} state={{ from: '/operations', tab: 'traces' }}>{t('viewTrace')}</Button> },
+      { key: 'detail', label: t('trace'), render: (_value, row) => <Button variant="subtle" size="compact-sm" component={Link} to={`/operations/traces/${row.id}`} state={{ from: `/operations${location.search}` }}>{t('viewTrace')}</Button> },
       { key: 'external_id', label: t('traceExternalId'), mono: true },
       { key: 'request_count', label: t('requestCount') },
       { key: 'first_user_query', label: t('firstUserQuery'), render: (value) => <span title={typeof value === 'string' ? value : undefined}>{displayValue(value)}</span> },
@@ -311,13 +316,13 @@ function RequestList({ observability }: { observability: ReturnType<typeof useOb
     {!measured
       ? <EmptyState icon={<Activity />} title={unavailable ? t('telemetryUnavailableTitle') : t('telemetryNotRecordedTitle')} copy={unavailable ? t('telemetryUnavailableCopy') : t('telemetryNotRecordedCopy')} />
       : query.isError ? <QueryError retry={() => void query.refetch()} /> : query.isLoading ? <SkeletonRows /> : !rows.length ? <EmptyState icon={<Activity />} title={t('requests')} copy={filtered ? t('noSearchResults') : t('noRequests24h')} action={filtered ? <Button variant="default" onClick={clearFilters}>{t('clearFilters')}</Button> : undefined} /> : <>
-        <TableScrollContainer minWidth={1500} style={{ maxHeight: 'min(74vh, 900px)' }}>
+        <TableScrollContainer minWidth={1500} scrollAreaProps={{ viewportProps: { role: 'region', 'aria-label': t('requests'), tabIndex: 0 } }} style={{ maxHeight: 'min(74vh, 900px)' }}>
           <Table stickyHeader highlightOnHover>
             <Table.Thead><Table.Tr><Table.Th>{t('status')}</Table.Th><Table.Th>{t('failureReason')}</Table.Th><Table.Th>{t('requestExternalId')}</Table.Th><Table.Th>{t('model')}</Table.Th><Table.Th>{t('provider')}</Table.Th><Table.Th>{t('endpoint')}</Table.Th><Table.Th>{t('tokens')}</Table.Th><Table.Th>{t('ttft')}</Table.Th><Table.Th>{t('stream')}</Table.Th><Table.Th>{t('latency')}</Table.Th><Table.Th>{t('cost')}</Table.Th><Table.Th>{t('startedAt')}</Table.Th></Table.Tr></Table.Thead>
             {/* The row is keyed and linked by Pangolin's own UUID: the external id is
                 chosen by the caller, so two rows can share one and only one of them
                 would ever be openable. The external id stays visible for correlation. */}
-            <Table.Tbody>{rows.map((row, index) => <Table.Tr key={row.internal_id}><Table.Td><Link to={`/operations/requests/${row.internal_id}`} state={{ from: '/operations', tab: 'requests', ids: rows.map(item => item.internal_id), index }}><Status code={row.status_code} /></Link></Table.Td><Table.Td>{row.error_kind ? kindLabel(row.error_kind) : UNMEASURED}</Table.Td><Table.Td className="mono-cell">{displayValue(row.request_id)}</Table.Td><Table.Td><ModelPair row={row} /></Table.Td><Table.Td>{displayValue(row.provider)}</Table.Td><Table.Td><Code>{row.endpoint}</Code></Table.Td><Table.Td><TokenFacts row={row} /></Table.Td><Table.Td className="mono-cell">{row.ttft_ms == null ? UNMEASURED : `${row.ttft_ms} ms`}</Table.Td><Table.Td>{row.stream == null ? UNMEASURED : t(row.stream ? 'yes' : 'no')}</Table.Td><Table.Td className="mono-cell">{row.latency_ms >= 0 ? `${row.latency_ms} ms` : UNMEASURED}</Table.Td><Table.Td className="mono-cell">{usageMeasured(row) ? formatMicros(row.cost_micros) : UNMEASURED}</Table.Td><Table.Td>{formatDate(row.started_at)}</Table.Td></Table.Tr>)}</Table.Tbody>
+            <Table.Tbody>{rows.map((row, index) => <Table.Tr key={row.internal_id}><Table.Td><Link to={`/operations/requests/${row.internal_id}`} state={{ from: '/operations' + (searchParams.size ? '?' + searchParams.toString() : ''), ids: rows.map(item => item.internal_id), index }}><Status code={row.status_code} /></Link></Table.Td><Table.Td>{row.error_kind ? kindLabel(row.error_kind) : UNMEASURED}</Table.Td><Table.Td className="mono-cell">{displayValue(row.request_id)}</Table.Td><Table.Td><ModelPair row={row} /></Table.Td><Table.Td>{displayValue(row.provider)}</Table.Td><Table.Td><Code>{row.endpoint}</Code></Table.Td><Table.Td><TokenFacts row={row} /></Table.Td><Table.Td className="mono-cell">{row.ttft_ms == null ? UNMEASURED : `${row.ttft_ms} ms`}</Table.Td><Table.Td>{row.stream == null ? UNMEASURED : t(row.stream ? 'yes' : 'no')}</Table.Td><Table.Td className="mono-cell">{row.latency_ms >= 0 ? `${row.latency_ms} ms` : UNMEASURED}</Table.Td><Table.Td className="mono-cell">{usageMeasured(row) ? formatMicros(row.cost_micros) : UNMEASURED}</Table.Td><Table.Td>{formatDate(row.started_at)}</Table.Td></Table.Tr>)}</Table.Tbody>
           </Table>
         </TableScrollContainer>
         {total > limit && <Group justify="flex-end" gap="sm" mt="md">
@@ -414,10 +419,10 @@ export function RequestDetailPage() {
     const next = ids[target]
     if (next) navigate(`/operations/requests/${next}`, { state: { ...navigation, index: target } })
   }
-  const backTo = navigation?.from || '/operations'
+  const backTo = navigation?.from || '/operations?tab=requests'
   return <><PageHeader title={t('requestDetail')} description={id} />
     <Group justify="space-between" align="center" mb="md" wrap="wrap">
-      <Button variant="subtle" size="compact-sm" component={Link} to={backTo} state={{ tab: navigation?.tab || 'requests' }}>{`← ${t('backToRequests')}`}</Button>
+      <Button variant="subtle" size="compact-sm" component={Link} to={backTo}>{`← ${t('backToRequests')}`}</Button>
       {ids.length > 0 && index >= 0 && <Group gap="xs" align="center">
         <Tooltip label={t('previousRequest')}><ActionIcon variant="default" aria-label={t('previousRequest')} disabled={index <= 0} onClick={() => step(index - 1)}><ChevronLeft size={16} /></ActionIcon></Tooltip>
         <Text size="sm" c="dimmed">{t('requestPosition', { index: index + 1, total: ids.length })}</Text>
@@ -447,9 +452,8 @@ export function TraceDetailPage() {
   })
   const data = query.data
   const duration = data?.trace.finished_at ? Math.max((data.trace.finished_at - data.trace.started_at) * 1000, ...data.executions.map(item => item.latency_ms || 0)) : null
-  const backTo = (location.state as { from?: string } | null)?.from || '/operations'
-  const backTab = (location.state as { tab?: string } | null)?.tab || 'traces'
-  return <><PageHeader title={t('traceDetail')} description={data ? undefined : id} /><Button variant="subtle" size="compact-sm" component={Link} to={backTo} state={{ tab: backTab }} mb="md">{`← ${t('backToTraces')}`}</Button>
+  const backTo = (location.state as { from?: string } | null)?.from || '/operations?tab=traces'
+  return <><PageHeader title={t('traceDetail')} description={data ? undefined : id} /><Button variant="subtle" size="compact-sm" component={Link} to={backTo} mb="md">{`← ${t('backToTraces')}`}</Button>
     {query.isError ? <QueryError retry={() => void query.refetch()} /> : query.isLoading ? <SkeletonRows /> : data && <>
       <SimpleGrid cols={{ base: 1, sm: 3 }} mb="lg">
         <Card p="md"><Stack gap={4}><Text size="xs" c="dimmed" fw={540}>{t('outcome')}</Text><Text fw={620} fz="lg" style={{ fontVariantNumeric: 'tabular-nums' }}>{humanStatus(data.trace.status, t)}</Text></Stack></Card>
@@ -508,13 +512,13 @@ function TraceTimeline({ trace, requests, executions, from }: { trace: TraceBund
           </Group>
           <Group gap={6} wrap="nowrap">
             <Text size="xs" c="dimmed" truncate>{`${humanStatus(row.status, t)}${row.retryReason ? ` · ${humanDecision(row.retryReason, t)}` : ''}`}</Text>
-            {row.externalId && <Text size="xs" c="dimmed" className="mono-cell" aria-label={t('requestExternalId')} truncate>{row.externalId}</Text>}
+            {row.externalId && <Text size="xs" c="dimmed" className="mono-cell" truncate><span className="sr-only">{t('requestExternalId')}: </span>{row.externalId}</Text>}
             {row.href && <Link to={row.href} state={{ from }}><Text size="xs">{t('viewDetails')}</Text></Link>}
           </Group>
         </Stack>
         <div style={{ position: 'relative', height: 26, background: 'var(--mantine-color-default-border)', borderRadius: 4, overflow: 'hidden' }}>
           <div style={{ position: 'absolute', left: `${(row.start - start) / span * 100}%`, width: `${width(row)}%`, top: 5, height: 16, borderRadius: 3, background: row.status === 'succeeded' ? 'var(--accent)' : 'var(--danger)' }} />
-          <Text size="xs" c="dimmed" style={{ position: 'absolute', right: 6, top: 5 }}>{row.latencyMs == null ? UNMEASURED : `${row.latencyMs} ms`}</Text>
+          <Text size="xs" style={{ position: 'absolute', right: 4, top: 4, zIndex: 1, padding: '0 4px', borderRadius: 3, background: 'var(--surface)', color: 'var(--ink)' }}>{row.latencyMs == null ? UNMEASURED : `${row.latencyMs} ms`}</Text>
         </div>
       </div>)}
     </Stack>
@@ -567,7 +571,7 @@ function TraceAttempts({ executions, usage, costItems }: { executions: TraceBund
       <Title order={2} p="lg">{t('attempts')}</Title>
       {!executions.length
         ? <Stack px="lg" pb="lg"><EmptyState icon={<Activity />} title={t('attempts')} copy={t('executionEmpty')} /></Stack>
-        : <TableScrollContainer minWidth={1080} role="region" aria-label={t('attempts')} tabIndex={0} style={{ maxHeight: 'min(60vh, 720px)' }}>
+        : <TableScrollContainer minWidth={1080} scrollAreaProps={{ viewportProps: { role: 'region', 'aria-label': t('attempts'), tabIndex: 0 } }} style={{ maxHeight: 'min(60vh, 720px)' }}>
         <Table stickyHeader highlightOnHover>
           <Table.Thead><Table.Tr><Table.Th>{t('attempt')}</Table.Th><Table.Th>{t('provider')}</Table.Th><Table.Th>{t('model')}</Table.Th><Table.Th>{t('status')}</Table.Th><Table.Th>{t('retryReason')}</Table.Th><Table.Th>{t('latency')}</Table.Th><Table.Th>{t('inputTokens')}</Table.Th><Table.Th>{t('outputTokens')}</Table.Th><Table.Th>{t('cacheReadTokens')}</Table.Th><Table.Th>{t('cacheWriteTokens')}</Table.Th><Table.Th>{t('reasoningTokens')}</Table.Th><Table.Th>{t('cost')}</Table.Th></Table.Tr></Table.Thead>
           <Table.Tbody>{executions.map((execution) => {
@@ -598,7 +602,7 @@ function TraceAttempts({ executions, usage, costItems }: { executions: TraceBund
       <Title order={2} p="lg">{t('costComponents')}</Title>
       {!costItems.length
         ? <Stack px="lg" pb="lg"><EmptyState icon={<Activity />} title={t('costComponents')} copy={t('costComponentsEmpty')} /></Stack>
-        : <TableScrollContainer minWidth={700} role="region" aria-label={t('costComponents')} tabIndex={0}>
+        : <TableScrollContainer minWidth={700} scrollAreaProps={{ viewportProps: { role: 'region', 'aria-label': t('costComponents'), tabIndex: 0 } }}>
           <Table highlightOnHover>
             <Table.Thead><Table.Tr><Table.Th>{t('attempt')}</Table.Th><Table.Th>{t('component')}</Table.Th><Table.Th>{t('quantity')}</Table.Th><Table.Th>{t('unitPrice')}</Table.Th><Table.Th>{t('subtotal')}</Table.Th></Table.Tr></Table.Thead>
             <Table.Tbody>{costItems.map((item, index) => <Table.Tr key={`${item.execution_id}-${index}`}>
@@ -689,7 +693,7 @@ function TraceFacts({ data, record, traceLink }: { data: RequestDetail; record?:
             </Table.Tr>
           ))}</Table.Tbody>
         </Table> : <Text size="xs" c="dimmed">{record ? t('costEmpty') : t('costComponentUnavailable')}</Text>}
-        {attempts.length > 0 ? <TableScrollContainer minWidth={620}><Table>
+        {attempts.length > 0 ? <TableScrollContainer minWidth={620} scrollAreaProps={{ viewportProps: { role: 'region', 'aria-label': t('attempts'), tabIndex: 0 } }}><Table>
           <Table.Thead><Table.Tr><Table.Th>{t('attempt')}</Table.Th><Table.Th>{t('provider')}</Table.Th><Table.Th>{t('model')}</Table.Th><Table.Th>{t('status')}</Table.Th><Table.Th>{t('latency')}</Table.Th></Table.Tr></Table.Thead>
           <Table.Tbody>{attempts.map((attempt, position) => (
             <Table.Tr key={attempt.id ?? position}>

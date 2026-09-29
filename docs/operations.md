@@ -71,6 +71,8 @@ Base path: `/api/admin/v1/projects/{project}/operations`.
 Interactive requests use the existing session cookie. Mutations also require `X-Pangolin-CSRF: 1`; cross-site browser mutations are rejected. Scoped bearer/API-key principals use the same authorization evaluator and do not require browser CSRF headers. Reads require `project:read`; mutations require `project:manage`. Audit records and control-plane changes commit in the same transaction, preserving service-key subject IDs separately from user IDs.
 
 `GET /{resource}` supports `offset` and `limit` (maximum 500). `GET /{resource}/{id}` reads one scoped item. Read resources include `threads`, `traces`, `requests`, `executions`, `usage`, `cost-items`, `prices`, `probes`, `quotas`, `health`, `credential-health`, `storage`, `schedules`, `jobs`, `backup-target-results`, `webhooks`, `webhook-deliveries`, `groups`, `retention` and `audit`. `GET /content/{request_id}` returns permitted stored request/response content, including in-flight inbound content.
+`GET /probes?provider_id=<channel_id>` applies an exact project-scoped channel filter before `offset` and `limit`, so a busy channel cannot displace another channel's history from a page.
+`GET /channels?kind=<adapter>&enabled=<true|false>` applies both optional channel facets before pagination and total counting.
 
 `POST /{resource}` mutations:
 

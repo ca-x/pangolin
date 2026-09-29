@@ -34,7 +34,7 @@ const pickOption = async (name: string, option: string) => {
 describe('empty states drop controls that cannot do anything', () => {
   beforeEach(() => { void i18n.changeLanguage('en') })
 
-  it('hides the bulk channel form until a channel exists', async () => {
+  it('keeps an empty channel page free of bulk controls', async () => {
     vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => base(String(input)) ?? json({ data: [], total: 0, offset: 0, limit: 25 })))
     renderPage(<ChannelsPage />)
     expect(await screen.findByText(/Add a channel, then attach/i)).toBeInTheDocument()
@@ -44,11 +44,12 @@ describe('empty states drop controls that cannot do anything', () => {
     expect(screen.getAllByRole('button', { name: 'Add channel' })).toHaveLength(1)
   })
 
-  it('shows the bulk channel form once a channel exists', async () => {
+  it('uses row selection for channel bulk actions without a second form', async () => {
     vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => base(String(input)) ?? json({ data: [{ id: 'c1', name: 'Primary', kind: 'openai', base_url: 'https://api.openai.com', enabled: true }], total: 1, offset: 0, limit: 25 })))
     renderPage(<ChannelsPage />)
     expect(await screen.findByRole('button', { name: 'Add channel' })).toBeInTheDocument()
-    expect(screen.getByText('Bulk enable or disable')).toBeInTheDocument()
+    expect(screen.getByRole('checkbox', { name: 'Select Primary' })).toBeInTheDocument()
+    expect(screen.queryByText('Bulk enable or disable')).not.toBeInTheDocument()
     expect(screen.getAllByRole('button', { name: 'Add channel' })).toHaveLength(1)
   })
 
@@ -83,37 +84,14 @@ describe('empty states drop controls that cannot do anything', () => {
     await i18n.changeLanguage('en')
   })
 
-  it('keeps the bulk form when the count request fails', async () => {
-    // The count is an auxiliary request. A failure there must not read as "no
-    // rows" and silently remove a control the page can still use.
+  it('keeps row selection available when an auxiliary count fails', async () => {
     vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
       const path = String(input)
       if (path.includes('limit=1')) return Promise.reject(new Error('count unavailable'))
       return base(path) ?? json({ data: [{ id: 'c1', name: 'Primary', kind: 'openai', base_url: 'https://api.openai.com', enabled: true }], total: 1, offset: 0, limit: 25 })
     }))
     renderPage(<ChannelsPage />)
-    expect(await screen.findByText('Bulk enable or disable')).toBeInTheDocument()
-  })
-
-  it('keeps the bulk form when a refetch fails after a zero count', async () => {
-    // A cached zero survives a failed refetch, and reading it as "no rows" would
-    // hide a usable control — the failure state the count guard exists for.
-    let failCount = false
-    vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
-      const path = String(input)
-      if (path.includes('limit=1')) {
-        return failCount ? Promise.reject(new Error('count unavailable')) : json({ data: [], total: 0, offset: 0, limit: 1 })
-      }
-      return base(path) ?? json({ data: [{ id: 'c1', name: 'Primary', kind: 'openai', base_url: 'https://api.openai.com', enabled: true }], total: 1, offset: 0, limit: 25 })
-    }))
-    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-    render(<QueryClientProvider client={client}><MemoryRouter><ProjectProvider><ChannelsPage /></ProjectProvider></MemoryRouter></QueryClientProvider>)
-    // No rows yet, so the bulk form is correctly absent.
-    expect(await screen.findByRole('button', { name: 'Add channel' })).toBeInTheDocument()
-    expect(screen.queryByText('Bulk enable or disable')).not.toBeInTheDocument()
-    failCount = true
-    await client.invalidateQueries({ queryKey: ['resource', 'p1', 'channels'] })
-    expect(await screen.findByText('Bulk enable or disable')).toBeInTheDocument()
+    expect(await screen.findByRole('checkbox', { name: 'Select Primary' })).toBeInTheDocument()
   })
 
   it('keeps a required JSON editor open, so an invalid one can be reported', async () => {

@@ -2,30 +2,34 @@ import { ActionIcon, Alert, Badge, Button, Checkbox, Collapse, Group, Loader, Nu
 import { useMediaQuery } from '@mantine/hooks'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Archive, ChevronRight, Copy, Download, Inbox, Layers3, Plus, RefreshCw, RotateCcw, Search, Trash2, Upload } from 'lucide-react'
-import { useEffect, useMemo, useState, type FormEvent } from 'react'
+import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 import { api, type Document, type Paged } from '../api'
 import { CapabilityTags, capabilityList, confirmAction, describeFailure, EmptyState, EnabledPill, Modal, SelectField, SkeletonRows, useCapabilityLabel } from '../components'
 import { useProject } from '../project'
 import { ProviderIcon } from '../ProviderIcon'
+import { CHANNEL_PROVIDERS } from '../providers'
 import { ExclusionsEditor } from './documentEditors'
 import { AutoRefreshControl, useAutoRefreshInterval } from './autoRefresh'
 import { PageHeader, QueryError, ResourcePage, displayValue, formatDate } from './shared'
+import { useRoutedTab } from './useRoutedTab'
 
 const TAB_VALUES = ['models', 'routing', 'groups', 'prices', 'catalog', 'subscriptions'] as const
 
 export default function ModelsPage() {
   const { t } = useTranslation()
+  const { project } = useProject()
+  const [tab, setTab] = useRoutedTab(TAB_VALUES, 'models')
   return (
-    <Tabs keepMounted={false} defaultValue="models">
+    <Tabs keepMounted={false} value={tab} onChange={setTab}>
       <Tabs.List mb="lg">
         {TAB_VALUES.map((value) => (
           <Tabs.Tab key={value} value={value}>{t(value)}</Tabs.Tab>
         ))}
       </Tabs.List>
       <Tabs.Panel value="models"><ModelsPanel /></Tabs.Panel>
-      <Tabs.Panel value="routing"><UnassociatedModels /><section id="association-editor"><RoutingEditor /></section><RoutingPreview /></Tabs.Panel>
+      <Tabs.Panel value="routing"><UnassociatedModels /><section id="association-editor"><RoutingEditor /></section><RoutingPreview key={project.id} /></Tabs.Panel>
       <Tabs.Panel value="groups"><ServiceGroupsPanel /></Tabs.Panel>
       <Tabs.Panel value="prices"><PricesPanel /></Tabs.Panel>
       <Tabs.Panel value="catalog"><CatalogPanel /></Tabs.Panel>
@@ -59,7 +63,7 @@ function DeveloperSettingsEditor() {
   const query = useQuery({ queryKey: ['developer-settings', project.id], queryFn: () => api<Document>(path) })
   const save = useMutation({ mutationFn: (document: unknown) => api(path, { method: 'PUT', body: JSON.stringify(document) }), onSuccess: () => { toast.success(t('saved')); setOpen(false); void query.refetch(); void client.invalidateQueries({ queryKey: ['resource', project.id, 'models'] }) }, onError: (error: Error) => toast.error(error.message) })
   const submit = (event: FormEvent<HTMLFormElement>) => { event.preventDefault(); try { save.mutate(JSON.parse(String(new FormData(event.currentTarget).get('document')))) } catch { toast.error(t('invalidJson')) } }
-  return <Paper withBorder p="md" mb="md"><Group justify="space-between" align="flex-start"><Stack gap={2}><Text fw={600}>{t('developerSettings')}</Text><Text size="sm" c="dimmed">{t('developerSettingsHint')}</Text></Stack><Button variant="default" onClick={() => setOpen(true)}>{t('developerSettings')}</Button></Group><Modal open={open} onOpenChange={setOpen} title={t('developerSettings')}><form onSubmit={submit}><Stack gap="md">{query.isError ? <QueryError retry={() => void query.refetch()} /> : <Textarea name="document" label={t('developerSettingsDocument')} rows={12} defaultValue={JSON.stringify(query.data ?? { version: 1, rules: [] }, null, 2)} disabled={query.isLoading} />}<Text size="sm" c="dimmed">{t('developerSettingsPreserveUnknown')}</Text><Group justify="flex-end"><Button variant="default" type="button" onClick={() => setOpen(false)}>{t('cancel')}</Button><Button type="submit" loading={save.isPending} disabled={query.isLoading || query.isError}>{t('save')}</Button></Group></Stack></form></Modal></Paper>
+  return <><Button variant="default" onClick={() => setOpen(true)}>{t('developerSettings')}</Button><Modal open={open} onOpenChange={setOpen} title={t('developerSettings')}><form onSubmit={submit}><Stack gap="md"><Text size="sm" c="dimmed">{t('developerSettingsHint')}</Text>{query.isLoading ? <SkeletonRows count={2} /> : query.isError ? <QueryError retry={() => void query.refetch()} /> : <Textarea name="document" label={t('developerSettingsDocument')} rows={12} defaultValue={JSON.stringify(query.data ?? { version: 1, rules: [] }, null, 2)} />}<Text size="sm" c="dimmed">{t('developerSettingsPreserveUnknown')}</Text><Group justify="flex-end"><Button variant="default" type="button" onClick={() => setOpen(false)}>{t('cancel')}</Button><Button type="submit" loading={save.isPending} disabled={query.isLoading || query.isError}>{t('save')}</Button></Group></Stack></form></Modal></>
 }
 
 function ModelsPanel() {
@@ -75,8 +79,7 @@ function ModelsPanel() {
   const optionsError = channelsError ? t('optionsUnavailable') : undefined
   const modelIdentity = (row: Document) => <span className="provider-cell"><ProviderIcon logoKey={typeof row.catalog_logo_key === 'string' ? row.catalog_logo_key : undefined} name={typeof row.catalog_developer === 'string' ? row.catalog_developer : String(row.public_name)} /><strong>{String(row.public_name)}</strong></span>
   return <>
-    <DeveloperSettingsEditor />
-    <ResourcePage key={project.id} resource="models" endpoint={(projectId) => `/api/admin/v1/projects/${projectId}/operations/models?lifecycle=${lifecycle}`} title={t('models')} description={t('modelsDescription')} selectable={lifecycle === 'all' ? undefined : 'models'} bulkActions={(selected, clear) => <ModelBulkActions ids={selected} lifecycle={lifecycle as 'active' | 'archived'} clear={clear} />} secondaryAction={<BatchModelImport cards={catalog.data?.data || []} cardsLoading={catalog.isLoading} cardsError={catalog.isError} retryCards={() => void catalog.refetch()} channels={channels} channelsError={channelsError} retryChannels={retryChannels} />} empty={t('modelEmpty')} createLabel={t('addModel')} tableMinWidth={1540} mobileColumnLimit={8} mobilePrimary={modelIdentity} mobilePrimaryKey="public_name" mobileHiddenKeys={['enabled', 'lifecycle']} mobileStatus={(row) => <Stack gap={4} align="flex-end"><LifecyclePill lifecycle={row.lifecycle} /><EnabledPill enabled={row.enabled} /></Stack>} filters={<Select label={t('modelLifecycle')} value={lifecycle} onChange={(value) => setLifecycle(value || 'active')} allowDeselect={false} data={[{ value: 'active', label: t('modelLifecycleActive') }, { value: 'archived', label: t('modelLifecycleArchived') }, { value: 'all', label: t('modelLifecycleAll') }]} w={{ base: '100%', sm: 220 }} />} editDisabled={(row) => row.lifecycle === 'archived'} canDelete={false} rowActions={(row) => <ModelLifecycleActions row={row} />} columns={[{ key: 'public_name', label: t('publicModel'), mono: true, render: (_value, row) => modelIdentity(row) }, { key: 'provider_name', label: t('channel') }, { key: 'upstream_name', label: t('upstreamModel'), mono: true }, { key: 'catalog_developer', label: t('modelDeveloper') }, { key: 'catalog_model_type', label: t('modelType') }, { key: 'catalog_context_limit_tokens', label: t('modelLimits'), render: (_value, row) => <ModelLimits row={row} /> }, { key: 'catalog_input_cost', label: t('catalogCostDefaults'), render: (_value, row) => <CatalogCosts row={row} /> }, { key: 'capabilities', label: t('capabilities'), render: (value) => <CapabilityTags value={value} /> }, { key: 'enabled', label: t('status'), render: (value) => <EnabledPill enabled={value} /> }, { key: 'lifecycle', label: t('modelLifecycle'), render: (value) => <LifecyclePill lifecycle={value} /> }]} fields={[{ key: 'catalog_model_id', label: t('catalogModel'), hint: t('catalogModelHint'), kind: 'select', createOnly: true, defaultValue: '__manual__', options: catalogOptions, loading: catalog.isLoading, error: catalog.isError ? t('catalogModelUnavailable') : undefined, emptyMessage: t('catalogModelEmpty'), allowManualOnError: true, onRetry: () => void catalog.refetch() }, { key: 'provider_ids', label: t('channels'), kind: 'multi-checkbox', createOnly: true, required: true, options: channels, error: optionsError, onRetry: retryChannels, emptyMessage: t('channelRequiredForImport'), hint: t('multiChannelCreateHint') }, { key: 'provider_id', label: t('channel'), kind: 'select', editOnly: true, required: true, options: channels, error: optionsError, onRetry: retryChannels }, { key: 'public_name', label: t('publicModel'), required: true }, { key: 'upstream_name', label: t('upstreamModel'), required: true }, { key: 'capabilities', label: t('capabilities'), kind: 'json', defaultValue: ['chat', 'responses'] }, { key: 'input_price_micros', label: t('inputPrice'), kind: 'number', defaultValue: 0 }, { key: 'output_price_micros', label: t('outputPrice'), kind: 'number', defaultValue: 0 }, { key: 'priority', label: t('priority'), kind: 'number', defaultValue: 100 }, { key: 'disable_developer_settings_inheritance', label: t('disableDeveloperInheritance'), hint: t('disableDeveloperInheritanceHint'), kind: 'checkbox', defaultValue: false }, { key: 'enabled', label: t('status'), kind: 'checkbox' }]} normalize={(values, editing) => {
+    <ResourcePage key={project.id} resource="models" endpoint={(projectId) => `/api/admin/v1/projects/${projectId}/operations/models?lifecycle=${lifecycle}`} title={t('models')} description={t('modelsDescription')} selectable={lifecycle === 'all' ? undefined : 'models'} bulkActions={(selected, clear) => <ModelBulkActions ids={selected} lifecycle={lifecycle as 'active' | 'archived'} clear={clear} />} headerExtra={<DeveloperSettingsEditor />} secondaryAction={<BatchModelImport cards={catalog.data?.data || []} cardsLoading={catalog.isLoading} cardsError={catalog.isError} retryCards={() => void catalog.refetch()} channels={channels} channelsError={channelsError} retryChannels={retryChannels} />} empty={t('modelEmpty')} createLabel={t('addModel')} tableMinWidth={1540} mobileColumnLimit={8} mobilePrimary={modelIdentity} mobilePrimaryKey="public_name" mobileHiddenKeys={['enabled', 'lifecycle']} mobileStatus={(row) => <Stack gap={4} align="flex-end"><LifecyclePill lifecycle={row.lifecycle} /><EnabledPill enabled={row.enabled} /></Stack>} filters={<Select label={t('modelLifecycle')} value={lifecycle} onChange={(value) => setLifecycle(value || 'active')} allowDeselect={false} data={[{ value: 'active', label: t('modelLifecycleActive') }, { value: 'archived', label: t('modelLifecycleArchived') }, { value: 'all', label: t('modelLifecycleAll') }]} w={{ base: '100%', sm: 220 }} />} editDisabled={(row) => row.lifecycle === 'archived'} canDelete={false} rowActions={(row) => <ModelLifecycleActions row={row} />} columns={[{ key: 'public_name', label: t('publicModel'), mono: true, render: (_value, row) => modelIdentity(row) }, { key: 'provider_name', label: t('channel') }, { key: 'upstream_name', label: t('upstreamModel'), mono: true }, { key: 'catalog_developer', label: t('modelDeveloper') }, { key: 'catalog_model_type', label: t('modelType') }, { key: 'catalog_context_limit_tokens', label: t('modelLimits'), render: (_value, row) => <ModelLimits row={row} /> }, { key: 'catalog_input_cost', label: t('catalogCostDefaults'), render: (_value, row) => <CatalogCosts row={row} /> }, { key: 'capabilities', label: t('capabilities'), render: (value) => <CapabilityTags value={value} /> }, { key: 'enabled', label: t('status'), render: (value) => <EnabledPill enabled={value} /> }, { key: 'lifecycle', label: t('modelLifecycle'), render: (value) => <LifecyclePill lifecycle={value} /> }]} fields={[{ key: 'catalog_model_id', label: t('catalogModel'), hint: t('catalogModelHint'), kind: 'select', createOnly: true, defaultValue: '__manual__', options: catalogOptions, loading: catalog.isLoading, error: catalog.isError ? t('catalogModelUnavailable') : undefined, emptyMessage: t('catalogModelEmpty'), allowManualOnError: true, onRetry: () => void catalog.refetch() }, { key: 'provider_ids', label: t('channels'), kind: 'multi-checkbox', createOnly: true, required: true, options: channels, error: optionsError, onRetry: retryChannels, emptyMessage: t('channelRequiredForImport'), hint: t('multiChannelCreateHint') }, { key: 'provider_id', label: t('channel'), kind: 'select', editOnly: true, required: true, options: channels, error: optionsError, onRetry: retryChannels }, { key: 'public_name', label: t('publicModel'), required: true }, { key: 'upstream_name', label: t('upstreamModel'), required: true }, { key: 'capabilities', label: t('capabilities'), kind: 'json', defaultValue: ['chat', 'responses'] }, { key: 'input_price_micros', label: t('inputPrice'), kind: 'number', defaultValue: 0 }, { key: 'output_price_micros', label: t('outputPrice'), kind: 'number', defaultValue: 0 }, { key: 'priority', label: t('priority'), kind: 'number', defaultValue: 100 }, { key: 'disable_developer_settings_inheritance', label: t('disableDeveloperInheritance'), hint: t('disableDeveloperInheritanceHint'), kind: 'checkbox', defaultValue: false }, { key: 'enabled', label: t('status'), kind: 'checkbox' }]} normalize={(values, editing) => {
     const payload = { ...values }
     if (editing || payload.catalog_model_id === '__manual__') delete payload.catalog_model_id
     if (editing) {
@@ -669,15 +672,62 @@ const humanRoutingReason = (value: string, t: (key: string) => string) => {
   return key ? t(key) : value.replaceAll('_', ' ')
 }
 
+function RouteJourney({ requestedModel, endpoint, candidates, animate, visible }: { requestedModel: string; endpoint: string; candidates: Document[]; animate: boolean; visible: boolean }) {
+  const { t } = useTranslation()
+  const first = candidates[0]
+  if (!first) return null
+  const adapter = CHANNEL_PROVIDERS.find((provider) => provider.kind === first.provider_kind)
+  return <section className="pm-route-journey" data-animate={animate} data-visible={visible}>
+    <Title order={3} mb="sm">{t('modelTransformationPath')}</Title>
+    <div className="pm-route-flow">
+      <div className="pm-route-node"><Text size="xs" c="dimmed">{t('requestedModel')}</Text><Text fw={620} className="mono-cell">{requestedModel}</Text><Text size="xs" c="dimmed" className="mono-cell">{endpoint}</Text></div>
+      <span className="pm-route-link" aria-hidden="true" />
+      <div className="pm-route-node"><Text size="xs" c="dimmed">{t('routing')}</Text><Text fw={620}>{t('routeCandidateCount', { count: candidates.length })}</Text><Text size="xs" c="dimmed">{t('routingPreview')}</Text></div>
+      <span className="pm-route-link" aria-hidden="true" />
+      <div className="pm-route-node"><Text size="xs" c="dimmed">{t('firstCandidate')}</Text><Text fw={620} className="mono-cell">{displayValue(first.upstream_model)}</Text><Text size="xs" c="dimmed">{displayValue(first.provider)}{first.provider_kind ? ` · ${t('upstreamAdapter')}: ${adapter ? t(adapter.labelKey) : displayValue(first.provider_kind)}` : ''}</Text><Text size="xs" c="dimmed" className="mono-cell">{displayValue(first.endpoint)}</Text></div>
+    </div>
+    <Text size="xs" c="dimmed" mt="sm">{t('routePreviewOrderHint')}</Text>
+  </section>
+}
+
 function RoutingPreview() {
   const { t } = useTranslation()
   const { project } = useProject()
   const [result, setResult] = useState<Preview | null>(null)
+  const [previewInput, setPreviewInput] = useState({ projectId: project.id, model: '', endpoint: '' })
+  const [routeVisible, setRouteVisible] = useState(true)
+  const [animateRoute, setAnimateRoute] = useState(false)
+  const pointerSubmit = useRef(false)
+  const pendingAnimate = useRef(false)
+  const mounted = useRef(true)
+  const displayedProject = useRef(project.id)
+  displayedProject.current = project.id
+  useEffect(() => { mounted.current = true; return () => { mounted.current = false } }, [])
   const [keyId, setKeyId] = useState('')
   const [endpoint, setEndpoint] = useState('/v1/chat/completions')
   const keys = useQuery({ queryKey: ['keys', project.id], queryFn: () => api<Array<{ id: string; name: string; enabled: boolean }>>(`/api/admin/v1/projects/${project.id}/api-keys`) })
-  const preview = useMutation({ mutationFn: (body: unknown) => api<Preview>(`/api/admin/v1/projects/${project.id}/routing-preview`, { method: 'POST', body: JSON.stringify(body) }), onSuccess: setResult, onError: (error: Error) => toast.error(error.message) })
-  const submit = (event: FormEvent<HTMLFormElement>) => { event.preventDefault(); const data = new FormData(event.currentTarget); preview.mutate({ api_key_id: keyId, model: data.get('model'), endpoint, body: {} }) }
+  const preview = useMutation({
+    mutationFn: ({ projectId, body }: { projectId: string; body: unknown }) => api<Preview>(`/api/admin/v1/projects/${projectId}/routing-preview`, { method: 'POST', body: JSON.stringify(body) }),
+    onSuccess: (next, variables) => {
+      if (!mounted.current || displayedProject.current !== variables.projectId) return
+      setAnimateRoute(pendingAnimate.current)
+      setRouteVisible(!pendingAnimate.current)
+      setResult(next)
+      if (pendingAnimate.current) requestAnimationFrame(() => requestAnimationFrame(() => setRouteVisible(true)))
+    },
+    onError: (error: Error, variables) => { if (mounted.current && displayedProject.current === variables.projectId) toast.error(error.message) },
+  })
+  useEffect(() => { setResult(null); setPreviewInput({ projectId: project.id, model: '', endpoint: '' }) }, [project.id])
+  const submit = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    const data = new FormData(event.currentTarget)
+    const model = String(data.get('model') || '').trim()
+    pendingAnimate.current = pointerSubmit.current
+    pointerSubmit.current = false
+    setPreviewInput({ projectId: project.id, model, endpoint })
+    setResult(null)
+    preview.mutate({ projectId: project.id, body: { api_key_id: keyId, model, endpoint, body: {} } })
+  }
   const keyOptions = (keys.data || []).filter((key) => key.enabled).map((key) => ({ value: key.id, label: key.name }))
   useEffect(() => { if (!keyOptions.some((option) => option.value === keyId)) setKeyId(keyOptions[0]?.value || '') }, [keyId, keyOptions.map((option) => option.value).join(',')])
   return (
@@ -687,17 +737,18 @@ function RoutingPreview() {
         <Text size="sm" c="dimmed">{t('routingPreviewHint')}</Text>
       </Stack>
       {keys.isError ? <QueryError retry={() => void keys.refetch()} /> : keys.isLoading ? <SkeletonRows count={2} /> : keyOptions.length === 0 ? <Text size="sm" c="dimmed">{t('routingPreviewNeedsKey')}</Text> : (
-        <form onSubmit={submit}>
+        <form onSubmit={submit} onKeyDownCapture={() => { pointerSubmit.current = false }}>
           <Group align="flex-end" gap="sm" wrap="wrap">
             <SelectField name="api_key_id" label={t('apiKey')} value={keyId} onValueChange={setKeyId} options={keyOptions} />
             <TextInput name="model" label={t('requestedModel')} required style={{ minWidth: 160 }} />
             <SelectField name="endpoint" label={t('endpoint')} value={endpoint} onValueChange={setEndpoint} options={[{ value: '/v1/chat/completions', label: t('endpointChatCompletions') }, { value: '/v1/responses', label: t('endpointResponses') }, { value: '/v1/messages', label: t('endpointMessages') }]} />
-            <Button type="submit" loading={preview.isPending}>{t('preview')}</Button>
+            <Button type="submit" loading={preview.isPending} onPointerDown={() => { pointerSubmit.current = true }} onKeyDown={() => { pointerSubmit.current = false }}>{t('preview')}</Button>
           </Group>
         </form>
       )}
-      {result && (
+      {result && previewInput.projectId === project.id && (
         <Stack gap="md" mt="lg" aria-live="polite">
+          <RouteJourney requestedModel={previewInput.model} endpoint={previewInput.endpoint} candidates={result.candidates} animate={animateRoute} visible={routeVisible} />
           <div>
             <Title order={3}>{t('orderedCandidates')}</Title>
             {result.candidates.length
@@ -1036,7 +1087,7 @@ function CatalogSubscriptions() {
         }
       />
       {query.isError ? <QueryError retry={() => void query.refetch()} /> : query.isLoading ? <SkeletonRows /> : query.data && query.data.length > 0 ? (
-        <TableScrollContainer minWidth={1100} style={{ maxHeight: 'min(74vh, 900px)' }}>
+        <TableScrollContainer minWidth={1100} scrollAreaProps={{ viewportProps: { role: 'region', 'aria-label': t('subscriptions'), tabIndex: 0 } }} style={{ maxHeight: 'min(74vh, 900px)' }}>
           <Table stickyHeader highlightOnHover>
             <Table.Thead>
               <Table.Tr>

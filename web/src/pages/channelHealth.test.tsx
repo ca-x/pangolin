@@ -79,7 +79,7 @@ describe('the channels page states recorded channel health', () => {
   })
 
   it('draws recorded probe outcomes and prints an em dash when no history exists', async () => {
-    mockApi({
+    const fetchMock = mockApi({
       channels: [channel(), channel({ id: 'c2', name: 'Unreported' })],
       probes: [
         { id: 'p1', provider_id: 'c1', success: 1, probed_at: 2 },
@@ -89,10 +89,14 @@ describe('the channels page states recorded channel health', () => {
     renderPage()
 
     const primary = await rowFor('Primary')
-    expect(primary.getByLabelText('Probe success history for Primary')).toHaveTextContent('50%')
-    expect(primary.getByLabelText('Probe success history for Primary').querySelector('svg')).not.toBeNull()
-    expect((await rowFor('Unreported')).getByLabelText('Probe success history for Unreported')).toHaveTextContent('—')
+    expect(primary.getByRole('img', { name: /Probe success history for Primary/ })).toHaveTextContent('50%')
+    expect(primary.getByRole('img', { name: /Probe success history for Primary/ }).querySelector('svg')).not.toBeNull()
+    expect((await rowFor('Unreported')).getByRole('img', { name: /Probe success history for Unreported/ })).toHaveTextContent('—')
     expect((await rowFor('Unreported')).queryByText('0%')).not.toBeInTheDocument()
+    const mobile = document.querySelector('.mobile-resource-list') as HTMLElement
+    expect(within(mobile).getByRole('img', { name: /Probe success history for Primary/ })).toHaveTextContent('50%')
+    expect(fetchMock.mock.calls.some(([input]) => String(input).includes('operations/probes?limit=100&provider_id=c1'))).toBe(true)
+    expect(fetchMock.mock.calls.some(([input]) => String(input).includes('operations/probes?limit=100&provider_id=c2'))).toBe(true)
   })
 
   it('renders the health recorded for each credential', async () => {

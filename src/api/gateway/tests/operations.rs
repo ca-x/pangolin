@@ -459,6 +459,67 @@ async fn generic_probe_list_uses_its_probed_at_event_time() {
     assert_eq!(ids, ["b13-probe-last", "b13-probe-from"]);
 }
 
+#[tokio::test]
+async fn probe_list_filters_by_provider_before_limit() {
+    let f = fixture(success()).await;
+    let cookie = owner(&f).await;
+    let target = &f.providers[0];
+    let other = &f.providers[1];
+    sql(
+        &f,
+        "INSERT INTO channel_probes(id,provider_id,success,probed_at) VALUES('target-old',?,1,1),('other-new-1',?,1,2),('other-new-2',?,1,3)",
+        vec![target.clone().into(), other.clone().into(), other.clone().into()],
+    )
+    .await;
+    let document = json_body(
+        admin(
+            &f,
+            &cookie,
+            http::Method::GET,
+            &format!(
+                "/api/admin/v1/projects/{}/operations/probes?provider_id={target}&limit=1",
+                db::DEFAULT_PROJECT_ID
+            ),
+            Value::Null,
+            false,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(document["total"], json!(1), "{document}");
+    assert_eq!(document["data"][0]["id"], json!("target-old"), "{document}");
+}
+
+#[tokio::test]
+async fn channel_list_filters_provider_kind_and_state_before_paging() {
+    let f = fixture(success()).await;
+    let cookie = owner(&f).await;
+    let target = &f.providers[1];
+    sql(
+        &f,
+        "UPDATE providers SET kind='anthropic',enabled=0 WHERE id=?",
+        vec![target.clone().into()],
+    )
+    .await;
+    let document = json_body(
+        admin(
+            &f,
+            &cookie,
+            http::Method::GET,
+            &format!(
+                "/api/admin/v1/projects/{}/operations/channels?kind=anthropic&enabled=false&limit=1",
+                db::DEFAULT_PROJECT_ID
+            ),
+            Value::Null,
+            false,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(document["total"], json!(1), "{document}");
+    assert_eq!(document["data"][0]["id"], json!(target), "{document}");
+}
+
 /// Configuration records with an immutable creation instant use that instant as
 /// their point event, rather than their mutable update state.
 #[tokio::test]
@@ -2948,6 +3009,7 @@ async fn task6_control_plane_crud_redacts_credentials_and_audits_changes() {
     )
     .await;
     assert!(!preview["candidates"].as_array().unwrap().is_empty());
+    assert_eq!(preview["candidates"][0]["provider_kind"], json!("openai"));
     assert_eq!(preview["decisions"][0]["stage"], "access");
     assert_eq!(admin(&f,&cookie,http::Method::PUT,"/api/admin/v1/settings/system",json!({"instance_name":"Operations","branding_name":"Pangolin / 鲮鲤","favicon_url":"/logo.webp","onboarding_complete":true}),true).await.status(),StatusCode::OK);
     assert_eq!(

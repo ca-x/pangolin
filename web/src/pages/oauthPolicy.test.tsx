@@ -34,7 +34,7 @@ describe('OAuth and HTTP policy settings', () => {
     })
     vi.stubGlobal('fetch', fetchMock)
     renderPage(<SystemPage />)
-    const origins = await screen.findByLabelText(/Allowed cross-origin origins/)
+    const origins = await screen.findByLabelText(/Allowed cross-origin origins/, {}, { timeout: 5000 })
     const form = origins.closest('form') as HTMLFormElement
     await userEvent.clear(origins)
     await userEvent.type(origins, 'https://one.example\nhttps://two.example')

@@ -14,6 +14,7 @@ import { resolveSkin, skinLabel, skins } from '../skins'
 import { useTheme, type ColorMode } from '../theme'
 import { AutoRefreshControl, formatUpdatedAt, useAutoRefreshInterval } from './autoRefresh'
 import { PageHeader, QueryError, ResourcePage, displayValue, formatDate, type FormField } from './shared'
+import { useRoutedTab } from './useRoutedTab'
 
 /**
  * Project-scoped tabs read and write rows that belong to one project, so their
@@ -23,15 +24,25 @@ import { PageHeader, QueryError, ResourcePage, displayValue, formatDate, type Fo
  * not offer a tab whose calls would be refused.
  */
 const PROJECT_TABS = ['orchestrationSettings', 'storage', 'backups', 'webhooks', 'jobs', 'retention'] as const
+const SYSTEM_TABS = ['appearance', ...PROJECT_TABS, 'modelSettings', 'requestLogging', 'proxyPresets', 'diagnostics', 'about'] as const
 
 export default function SystemPage() {
   const { t } = useTranslation()
-  const { permissions } = useProject()
+  const { permissions, permissionsStatus } = useProject()
   const can = (permission: string) => permissions.has('*') || permissions.has(permission)
   const projectScoped = can('project:manage')
   const instanceScoped = can('*')
+  const [requestedTab, setTab] = useRoutedTab(SYSTEM_TABS, 'appearance')
+  const tab = PROJECT_TABS.some((value) => value === requestedTab) && !projectScoped
+    ? 'appearance'
+    : ['modelSettings', 'requestLogging', 'proxyPresets', 'diagnostics'].includes(requestedTab) && !instanceScoped
+      ? 'appearance'
+      : requestedTab
+  useEffect(() => {
+    if (permissionsStatus === 'ready' && tab !== requestedTab) setTab(tab, true)
+  }, [permissionsStatus, requestedTab, tab, setTab])
   return (
-    <Tabs keepMounted={false} defaultValue="appearance">
+    <Tabs keepMounted={false} value={tab} onChange={setTab}>
       <Tabs.List mb="lg">
         <Tabs.Tab value="appearance">{t('appearance')}</Tabs.Tab>
         {projectScoped && PROJECT_TABS.map((value) => <Tabs.Tab key={value} value={value}>{t(value)}</Tabs.Tab>)}
@@ -44,7 +55,7 @@ export default function SystemPage() {
       {!projectScoped && !instanceScoped && (
         <Alert variant="light" color="yellow" radius="lg" icon={<ShieldAlert />} mb="lg">{t('systemNoScope')}</Alert>
       )}
-      <Tabs.Panel value="appearance"><Appearance /><BrandingSettings /></Tabs.Panel>
+      <Tabs.Panel value="appearance"><Appearance />{instanceScoped && <BrandingSettings />}</Tabs.Panel>
       {projectScoped && (
         <>
           <Tabs.Panel value="orchestrationSettings"><ProjectScope /><OrchestrationSettings /></Tabs.Panel>
@@ -435,7 +446,7 @@ function DiagnosticsPanel() {
           <Button color="red" variant="default" leftSection={<Trash2 size={16} />} loading={clear.isPending} onClick={confirmClear}>{t('clearCache')}</Button>
         </Group>
       </Group>
-      <TableScrollContainer minWidth={560} role="region" aria-label={t('diagnostics')} tabIndex={0}>
+      <TableScrollContainer minWidth={560} scrollAreaProps={{ viewportProps: { role: 'region', 'aria-label': t('diagnostics'), tabIndex: 0 } }}>
         <Table highlightOnHover>
           <Table.Thead><Table.Tr><Table.Th>{t('cacheName')}</Table.Th><Table.Th>{t('shapeVersion')}</Table.Th><Table.Th>{t('entries')}</Table.Th><Table.Th>{t('capacity')}</Table.Th></Table.Tr></Table.Thead>
           <Table.Tbody>{query.data.runtime.caches.map((cache) => <Table.Tr key={cache.name}><Table.Td className="mono-cell">{cache.name}</Table.Td><Table.Td>{cache.shape_version}</Table.Td><Table.Td>{cache.entries}</Table.Td><Table.Td>{cache.max_entries ?? '—'}</Table.Td></Table.Tr>)}</Table.Tbody>
@@ -997,7 +1008,7 @@ function BackupPanel() {
               : runs.isLoading || results.isLoading ? <SkeletonRows />
                 : backupRuns.length === 0 ? <EmptyState icon={<History />} title={t('backupRuns')} copy={t('backupRunsEmpty')} />
                   : (
-                    <TableScrollContainer minWidth={900}>
+                    <TableScrollContainer minWidth={900} scrollAreaProps={{ viewportProps: { role: 'region', 'aria-label': t('backupRuns'), tabIndex: 0 } }}>
                       <Table highlightOnHover>
                         <Table.Thead>
                           <Table.Tr>
@@ -1109,7 +1120,7 @@ function WebhookDeliveries() {
               ? <EmptyState icon={<Webhook />} title={t('webhookDeliveries')} copy={t('webhookDeliveriesEmpty')} />
               : (
                 <>
-                  <TableScrollContainer minWidth={760} role="region" aria-label={t('webhookDeliveries')} tabIndex={0}>
+                  <TableScrollContainer minWidth={760} scrollAreaProps={{ viewportProps: { role: 'region', 'aria-label': t('webhookDeliveries'), tabIndex: 0 } }}>
                     <Table highlightOnHover>
                       <Table.Thead>
                         <Table.Tr>
@@ -1265,7 +1276,7 @@ function JobsPanel() {
           action={status ? <Button variant="default" onClick={() => filter('')}>{t('clearFilters')}</Button> : undefined}
         />
       ) : (
-        <TableScrollContainer minWidth={900}>
+        <TableScrollContainer minWidth={900} scrollAreaProps={{ viewportProps: { role: 'region', 'aria-label': t('jobs'), tabIndex: 0 } }}>
           <Table stickyHeader highlightOnHover>
             <Table.Thead>
               <Table.Tr>

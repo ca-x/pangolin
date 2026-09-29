@@ -2,7 +2,7 @@ import { ActionIcon, Alert, Button, Checkbox, Collapse, Group, Loader, Modal, Nu
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { createColumnHelper, flexRender, getCoreRowModel, getFilteredRowModel, useReactTable } from '@tanstack/react-table'
 import { AlertTriangle, ChevronRight, Copy, Inbox, Plus, Search, Trash2 } from 'lucide-react'
-import { useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react'
+import { useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 import { api, displayTimezone, type Document, type Paged } from '../api'
@@ -104,11 +104,15 @@ type ResourcePageProps = {
    * the rows is exactly what makes a filtered-out row unreachable.
    */
   filters?: ReactNode
+  /** Server-side list facets; writes still use the unfiltered resource path. */
+  listQuery?: Record<string, string>
   normalize?: (values: Record<string, unknown>, editing: Document | null) => Record<string, unknown>
   /** A slot for an auxiliary query's own banner (health, a lookup). The element carries its own spacing, so an absent banner leaves no gap. */
   notice?: ReactNode
   /** Resource-specific controls can use the shared list shell without adopting its generic editor. */
   headerAction?: ReactNode
+  /** Small resource-specific action grouped with create, including in empty states. */
+  headerExtra?: ReactNode
   /** Adds a resource-specific action beside the shared create action, including in the empty state. */
   secondaryAction?: ReactNode
   /** Replaces enable/disable for a selected resource whose lifecycle has its own contract. */
@@ -148,7 +152,7 @@ function readForm(form: HTMLFormElement, fields: FormField[]) {
   return output
 }
 
-export function ResourcePage({ resource, title, description, empty, columns, fields = [], createLabel, immutable, appendOnly, editDisabled = false, endpoint, itemEndpoint, createMethod = 'POST', updateMethod = 'POST', canDelete = true, rowActions, mobileStatus, filters, normalize, notice, selectable, bulkDelete = false, headerAction, secondaryAction, bulkActions, emptyAction, mobilePrimary, mobilePrimaryKey, mobileHiddenKeys, tableMinWidth = 700, mobileColumnLimit = 3 }: ResourcePageProps) {
+export function ResourcePage({ resource, title, description, empty, columns, fields = [], createLabel, immutable, appendOnly, editDisabled = false, endpoint, itemEndpoint, createMethod = 'POST', updateMethod = 'POST', canDelete = true, rowActions, mobileStatus, filters, listQuery, normalize, notice, selectable, bulkDelete = false, headerAction, headerExtra, secondaryAction, bulkActions, emptyAction, mobilePrimary, mobilePrimaryKey, mobileHiddenKeys, tableMinWidth = 700, mobileColumnLimit = 3 }: ResourcePageProps) {
   const { t } = useTranslation()
   const { project } = useProject()
   const client = useQueryClient()
@@ -162,8 +166,19 @@ export function ResourcePage({ resource, title, description, empty, columns, fie
   const lastTrigger = useRef<HTMLButtonElement | null>(null)
   const formRef = useRef<HTMLFormElement | null>(null)
   const path = typeof endpoint === 'function' ? endpoint(project.id) : endpoint || projectOperationPath(project.id, resource)
-  const queryPath = `${path}${path.includes('?') ? '&' : '?'}offset=${offset}&limit=${limit}${filter.trim() ? `&q=${encodeURIComponent(filter.trim())}` : ''}`
-  const query = useQuery({ queryKey: ['resource', project.id, resource, path, offset, limit, filter], queryFn: () => api<Paged<Document> | Document[]>(queryPath) })
+  const facets = new URLSearchParams(listQuery).toString()
+  const previousFacets = useRef(facets)
+  useEffect(() => {
+    if (previousFacets.current === facets) return
+    previousFacets.current = facets
+    setOffset(0)
+    setSelected([])
+  }, [facets])
+  const queryParams = new URLSearchParams({ offset: String(offset), limit: String(limit) })
+  if (filter.trim()) queryParams.set('q', filter.trim())
+  for (const [key, value] of Object.entries(listQuery ?? {})) queryParams.set(key, value)
+  const queryPath = `${path}${path.includes('?') ? '&' : '?'}${queryParams}`
+  const query = useQuery({ queryKey: ['resource', project.id, resource, path, offset, limit, filter, facets], queryFn: () => api<Paged<Document> | Document[]>(queryPath) })
   const allRows = useMemo(() => Array.isArray(query.data) ? query.data.filter((row) => !filter.trim() || JSON.stringify(row).toLowerCase().includes(filter.trim().toLowerCase())) : query.data?.data || [], [filter, query.data])
   const rows = Array.isArray(query.data) ? allRows.slice(offset, offset + limit) : allRows
   const total = Array.isArray(query.data) ? allRows.length : query.data?.total ?? rows.length
@@ -240,14 +255,15 @@ export function ResourcePage({ resource, title, description, empty, columns, fie
   }
   const handleClose = () => { setOpen(false); setEditing(null); requestAnimationFrame(() => lastTrigger.current?.focus()) }
   const createAction = !immutable && fields.length ? <Button leftSection={<Plus size={17} />} onClick={(event) => beginCreate(event.currentTarget)}>{createLabel || t('add')}</Button> : undefined
-  const defaultActions = (secondaryAction || createAction) ? <Group gap="xs" wrap="wrap" justify="flex-end">{secondaryAction}{createAction}</Group> : undefined
+  const defaultActions = (headerExtra || secondaryAction || createAction) ? <Group gap="xs" wrap="wrap" justify="flex-end">{headerExtra}{secondaryAction}{createAction}</Group> : undefined
+  const emptyActions = (secondaryAction || createAction) ? <Group gap="xs" wrap="wrap" justify="flex-end">{secondaryAction}{createAction}</Group> : undefined
   return <>
-    <PageHeader title={title} description={description} action={(total > 0 || filter) ? headerAction ?? defaultActions : undefined} />
+    <PageHeader title={title} description={description} action={(total > 0 || filter || headerExtra) ? headerAction ?? defaultActions : undefined} />
     {/* A slot for an auxiliary query's own banner (health, a lookup). The element
         carries its own spacing so an empty slot leaves no gap. */}
     {notice}
     {filters && <Group gap="sm" mb="md" className="resource-filters">{filters}</Group>}
-    {(total > 0 || filter) && <TextInput leftSection={<Search size={17} />} placeholder={t('search')} value={filter} onChange={(event) => { setFilter(event.target.value); setOffset(0) }} aria-label={t('search')} mb="md" w={{ base: '100%', sm: 360 }} />}
+    {(total > 0 || filter) && <div className="resource-toolbar"><TextInput className="resource-search" leftSection={<Search size={17} />} placeholder={t('search')} value={filter} onChange={(event) => { setFilter(event.target.value); setOffset(0) }} aria-label={t('search')} /><Text size="sm" c="dimmed">{t('rowCount', { count: total })}</Text></div>}
     {selectable && selected.length > 0 && <Group gap="sm" mb="md" role="region" aria-label={t('bulkActions')} className="selection-bar">
       <Text size="sm" fw={540}>{t('selectedCount', { count: selected.length })}</Text>
       {bulkActions ? bulkActions(selected, () => setSelected([])) : <>
@@ -257,7 +273,7 @@ export function ResourcePage({ resource, title, description, empty, columns, fie
         <Button size="compact-sm" variant="subtle" onClick={() => setSelected([])}>{t('cancel')}</Button>
       </>}
     </Group>}
-    {query.isError ? <QueryError retry={() => void query.refetch()} /> : query.isLoading ? <SkeletonRows /> : rows.length === 0 ? <EmptyState icon={<Inbox />} title={title} copy={filter ? t('noSearchResults') : empty} action={!filter ? emptyAction ?? defaultActions : undefined} /> : <><TableScrollContainer minWidth={tableMinWidth} className="desktop-resource-table" style={{ maxHeight: 'min(74vh, 900px)' }} role="region" aria-label={title} tabIndex={0}><Table stickyHeader highlightOnHover><Table.Thead>{table.getHeaderGroups().map((group) => <Table.Tr key={group.id}>{group.headers.map((header) => <Table.Th key={header.id}>{flexRender(header.column.columnDef.header, header.getContext())}</Table.Th>)}</Table.Tr>)}</Table.Thead><Table.Tbody>{table.getRowModel().rows.map((row) => <Table.Tr key={row.id}>{row.getVisibleCells().map((cell) => <Table.Td key={cell.id}>{flexRender(cell.column.columnDef.cell, cell.getContext())}</Table.Td>)}</Table.Tr>)}</Table.Tbody></Table></TableScrollContainer><MobileResources rows={rows} columns={columns} rowActions={rowActions} mobileStatus={mobileStatus} onEdit={!immutable && !appendOnly && fields.length ? (row, trigger) => { lastTrigger.current = trigger; setInvalidFields(new Set()); setEditing(row); setOpen(true) } : undefined} editDisabled={editDisabled} onDelete={!immutable && !appendOnly ? confirmRemove : undefined} canDelete={canDelete} primary={mobilePrimary} primaryKey={mobilePrimaryKey} hiddenKeys={mobileHiddenKeys} columnLimit={mobileColumnLimit} /></>}
+    {query.isError ? <QueryError retry={() => void query.refetch()} /> : query.isLoading ? <SkeletonRows /> : rows.length === 0 ? <EmptyState icon={<Inbox />} title={title} copy={filter ? t('noSearchResults') : empty} action={!filter && !headerExtra ? emptyAction ?? emptyActions : undefined} /> : <><TableScrollContainer minWidth={tableMinWidth} className="desktop-resource-table" style={{ maxHeight: 'min(74vh, 900px)' }} scrollAreaProps={{ viewportProps: { role: 'region', 'aria-label': title, tabIndex: 0 } }}><Table stickyHeader highlightOnHover><Table.Thead>{table.getHeaderGroups().map((group) => <Table.Tr key={group.id}>{group.headers.map((header) => <Table.Th key={header.id}>{flexRender(header.column.columnDef.header, header.getContext())}</Table.Th>)}</Table.Tr>)}</Table.Thead><Table.Tbody>{table.getRowModel().rows.map((row) => <Table.Tr key={row.id}>{row.getVisibleCells().map((cell) => <Table.Td key={cell.id}>{flexRender(cell.column.columnDef.cell, cell.getContext())}</Table.Td>)}</Table.Tr>)}</Table.Tbody></Table></TableScrollContainer><MobileResources rows={rows} columns={columns} rowActions={rowActions} mobileStatus={mobileStatus} onEdit={!immutable && !appendOnly && fields.length ? (row, trigger) => { lastTrigger.current = trigger; setInvalidFields(new Set()); setEditing(row); setOpen(true) } : undefined} editDisabled={editDisabled} onDelete={!immutable && !appendOnly ? confirmRemove : undefined} canDelete={canDelete} primary={mobilePrimary} primaryKey={mobilePrimaryKey} hiddenKeys={mobileHiddenKeys} columnLimit={mobileColumnLimit} /></>}
     {total > limit && <Group justify="flex-end" gap="sm" mt="md" className="pagination"><Pagination total={totalPages} value={currentPage} onChange={(page) => setOffset((page - 1) * limit)} getControlProps={(control) => {
       if (control === 'previous') return { 'aria-label': t('previous') }
       if (control === 'next') return { 'aria-label': t('next') }

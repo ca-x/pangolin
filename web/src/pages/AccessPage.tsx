@@ -10,8 +10,10 @@ import { AllowedModelsEditor, ProfileMappingsEditor, RoutingPolicyEditor } from 
 import { UNMEASURED, formatCount, formatMicros } from '../observability'
 import { projectOperationPath, useProject } from '../project'
 import { PageHeader, QueryError, ResourcePage, displayValue, formatDate } from './shared'
+import { useRoutedTab } from './useRoutedTab'
 
 const ACCESS_TABS: Array<[string, string]> = [['keys', 'api_key:manage'], ['profiles', 'api_key:manage'], ['projects', 'project:manage'], ['users', 'user:manage'], ['members', 'project:read'], ['roles', 'role:manage'], ['invitations', 'project:manage'], ['oidc', 'oidc:manage'], ['identities', 'oidc:manage']]
+const ACCESS_TAB_VALUES = ACCESS_TABS.map(([value]) => value)
 
 /**
  * The API-key type the record system stores, in the console's own words. A type
@@ -43,7 +45,7 @@ function useKeyTypeLabel() {
 export default function AccessPage() {
   const { t } = useTranslation()
   const { project, permissions, permissionsStatus, retryPermissions } = useProject()
-  const [tab, setTab] = useState('keys')
+  const [tab, setTab] = useRoutedTab(ACCESS_TAB_VALUES, 'keys')
   // Mirrors access::authorize: project:manage satisfies project:read, role:manage
   // and api_key:manage. Without this the UI hid tabs the backend would accept.
   const granted = new Set<string>(permissions)
@@ -51,6 +53,9 @@ export default function AccessPage() {
   const can = (permission: string) => granted.has('*') || granted.has(permission)
   const visible = ACCESS_TABS.filter(([, permission]) => can(permission))
   const active = visible.some(([v]) => v === tab) ? tab : visible[0]?.[0]
+  useEffect(() => {
+    if (permissionsStatus === 'ready' && active && active !== tab) setTab(active, true)
+  }, [permissionsStatus, active, tab, setTab])
   // The active project's permissions are what this page may offer, and the query is keyed
   // by the project, so a switch leaves them unanswered for the project on screen. That is
   // not "no access": while the answer is in flight the page says which project's
@@ -69,7 +74,6 @@ export default function AccessPage() {
   if (!active && !loading) return <div>{header}<Paper withBorder p="lg" mt="md"><Text size="sm" c="dimmed">{t('noAccessSection')}</Text></Paper></div>
   return (
     <div>
-      {header}
       {loading && (
         <Stack gap="sm" mt="md">
           <Text size="sm" c="dimmed">{t('accessPermissionsLoading')}</Text>
@@ -77,7 +81,7 @@ export default function AccessPage() {
         </Stack>
       )}
       <div hidden={loading}>
-        <Tabs keepMounted={false} value={mounted} onChange={(v) => v && setTab(v)}>
+        <Tabs keepMounted={false} value={mounted} onChange={setTab}>
           <Tabs.List mb="lg">
             {visible.map(([value]) => (
               <Tabs.Tab key={value} value={value}>{t(value)}</Tabs.Tab>
@@ -382,7 +386,7 @@ function KeyUsageDialog({ projectId, apiKey, onClose }: { projectId: string; api
       </Tabs>
       {query.isError ? <QueryError retry={() => void query.refetch()} /> : query.isLoading ? <SkeletonRows count={4} /> : <>
         {!measured && <Text size="sm" c="dimmed">{t('keyUsageUnmeasured')}</Text>}
-        <TableScrollContainer minWidth={440} role="region" aria-label={t('keyUsageOverall')} tabIndex={0}>
+        <TableScrollContainer minWidth={440} scrollAreaProps={{ viewportProps: { role: 'region', 'aria-label': t('keyUsageOverall'), tabIndex: 0 } }}>
           <Table>
             <Table.Thead><Table.Tr><Table.Th>{t('tokenType')}</Table.Th><Table.Th>{t('count')}</Table.Th></Table.Tr></Table.Thead>
             <Table.Tbody>
@@ -558,7 +562,7 @@ function KeysPanel() {
         <Button size="compact-sm" variant="subtle" onClick={() => setSelected([])}>{t('cancel')}</Button>
       </Group>}
       {query.isError ? <QueryError retry={() => void query.refetch()} /> : query.isLoading ? <SkeletonRows /> : !query.data?.length ? <EmptyState icon={<KeyRound />} title={t('keys')} copy={t('keyEmpty')} action={<Button onClick={beginCreate}>{t('addKey')}</Button>} /> : (
-        <TableScrollContainer minWidth={1020} role="region" aria-label={t('keys')} tabIndex={0}>
+        <TableScrollContainer minWidth={1020} scrollAreaProps={{ viewportProps: { role: 'region', 'aria-label': t('keys'), tabIndex: 0 } }}>
           <Table stickyHeader highlightOnHover>
             <Table.Thead>
               <Table.Tr>
@@ -819,7 +823,7 @@ function AssignmentsPanel() {
                   : bindings.isError ? <QueryError retry={() => void bindings.refetch()} />
                     : !bindings.data?.length ? <Text size="sm" c="dimmed">{t('bindingsEmpty')}</Text>
                       : (
-                        <TableScrollContainer minWidth={600}>
+                        <TableScrollContainer minWidth={600} scrollAreaProps={{ viewportProps: { role: 'region', 'aria-label': t('roleBindingsList'), tabIndex: 0 } }}>
                           <Table highlightOnHover>
                             <Table.Thead>
                               <Table.Tr>
@@ -965,7 +969,7 @@ function InvitationsPanel() {
     <>
       <PageHeader title={t('invitations')} description={t('invitationsDescription')} action={query.data?.length ? <Button leftSection={<Plus size={17} />} onClick={invite}>{t('inviteUser')}</Button> : undefined} />
       {query.isLoading ? <SkeletonRows /> : query.isError ? <QueryError retry={() => void query.refetch()} /> : !query.data?.length ? <EmptyState icon={<Mail />} title={t('invitations')} copy={t('invitationEmpty')} action={<Button onClick={invite}>{t('inviteUser')}</Button>} /> : (
-        <TableScrollContainer minWidth={600}>
+        <TableScrollContainer minWidth={600} scrollAreaProps={{ viewportProps: { role: 'region', 'aria-label': t('invitations'), tabIndex: 0 } }}>
           <Table stickyHeader highlightOnHover>
             <Table.Thead>
               <Table.Tr>

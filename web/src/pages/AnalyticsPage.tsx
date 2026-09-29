@@ -112,7 +112,7 @@ function ConfidenceFact({ row, compact = false }: { row: AnalyticsRow; compact?:
   const { t } = useTranslation()
   if (typeof row.sample_count !== 'number' || !row.confidence_level) return <>{UNMEASURED}</>
   const sample = t('analyticsSampleCount', { count: row.sample_count })
-  if (compact) return <Text size="xs" c={row.confidence_level === 'low' ? 'yellow' : 'dimmed'}>{sample} · {confidenceLabel(row.confidence_level, t)}</Text>
+  if (compact) return <Text size="xs" c={row.confidence_level === 'low' ? undefined : 'dimmed'} className={row.confidence_level === 'low' ? 'confidence-low' : undefined}>{sample} · {confidenceLabel(row.confidence_level, t)}</Text>
   return <Group gap="xs" wrap="nowrap"><Text size="sm" className="analytics-bar-value">{sample}</Text><Badge variant="light" color={{ low: 'gray', medium: 'yellow', high: 'green' }[row.confidence_level]}>{confidenceLabel(row.confidence_level, t)}</Badge></Group>
 }
 

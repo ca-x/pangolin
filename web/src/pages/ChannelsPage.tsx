@@ -1,6 +1,6 @@
-import { ActionIcon, Alert, Badge, Button, Card, Code, Collapse, Group, Modal, Paper, Select, SimpleGrid, Skeleton, Stack, Switch, Tabs, Text, Textarea, TextInput, Title, Tooltip } from '@mantine/core'
+import { ActionIcon, Alert, Badge, Button, Card, Code, Collapse, Group, Menu, Modal, Paper, Select, SimpleGrid, Skeleton, Stack, Switch, Tabs, Text, Textarea, TextInput, Title, Tooltip, UnstyledButton } from '@mantine/core'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { ChevronRight, Plus, Trash2 } from 'lucide-react'
+import { ChevronRight, Eye, MoreHorizontal, Play, Plus, RefreshCw, Trash2 } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
@@ -11,7 +11,8 @@ import { UNMEASURED, useErrorCodeLabel } from '../observability'
 import { ProviderIcon } from '../ProviderIcon'
 import { CHANNEL_PROVIDERS } from '../providers'
 import { projectOperationPath, useProject } from '../project'
-import { BulkToggle, PageHeader, QueryError, ResourcePage, displayValue, formatDate } from './shared'
+import { PageHeader, QueryError, ResourcePage, displayValue, formatDate } from './shared'
+import { useRoutedTab } from './useRoutedTab'
 
 const CHANNEL_TABS = ['channels', 'credentials', 'channelPolicies', 'probes', 'quotas', 'presets'] as const
 
@@ -22,20 +23,41 @@ const CHANNEL_TABS = ['channels', 'credentials', 'channelPolicies', 'probes', 'q
  */
 type HealthRow = { id: string; provider_id?: string; credential_id?: string; consecutive_failures?: number; disabled_until?: number | null; backoff_until?: number | null; reason?: string | null; updated_at?: number }
 
+function ChannelNameCell({ row }: { row: Document }) {
+  const { t } = useTranslation()
+  const name = String(row.name)
+  const url = String(row.base_url || '')
+  const [open, setOpen] = useState(false)
+  const copyUrl = async () => {
+    try { await navigator.clipboard.writeText(url); toast.success(t('copied')) }
+    catch { toast.error(t('copyUnavailable')) }
+  }
+  return <><span className="provider-cell"><ProviderIcon logoKey={String((row.settings as Record<string, unknown>)?.logo_key || '')} name={name} /><span className="pm-channel-identity"><strong>{name}</strong><Tooltip label={t('viewBaseUrl')}><UnstyledButton className="pm-channel-url" aria-label={`${t('viewBaseUrl')}: ${url}`} onClick={() => setOpen(true)}><span className="mono-cell">{url}</span><Eye size={15} aria-hidden="true" /></UnstyledButton></Tooltip></span></span><Modal opened={open} onClose={() => setOpen(false)} title={`${t('baseUrl')} · ${name}`} closeButtonProps={{ 'aria-label': t('close') }}><Stack gap="md"><Code block style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>{url}</Code><Group justify="flex-end"><Button variant="default" onClick={() => setOpen(false)}>{t('close')}</Button><Button onClick={() => void copyUrl()}>{t('copyBaseUrl')}</Button></Group></Stack></Modal></>
+}
+
+function ChannelMobilePrimary({ row }: { row: Document }) {
+  const { t } = useTranslation()
+  return <Stack gap={2}><span>{String(row.name)}</span><Text component="span" size="sm" c="dimmed" className="mono-cell" style={{ overflowWrap: 'anywhere' }}><span className="sr-only">{t('baseUrl')}: </span>{displayValue(row.base_url)}</Text></Stack>
+}
+
 export default function ChannelsPage() {
   const { t } = useTranslation()
   const kindLabel = useProviderKindLabel()
+  const [kind, setKind] = useState('all')
+  const [channelState, setChannelState] = useState('all')
+  const activeFilters = kind !== 'all' || channelState !== 'all'
+  const listQuery = { ...(kind === 'all' ? {} : { kind }), ...(channelState === 'all' ? {} : { enabled: channelState }) }
+  const [tab, setTab] = useRoutedTab(CHANNEL_TABS, 'channels')
   return (
-    <Tabs keepMounted={false} defaultValue="channels">
+    <Tabs keepMounted={false} value={tab} onChange={setTab}>
       <Tabs.List mb="lg">
         {CHANNEL_TABS.map((value) => (
           <Tabs.Tab key={value} value={value}>{t(value)}</Tabs.Tab>
         ))}
       </Tabs.List>
       <Tabs.Panel value="channels">
-        <ResourcePage resource="channels" title={t('channels')} description={t('channelsDescription')} empty={t('channelEmpty')} createLabel={t('addChannel')} selectable="channels" bulkDelete notice={<HealthNotice kind="channel" />} columns={[{ key: 'name', label: t('name'), render: (value, row) => <span className="provider-cell"><ProviderIcon logoKey={String((row.settings as Record<string, unknown>)?.logo_key || '')} name={String(value)} /><strong>{String(value)}</strong></span> }, { key: 'kind', label: t('providerType'), render: (value) => kindLabel(value) }, { key: 'priority', label: t('priority') }, { key: 'base_url', label: t('baseUrl'), mono: true }, { key: 'health', label: t('channelHealth'), render: (_value, row) => <HealthCell kind="channel" id={String(row.id)} /> }, { key: 'enabled', label: t('status'), render: (value) => <EnabledPill enabled={value} /> }]} rowActions={(row) => <><ChannelSyncAction id={String(row.id)} name={displayValue(row.name || row.id)} /><ProbeRowAction id={String(row.id)} name={displayValue(row.name || row.id)} /><ChannelLifecycleActions row={row} /></>} fields={[{ key: 'name', label: t('name'), required: true }, { key: 'kind', label: t('providerType'), kind: 'provider', required: true, baseUrlKey: 'base_url', options: providerOptions(t) }, { key: 'base_url', label: t('baseUrl'), required: true, defaultValue: CHANNEL_PROVIDERS[0].defaultBaseUrl ?? '' }, { key: 'priority', label: t('priority'), kind: 'number', defaultValue: 100, hint: t('channelPriorityHint') }, { key: 'settings', label: t('advancedSettings'), kind: 'json', defaultValue: { version: 1, tags: [], limits: {}, circuit: { failures: 5, window_ms: 60000, recovery_ms: 30000 }, quota: { path: '/api/v1/key' } }, render: ({ name, label, value, setValid }) => <ChannelSettingsEditor name={name} label={label} value={value} setValid={setValid} /> }, { key: 'enabled', label: t('status'), kind: 'checkbox' }]} />
+        <ResourcePage resource="channels" title={t('channels')} description={t('channelsDescription')} empty={activeFilters ? t('noSearchResults') : t('channelEmpty')} emptyAction={activeFilters ? <Button variant="default" onClick={() => { setKind('all'); setChannelState('all') }}>{t('clearFilters')}</Button> : undefined} createLabel={t('addChannel')} selectable="channels" bulkDelete notice={<HealthNotice kind="channel" />} listQuery={listQuery} filters={<><Select label={t('filterProviderType')} value={kind} onChange={(value) => setKind(value || 'all')} allowDeselect={false} searchable data={[{ value: 'all', label: t('allProviderTypes') }, ...CHANNEL_PROVIDERS.map((provider) => ({ value: provider.kind, label: t(provider.labelKey) }))]} w={{ base: '100%', sm: 230 }} /><Select label={t('status')} value={channelState} onChange={(value) => setChannelState(value || 'all')} allowDeselect={false} data={[{ value: 'all', label: t('allStatuses') }, { value: 'true', label: t('enabled') }, { value: 'false', label: t('disabled') }]} w={{ base: '100%', sm: 180 }} /></>} tableMinWidth={1100} mobileColumnLimit={4} mobileHiddenKeys={['enabled']} mobilePrimary={(row) => <ChannelMobilePrimary row={row} />} columns={[{ key: 'name', label: t('name'), render: (_value, row) => <ChannelNameCell row={row} /> }, { key: 'kind', label: t('providerType'), render: (value) => kindLabel(value) }, { key: 'priority', label: t('priority') }, { key: 'health', label: t('channelHealth'), render: (_value, row) => <ChannelHealthWithHistory id={String(row.id)} name={displayValue(row.name || row.id)} /> }, { key: 'enabled', label: t('status'), render: (value) => <EnabledPill enabled={value} /> }]} rowActions={(row) => <><ChannelSyncAction id={String(row.id)} name={displayValue(row.name || row.id)} /><ProbeRowAction id={String(row.id)} name={displayValue(row.name || row.id)} /><ChannelLifecycleActions row={row} /></>} fields={[{ key: 'name', label: t('name'), required: true }, { key: 'kind', label: t('providerType'), kind: 'provider', required: true, baseUrlKey: 'base_url', options: providerOptions(t) }, { key: 'base_url', label: t('baseUrl'), required: true, defaultValue: CHANNEL_PROVIDERS[0].defaultBaseUrl ?? '' }, { key: 'priority', label: t('priority'), kind: 'number', defaultValue: 100, hint: t('channelPriorityHint') }, { key: 'settings', label: t('advancedSettings'), kind: 'json', defaultValue: { version: 1, tags: [], limits: {}, circuit: { failures: 5, window_ms: 60000, recovery_ms: 30000 }, quota: { path: '/api/v1/key' } }, render: ({ name, label, value, setValid }) => <ChannelSettingsEditor name={name} label={label} value={value} setValid={setValid} /> }, { key: 'enabled', label: t('status'), kind: 'checkbox' }]} />
         <BulkProbe />
-        <BulkToggle />
       </Tabs.Panel>
       <Tabs.Panel value="credentials"><CredentialsPanel /></Tabs.Panel>
       <Tabs.Panel value="channelPolicies"><ChannelSettingsPanel /></Tabs.Panel>
@@ -150,8 +172,13 @@ function ChannelLifecycleActions({ row }: { row: Document }) {
   }, onSuccess: () => { toast.success(t('saved')); setMode(null); setPreview(null); void client.invalidateQueries({ queryKey: ['resource', project.id] }) }, onError: (error: Error) => toast.error(error.message) })
   const dependencies = preview?.dependencies?.[0]
   return <>
-    <Button variant="subtle" size="compact-sm" onClick={() => { setPreview(null); setMode('clone') }}>{t('cloneChannel')}</Button>
-    <Button variant="subtle" size="compact-sm" onClick={() => { setPreview(null); setMode('merge') }}>{t('mergeChannel')}</Button>
+    <Menu position="bottom-end" withinPortal>
+      <Menu.Target><Tooltip label={t('actions')}><ActionIcon variant="subtle" color="gray" aria-label={`${t('actions')} ${displayValue(row.name || row.id)}`}><MoreHorizontal size={17} /></ActionIcon></Tooltip></Menu.Target>
+      <Menu.Dropdown>
+        <Menu.Item onClick={() => { setPreview(null); setMode('clone') }}>{t('cloneChannel')}</Menu.Item>
+        <Menu.Item onClick={() => { setPreview(null); setMode('merge') }}>{t('mergeChannel')}</Menu.Item>
+      </Menu.Dropdown>
+    </Menu>
     <Modal opened={mode !== null} onClose={() => !mutation.isPending && setMode(null)} title={t(mode === 'merge' ? 'mergeChannel' : 'cloneChannel')} closeButtonProps={{ 'aria-label': t('close') }}>
       <Stack gap="md">
         {mode === 'clone' ? <TextInput label={t('name')} value={name} onChange={(event) => setName(event.currentTarget.value)} required /> : <SelectField label={t('targetChannel')} value={target} onValueChange={setTarget} options={options.filter((option) => option.value !== String(row.id))} />}
@@ -174,13 +201,13 @@ function useProbeModels() {
 }
 
 type ProbeRow = { id?: string; provider_id?: string; model?: string | null; success?: number | boolean | null; status_code?: number | null; latency_ms?: number | null; ttft_ms?: number | null; output_tokens?: number | null; probed_at?: number | null; error?: string | null }
-const probesQuery = (project: string) => ({
-  queryKey: ['probe-history', project],
-  queryFn: () => api<Paged<ProbeRow>>(projectOperationPath(project, 'probes') + '?limit=500'),
+const probesQuery = (project: string, providerId: string) => ({
+  queryKey: ['probe-history', project, providerId],
+  queryFn: () => api<Paged<ProbeRow>>(projectOperationPath(project, 'probes') + `?limit=100&provider_id=${encodeURIComponent(providerId)}`),
 })
-function useProbeHistory(polling = false) {
+function useProbeHistory(providerId: string, polling = false) {
   const { project } = useProject()
-  return useQuery({ ...probesQuery(project.id), refetchInterval: polling ? 2000 : false })
+  return useQuery({ ...probesQuery(project.id, providerId), refetchInterval: polling ? 2000 : false })
 }
 
 /**
@@ -212,6 +239,12 @@ function HealthCell({ kind, id }: { kind: 'channel' | 'credential'; id: string }
   // which left the column blank for every credential.
   const row = (query.data?.data || []).find((item) => String(item[healthKey(kind)] ?? item.id) === id)
   return <HealthPill health={row} kind={kind} />
+}
+
+function ChannelHealthWithHistory({ id, name }: { id: string; name: string }) {
+  const query = useProbeHistory(id)
+  const rows = (query.data?.data || []).filter((row) => String(row.provider_id) === id)
+  return <Stack gap={3}><HealthCell kind="channel" id={id} />{query.isLoading ? <Skeleton height={18} width={72} radius="sm" /> : <ProbeSparkline rows={rows} name={name} failed={query.isError} retry={() => void query.refetch()} />}</Stack>
 }
 
 /** The banner a page shows when the health projection itself cannot be read. */
@@ -261,7 +294,6 @@ function CredentialsPanel() {
       <Modal opened={oauthOpen} onClose={() => setOauthOpen(false)} title={t('providerOauth')} size="lg" closeOnClickOutside={false} closeButtonProps={{ 'aria-label': t('close') }}>
         {oauthOpen && <OAuthCredentialPanel options={options} optionsError={optionsError} retryOptions={retryOptions} onComplete={() => setOauthOpen(false)} />}
       </Modal>
-      <BulkToggle resource="credentials" />
     </>
   )
 }
@@ -275,7 +307,7 @@ function ChannelSyncAction({ id, name }: { id: string; name: string }) {
     onSuccess: () => { toast.success(t('modelSyncQueued')); void client.invalidateQueries({ queryKey: ['resource', project.id, 'channel-settings'] }) },
     onError: (error: Error) => toast.error(error.message),
   })
-  return <Button variant="subtle" size="compact-sm" aria-label={`${t('syncModels')} ${name}`} loading={sync.isPending} onClick={() => sync.mutate()}>{t('syncModels')}</Button>
+  return <Tooltip label={t('syncModels')}><ActionIcon variant="subtle" color="gray" aria-label={`${t('syncModels')} ${name}`} loading={sync.isPending} onClick={() => sync.mutate()}><RefreshCw size={16} /></ActionIcon></Tooltip>
 }
 
 type OAuthStart = { state: string; authorization_url?: string; verification_uri?: string; user_code?: string; expires_in?: number; interval?: number }
@@ -471,10 +503,10 @@ function ProbeSparkline({ rows, name, failed, retry }: { rows: ProbeRow[]; name:
   const { t } = useTranslation()
   if (failed) return <Button variant="subtle" size="compact-xs" aria-label={t('probeHistoryUnavailableFor', { name })} onClick={retry}>{t('retry')}</Button>
   const history = [...rows].sort((left, right) => Number(left.probed_at || 0) - Number(right.probed_at || 0)).slice(-12)
-  if (!history.length) return <Text component="span" size="xs" c="dimmed" aria-label={t('probeSparklineLabel', { name })}>{UNMEASURED}</Text>
+  if (!history.length) return <Text component="span" size="xs" c="dimmed" role="img" aria-label={`${t('probeSparklineLabel', { name })}: ${UNMEASURED}`}>{UNMEASURED}</Text>
   const points = history.map((row, index) => `${history.length === 1 ? 18 : index * 36 / (history.length - 1)},${successfulProbe(row) ? 4 : 16}`).join(' ')
   const rate = Math.round(history.filter(successfulProbe).length / history.length * 100)
-  return <Group gap={4} wrap="nowrap" aria-label={t('probeSparklineLabel', { name })}>
+  return <Group gap={4} wrap="nowrap" role="img" aria-label={`${t('probeSparklineLabel', { name })}: ${rate}%`}>
     <svg width="38" height="20" viewBox="0 0 38 20" aria-hidden="true"><polyline points={points} fill="none" stroke="var(--accent)" strokeWidth="2" vectorEffect="non-scaling-stroke" /></svg>
     <Text component="span" size="xs" c="dimmed" ff="monospace">{rate}%</Text>
   </Group>
@@ -511,7 +543,7 @@ function ProbeRowAction({ id, name }: { id: string; name: string }) {
   const [baseline, setBaseline] = useState<number | null>(null)
   const [queued, setQueued] = useState(false)
   const [model, setModel] = useState('')
-  const query = useProbeHistory(open && queued)
+  const query = useProbeHistory(id, open && queued)
   const models = useProbeModels()
   const availableModels = (models.data?.data || []).filter((item) => item.provider_id === id && item.enabled !== false && item.lifecycle !== 'archived')
   useEffect(() => { if (open && !availableModels.some((item) => item.id === model)) setModel(availableModels[0]?.id || '') }, [open, model, availableModels])
@@ -532,7 +564,7 @@ function ProbeRowAction({ id, name }: { id: string; name: string }) {
   const openDialog = () => { setOpen(true); setBaseline(null); setQueued(false) }
   const closeDialog = () => setOpen(false)
   return <>
-    <Stack gap={2} align="flex-end"><ProbeSparkline rows={rows} name={name} failed={query.isError} retry={() => void query.refetch()} /><Button variant="subtle" size="compact-sm" aria-label={`${t('test')} ${name}`} onClick={openDialog}>{t('test')}</Button></Stack>
+    <Tooltip label={t('test')}><ActionIcon variant="subtle" color="gray" aria-label={`${t('test')} ${name}`} onClick={openDialog}><Play size={16} /></ActionIcon></Tooltip>
     <Modal opened={open} onClose={closeDialog} title={`${t('test')} ${name}`} closeButtonProps={{ 'aria-label': t('close') }}>
       <Stack gap="md">
         <Group gap="sm" align="end" wrap="wrap">

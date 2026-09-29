@@ -1411,6 +1411,11 @@ struct Filter {
     dimension: Option<String>,
     model: Option<String>,
     provider: Option<String>,
+    /// Exact channel scope for probe history. Applied before pagination.
+    provider_id: Option<String>,
+    /// Channel-list facets are predicates on stored fields, before pagination.
+    kind: Option<String>,
+    enabled: Option<bool>,
     api_key: Option<String>,
     q: Option<String>,
     /// The trace list's own lifecycle facet. Only the traces resource reads it.
@@ -1660,6 +1665,27 @@ async fn list(
     // different window from the rows it accompanies.
     let mut predicate = format!("{scope}{lifecycle}");
     let mut scoped_values: Vec<sea_orm::Value> = vec![project.clone().into()];
+    if let Some(provider_id) = filter.provider_id.as_deref() {
+        if resource != "probes" || provider_id.is_empty() || provider_id.len() > 128 {
+            return Err(ApiError::BadRequest("invalid provider filter".into()));
+        }
+        predicate.push_str(" AND provider_id=?");
+        scoped_values.push(provider_id.to_owned().into());
+    }
+    if let Some(kind) = filter.kind.as_deref() {
+        if resource != "channels" || kind.is_empty() || kind.len() > 64 {
+            return Err(ApiError::BadRequest("invalid channel kind filter".into()));
+        }
+        predicate.push_str(" AND kind=?");
+        scoped_values.push(kind.to_owned().into());
+    }
+    if let Some(enabled) = filter.enabled {
+        if resource != "channels" {
+            return Err(ApiError::BadRequest("invalid enabled filter".into()));
+        }
+        predicate.push_str(" AND enabled=?");
+        scoped_values.push(i64::from(enabled).into());
+    }
     if let Some(column) = event_time_column(&resource) {
         if let Some(from) = filter.from {
             predicate.push_str(&format!(" AND {}>=?", column.sql()));
@@ -3025,6 +3051,7 @@ async fn routing_preview(
     let candidates = plan.candidates.iter().map(|candidate| json!({
         "id":candidate.id(),"provider_id":candidate.provider_id,"model_id":candidate.model_id,
         "upstream_model":candidate.target.upstream_name,"provider":candidate.target.provider_name,
+        "provider_kind":candidate.target.provider_kind,
         "priority":candidate.priority,"weight":candidate.weight,"endpoint":candidate.endpoint,
     })).collect::<Vec<_>>();
     Ok(Json(

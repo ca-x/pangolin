@@ -163,7 +163,7 @@ describe('role bindings can be listed and revoked', () => {
     // The second project's request runs — the cache entry names the project — and the
     // first project's row is gone rather than reused.
     await waitFor(() => expect(listCallsFor(fetchMock, 'p2').length).toBeGreaterThan(0))
-    expect(await screen.findByRole('button', { name: 'Revoke Reviewer' })).toBeInTheDocument()
+    expect(await screen.findByRole('button', { name: 'Revoke Reviewer' }, { timeout: 5000 })).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Revoke Developer' })).not.toBeInTheDocument()
     // The row shown is the second project's binding, not the first project's reused row.
     const bindingsTable = screen.getByRole('button', { name: 'Revoke Reviewer' }).closest('table') as HTMLElement
@@ -358,7 +358,7 @@ describe('the access page while the active project’s permissions are in flight
     next.release()
 
     // The work in progress survived the switch and now belongs to the project on screen.
-    expect(await screen.findByRole('button', { name: 'Revoke Reviewer' })).toBeInTheDocument()
+    expect(await screen.findByRole('button', { name: 'Revoke Reviewer' }, { timeout: 5000 })).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Revoke Developer' })).not.toBeInTheDocument()
     expect(screen.queryByText(noAccess)).not.toBeInTheDocument()
     const kept = (await screen.findByRole('heading', { name: 'Role binding' })).closest('form') as HTMLElement

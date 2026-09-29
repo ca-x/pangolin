@@ -308,8 +308,8 @@ describe('project members', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent('The selected project changed. Close this form and reopen it from the current project.')
     expect(within(screen.getByRole('dialog', { name: 'Edit u-member' })).getByRole('button', { name: 'Save changes' })).toBeDisabled()
     expect(await screen.findByRole('row', { name: /u-other/ })).toBeInTheDocument()
-    const firstKey = ['resource', 'p1', 'members', '/api/admin/v1/projects/p1/members', 0, 25, '']
-    const secondKey = ['resource', 'p2', 'members', '/api/admin/v1/projects/p2/members', 0, 25, '']
+    const firstKey = ['resource', 'p1', 'members', '/api/admin/v1/projects/p1/members', 0, 25, '', '']
+    const secondKey = ['resource', 'p2', 'members', '/api/admin/v1/projects/p2/members', 0, 25, '', '']
     expect(client.getQueryState(secondKey)?.isInvalidated).toBe(false)
     const secondReads = fetchMock.mock.calls.filter(([path, init]) => String(path).includes('/projects/p2/members') && !init?.method).length
 

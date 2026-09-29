@@ -40,4 +40,9 @@ describe('translations', () => {
   it('uses a key at all, so the guard cannot pass vacuously', () => {
     expect(usedKeys().length).toBeGreaterThan(200)
   })
+
+  it('names a single result without a plural suffix', () => {
+    expect(i18n.t('rowCount', { count: 1, lng: 'en' })).toBe('1 row')
+    expect(i18n.t('rowCount', { count: 2, lng: 'en' })).toBe('2 rows')
+  })
 })

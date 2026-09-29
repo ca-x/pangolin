@@ -204,7 +204,7 @@ export function EnabledPill({ enabled, tone }: { enabled: unknown; tone?: 'accen
   const on = Boolean(Number(enabled))
   const color = on ? (tone === 'warning' ? 'yellow' : tone === 'accent' ? 'pangolin' : 'teal') : 'gray'
   return (
-    <Badge variant="light" color={color} leftSection={<span aria-hidden="true" style={{ width: 6, height: 6, borderRadius: '50%', background: 'currentColor' }} />}>
+    <Badge variant="light" color={color} className="status-badge" leftSection={<span aria-hidden="true" style={{ width: 6, height: 6, borderRadius: '50%', background: 'currentColor' }} />}>
       {on ? t('enabled') : t('disabled')}
     </Badge>
   )
@@ -253,9 +253,9 @@ export function useCapabilityLabel() {
 
 export function EmptyState({ icon, title, copy, action }: { icon: ReactNode; title: string; copy: string; action?: ReactNode }) {
   return (
-    <Stack align="center" gap="md" py="xl" style={{ border: '1px dashed var(--mantine-color-default-border)', borderRadius: 'var(--mantine-radius-default)' }}>
+    <Stack className="pm-empty-state" align="center" gap="sm" py="xl" px="lg">
       <ThemeIcon variant="light" size={54} radius="lg">{icon}</ThemeIcon>
-      <Title order={3}>{title}</Title>
+      <Title order={2}>{title}</Title>
       <Text size="sm" c="dimmed" maw={420} ta="center">{copy}</Text>
       {action}
     </Stack>
