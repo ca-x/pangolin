@@ -48,6 +48,24 @@ function spyDownloads() {
   return { clicked, click }
 }
 
+it('removes cached system controls when permission refresh fails', async () => {
+  await i18n.changeLanguage('en')
+  vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
+    const path = String(input)
+    if (path.endsWith('/projects')) return json([project])
+    if (path.includes('/permissions')) return json(['*'])
+    return paged([])
+  }))
+  const client = renderPage()
+  expect(await screen.findByRole('tab', { name: 'Backups' })).toBeInTheDocument()
+  vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => String(input).includes('/permissions')
+    ? json({ error: { type: 'unavailable', message: 'Unavailable' } }, 503)
+    : paged([])))
+  await client.invalidateQueries({ queryKey: ['project-permissions', project.id] })
+  await waitFor(() => expect(screen.queryByRole('tab', { name: 'Backups' })).not.toBeInTheDocument())
+  expect(screen.getByRole('button', { name: 'Retry' })).toBeInTheDocument()
+})
+
 describe('backup and restore are a workflow', () => {
   beforeEach(async () => {
     await i18n.changeLanguage('en')

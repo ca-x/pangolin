@@ -12,7 +12,7 @@ import { ProviderIcon } from '../ProviderIcon'
 import { CHANNEL_PROVIDERS } from '../providers'
 import { projectOperationPath, useProject } from '../project'
 import { PageHeader, QueryError, ResourcePage, displayValue, formatDate } from './shared'
-import { useRoutedTab } from './useRoutedTab'
+import { useActiveTabInView, useRoutedTab } from './useRoutedTab'
 
 const CHANNEL_TABS = ['channels', 'credentials', 'channelPolicies', 'probes', 'quotas', 'presets'] as const
 
@@ -48,9 +48,10 @@ export default function ChannelsPage() {
   const activeFilters = kind !== 'all' || channelState !== 'all'
   const listQuery = { ...(kind === 'all' ? {} : { kind }), ...(channelState === 'all' ? {} : { enabled: channelState }) }
   const [tab, setTab] = useRoutedTab(CHANNEL_TABS, 'channels')
+  const tabsRef = useActiveTabInView(tab)
   return (
     <Tabs keepMounted={false} value={tab} onChange={setTab}>
-      <Tabs.List mb="lg">
+      <Tabs.List ref={tabsRef} mb="lg" className="pm-management-tabs">
         {CHANNEL_TABS.map((value) => (
           <Tabs.Tab key={value} value={value}>{t(value)}</Tabs.Tab>
         ))}

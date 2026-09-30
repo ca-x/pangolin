@@ -7,7 +7,7 @@ import { api } from '../api'
 import { EnabledPill } from '../components'
 import { useProject } from '../project'
 import { BulkToggle, ResourcePage } from './shared'
-import { useRoutedTab } from './useRoutedTab'
+import { useActiveTabInView, useRoutedTab } from './useRoutedTab'
 
 /**
  * A prompt's activation in words. The document is the condition tree
@@ -161,9 +161,10 @@ function ProtectionPreview() {
 export default function PromptsPage() {
   const { t } = useTranslation()
   const [tab, setTab] = useRoutedTab(['prompts', 'protection', 'overrides'] as const, 'prompts')
+  const tabsRef = useActiveTabInView(tab)
   return (
     <Tabs keepMounted={false} value={tab} onChange={setTab}>
-      <Tabs.List mb="lg">
+      <Tabs.List ref={tabsRef} mb="lg" className="pm-management-tabs">
         <Tabs.Tab value="prompts">{t('prompts')}</Tabs.Tab>
         <Tabs.Tab value="protection">{t('protection')}</Tabs.Tab>
         <Tabs.Tab value="overrides">{t('overrides')}</Tabs.Tab>

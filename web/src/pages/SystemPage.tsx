@@ -14,7 +14,7 @@ import { resolveSkin, skinLabel, skins } from '../skins'
 import { useTheme, type ColorMode } from '../theme'
 import { AutoRefreshControl, formatUpdatedAt, useAutoRefreshInterval } from './autoRefresh'
 import { PageHeader, QueryError, ResourcePage, displayValue, formatDate, type FormField } from './shared'
-import { useRoutedTab } from './useRoutedTab'
+import { useActiveTabInView, useRoutedTab } from './useRoutedTab'
 
 /**
  * Project-scoped tabs read and write rows that belong to one project, so their
@@ -28,8 +28,8 @@ const SYSTEM_TABS = ['appearance', ...PROJECT_TABS, 'modelSettings', 'requestLog
 
 export default function SystemPage() {
   const { t } = useTranslation()
-  const { permissions, permissionsStatus } = useProject()
-  const can = (permission: string) => permissions.has('*') || permissions.has(permission)
+  const { permissions, permissionsStatus, retryPermissions } = useProject()
+  const can = (permission: string) => permissionsStatus === 'ready' && (permissions.has('*') || permissions.has(permission))
   const projectScoped = can('project:manage')
   const instanceScoped = can('*')
   const [requestedTab, setTab] = useRoutedTab(SYSTEM_TABS, 'appearance')
@@ -38,12 +38,15 @@ export default function SystemPage() {
     : ['modelSettings', 'requestLogging', 'proxyPresets', 'diagnostics'].includes(requestedTab) && !instanceScoped
       ? 'appearance'
       : requestedTab
+  const tabsRef = useActiveTabInView(tab)
   useEffect(() => {
     if (permissionsStatus === 'ready' && tab !== requestedTab) setTab(tab, true)
   }, [permissionsStatus, requestedTab, tab, setTab])
+  if (permissionsStatus === 'loading') return <SkeletonRows count={3} />
+  if (permissionsStatus === 'error') return <QueryError retry={retryPermissions} />
   return (
     <Tabs keepMounted={false} value={tab} onChange={setTab}>
-      <Tabs.List mb="lg">
+      <Tabs.List ref={tabsRef} mb="lg">
         <Tabs.Tab value="appearance">{t('appearance')}</Tabs.Tab>
         {projectScoped && PROJECT_TABS.map((value) => <Tabs.Tab key={value} value={value}>{t(value)}</Tabs.Tab>)}
         {instanceScoped && <Tabs.Tab value="modelSettings">{t('modelSettings')}</Tabs.Tab>}

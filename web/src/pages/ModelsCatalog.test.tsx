@@ -47,16 +47,72 @@ const snapshots = [
   { id: 'snap-1', version: '6', digest: '0123456789abcdef', source_url: 'https://catalog.example/catalog.json', signature_verified: false, created_at: 1_699_000_000 },
 ]
 
-const renderPage = () => {
+const renderPage = (path = '/') => {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   render(
     <QueryClientProvider client={client}>
-      <MemoryRouter>
+      <MemoryRouter initialEntries={[path]}>
         <ProjectProvider><ModelsPage /><ConfirmHost /></ProjectProvider>
       </MemoryRouter>
     </QueryClientProvider>,
   )
 }
+
+it('puts catalog search and the model list directly after the page heading', async () => {
+  await i18n.changeLanguage('en')
+  vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL, init?: RequestInit) => base(String(input), init)))
+  renderPage('/models?tab=catalog')
+
+  const heading = await screen.findByRole('heading', { level: 1, name: 'Model catalog' })
+  const models = screen.getByRole('heading', { name: 'Catalog models' })
+  expect(screen.getAllByRole('heading', { level: 1 })).toHaveLength(1)
+  expect(heading.compareDocumentPosition(models) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+  expect(models.compareDocumentPosition(screen.getByRole('button', { name: 'Local catalog overrides' })) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+})
+
+it('expands catalog import below the page header and lets the operator cancel', async () => {
+  await i18n.changeLanguage('en')
+  vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL, init?: RequestInit) => base(String(input), init)))
+  renderPage('/models?tab=catalog')
+
+  const toggle = await screen.findByRole('button', { name: 'Import' })
+  await userEvent.click(toggle)
+  const field = screen.getByRole('textbox', { name: 'Catalog JSON' })
+  expect(toggle).toHaveAttribute('aria-expanded', 'true')
+  expect(screen.getByRole('heading', { name: 'Catalog import and export' }).closest('.mantine-Paper-root')).toContainElement(field)
+  await userEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+  expect(toggle).toHaveAttribute('aria-expanded', 'false')
+  expect(screen.queryByRole('textbox', { name: 'Catalog JSON' })).not.toBeInTheDocument()
+})
+
+it('shows only catalog views to an operator who can read a project and manage the catalog', async () => {
+  await i18n.changeLanguage('en')
+  vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+    if (String(input).includes('/permissions')) return json(['project:read', 'catalog:manage'])
+    return base(String(input), init)
+  }))
+  renderPage('/models')
+
+  expect(await screen.findByRole('heading', { level: 1, name: 'Model catalog' })).toBeInTheDocument()
+  expect(screen.getByRole('tab', { name: 'Model catalog' })).toBeInTheDocument()
+  expect(screen.getByRole('tab', { name: 'Subscriptions' })).toBeInTheDocument()
+  expect(screen.queryByRole('tab', { name: 'Models & routes' })).not.toBeInTheDocument()
+  expect(screen.queryByRole('tab', { name: 'Model routing' })).not.toBeInTheDocument()
+})
+
+it('keeps instance catalog writes out of a project manager’s read-only catalog view', async () => {
+  await i18n.changeLanguage('en')
+  vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+    if (String(input).includes('/permissions')) return json(['project:manage'])
+    return base(String(input), init)
+  }))
+  renderPage('/models?tab=catalog')
+
+  expect(await screen.findByRole('heading', { level: 1, name: 'Model catalog' })).toBeInTheDocument()
+  expect(screen.getByRole('link', { name: 'Export' })).toBeInTheDocument()
+  expect(screen.queryByRole('button', { name: 'Import' })).not.toBeInTheDocument()
+  expect(screen.queryByRole('button', { name: 'Local catalog overrides' })).not.toBeInTheDocument()
+})
 
 const base = (path: string, init?: RequestInit) => {
   if (path.endsWith('/projects')) return json([project])
