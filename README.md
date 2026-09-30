@@ -29,7 +29,23 @@ Pangolin (Chinese name 鲮鲤) is a single-binary AI API aggregation gateway. It
 
 ## Screenshots
 
-### Desktop
+### v0.6.2 management console
+
+These screenshots use the v0.6.2 release binary and test data.
+
+| Model catalog · dark · 中文 | Channels · light · English | Projects · light · 中文 |
+| --- | --- | --- |
+| ![Model catalog with direct management navigation](docs/screenshots/management-catalog-desktop-dark-zh.png) | ![Channel management with a populated channel](docs/screenshots/management-channels-desktop-light-en.png) | ![Project management with a populated project](docs/screenshots/management-projects-desktop-light-zh.png) |
+
+| Model catalog · 375px | Channels · 375px | Projects · 375px |
+| --- | --- | --- |
+| ![Mobile model catalog in dark mode](docs/screenshots/management-catalog-mobile-dark-zh.png) | ![Mobile channel management in light mode](docs/screenshots/management-channels-mobile-light-en.png) | ![Mobile project management in dark mode](docs/screenshots/management-projects-mobile-dark-zh.png) |
+
+### Additional workflow captures from v0.6.1
+
+These show earlier navigation; the workflows and theme examples remain available for reference.
+
+#### Desktop
 
 | Overview (light) | Overview (dark) | Channels |
 | --- | --- | --- |
@@ -47,7 +63,7 @@ Pangolin (Chinese name 鲮鲤) is a single-binary AI API aggregation gateway. It
 | --- | --- | --- | --- |
 | ![Pangolin trace detail](docs/screenshots/trace-desktop-dark-en.png) | ![Pangolin access control](docs/screenshots/access-desktop-light-zh.png) | ![Pangolin system settings](docs/screenshots/system-desktop-dark-zh.png) | ![Pangolin build identity](docs/screenshots/about-desktop-dark-zh.png) |
 
-### Themes
+#### Themes
 
 Interface style (16) and colour palette (20) are independent axes layered on top of light/dark. The styles follow the `ui-ux-pro-max` style catalogue and are implemented in its visual language; the palettes come from its product colour catalogue. Every combination is covered by an automated contrast audit (20 palettes × 2 modes × 23 pairs). See [design-system/pangolin/THEMES.md](design-system/pangolin/THEMES.md).
 
@@ -59,7 +75,7 @@ Interface style (16) and colour palette (20) are independent axes layered on top
 | --- | --- | --- |
 | ![Aurora style](docs/screenshots/theme-aurora.png) | ![Sci-fi HUD style](docs/screenshots/theme-hud.png) | ![Editorial style](docs/screenshots/theme-editorial.png) |
 
-### Mobile
+#### Mobile
 
 | Overview | Channels | Credentials | Trace detail |
 | --- | --- | --- | --- |
