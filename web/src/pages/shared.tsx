@@ -79,6 +79,8 @@ type ResourcePageProps = {
   columns: Array<{ key: string; label: string; mono?: boolean; render?: (value: unknown, row: Document) => ReactNode }>
   fields?: FormField[]
   createLabel?: string
+  /** Some resources permit editing in the active project but require a separate grant to create. */
+  canCreate?: boolean
   immutable?: boolean
   appendOnly?: boolean
   editDisabled?: boolean | ((row: Document) => boolean)
@@ -111,6 +113,8 @@ type ResourcePageProps = {
   notice?: ReactNode
   /** Resource-specific controls can use the shared list shell without adopting its generic editor. */
   headerAction?: ReactNode
+  /** An enclosing page may provide the single page heading above other controls. */
+  hideHeader?: boolean
   /** Small resource-specific action grouped with create, including in empty states. */
   headerExtra?: ReactNode
   /** Adds a resource-specific action beside the shared create action, including in the empty state. */
@@ -152,7 +156,7 @@ function readForm(form: HTMLFormElement, fields: FormField[]) {
   return output
 }
 
-export function ResourcePage({ resource, title, description, empty, columns, fields = [], createLabel, immutable, appendOnly, editDisabled = false, endpoint, itemEndpoint, createMethod = 'POST', updateMethod = 'POST', canDelete = true, rowActions, mobileStatus, filters, listQuery, normalize, notice, selectable, bulkDelete = false, headerAction, headerExtra, secondaryAction, bulkActions, emptyAction, mobilePrimary, mobilePrimaryKey, mobileHiddenKeys, tableMinWidth = 700, mobileColumnLimit = 3 }: ResourcePageProps) {
+export function ResourcePage({ resource, title, description, empty, columns, fields = [], createLabel, canCreate = true, immutable, appendOnly, editDisabled = false, endpoint, itemEndpoint, createMethod = 'POST', updateMethod = 'POST', canDelete = true, rowActions, mobileStatus, filters, listQuery, normalize, notice, selectable, bulkDelete = false, headerAction, hideHeader = false, headerExtra, secondaryAction, bulkActions, emptyAction, mobilePrimary, mobilePrimaryKey, mobileHiddenKeys, tableMinWidth = 700, mobileColumnLimit = 3 }: ResourcePageProps) {
   const { t } = useTranslation()
   const { project } = useProject()
   const client = useQueryClient()
@@ -257,11 +261,11 @@ export function ResourcePage({ resource, title, description, empty, columns, fie
     if (input instanceof HTMLInputElement) input.value = baseUrl
   }
   const handleClose = () => { setOpen(false); setEditing(null); requestAnimationFrame(() => lastTrigger.current?.focus()) }
-  const createAction = !immutable && fields.length ? <Button leftSection={<Plus size={17} />} onClick={(event) => beginCreate(event.currentTarget)}>{createLabel || t('add')}</Button> : undefined
+  const createAction = canCreate && !immutable && fields.length ? <Button leftSection={<Plus size={17} />} onClick={(event) => beginCreate(event.currentTarget)}>{createLabel || t('add')}</Button> : undefined
   const defaultActions = (headerExtra || secondaryAction || createAction) ? <Group gap="xs" wrap="wrap" justify="flex-end">{headerExtra}{secondaryAction}{createAction}</Group> : undefined
   const emptyActions = (secondaryAction || createAction) ? <Group gap="xs" wrap="wrap" justify="flex-end">{secondaryAction}{createAction}</Group> : undefined
   return <>
-    <PageHeader title={title} description={description} action={(total > 0 || filter || headerExtra) ? headerAction ?? defaultActions : undefined} />
+    {!hideHeader && <PageHeader title={title} description={description} action={(total > 0 || filter || headerExtra) ? headerAction ?? defaultActions : undefined} />}
     {/* A slot for an auxiliary query's own banner (health, a lookup). The element
         carries its own spacing so an empty slot leaves no gap. */}
     {notice}
@@ -303,7 +307,7 @@ function MobileResources({ rows, columns, onEdit, onDelete, rowActions, mobileSt
   // value only where no owner asked for one.
   const state = (row: Document) => mobileStatus ? mobileStatus(row) : row.enabled != null ? <EnabledPill enabled={row.enabled} /> : displayValue(row.status)
   const visible = columns.filter((column) => column.key !== 'id' && column.key !== primaryKey && !hiddenKeys.includes(column.key)).slice(0, columnLimit)
-  return <Stack gap="sm" className="mobile-resource-list">{rows.map((row) => <Paper key={row.id} p="md" withBorder><Group justify="space-between" align="flex-start" mb="sm"><Stack gap={4} style={{ minWidth: 0 }}><Text component="div" fw={600} style={{ overflowWrap: 'anywhere' }}>{primary(row)}</Text><Button variant="subtle" size="compact-xs" c="dimmed" onClick={() => void navigator.clipboard?.writeText(String(row.id))}>{t('copyId')}</Button></Stack><Text component="div" size="sm">{state(row)}</Text></Group><Stack gap="xs" mb={onEdit || onDelete || rowActions ? 'sm' : undefined} style={{ minWidth: 0 }}>{visible.filter((column) => primaryKey || String(row[column.key] ?? '') !== primaryText(row)).map((column) => <Group key={column.key} gap="xs" wrap="nowrap" style={{ minWidth: 0 }}><Text size="sm" c="dimmed" style={{ minWidth: '88px', flex: '0 0 auto' }}>{column.label}</Text><Text component="div" size="sm" className={column.mono ? 'mono-cell' : undefined} style={{ flex: 1, minWidth: 0 }}>{column.render ? column.render(row[column.key], row) : displayValue(row[column.key])}</Text></Group>)}</Stack>{(onEdit || onDelete || rowActions) && <Group gap="xs">{onEdit && !forbids(editDisabled, row) && <Button variant="subtle" size="compact-sm" onClick={(event) => onEdit(row, event.currentTarget)}>{t('edit')}</Button>}{onDelete && allows(canDelete, row) && <Button variant="subtle" color="red" size="compact-sm" onClick={() => onDelete(row)}>{t('delete')}</Button>}{rowActions?.(row)}</Group>}</Paper>)}</Stack>
+  return <Stack gap="sm" className="mobile-resource-list">{rows.map((row) => <Paper key={row.id} p="md" withBorder><Group justify="space-between" align="flex-start" mb="sm"><Stack gap={4} style={{ minWidth: 0 }}><Text component="div" fw={600} style={{ overflowWrap: 'anywhere' }}>{primary(row)}</Text><Button variant="subtle" size="compact-xs" c="dimmed" style={{ alignSelf: 'flex-start' }} onClick={() => void navigator.clipboard?.writeText(String(row.id))}>{t('copyId')}</Button></Stack><Text component="div" size="sm">{state(row)}</Text></Group><Stack gap="xs" mb={onEdit || onDelete || rowActions ? 'sm' : undefined} style={{ minWidth: 0 }}>{visible.filter((column) => primaryKey || String(row[column.key] ?? '') !== primaryText(row)).map((column) => <Group key={column.key} gap="xs" wrap="nowrap" style={{ minWidth: 0 }}><Text size="sm" c="dimmed" style={{ minWidth: '88px', flex: '0 0 auto' }}>{column.label}</Text><Text component="div" size="sm" className={column.mono ? 'mono-cell' : undefined} style={{ flex: 1, minWidth: 0 }}>{column.render ? column.render(row[column.key], row) : displayValue(row[column.key])}</Text></Group>)}</Stack>{(onEdit || onDelete || rowActions) && <Group gap="xs">{onEdit && !forbids(editDisabled, row) && <Button variant="subtle" size="compact-sm" onClick={(event) => onEdit(row, event.currentTarget)}>{t('edit')}</Button>}{onDelete && allows(canDelete, row) && <Button variant="subtle" color="red" size="compact-sm" onClick={() => onDelete(row)}>{t('delete')}</Button>}{rowActions?.(row)}</Group>}</Paper>)}</Stack>
 }
 
 function permissionValues(value: unknown): string[] {

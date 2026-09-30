@@ -10,7 +10,7 @@ import { AllowedModelsEditor, ProfileMappingsEditor, RoutingPolicyEditor } from 
 import { UNMEASURED, formatCount, formatMicros } from '../observability'
 import { projectOperationPath, useProject } from '../project'
 import { PageHeader, QueryError, ResourcePage, displayValue, formatDate } from './shared'
-import { useRoutedTab } from './useRoutedTab'
+import { useActiveTabInView, useRoutedTab } from './useRoutedTab'
 
 const ACCESS_TABS: Array<[string, string]> = [['keys', 'api_key:manage'], ['profiles', 'api_key:manage'], ['projects', 'project:manage'], ['users', 'user:manage'], ['members', 'project:read'], ['roles', 'role:manage'], ['invitations', 'project:manage'], ['oidc', 'oidc:manage'], ['identities', 'oidc:manage']]
 const ACCESS_TAB_VALUES = ACCESS_TABS.map(([value]) => value)
@@ -54,6 +54,7 @@ export default function AccessPage() {
   const can = (permission: string) => granted.has('*') || granted.has(permission)
   const visible = ACCESS_TABS.filter(([, permission]) => can(permission))
   const active = visible.some(([v]) => v === tab) ? tab : visible[0]?.[0]
+  const tabsRef = useActiveTabInView(active)
   useEffect(() => {
     if (permissionsStatus === 'ready' && active && active !== tab) setTab(active, true)
   }, [permissionsStatus, active, tab, setTab])
@@ -83,7 +84,7 @@ export default function AccessPage() {
       )}
       <div hidden={loading}>
         <Tabs keepMounted={false} value={mounted} onChange={setTab}>
-          <Tabs.List mb="lg">
+          <Tabs.List ref={tabsRef} mb="lg" className="pm-management-tabs">
             {visible.map(([value]) => (
               <Tabs.Tab key={value} value={value}>{t(value)}</Tabs.Tab>
             ))}
@@ -91,7 +92,7 @@ export default function AccessPage() {
         <Tabs.Panel value="keys"><KeysPanel /><KeyLoggingForm /></Tabs.Panel>
         <Tabs.Panel value="profiles"><ProfilesPanel /></Tabs.Panel>
         <Tabs.Panel value="projects">
-          <ResourcePage resource="projects" endpoint="/api/admin/v1/projects" itemEndpoint={(id) => `/api/admin/v1/projects/${id}`} updateMethod="PATCH" title={t('projects')} description={t('projectsDescription')} empty={t('projectEmpty')} createLabel={t('addProject')} columns={[{ key: 'name', label: t('name') }, { key: 'slug', label: t('slug'), mono: true }, { key: 'enabled', label: t('status'), render: (value) => <EnabledPill enabled={value} /> }]} fields={[{ key: 'name', label: t('name'), required: true }, { key: 'slug', label: t('slug'), required: true }, { key: 'owner_user_id', label: t('ownerId') }, { key: 'enabled', label: t('enabled'), kind: 'checkbox' }]} />
+          <ProjectsPanel />
         </Tabs.Panel>
         <Tabs.Panel value="users">
           <ResourcePage resource="users" endpoint="/api/admin/v1/users" itemEndpoint={(id) => `/api/admin/v1/users/${id}`} updateMethod="PATCH" title={t('users')} description={t('usersDescription')} empty={t('userEmpty')} createLabel={t('addUser')} columns={[{ key: 'display_name', label: t('name') }, { key: 'email', label: t('email') }, { key: 'role', label: t('role') }, { key: 'enabled', label: t('status'), render: (value) => <EnabledPill enabled={value} /> }]} fields={[{ key: 'email', label: t('email'), required: true }, { key: 'display_name', label: t('name') }, { key: 'password', label: t('password'), kind: 'secret', hint: t('passwordHint') }, { key: 'language', label: t('language'), defaultValue: 'zh-CN' }, { key: 'enabled', label: t('enabled'), kind: 'checkbox' }]} />
@@ -141,6 +142,20 @@ export default function AccessPage() {
       </div>
     </div>
   )
+}
+
+function ProjectsPanel() {
+  const { t } = useTranslation()
+  const { project } = useProject()
+  const globalPermissions = useQuery({ queryKey: ['global-permissions'], queryFn: () => api<string[]>('/api/admin/v1/permissions') })
+  // Creating a project assigns its owner role. That grant contains `*`, so the
+  // server permits creation only to a principal that already holds `*`.
+  const canCreate = globalPermissions.isSuccess && globalPermissions.data.includes('*')
+  const canManageGlobally = globalPermissions.isSuccess && (canCreate || globalPermissions.data.includes('project:manage'))
+  const canManageRow = (row: Document) => canManageGlobally || row.id === project.id
+  const notice = globalPermissions.isError ? <QueryError retry={() => void globalPermissions.refetch()} />
+    : globalPermissions.isSuccess && !canCreate ? <Text size="sm" c="dimmed" mb="md">{t('projectCreateOwnerOnly')}</Text> : undefined
+  return <ResourcePage resource="projects" endpoint="/api/admin/v1/projects" itemEndpoint={(id) => `/api/admin/v1/projects/${id}`} updateMethod="PATCH" title={t('projects')} description={t('projectsDescription')} empty={t('projectEmpty')} createLabel={t('addProject')} canCreate={canCreate} editDisabled={(row) => !canManageRow(row)} canDelete={(row) => canManageRow(row) && !row.is_default} notice={notice} columns={[{ key: 'name', label: t('name') }, { key: 'slug', label: t('slug'), mono: true }, { key: 'enabled', label: t('status'), render: (value) => <EnabledPill enabled={value} /> }]} fields={[{ key: 'name', label: t('name'), required: true }, { key: 'slug', label: t('slug'), required: true }, { key: 'owner_user_id', label: t('ownerId') }, { key: 'enabled', label: t('enabled'), kind: 'checkbox' }]} />
 }
 
 function RolesPanel() {

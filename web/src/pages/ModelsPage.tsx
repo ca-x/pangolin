@@ -14,18 +14,29 @@ import { ExclusionsEditor } from './documentEditors'
 import { AutoRefreshControl, useAutoRefreshInterval } from './autoRefresh'
 import { PageHeader, QueryError, ResourcePage, displayValue, formatDate } from './shared'
 import { nextModelImportSelection } from './modelImportSelection'
-import { useRoutedTab } from './useRoutedTab'
+import { useActiveTabInView, useRoutedTab } from './useRoutedTab'
 
 const TAB_VALUES = ['models', 'routing', 'groups', 'prices', 'catalog', 'subscriptions'] as const
 
 export default function ModelsPage() {
   const { t } = useTranslation()
-  const { project } = useProject()
+  const { project, permissions, permissionsStatus, retryPermissions } = useProject()
   const [tab, setTab] = useRoutedTab(TAB_VALUES, 'models')
+  const canManageProject = permissions.has('*') || permissions.has('project:manage')
+  const canManageCatalog = permissions.has('*') || permissions.has('catalog:manage')
+  const visibleTabs = TAB_VALUES.filter((value) => value === 'subscriptions' ? canManageCatalog : value === 'catalog' ? canManageProject || canManageCatalog : canManageProject)
+  const active = visibleTabs.includes(tab) ? tab : visibleTabs[0]
+  const tabsRef = useActiveTabInView(active)
+  useEffect(() => {
+    if (permissionsStatus === 'ready' && active && active !== tab) setTab(active, true)
+  }, [permissionsStatus, active, tab, setTab])
+  if (permissionsStatus === 'loading') return <SkeletonRows count={3} />
+  if (permissionsStatus === 'error') return <QueryError retry={retryPermissions} />
+  if (!active) return <EmptyState icon={<Inbox />} title={t('models')} copy={t('noAccessSection')} />
   return (
-    <Tabs keepMounted={false} value={tab} onChange={setTab}>
-      <Tabs.List mb="lg">
-        {TAB_VALUES.map((value) => (
+    <Tabs keepMounted={false} value={active} onChange={setTab}>
+      <Tabs.List ref={tabsRef} mb="lg" className="pm-management-tabs">
+        {visibleTabs.map((value) => (
           <Tabs.Tab key={value} value={value}>{t(value)}</Tabs.Tab>
         ))}
       </Tabs.List>
@@ -33,7 +44,7 @@ export default function ModelsPage() {
       <Tabs.Panel value="routing"><UnassociatedModels /><section id="association-editor"><RoutingEditor /></section><RoutingPreview key={project.id} /></Tabs.Panel>
       <Tabs.Panel value="groups"><ServiceGroupsPanel /></Tabs.Panel>
       <Tabs.Panel value="prices"><PricesPanel /></Tabs.Panel>
-      <Tabs.Panel value="catalog"><CatalogPanel /></Tabs.Panel>
+      <Tabs.Panel value="catalog"><CatalogPanel canManageCatalog={canManageCatalog} /></Tabs.Panel>
       <Tabs.Panel value="subscriptions"><CatalogSubscriptions /></Tabs.Panel>
     </Tabs>
   )
@@ -807,27 +818,44 @@ const CATALOG_MOBILE_PAGE_SIZE = 10
  * Below the shared table breakpoint the list is a compact 10-row mobile list
  * instead of `ResourcePage`'s 25-row cards (audit P2-6).
  */
-function CatalogPanel() {
+function CatalogPanel({ canManageCatalog }: { canManageCatalog: boolean }) {
   const { t } = useTranslation()
   const mobile = useMediaQuery(MOBILE_VIEWPORT, undefined, { getInitialValueInEffect: false })
+  const client = useQueryClient()
+  const [importOpen, setImportOpen] = useState(false)
+  const importCatalog = useMutation({ mutationFn: (document: unknown) => api('/api/admin/v1/catalog/import', { method: 'POST', body: JSON.stringify(document) }), onSuccess: () => { toast.success(t('saved')); void client.invalidateQueries({ queryKey: ['resource'] }); setImportOpen(false) }, onError: (error: Error) => toast.error(error.message) })
+  const submit = (event: FormEvent<HTMLFormElement>) => { event.preventDefault(); const raw = String(new FormData(event.currentTarget).get('catalog') || ''); try { importCatalog.mutate(JSON.parse(raw)) } catch { toast.error(t('invalidJson')) } }
   return (
-    <Stack gap={CATALOG_GROUP_GAP}>
-      <CatalogMaintenance />
-      <CatalogOverrideEditor />
-      {mobile
-        ? <CatalogModelsMobile />
-        : <ResourcePage resource="catalog-models" endpoint="/api/admin/v1/catalog/models" title={t('catalog')} description={t('catalogDescription')} empty={t('catalogEmpty')} immutable columns={[{ key: 'id', label: t('modelId'), mono: true }, { key: 'name', label: t('name'), mono: true }, { key: 'type', label: t('type') }, { key: 'capabilities', label: t('capabilities'), render: (value) => <CapabilityTags value={value} /> }, { key: 'provider_id', label: t('provider') }]} />}
-    </Stack>
+    <>
+      <PageHeader title={t('catalog')} description={t('catalogDescription')} action={<Group gap="xs" className="pm-catalog-header-actions">
+        <Button component="a" href="/api/admin/v1/catalog/export" download variant="default" leftSection={<Download size={17} />}>{t('export')}</Button>
+        {canManageCatalog && <Button variant="default" leftSection={<Upload size={17} />} aria-expanded={importOpen} aria-controls={importOpen ? 'catalog-import-form' : undefined} onClick={() => setImportOpen(!importOpen)}>{t('import')}</Button>}
+      </Group>} />
+      {importOpen && <Paper p="lg" withBorder mb="lg">
+        <Title order={2}>{t('catalogTransfer')}</Title>
+        <Text size="sm" c="dimmed">{t('catalogTransferHint')}</Text>
+        <form id="catalog-import-form" className="pm-catalog-import-form" onSubmit={submit}>
+          <Stack gap="md">
+            <Textarea name="catalog" label={t('catalogJson')} rows={8} required />
+            <Group justify="flex-end">
+              <Button variant="default" type="button" onClick={() => setImportOpen(false)}>{t('cancel')}</Button>
+              <Button type="submit" loading={importCatalog.isPending}>{t('validateAndImport')}</Button>
+            </Group>
+          </Stack>
+        </form>
+      </Paper>}
+      <section aria-label={t('catalogModels')}>
+        <Title order={2} mb="md">{t('catalogModels')}</Title>
+        {mobile
+          ? <CatalogModelsMobile />
+          : <ResourcePage resource="catalog-models" endpoint="/api/admin/v1/catalog/models" title={t('catalog')} description={t('catalogDescription')} empty={t('catalogEmpty')} immutable hideHeader columns={[{ key: 'id', label: t('modelId'), mono: true }, { key: 'name', label: t('name'), mono: true }, { key: 'type', label: t('type') }, { key: 'capabilities', label: t('capabilities'), render: (value) => <CapabilityTags value={value} /> }, { key: 'provider_id', label: t('provider') }]} />}
+      </section>
+      {canManageCatalog && <div style={{ marginTop: CATALOG_GROUP_GAP }}><CatalogOverrideEditor /></div>}
+    </>
   )
 }
 
-/**
- * Mobile catalog list. Title/description/search/result count sit on an
- * 8/12/16px ladder (the shared `h1` rule adds 6px under the title, so the
- * rendered title-to-description gap is 14px), each card is a two-line summary,
- * and the result count is repeated above the list so the page size is knowable
- * without scrolling.
- */
+/** Mobile catalog list. Search and result count remain with the compact cards. */
 function CatalogModelsMobile() {
   const { t } = useTranslation()
   const { project } = useProject()
@@ -843,11 +871,7 @@ function CatalogModelsMobile() {
   const changePageSize = (value: string | null) => { if (value) { setPageSize(Number(value)); setOffset(0) } }
   return (
     <div>
-      <Stack gap={8}>
-        <Title order={1}>{t('catalog')}</Title>
-        <Text size="md" c="dimmed">{t('catalogDescription')}</Text>
-      </Stack>
-      {(total > 0 || filter) && <TextInput leftSection={<Search size={17} />} placeholder={t('search')} aria-label={t('search')} value={filter} onChange={(event) => { setFilter(event.currentTarget.value); setOffset(0) }} w={{ base: '100%', sm: 360 }} style={{ marginTop: 12 }} />}
+      {(total > 0 || filter) && <TextInput leftSection={<Search size={17} />} placeholder={t('search')} aria-label={t('search')} value={filter} onChange={(event) => { setFilter(event.currentTarget.value); setOffset(0) }} w={{ base: '100%', sm: 360 }} mb="md" />}
       {query.isError ? <QueryError retry={() => void query.refetch()} /> : query.isLoading ? <SkeletonRows /> : rows.length === 0 ? <EmptyState icon={<Inbox />} title={t('catalog')} copy={filter ? t('noSearchResults') : t('catalogEmpty')} /> : (
         <>
           <Text size="md" c="dimmed" style={{ marginBottom: 16 }}>{t('catalogResultCount', { count: total })}</Text>
@@ -887,40 +911,6 @@ function CatalogModelCard({ row }: { row: Document }) {
         </Stack>
         <ActionIcon variant="subtle" color="gray" aria-label={`${t('copyId')} ${name}`} onClick={() => void navigator.clipboard?.writeText(String(row.id))}><Copy size={16} /></ActionIcon>
       </Group>
-    </Paper>
-  )
-}
-
-function CatalogMaintenance() {
-  const { t } = useTranslation()
-  const client = useQueryClient()
-  const [importOpen, setImportOpen] = useState(false)
-  const importCatalog = useMutation({ mutationFn: (document: unknown) => api('/api/admin/v1/catalog/import', { method: 'POST', body: JSON.stringify(document) }), onSuccess: () => { toast.success(t('saved')); void client.invalidateQueries({ queryKey: ['resource'] }); setImportOpen(false) }, onError: (error: Error) => toast.error(error.message) })
-  const submit = (event: FormEvent<HTMLFormElement>) => { event.preventDefault(); const raw = String(new FormData(event.currentTarget).get('catalog') || ''); try { importCatalog.mutate(JSON.parse(raw)) } catch { toast.error(t('invalidJson')) } }
-  return (
-    <Paper p="lg" withBorder style={{ position: 'relative' }}>
-      <Group justify="space-between" align="flex-start" wrap="nowrap">
-        <Stack gap="xs">
-          <Title order={2}>{t('catalogTransfer')}</Title>
-          <Text size="sm" c="dimmed">{t('catalogTransferHint')}</Text>
-        </Stack>
-        <Group>
-          <Button component="a" href="/api/admin/v1/catalog/export" download variant="default" leftSection={<Download size={17} />}>{t('export')}</Button>
-          <Button variant="default" leftSection={<Upload size={17} />} onClick={() => setImportOpen(!importOpen)}>{t('import')}</Button>
-        </Group>
-      </Group>
-      {importOpen && (
-        <Paper p="md" shadow="lg" style={{ position: 'absolute', right: 0, top: '100%', zIndex: 10, width: 'min(620px, calc(100vw - 40px))' }}>
-          <form onSubmit={submit}>
-            <Stack gap="md">
-              <Textarea name="catalog" label={t('catalogJson')} rows={8} required />
-              <Group justify="flex-end">
-                <Button type="submit" loading={importCatalog.isPending}>{t('validateAndImport')}</Button>
-              </Group>
-            </Stack>
-          </form>
-        </Paper>
-      )}
     </Paper>
   )
 }

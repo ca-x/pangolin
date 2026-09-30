@@ -12,6 +12,21 @@ import { ProjectProvider, useProject } from './project'
 import { useTheme } from './theme'
 
 type NavLinkSpec = { to: string; label: string; icon: typeof Gauge; children?: NavLinkSpec[] }
+const DEFAULT_TAB_FOR_PATH: Record<string, string> = { '/channels': 'channels', '/models': 'models', '/access': 'keys', '/prompts': 'prompts', '/operations': 'requests', '/system': 'appearance' }
+
+function navLinkMatches(to: string, pathname: string, search: string) {
+  const [path, query] = to.split('?')
+  const targetTab = new URLSearchParams(query).get('tab')
+  const currentTab = new URLSearchParams(search).get('tab')
+  const effectiveTab = currentTab ?? DEFAULT_TAB_FOR_PATH[path] ?? null
+  const atPath = pathname === path
+  const atDetail = path !== '/' && pathname.startsWith(path + '/')
+  const detailTab = path === '/operations' && atDetail ? pathname.split('/')[2] : null
+  if (path === '/system') return atPath
+  return targetTab
+    ? (atPath && targetTab === effectiveTab) || (atDetail && targetTab === detailTab)
+    : (atDetail && DEFAULT_TAB_FOR_PATH[path] === detailTab) || (atPath && (!currentTab || currentTab === DEFAULT_TAB_FOR_PATH[path]))
+}
 
 export default function Shell({ user, branding }: { user: User; branding: Branding }) {
   return <ProjectProvider><ShellContent user={user} branding={branding} /></ProjectProvider>
@@ -21,7 +36,8 @@ function ShellContent({ user, branding }: { user: User; branding: Branding }) {
   const { t } = useTranslation()
   const route = useLocation()
   const isOverview = route.pathname === '/'
-  const { project, projects, permissions, setProjectId } = useProject()
+  const { project, projects, permissions, permissionsStatus, retryPermissions, setProjectId } = useProject()
+  const enabledProjects = projects.filter((item) => item.enabled)
   const { mode, setMode } = useTheme()
   const navigate = useNavigate()
   const [mobileOpen, { toggle: toggleMobile, close: closeMobile }] = useDisclosure(false)
@@ -42,7 +58,7 @@ function ShellContent({ user, branding }: { user: User; branding: Branding }) {
     if (mobile && wasMobileOpen.current && !mobileOpen) requestAnimationFrame(() => menuTrigger.current?.focus())
     wasMobileOpen.current = mobileOpen
   }, [mobile, mobileOpen])
-  const can = (permission: string) => permissions.has('*') || permissions.has(permission)
+  const can = (permission: string) => permissionsStatus === 'ready' && (permissions.has('*') || permissions.has(permission))
   // The guidance is dismissed per instance and remembered in this browser, so
   // hiding it is not the same decision as declaring onboarding finished for the
   // whole instance. It stays restorable from the appearance settings.
@@ -52,38 +68,58 @@ function ShellContent({ user, branding }: { user: User; branding: Branding }) {
     window.addEventListener(ONBOARDING_CHANGED_EVENT, sync)
     return () => window.removeEventListener(ONBOARDING_CHANGED_EVENT, sync)
   }, [branding.instance_name])
-  const canAccess = ['project:manage', 'api_key:manage', 'role:manage', 'user:manage', 'oidc:manage', 'project:read'].some(can)
-  const groups: Array<{ label: string; links: NavLinkSpec[] }> = [
-    { label: t('workspace'), links: [
+  const canManageProject = can('project:manage')
+  const canReadProject = can('project:read') || canManageProject
+  const canManageKeys = can('api_key:manage') || canManageProject
+  const canManageRoles = can('role:manage') || canManageProject
+  const canManageCatalog = can('catalog:manage')
+  const adminLinks: NavLinkSpec[] = [
+    ...(canManageProject ? [{ to: '/access?tab=projects', label: t('projects'), icon: Boxes }, { to: '/access?tab=invitations', label: t('invitations'), icon: Mail }] : []),
+    ...(can('user:manage') ? [{ to: '/access?tab=users', label: t('users'), icon: Users }] : []),
+    ...(canManageRoles ? [{ to: '/access?tab=roles', label: t('roles'), icon: Shield }] : []),
+    ...(can('oidc:manage') ? [{ to: '/access?tab=oidc', label: 'OIDC', icon: Shield }, { to: '/access?tab=identities', label: t('identities'), icon: Users }] : []),
+    ...((canManageProject || canManageCatalog) ? [{ to: '/system', label: t('systemSettings'), icon: Settings }] : []),
+  ]
+  const groups: Array<{ id: string; label: string; links: NavLinkSpec[] }> = [
+    { id: 'workspace', label: t('workspace'), links: [
       { to: '/', label: t('overview'), icon: Gauge },
-      ...(can('project:manage') ? [{ to: '/channels', label: t('channels'), icon: Unplug }] : []),
-      ...((can('project:manage') || can('catalog:manage')) ? [{ to: '/models', label: t('models'), icon: Boxes }] : []),
-      ...(can('project:manage') ? [{ to: '/prompts', label: t('prompts'), icon: MessageSquareText }] : []),
+      ...(canManageProject ? [{ to: '/channels', label: t('channels'), icon: Unplug, children: [
+        { to: '/channels?tab=credentials', label: t('credentials'), icon: KeyRound },
+        { to: '/channels?tab=channelPolicies', label: t('channelPolicies'), icon: Shield },
+        { to: '/channels?tab=probes', label: t('probes'), icon: Activity },
+        { to: '/channels?tab=quotas', label: t('quotas'), icon: BarChart3 },
+        { to: '/channels?tab=presets', label: t('presets'), icon: Database },
+      ] }] : []),
+      ...((canManageProject || canManageCatalog) ? [{ to: canManageProject ? '/models' : '/models?tab=catalog', label: canManageProject ? t('models') : t('catalog'), icon: Boxes, children: [
+        ...(canManageProject ? [
+          { to: '/models?tab=routing', label: t('routing'), icon: ListTree },
+          { to: '/models?tab=groups', label: t('serviceGroups'), icon: Layers3 },
+          { to: '/models?tab=prices', label: t('prices'), icon: FileText },
+          { to: '/models?tab=catalog', label: t('catalog'), icon: Database },
+        ] : []),
+        ...(canManageCatalog ? [{ to: '/models?tab=subscriptions', label: t('subscriptions'), icon: Database }] : []),
+      ] }] : []),
+      ...(canManageKeys ? [{ to: '/access?tab=keys', label: t('keys'), icon: KeyRound }, { to: '/access?tab=profiles', label: t('profiles'), icon: Layers3 }] : []),
+      ...(canReadProject ? [{ to: '/access?tab=members', label: t('members'), icon: Users }] : []),
+      ...(canManageProject ? [{ to: '/prompts', label: t('prompts'), icon: MessageSquareText, children: [
+        { to: '/prompts?tab=protection', label: t('protection'), icon: Shield },
+        { to: '/prompts?tab=overrides', label: t('overrides'), icon: Settings },
+      ] }] : []),
       { to: '/playground', label: t('playground'), icon: FlaskConical },
     ] },
-    { label: t('observe'), links: [
-      { to: '/operations', label: t('operations'), icon: Activity, children: [
-        { to: '/operations?tab=requests', label: t('requests'), icon: Activity },
-        { to: '/operations?tab=traces', label: t('traces'), icon: ListTree },
-        { to: '/operations?tab=threads', label: t('threads'), icon: MessageSquareText },
-        { to: '/operations?tab=usage', label: t('usage'), icon: FileText },
-      ] },
+    ...(adminLinks.length ? [{ id: 'administration', label: t('administration'), links: adminLinks }] : []),
+    ...(canReadProject ? [{ id: 'observe', label: t('observe'), links: [
+      { to: '/operations', label: t('requests'), icon: Activity },
+      { to: '/operations?tab=traces', label: t('traces'), icon: ListTree },
+      { to: '/operations?tab=threads', label: t('threads'), icon: MessageSquareText },
+      { to: '/operations?tab=usage', label: t('usage'), icon: FileText },
       { to: '/analytics', label: t('analytics'), icon: BarChart3 },
-    ] },
-    ...((canAccess || can('catalog:manage') || can('project:manage')) ? [{ label: t('administration'), links: [
-      ...(canAccess ? [{ to: '/access', label: t('access'), icon: Shield, children: [
-        ...(can('api_key:manage') || can('project:manage') ? [{ to: '/access?tab=keys', label: t('keys'), icon: KeyRound }, { to: '/access?tab=profiles', label: t('profiles'), icon: Layers3 }] : []),
-        ...(can('project:manage') ? [{ to: '/access?tab=projects', label: t('projects'), icon: Boxes }, { to: '/access?tab=invitations', label: t('invitations'), icon: Mail }] : []),
-        ...(can('user:manage') ? [{ to: '/access?tab=users', label: t('users'), icon: Users }] : []),
-        ...(can('role:manage') || can('project:manage') ? [{ to: '/access?tab=roles', label: t('roles'), icon: Shield }] : []),
-        ...(can('project:read') || can('project:manage') ? [{ to: '/access?tab=members', label: t('members'), icon: Users }] : []),
-      ] }] : []),
-      ...((can('catalog:manage') || can('project:manage')) ? [{ to: '/system', label: t('systemSettings'), icon: Settings, children: [
-        { to: '/system?tab=appearance', label: t('appearance'), icon: SunMoon },
-        ...(can('project:manage') ? [{ to: '/system?tab=storage', label: t('storage'), icon: Database }] : []),
-      ] }] : []),
     ] }] : []),
   ]
+  const activeGroup = groups.find((group) => group.links.some((item) => navLinkMatches(item.to, route.pathname, route.search) || item.children?.some((child) => navLinkMatches(child.to, route.pathname, route.search))))?.id
+  const [manualGroup, setManualGroup] = useState<string | null>(null)
+  useEffect(() => setManualGroup(null), [route.pathname, route.search])
+  const expandedGroup = manualGroup ?? activeGroup ?? groups[0]?.id
 
   const signOut = async () => { await api('/api/v1/auth/logout', { method: 'POST' }); navigate('/login'); location.reload() }
 
@@ -113,38 +149,44 @@ function ShellContent({ user, branding }: { user: User; branding: Branding }) {
       <AppShell.Header hiddenFrom="md" px="sm">
         <Group justify="space-between" h="100%">
           <Brand compact name={branding.branding_name} />
-          <Burger ref={menuTrigger} className="pm-mobile-menu-button" opened={mobileOpen} onClick={toggleMobile} aria-label={t('menu')} aria-expanded={mobileOpen} size="sm" />
+          <Burger ref={menuTrigger} className="pm-mobile-menu-button" opened={mobileOpen} onClick={toggleMobile} aria-label={t('menu')} aria-expanded={mobileOpen} size="sm" style={{ visibility: mobileOpen ? 'hidden' : 'visible' }} />
         </Group>
       </AppShell.Header>
 
       {/* Sidebar (desktop: floating panel; mobile: Drawer via AppShell) */}
       <FocusTrap active={Boolean(mobile && mobileOpen)}><AppShell.Navbar
+        component="div"
         p="md"
         className="pm-shell-navbar"
         data-open={mobileOpen ? 'true' : 'false'}
-        role={mobile && mobileOpen ? 'dialog' : undefined}
+        role={mobile && mobileOpen ? 'dialog' : 'complementary'}
         aria-modal={mobile && mobileOpen ? true : undefined}
-        aria-label={mobile && mobileOpen ? t('primaryNavigation') : undefined}
+        aria-label={mobile && mobileOpen ? t('primaryNavigation') : t('navigationAndAccount')}
       >
         <Group justify="flex-end" hiddenFrom="md" mb="xs"><ActionIcon className="pm-drawer-close" variant="subtle" color="gray" aria-label={t('close')} data-autofocus onClick={closeMobile}><X size={18} /></ActionIcon></Group>
         {/* The mobile header already carries the brand. */}
-        <Group justify="space-between" mb="md" mt={2} mx={6} visibleFrom="md">
+        <Stack gap="md" mb="md" mt={2} mx={6} visibleFrom="md">
           <Brand name={branding.branding_name} />
-        </Group>
+          <div className="pm-nav-project" role="group" aria-label={t('project')}>
+            {enabledProjects.length > 1 ? (
+              <Select aria-label={t('project')} value={project.id} onChange={(value) => value && setProjectId(value)} data={enabledProjects.map((item) => ({ value: item.id, label: item.name }))} size="sm" />
+            ) : <Text fw={600} size="sm" truncate="end" title={project.name}>{project.name}</Text>}
+          </div>
+        </Stack>
 
         {/* Navigation */}
         <AppShell.Section grow component={Stack} gap="lg" className="pm-shell-navigation">
           <nav aria-label={t('primaryNavigation')}>
-            {groups.map((group) => (
-              <Stack key={group.label} gap={2} mb="md">
-                <Text size="xs" fw={600} c="dimmed" px="xs" mb={4} style={{ letterSpacing: 0 }}>
-                  {group.label}
-                </Text>
+            {groups.map((group) => <section key={group.id} className="pm-nav-section" aria-label={group.label}>
+              <UnstyledButton className="pm-nav-section-toggle" data-current={activeGroup === group.id ? 'true' : undefined} aria-expanded={expandedGroup === group.id} aria-controls={`pm-nav-${group.id}`} onClick={() => setManualGroup(expandedGroup === group.id ? 'none' : group.id)}>
+                <span>{group.label}</span><ChevronDown size={15} aria-hidden="true" className={expandedGroup === group.id ? 'is-open' : undefined} />
+              </UnstyledButton>
+              <div id={`pm-nav-${group.id}`} className="pm-nav-section-links" hidden={expandedGroup !== group.id}>
                 {group.links.map((item) => item.children?.length
                   ? <NavBranch key={item.to} item={item} onNavigate={closeMobile} />
                   : <NavItem key={item.to} {...item} onClick={closeMobile} />)}
-              </Stack>
-            ))}
+              </div>
+            </section>)}
           </nav>
         </AppShell.Section>
 
@@ -180,8 +222,8 @@ function ShellContent({ user, branding }: { user: User; branding: Branding }) {
         <div className="pm-workspace-bar">
           <div className="pm-workspace-context">
             <Text size="xs" c="dimmed">{t('project')}</Text>
-            {projects.filter((item) => item.enabled).length > 1 ? (
-              <Select aria-label={t('project')} value={project.id} onChange={(value) => value && setProjectId(value)} data={projects.filter((item) => item.enabled).map((item) => ({ value: item.id, label: item.name }))} size="xs" w={{ base: 160, sm: 220 }} />
+            {enabledProjects.length > 1 ? (
+              <Select aria-label={t('project')} value={project.id} onChange={(value) => value && setProjectId(value)} data={enabledProjects.map((item) => ({ value: item.id, label: item.name }))} size="xs" w={{ base: 160, sm: 220 }} />
             ) : <Text fw={600} size="sm" truncate="end">{project.name}</Text>}
           </div>
           <Group gap={4} wrap="nowrap">
@@ -193,24 +235,15 @@ function ShellContent({ user, branding }: { user: User; branding: Branding }) {
             {(can('catalog:manage') || can('project:manage')) && <Tooltip label={t('systemSettings')}><ActionIcon component={RouterLink} to="/system" variant="subtle" color="gray" aria-label={t('settings')}><Settings size={18} /></ActionIcon></Tooltip>}
           </Group>
         </div>
-        {/* Onboarding competes with the page's own primary action on every
-            screen, so it only takes the full width on the overview. Elsewhere it
-            drops its title and demotes its action to a text button, which keeps
-            one solid primary per resource page. */}
-        {can('*') && !branding.onboarding_complete && !onboardingDismissed && (
-          <Alert variant="light" color="pangolin" mb="lg" radius="md" className="pm-onboarding" title={isOverview ? t('onboardingTitle') : undefined}>
+        {permissionsStatus === 'error' && !['/access', '/models', '/system'].includes(route.pathname) && <Alert variant="light" color="red" mb="lg" title={t('networkError')}>
+          <Group justify="space-between" gap="sm"><Text size="sm">{t('retryHint')}</Text><Button variant="outline" color="red" size="compact-sm" onClick={retryPermissions}>{t('retry')}</Button></Group>
+        </Alert>}
+        {isOverview && can('*') && !branding.onboarding_complete && !onboardingDismissed && (
+          <Alert variant="light" color="pangolin" mb="lg" radius="md" className="pm-onboarding" title={t('onboardingTitle')}>
             <Group justify="space-between" align="center" gap="md" wrap="nowrap" className="pm-onboarding-row">
-              <Text size="sm">{t(isOverview ? 'onboardingHint' : 'onboardingProgressHint')}</Text>
+              <Text size="sm">{t('onboardingHint')}</Text>
               <Group gap="xs" wrap="nowrap">
-                {isOverview ? (
-                  <Button component={RouterLink} to="/channels" variant="light" size="sm">
-                    {t('channels')}
-                  </Button>
-                ) : (
-                  <Button component={RouterLink} to="/channels" variant="subtle" size="compact-sm">
-                    {t('channels')}
-                  </Button>
-                )}
+                <Button component={RouterLink} to="/channels" variant="light" size="sm">{t('channels')}</Button>
                 {/* Dismissing hides the guidance here only; the branding switch
                     still records that onboarding is finished instance-wide. */}
                 <Tooltip label={t('dismissOnboarding')}>
@@ -236,9 +269,10 @@ function ShellContent({ user, branding }: { user: User; branding: Branding }) {
 function NavBranch({ item, onNavigate }: { item: NavLinkSpec; onNavigate: () => void }) {
   const { t } = useTranslation()
   const location = useLocation()
-  const belongsHere = location.pathname === item.to || location.pathname.startsWith(item.to + '/')
+  const path = item.to.split('?')[0]
+  const belongsHere = location.pathname === path || location.pathname.startsWith(path + '/')
   const [manual, setManual] = useState<boolean | null>(null)
-  useEffect(() => setManual(null), [location.pathname])
+  useEffect(() => setManual(null), [location.pathname, location.search])
   const expanded = manual ?? belongsHere
   return <div className="pm-nav-branch">
     <Group gap={2} wrap="nowrap">
@@ -257,12 +291,7 @@ function NavItem({ to, label, icon: Icon, nested = false, onClick }: {
   onClick: () => void
 }) {
   const location = useLocation()
-  const [path, query] = to.split('?')
-  const targetTab = new URLSearchParams(query).get('tab')
-  const currentTab = new URLSearchParams(location.search).get('tab')
-  const atPath = location.pathname === path
-  const atDetail = path !== '/' && location.pathname.startsWith(path + '/')
-  const active = (atPath || atDetail) && (targetTab ? atPath && targetTab === currentTab : !currentTab)
+  const active = navLinkMatches(to, location.pathname, location.search)
 
   return (
     <MantineNavLink

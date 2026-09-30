@@ -16,6 +16,7 @@ use crate::{
 
 pub fn router() -> Router<AppState> {
     Router::new()
+        .route("/api/admin/v1/permissions", get(global_permissions))
         .route(
             "/api/admin/v1/projects",
             get(list_projects).post(create_project),
@@ -193,6 +194,20 @@ async fn list_projects(
         access::list_projects(&state.db, &actor)
             .await
             .map_err(map_access)?,
+    ))
+}
+
+async fn global_permissions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<String>>, ApiError> {
+    let actor = principal(&state, &headers).await?;
+    Ok(Json(
+        access::effective_scopes(&state.db, &actor, None)
+            .await
+            .map_err(map_access)?
+            .into_iter()
+            .collect(),
     ))
 }
 
@@ -1099,6 +1114,161 @@ mod tests {
             directory,
             Principal::session(owner.id),
         )
+    }
+
+    #[tokio::test]
+    async fn global_permissions_do_not_upgrade_project_grants_or_api_keys() {
+        let (app, database, _directory, owner) = test_app().await;
+        let manager = access::create_user(
+            &database,
+            &owner,
+            &UserInput {
+                email: "project-manager@example.com".into(),
+                password: "another secure password".into(),
+                display_name: None,
+                language: None,
+                enabled: true,
+            },
+        )
+        .await
+        .unwrap();
+        let role = access::create_role(
+            &database,
+            &owner,
+            db::DEFAULT_PROJECT_ID,
+            &access::RoleInput {
+                name: "project manager".into(),
+                permissions: vec!["project:manage".into()],
+            },
+        )
+        .await
+        .unwrap();
+        access::upsert_membership(
+            &database,
+            &owner,
+            db::DEFAULT_PROJECT_ID,
+            &MembershipInput {
+                user_id: manager.id.clone(),
+                role_id: role.id,
+                status: "active".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let unauthenticated = app
+            .clone()
+            .oneshot(
+                Request::get("/api/admin/v1/permissions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+        let session = db::create_session(&database, &manager.id).await.unwrap();
+        let global = app
+            .clone()
+            .oneshot(
+                Request::get("/api/admin/v1/permissions")
+                    .header(header::COOKIE, format!("pangolin_session={session}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(global.status(), StatusCode::OK);
+        let scopes: Vec<String> =
+            serde_json::from_slice(&to_bytes(global.into_body(), 1024 * 1024).await.unwrap())
+                .unwrap();
+        assert!(!scopes.iter().any(|scope| scope == "project:manage"));
+
+        let project = app
+            .clone()
+            .oneshot(
+                Request::get(format!(
+                    "/api/admin/v1/projects/{}/permissions",
+                    db::DEFAULT_PROJECT_ID
+                ))
+                .header(header::COOKIE, format!("pangolin_session={session}"))
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let project_scopes: Vec<String> =
+            serde_json::from_slice(&to_bytes(project.into_body(), 1024 * 1024).await.unwrap())
+                .unwrap();
+        assert!(project_scopes.iter().any(|scope| scope == "project:manage"));
+
+        let admin = access::create_user(
+            &database,
+            &owner,
+            &UserInput {
+                email: "global-admin@example.com".into(),
+                password: "another secure password".into(),
+                display_name: None,
+                language: None,
+                enabled: true,
+            },
+        )
+        .await
+        .unwrap();
+        access::create_role_binding(
+            &database,
+            &owner,
+            &admin.id,
+            &access::RoleBindingInput {
+                role_id: "00000000-0000-0000-0000-000000000011".into(),
+                project_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        let admin_actor = Principal::session(admin.id);
+        let admin_scopes = access::effective_scopes(&database, &admin_actor, None)
+            .await
+            .unwrap();
+        assert!(admin_scopes.contains("project:manage"));
+        assert!(!admin_scopes.contains("*"));
+        assert!(matches!(
+            access::create_project(
+                &database,
+                &admin_actor,
+                &access::ProjectInput {
+                    name: "Cannot assign owner".into(),
+                    slug: "cannot-assign-owner".into(),
+                    owner_user_id: None,
+                }
+            )
+            .await,
+            Err(AccessError::Forbidden)
+        ));
+
+        let (_, token) = access::create_scoped_api_key(
+            &database,
+            &owner,
+            &ScopedApiKeyInput {
+                name: "project manager key".into(),
+                project_id: db::DEFAULT_PROJECT_ID.into(),
+                key_type: "service".into(),
+                scopes: vec!["project:manage".into()],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let api_key = app
+            .oneshot(
+                Request::get("/api/admin/v1/permissions")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(api_key.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]

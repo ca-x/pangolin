@@ -120,11 +120,23 @@ button { cursor: pointer; }
     border-radius: var(--mantine-radius-xl);
     box-shadow: var(--mantine-shadow-md);
   }
+  /* On desktop the sidebar owns management navigation; panels begin with their
+     own title and actions, as in the direct-link AxonHub management layout. */
+  .pm-management-tabs { display: none; }
 }
 
 .pm-shell-navbar { overflow: hidden; }
+.pm-nav-project { display: grid; min-width: 0; gap: 4px; padding: 10px 12px; border-radius: var(--radius-control); background: var(--surface-muted); }
+.pm-nav-project .mantine-Select-input { font-weight: 600; }
 .pm-shell-navigation { min-height: 0; overflow-y: auto; margin-inline: -4px; padding-inline: 4px; }
-.pm-shell-navigation .mantine-NavLink-root { min-height: 38px; }
+.pm-nav-section { margin-bottom: 12px; }
+.pm-nav-section-toggle { display: flex; width: 100%; min-height: 40px; align-items: center; justify-content: space-between; gap: 8px; padding: 0 8px; border-radius: var(--radius-control); color: var(--muted); font-size: 12px; font-weight: 600; text-align: left; }
+.pm-nav-section-toggle[data-current='true'] { color: var(--ink); }
+.pm-nav-section-toggle svg { flex: none; transition: transform 160ms var(--ease-out); }
+.pm-nav-section-toggle svg.is-open { transform: rotate(180deg); }
+.pm-nav-section-links { display: grid; gap: 2px; margin-top: 2px; }
+.pm-nav-section-links[hidden] { display: none; }
+.pm-shell-navigation .mantine-NavLink-root { min-height: 40px; }
 .pm-nav-branch > .mantine-Group-root > .mantine-NavLink-root { min-width: 0; flex: 1; }
 .pm-nav-disclosure { flex: 0 0 36px; width: 36px; height: 38px; }
 .pm-nav-disclosure svg { transition: transform 160ms var(--ease-out); }
@@ -133,10 +145,15 @@ button { cursor: pointer; }
 .pm-nav-sublist { display: grid; gap: 2px; margin: 2px 0 7px 18px; padding-left: 9px; border-left: 1px solid var(--border); }
 .pm-nav-child { color: var(--muted); }
 .pm-nav-child[data-active] { color: var(--accent-strong); }
+.pm-catalog-import-form { margin-top: 16px; padding-top: 16px; border-top: 1px solid var(--border-subtle); }
 .pm-workspace-bar { display: flex; min-height: 54px; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 22px; padding: 0 2px 12px; border-bottom: 1px solid var(--border); }
 .pm-workspace-bar .mantine-ActionIcon-root { min-width: 40px; min-height: 40px; }
 .pm-workspace-context { display: flex; min-width: 0; align-items: center; gap: 10px; }
 .pm-workspace-context > :last-child { min-width: 0; }
+@media (min-width: 62em) {
+  .pm-workspace-bar { justify-content: flex-end; }
+  .pm-workspace-bar .pm-workspace-context { display: none; }
+}
 .resource-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 14px; }
 .pm-route-journey { padding: 16px; border: 1px solid var(--border); border-radius: var(--radius-panel); background: var(--surface-muted); }
 .pm-route-flow { display: grid; grid-template-columns: minmax(0, 1fr) 28px minmax(0, 1fr) 28px minmax(0, 1fr); align-items: center; gap: 8px; }
@@ -635,6 +652,7 @@ input:not([type='checkbox']):not([type='radio']):not(.mantine-Input-input):focus
 /* Touch devices get a full-size hit target even though desktop controls are denser. */
 @media (pointer: coarse) {
   .button, input, textarea, select:not([aria-hidden='true']) { min-height: 44px; }
+  .pm-nav-section-toggle { min-height: 44px; }
   .pm-nav-disclosure { flex-basis: 44px; width: 44px; height: 44px; }
   .pm-shell-navigation .mantine-NavLink-root, .pm-shell-navbar .mantine-AppShell-section:last-child .mantine-UnstyledButton-root, .pm-workspace-bar .mantine-ActionIcon-root { min-height: 44px; }
   .pm-workspace-bar .mantine-ActionIcon-root { min-width: 44px; }

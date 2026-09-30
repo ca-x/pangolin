@@ -21,11 +21,11 @@ const json = (value: unknown) => Promise.resolve(new Response(JSON.stringify(val
 const project = { id: 'p1', name: 'Project A', slug: 'project-a', owner_user_id: 'u1', is_default: true, enabled: true }
 const user = { id: 'u1', email: 'principal@example.test', role: 'admin', language: 'en', theme: 'system:bronze', created_at: 1 }
 const branding = (instance: string) => ({ instance_name: instance, branding_name: instance, favicon_url: '/logo.webp', onboarding_complete: false })
-const guidance = 'Initial setup is still marked incomplete. Review it when convenient, or mark onboarding complete in system settings.'
+const guidance = 'Review channels, credentials, and model routes, then mark onboarding complete in system settings.'
 // Project discovery and owner permission resolve in sequence before the banner can render.
 const findGuidance = () => screen.findByText(guidance, undefined, { timeout: 5000 })
 
-const renderShell = (instance = 'Pangolin') => {
+const renderShell = (instance = 'Pangolin', path = '/') => {
   vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
     const path = String(input)
     if (path.endsWith('/projects')) return json([project])
@@ -37,9 +37,10 @@ const renderShell = (instance = 'Pangolin') => {
   return render(
     <QueryClientProvider client={client}>
       <ThemeProvider>
-        <MemoryRouter initialEntries={['/system']}>
+        <MemoryRouter initialEntries={[path]}>
           <Routes>
             <Route element={<Shell user={user} branding={branding(instance)} />}>
+              <Route path="/" element={<div>Overview body</div>} />
               <Route path="/system" element={<SystemPage />} />
             </Route>
           </Routes>
@@ -78,9 +79,13 @@ describe('the first-run guidance is dismissible', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Dismiss' }))
     expect(screen.queryByText(guidance)).not.toBeInTheDocument()
 
+    await userEvent.click(screen.getByRole('button', { name: 'Instance management' }))
+    await userEvent.click(screen.getByRole('link', { name: 'System settings' }))
     const restore = await screen.findByRole('button', { name: 'Show it again' })
     await userEvent.click(restore)
     expect(localStorage.getItem(ONBOARDING_DISMISSED_KEY)).toBeNull()
+    await userEvent.click(screen.getByRole('button', { name: 'Current project' }))
+    await userEvent.click(screen.getByRole('link', { name: 'Overview' }))
     expect(await findGuidance()).toBeInTheDocument()
   })
 
@@ -102,10 +107,9 @@ describe('the first-run guidance is dismissible', () => {
     expect(within(controls).getByRole('button', { name: 'Dismiss' })).toBeInTheDocument()
   })
 
-  it('does not claim setup resources are missing away from the overview', async () => {
-    renderShell()
-
-    expect(await findGuidance()).toBeInTheDocument()
-    expect(screen.queryByText('Add a channel, credential, and model route before sending requests.')).not.toBeInTheDocument()
+  it('keeps the first-run banner out of management pages', async () => {
+    renderShell('Pangolin', '/system')
+    expect(await screen.findByRole('button', { name: 'Show it again' })).toBeInTheDocument()
+    expect(screen.queryByText(guidance)).not.toBeInTheDocument()
   })
 })

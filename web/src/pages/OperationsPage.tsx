@@ -11,7 +11,7 @@ import { ObservabilityNotice, UNMEASURED, formatCount, formatMicros, usageMeasur
 import { projectOperationPath, useProject } from '../project'
 import { PageHeader, QueryError, ResourcePage, displayValue, formatDate } from './shared'
 import { PayloadViewer } from './PayloadViewer'
-import { useRoutedTab } from './useRoutedTab'
+import { useActiveTabInView, useRoutedTab } from './useRoutedTab'
 
 const TAB_VALUES = ['requests', 'executions', 'threads', 'traces', 'usage', 'costItems', 'audit'] as const
 
@@ -77,9 +77,10 @@ export default function OperationsPage() {
   const location = useLocation()
   const observability = useObservability()
   const [tab, setTab] = useRoutedTab(TAB_VALUES, 'requests', (location.state as { tab?: string } | null)?.tab)
+  const tabsRef = useActiveTabInView(tab)
   return <><ObservabilityNotice observability={observability} onRetry={observability.refresh} />
     <Tabs keepMounted={false} value={tab} onChange={setTab} mb="lg">
-      <Tabs.List mb="lg">{TAB_VALUES.map(value => <Tabs.Tab key={value} value={value}>{t(value)}</Tabs.Tab>)}</Tabs.List>
+      <Tabs.List ref={tabsRef} mb="lg">{TAB_VALUES.map(value => <Tabs.Tab key={value} value={value}>{t(value)}</Tabs.Tab>)}</Tabs.List>
       <Tabs.Panel value="requests"><LiveRequestsPanel /><RequestList observability={observability} /></Tabs.Panel>
       <Tabs.Panel value="executions"><ResourcePage resource="executions" title={t('executions')} description={t('executionsDescription')} empty={t('executionEmpty')} immutable columns={[{key:'status',label:t('status')},{key:'request_id',label:t('requestId'),mono:true},{key:'provider_id',label:t('provider'),mono:true},{key:'attempt',label:t('attempt')},{key:'latency_ms',label:t('latency')},{key:'retry_reason',label:t('retryReason')}]} /></Tabs.Panel>
       <Tabs.Panel value="threads"><ResourcePage resource="threads" title={t('threads')} description={t('threadsDescription')} empty={t('threadEmpty')} immutable columns={[{key:'id',label:t('threadId'),mono:true},{key:'external_id',label:t('externalId'),mono:true},{key:'api_key_id',label:t('key'),mono:true},{key:'created_at',label:t('time'),render:formatDate}]} /></Tabs.Panel>

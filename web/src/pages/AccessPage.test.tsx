@@ -11,7 +11,7 @@ import AccessPage from './AccessPage'
 const response = (value: unknown, status = 200) => Promise.resolve(new Response(JSON.stringify(value), { status, headers: { 'Content-Type': 'application/json' } }))
 
 describe('API key administration', () => {
-  beforeEach(() => { void i18n.changeLanguage('en'); vi.stubGlobal('fetch', vi.fn((input:RequestInfo|URL) => { const path=String(input); const data=path.endsWith('/projects')||path.includes('/projects?')?[{id:'project-a',name:'Project A',slug:'project-a',owner_user_id:'owner',is_default:true,enabled:true}]:path.includes('/permissions')?['project:read','project:manage','api_key:manage','role:manage']:[]; return Promise.resolve(new Response(JSON.stringify(data), { status: 200, headers: { 'Content-Type': 'application/json' } })) })) })
+  beforeEach(() => { void i18n.changeLanguage('en'); vi.stubGlobal('fetch', vi.fn((input:RequestInfo|URL) => { const path=String(input); const data=path.endsWith('/projects')||path.includes('/projects?')?[{id:'project-a',name:'Project A',slug:'project-a',owner_user_id:'owner',is_default:true,enabled:true}]:path.endsWith('/api/admin/v1/permissions')?['*']:path.includes('/permissions')?['project:read','project:manage','api_key:manage','role:manage']:[]; return Promise.resolve(new Response(JSON.stringify(data), { status: 200, headers: { 'Content-Type': 'application/json' } })) })) })
   it('explains generated and one-time imported token modes', async () => {
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
     render(<QueryClientProvider client={client}><MemoryRouter><ProjectProvider><AccessPage/></ProjectProvider></MemoryRouter></QueryClientProvider>)
@@ -27,10 +27,52 @@ describe('API key administration', () => {
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
     render(<QueryClientProvider client={client}><MemoryRouter><ProjectProvider><AccessPage/></ProjectProvider></MemoryRouter></QueryClientProvider>)
     await userEvent.click(await screen.findByRole('tab', { name: 'Projects' }))
+    expect(await screen.findByRole('button', { name: 'Add project' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Delete Project A' })).not.toBeInTheDocument()
     await userEvent.click((await screen.findAllByRole('button', { name: 'Edit' }))[0])
     const name=screen.getByLabelText(/Name/);await userEvent.clear(name);await userEvent.type(name,'Renamed project')
     await userEvent.click(screen.getByRole('button',{name:'Save'}))
     await vi.waitFor(()=>expect(vi.mocked(fetch).mock.calls.some(([path,init])=>String(path).endsWith('/projects/project-a')&&init?.method==='PATCH'&&new Headers(init.headers).get('X-Pangolin-CSRF')==='1')).toBe(true))
+  })
+  it('allows project edits without offering instance-level project creation', async () => {
+    vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
+      const path = String(input)
+      if (path.endsWith('/api/admin/v1/permissions')) return response(['project:read'])
+      if (path.includes('/permissions')) return response(['project:manage'])
+      if (path.endsWith('/projects') || path.includes('/projects?')) return response([
+        { id: 'project-a', name: 'Project A', slug: 'project-a', owner_user_id: 'owner', is_default: true, enabled: true },
+        { id: 'project-b', name: 'Project B', slug: 'project-b', owner_user_id: 'other', is_default: false, enabled: true },
+      ])
+      return response([])
+    }))
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    render(<QueryClientProvider client={client}><MemoryRouter><ProjectProvider><AccessPage /></ProjectProvider></MemoryRouter></QueryClientProvider>)
+    await userEvent.click(await screen.findByRole('tab', { name: 'Projects' }))
+    expect((await screen.findAllByText('Project A')).length).toBeGreaterThan(0)
+    expect(screen.queryByRole('button', { name: 'Add project' })).not.toBeInTheDocument()
+    expect(screen.getByText(/Only instance owners can create projects/)).toBeInTheDocument()
+    const rows = within(screen.getByRole('region', { name: 'Projects' })).getAllByRole('row')
+    const own = rows.find((row) => row.textContent?.includes('Project A'))!
+    const foreign = rows.find((row) => row.textContent?.includes('Project B'))!
+    expect(within(own).getByRole('button', { name: 'Edit' })).toBeInTheDocument()
+    expect(within(foreign).queryByRole('button', { name: 'Edit' })).not.toBeInTheDocument()
+    expect(within(foreign).queryByRole('button', { name: /Delete/ })).not.toBeInTheDocument()
+  })
+  it('does not offer owner-granting creation to a global project manager', async () => {
+    vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
+      const path = String(input)
+      if (path.endsWith('/api/admin/v1/permissions')) return response(['project:manage'])
+      if (path.includes('/permissions')) return response(['project:manage'])
+      if (path.endsWith('/projects') || path.includes('/projects?')) return response([{ id: 'project-a', name: 'Project A', slug: 'project-a', owner_user_id: 'owner', is_default: true, enabled: true }])
+      return response([])
+    }))
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    render(<QueryClientProvider client={client}><MemoryRouter><ProjectProvider><AccessPage /></ProjectProvider></MemoryRouter></QueryClientProvider>)
+    await userEvent.click(await screen.findByRole('tab', { name: 'Projects' }))
+    expect((await screen.findAllByText('Project A')).length).toBeGreaterThan(0)
+    expect(screen.queryByRole('button', { name: 'Add project' })).not.toBeInTheDocument()
+    expect(screen.getByText(/Only instance owners can create projects/)).toBeInTheDocument()
+    expect(screen.getAllByRole('button', { name: 'Edit' }).length).toBeGreaterThan(0)
   })
   it('only shows access tabs the principal is authorized to use', async () => {
     vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
