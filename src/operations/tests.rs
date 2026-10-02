@@ -252,6 +252,7 @@ fn axonhub_cached_and_write_cached_tokens_are_not_double_charged() {
     let price = Price {
         id: None,
         model_id: "model".into(),
+        pricing_status: Default::default(),
         ratio_millionths: 1_000_000,
         components,
     };
@@ -363,6 +364,7 @@ fn integer_cost_tiers_cache_ttls_rounding_and_overflow() {
     let price = Price {
         id: None,
         model_id: "test".into(),
+        pricing_status: Default::default(),
         ratio_millionths: 500000,
         components: vec![Component {
             id: "in".into(),
@@ -453,6 +455,7 @@ fn b36_pricing_volume_tiers_charge_every_unit_at_the_matched_rate() {
     let price = |tier_mode| Price {
         id: None,
         model_id: "tiered".into(),
+        pricing_status: Default::default(),
         ratio_millionths: 1_000_000,
         components: vec![component(tier_mode)],
     };
@@ -518,8 +521,6 @@ async fn b37_pricing_channel_scope_wins_only_for_the_matching_channel() {
             proxy_secret_envelope: None,
             proxy_reuse_connections: true,
             proxy_preset_id: None,
-            input_price_micros: 0,
-            output_price_micros: 0,
         },
         provider_id: provider_id.into(),
         model_id: "price-model".into(),
@@ -624,4 +625,23 @@ fn cc_switch_nonstandard_usage_delta_corrections_and_media_log_contracts() {
     assert!(!sanitized.contains("password"));
     assert!(!sanitized.contains("signature"));
     assert!(body.to_string().contains("binary-sentinel"));
+}
+
+#[test]
+fn reference_pricing_overflowing_quantities_are_unreported() {
+    let usage = pricing::Usage::parse_for(
+        &json!({"usage":{"input_tokens":i64::MAX,"cache_read_input_tokens":1,"output_tokens":0}}),
+        true,
+    );
+    assert!(
+        !usage.reported,
+        "overflowed totals cannot be trusted quantities"
+    );
+    let usage = pricing::Usage::parse(
+        &json!({"usageMetadata":{"promptTokenCount":10,"totalTokenCount":9}}),
+    );
+    assert!(
+        !usage.reported,
+        "a total below input cannot invent measured output zero"
+    );
 }

@@ -64,8 +64,6 @@ pub async fn credentials(
                     proxy_secret_envelope: row.try_get("", "proxy_secret_envelope")?,
                     proxy_reuse_connections: row.try_get("", "proxy_reuse_connections")?,
                     proxy_preset_id: row.try_get("", "proxy_preset_id")?,
-                    input_price_micros: 0,
-                    output_price_micros: 0,
                 },
             })
         })

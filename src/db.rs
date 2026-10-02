@@ -336,6 +336,7 @@ pub async fn create_model(
 }
 
 pub struct ModelCatalogDefaults {
+    pub pricing_configured: bool,
     pub capabilities: Vec<String>,
     pub input_price_micros: i64,
     pub output_price_micros: i64,
@@ -346,6 +347,7 @@ impl ModelCatalogDefaults {
     pub fn manual() -> Self {
         Self {
             capabilities: vec!["chat".into(), "responses".into(), "messages".into()],
+            pricing_configured: false,
             input_price_micros: 0,
             output_price_micros: 0,
             metadata: "{}".into(),
@@ -381,7 +383,12 @@ pub fn catalog_model_defaults_from(
             .unwrap_or(0)
     };
     let priced = (card.cost_defaults.currency.as_deref() == Some("USD")
-        && card.cost_defaults.unit.as_deref() == Some("per_million_tokens"))
+        && card.cost_defaults.unit.as_deref() == Some("per_million_tokens")
+        && [card.cost_defaults.input, card.cost_defaults.output]
+            .iter()
+            .all(|v| {
+                v.is_some_and(|v| v.is_finite() && v >= 0.0 && v <= (i64::MAX as f64 / 1_000_000.0))
+            }))
     .then_some(card);
     let logo_key = catalog
         .providers
@@ -389,6 +396,7 @@ pub fn catalog_model_defaults_from(
         .find(|provider| provider.id == card.developer)
         .map(|provider| provider.logo_key.as_str());
     Some(ModelCatalogDefaults {
+        pricing_configured: priced.is_some(),
         capabilities: card.gateway_capabilities(),
         input_price_micros: price(priced.and_then(|model| model.cost_defaults.input)),
         output_price_micros: price(priced.and_then(|model| model.cost_defaults.output)),
@@ -396,6 +404,20 @@ pub fn catalog_model_defaults_from(
             serde_json::json!({"catalog_version":catalog.version,"logo_key":logo_key,"card":card})
                 .to_string(),
     })
+}
+
+pub fn model_pricing_configured(
+    flag: Option<bool>,
+    input: i64,
+    output: i64,
+    prior: bool,
+) -> Result<bool, crate::api::ApiError> {
+    if input < 0 || output < 0 || (flag == Some(false) && (input > 0 || output > 0)) {
+        return Err(crate::api::ApiError::BadRequest(
+            "unconfigured prices must be zero; prices must be nonnegative".into(),
+        ));
+    }
+    Ok(flag.unwrap_or(prior || input > 0 || output > 0))
 }
 
 /// Insert a model on any connection — intended for callers that already hold a transaction.
@@ -422,9 +444,21 @@ pub async fn create_model_in<C: ConnectionTrait>(
             .as_deref()
             .unwrap_or(&resolved.capabilities),
     )?;
+    let input_rate = input
+        .input_price_micros
+        .unwrap_or(resolved.input_price_micros);
+    let output_rate = input
+        .output_price_micros
+        .unwrap_or(resolved.output_price_micros);
+    let configured = model_pricing_configured(
+        input.pricing_configured,
+        input_rate,
+        output_rate,
+        resolved.pricing_configured,
+    )?;
     db.execute(stmt(
-        "INSERT INTO models(id,provider_id,public_name,upstream_name,capabilities,input_price_micros,output_price_micros,priority,enabled,created_at,catalog_metadata_json) VALUES(?,?,?,?,?,?,?,?,1,?,?)",
-        vec![id.clone().into(), input.provider_id.clone().into(), input.public_name.trim().to_owned().into(), input.upstream_name.trim().to_owned().into(), capabilities.into(), input.input_price_micros.unwrap_or(resolved.input_price_micros).into(), input.output_price_micros.unwrap_or(resolved.output_price_micros).into(), input.priority.unwrap_or(100).into(), now().into(),resolved.metadata.clone().into()],
+        "INSERT INTO models(id,provider_id,public_name,upstream_name,capabilities,input_price_micros,output_price_micros,priority,enabled,created_at,catalog_metadata_json,pricing_configured) VALUES(?,?,?,?,?,?,?,?,1,?,?,?)",
+        vec![id.clone().into(), input.provider_id.clone().into(), input.public_name.trim().to_owned().into(), input.upstream_name.trim().to_owned().into(), capabilities.into(), input_rate.into(), output_rate.into(), input.priority.unwrap_or(100).into(), now().into(),resolved.metadata.clone().into(),configured.into()],
     )).await?;
     Ok(Model::find_by_statement(stmt(
         "SELECT m.*,p.name AS provider_name FROM models m JOIN providers p ON p.id=m.provider_id WHERE m.id=?",

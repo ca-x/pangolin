@@ -1763,6 +1763,9 @@ mod tests {
     #[test]
     fn the_scrape_omits_a_token_total_it_could_not_measure() {
         let unmeasured = Summary {
+            missing_pricing_count: 0,
+            incomplete_usage_count: 0,
+            measured_cost_count: 0,
             requests: 4,
             errors: 2,
             error_rate: 0.5,
@@ -2040,6 +2043,7 @@ mod tests {
                 public_name: "fast".into(),
                 upstream_name: "upstream-model".into(),
                 capabilities: None,
+                pricing_configured: None,
                 input_price_micros: Some(1_000_000),
                 output_price_micros: Some(2_000_000),
                 priority: None,
@@ -2163,8 +2167,6 @@ mod tests {
             proxy_secret_envelope: None,
             proxy_reuse_connections: true,
             proxy_preset_id: None,
-            input_price_micros: 0,
-            output_price_micros: 0,
         };
         let response = call_anthropic_chat(
             &reqwest::Client::new(),

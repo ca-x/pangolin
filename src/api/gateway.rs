@@ -956,6 +956,8 @@ pub(super) async fn discovery_response(
             // stream choice to record: `false` would be a claim about a provider
             // request that never happened.
             stream: crate::providers::streamed(endpoint, &json!({})),
+            usage_measurement: Default::default(),
+            pricing_status: Default::default(),
             cost_micros: 0,
             payload_captured: false,
             request_json: None,

@@ -62,6 +62,7 @@ async fn fill(f: &mut Fixture, owner: &access::Principal) {
             public_name: "public".into(),
             upstream_name: "upstream".into(),
             capabilities: None,
+            pricing_configured: None,
             input_price_micros: Some(1000000),
             output_price_micros: Some(2000000),
             priority: None,

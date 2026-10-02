@@ -32,6 +32,7 @@ pub struct Model {
     pub public_name: String,
     pub upstream_name: String,
     pub capabilities: String,
+    pub pricing_configured: bool,
     pub input_price_micros: i64,
     pub output_price_micros: i64,
     pub priority: i32,
@@ -86,8 +87,6 @@ pub struct RouteTarget {
     pub proxy_secret_envelope: Option<String>,
     pub proxy_reuse_connections: bool,
     pub proxy_preset_id: Option<String>,
-    pub input_price_micros: i64,
-    pub output_price_micros: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -120,6 +119,7 @@ pub struct ModelInput {
     pub public_name: String,
     pub upstream_name: String,
     pub capabilities: Option<Vec<String>>,
+    pub pricing_configured: Option<bool>,
     pub input_price_micros: Option<i64>,
     pub output_price_micros: Option<i64>,
     pub priority: Option<i32>,

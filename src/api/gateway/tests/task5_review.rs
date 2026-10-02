@@ -28,7 +28,9 @@ async fn task5_review_partial_anthropic_usage_keeps_reservation_until_final_delt
     ] {
         let f = fixture(Router::new().route("/v1/messages", post(move || async move {
             let stream = async_stream::stream! {
-                yield Ok::<_, std::io::Error>(Bytes::from_static(b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":20,\"output_tokens\":0}}}\n\n"));
+                // The complete final report relies on explicit zero cache counters
+                // in the initial usage: absent breakdowns cannot confirm total input.
+                yield Ok::<_, std::io::Error>(Bytes::from_static(b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":20,\"output_tokens\":0,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0}}}\n\n"));
                 yield Ok(Bytes::from_static(b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"generated\"}}\n\n"));
                 match mode {
                     "cancel" | "timeout" => tokio::time::sleep(Duration::from_secs(30)).await,

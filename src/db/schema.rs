@@ -1099,6 +1099,11 @@ UPDATE models SET pricing_configured=1 WHERE input_price_micros>0 OR output_pric
 ALTER TABLE prompt_protection_rules ADD COLUMN allowlist_json TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(allowlist_json));
 "#;
 
+const V30_USAGE_MEASUREMENT: &str = r#"
+ALTER TABLE usage_logs ADD COLUMN usage_measurement_json TEXT NOT NULL DEFAULT '{}'
+CHECK(json_valid(usage_measurement_json) AND length(CAST(usage_measurement_json AS BLOB))<=512);
+"#;
+
 #[derive(FromQueryResult)]
 struct Count {
     count: i64,
@@ -1624,6 +1629,25 @@ pub async fn migrate(db: &DatabaseConnection) -> Result<()> {
             .await?;
         transaction.commit().await?;
     }
+    let usage_measurement_applied = Count::find_by_statement(statement(
+        "SELECT COUNT(*) AS count FROM schema_migrations WHERE version=30",
+    ))
+    .one(db)
+    .await?
+    .is_some_and(|row| row.count > 0);
+    if !usage_measurement_applied {
+        let transaction = db.begin().await?;
+        transaction
+            .execute_unprepared(V30_USAGE_MEASUREMENT)
+            .await
+            .context("failed to add trusted usage measurement metadata")?;
+        transaction
+            .execute(statement(
+                "INSERT INTO schema_migrations(version,applied_at) VALUES(30,unixepoch())",
+            ))
+            .await?;
+        transaction.commit().await?;
+    }
     Ok(())
 }
 
@@ -1658,6 +1682,15 @@ mod tests {
     // written without any reference-adoption defaults or constraints.
     async fn reference_legacy_database(db: &DatabaseConnection) {
         migrate(db).await.unwrap();
+        if scalar(
+            db,
+            "SELECT COUNT(*) AS count FROM schema_migrations WHERE version=30",
+        )
+        .await
+            == 1
+        {
+            db.execute_unprepared("ALTER TABLE usage_logs DROP COLUMN usage_measurement_json; DELETE FROM schema_migrations WHERE version=30").await.unwrap();
+        }
         if scalar(
             db,
             "SELECT COUNT(*) AS count FROM schema_migrations WHERE version=29",
@@ -1735,6 +1768,42 @@ mod tests {
             INSERT INTO prompt_protection_rules(id,project_id,name,content_pattern,action,enabled,created_at,updated_at)
             VALUES('reference-rule','reference-a','rule','secret','deny',0,1,1);
         "#).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reference_pricing_measurement_upgrade_preserves_history_and_reopens() {
+        let directory = tempfile::tempdir().unwrap();
+        let url = format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("measurement.db").display()
+        );
+        let db = crate::db::connect(&url).await.unwrap();
+        reference_legacy_database(&db).await;
+        if scalar(&db,"SELECT COUNT(*) AS count FROM pragma_table_info('usage_logs') WHERE name='usage_measurement_json'").await>0 {
+            db.execute_unprepared("ALTER TABLE usage_logs DROP COLUMN usage_measurement_json; DELETE FROM schema_migrations WHERE version=30").await.unwrap();
+        }
+        db.close().await.unwrap();
+        let db = crate::db::connect(&url).await.unwrap();
+        assert_eq!(scalar(&db,"SELECT COUNT(*) AS count FROM usage_logs WHERE total_cost_micros=369 AND pricing_status='legacy' AND usage_measurement_json='{}' AND price_id='reference-price'").await,1);
+        assert_eq!(scalar(&db,"SELECT COUNT(*) AS count FROM execution_facts WHERE reserved_micros=789 AND price_json='{\"price\":123}' AND pricing_status='legacy'").await,1);
+        assert!(
+            db.execute_unprepared("UPDATE usage_logs SET usage_measurement_json='invalid'")
+                .await
+                .is_err()
+        );
+        db.execute_unprepared("UPDATE usage_logs SET usage_measurement_json='{\"version\":1,\"input_tokens\":true,\"output_tokens\":false}'").await.unwrap();
+        db.close().await.unwrap();
+        let db = crate::db::connect(&url).await.unwrap();
+        migrate(&db).await.unwrap();
+        assert_eq!(
+            scalar(
+                &db,
+                "SELECT COUNT(*) AS count FROM schema_migrations WHERE version=30"
+            )
+            .await,
+            1
+        );
+        assert_eq!(scalar(&db,"SELECT COUNT(*) AS count FROM usage_logs WHERE total_cost_micros=369 AND json_extract(usage_measurement_json,'$.input_tokens')=1 AND json_extract(usage_measurement_json,'$.output_tokens')=0").await,1);
     }
 
     #[tokio::test]
@@ -1916,7 +1985,7 @@ mod tests {
         migrate(&db).await.unwrap();
         assert_eq!(
             scalar(&db, "SELECT MAX(version) AS count FROM schema_migrations").await,
-            29
+            30
         );
         db.execute_unprepared("UPDATE channel_probes SET response_headers_ms=12,ttft_ms=8,first_event_ms=6,first_text_ms=8 WHERE id='reference-probe'; UPDATE models SET pricing_configured=1 WHERE id='reference-zero'").await.unwrap();
         let tables = scalar(
@@ -1954,7 +2023,7 @@ mod tests {
 
         assert_eq!(
             scalar(&db, "SELECT MAX(version) AS count FROM schema_migrations").await,
-            29
+            30
         );
         assert_eq!(
             scalar(
@@ -2280,7 +2349,7 @@ mod tests {
 
         assert_eq!(
             scalar(&db, "SELECT COUNT(*) AS count FROM schema_migrations").await,
-            26
+            27
         );
         assert_eq!(
             scalar(
@@ -2722,7 +2791,7 @@ mod tests {
 
         assert_eq!(
             scalar(&db, "SELECT MAX(version) AS count FROM schema_migrations").await,
-            29
+            30
         );
         assert_eq!(
             scalar(
@@ -2842,7 +2911,7 @@ mod tests {
 
         assert_eq!(
             scalar(&db, "SELECT MAX(version) AS count FROM schema_migrations").await,
-            29
+            30
         );
         assert_eq!(
             scalar(

@@ -18,8 +18,6 @@ fn target(kind: &str) -> RouteTarget {
         proxy_secret_envelope: None,
         proxy_reuse_connections: true,
         proxy_preset_id: None,
-        input_price_micros: 0,
-        output_price_micros: 0,
     }
 }
 

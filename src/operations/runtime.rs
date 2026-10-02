@@ -171,13 +171,31 @@ pub(super) async fn recover_in(
 ) -> Result<(), ApiError> {
     let execution_scope = json!(executions).to_string();
     let request_scope = json!(requests).to_string();
-    let rows=tx.query_all(sql("UPDATE execution_facts SET status='interrupted',finished_at=? WHERE status='running' AND (?='null' OR id IN (SELECT value FROM json_each(?))) RETURNING id,request_id,model_id,json_extract(price_json,'$.id') AS price_id,CASE WHEN contacted=1 THEN reserved_micros ELSE 0 END AS reserved_micros",vec![db::now().into(),execution_scope.clone().into(),execution_scope.into()])).await?;
+    let rows=tx.query_all(sql("UPDATE execution_facts SET status='interrupted',pricing_status=CASE WHEN pricing_status IN ('legacy','missing_price') THEN pricing_status ELSE 'incomplete_usage' END,finished_at=? WHERE status='running' AND (?='null' OR id IN (SELECT value FROM json_each(?))) RETURNING id,request_id,model_id,json_extract(price_json,'$.id') AS price_id,CASE WHEN contacted=1 THEN reserved_micros ELSE 0 END AS reserved_micros",vec![db::now().into(),execution_scope.clone().into(),execution_scope.into()])).await?;
     for row in rows {
         let execution: String = row.try_get("", "id")?;
         let request: String = row.try_get("", "request_id")?;
         let cost: i64 = row.try_get("", "reserved_micros")?;
         let usage = id();
+        let pricing_status: String = tx
+            .query_one(sql(
+                "SELECT pricing_status FROM execution_facts WHERE id=?",
+                vec![execution.clone().into()],
+            ))
+            .await?
+            .ok_or(ApiError::NotFound)?
+            .try_get("", "pricing_status")?;
         let inserted=tx.execute(sql("INSERT INTO usage_logs(id,execution_id,model_id,price_id,total_cost_micros,created_at,settlement_kind) VALUES(?,?,?,?,?,?,'interrupted') ON CONFLICT(execution_id) DO NOTHING",vec![usage.clone().into(),execution.clone().into(),row.try_get::<Option<String>>("","model_id")?.into(),row.try_get::<Option<String>>("","price_id")?.into(),cost.into(),db::now().into()])).await?.rows_affected();
+        tx.execute(sql(
+            "UPDATE usage_logs SET pricing_status=? WHERE id=?",
+            vec![pricing_status.clone().into(), usage.clone().into()],
+        ))
+        .await?;
+        tx.execute(sql(
+            "UPDATE request_executions SET pricing_status=? WHERE id=?",
+            vec![pricing_status.into(), execution.clone().into()],
+        ))
+        .await?;
         if inserted > 0 && cost > 0 {
             tx.execute(sql("INSERT INTO usage_cost_items(id,usage_log_id,quantity,subtotal_micros) VALUES(?,?,1,?)",vec![id().into(),usage.into(),cost.into()])).await?;
             tx.execute(sql("UPDATE api_keys SET spent_micros=spent_micros+? WHERE id=(SELECT api_key_id FROM request_facts WHERE id=?)",vec![cost.into(),request.into()])).await?;
@@ -333,8 +351,6 @@ async fn target(
             proxy_secret_envelope: row.try_get("", "proxy_secret_envelope")?,
             proxy_reuse_connections: row.try_get("", "proxy_reuse_connections")?,
             proxy_preset_id: row.try_get("", "proxy_preset_id")?,
-            input_price_micros: 0,
-            output_price_micros: 0,
         },
         credential,
         crate::oauth::credential_secret(
@@ -459,8 +475,6 @@ pub(crate) async fn validate_probe_selection<C: ConnectionTrait>(
             proxy_secret_envelope: row.try_get("", "proxy_secret_envelope")?,
             proxy_reuse_connections: row.try_get("", "proxy_reuse_connections")?,
             proxy_preset_id: row.try_get("", "proxy_preset_id")?,
-            input_price_micros: 0,
-            output_price_micros: 0,
         },
         credential: row.try_get("", "credential_id")?,
         endpoint: endpoint.into(),
@@ -797,7 +811,7 @@ async fn probe_response(
                 );
                 output |= probe_stream_output(endpoint, &value);
                 let usage = super::pricing::Usage::parse(&value);
-                if usage.reported {
+                if usage.reported && usage.presence.output {
                     measured.output_tokens = Some(usage.output);
                 }
             } else if event.data.trim() != "[DONE]" {
@@ -834,7 +848,7 @@ async fn probe_response(
             return Err("empty_response");
         }
         let usage = super::pricing::Usage::parse(&value);
-        if usage.reported {
+        if usage.reported && usage.presence.output {
             measured.output_tokens = Some(usage.output);
         }
         Ok(())

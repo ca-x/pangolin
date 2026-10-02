@@ -60,6 +60,10 @@ pub struct RequestEvent {
     /// has no such decision — a row written before it was recorded, or an endpoint
     /// with no stream choice — and never a guessed `false`.
     pub stream: Option<bool>,
+    #[serde(default)]
+    pub pricing_status: crate::operations::pricing::PricingStatus,
+    #[serde(default)]
+    pub usage_measurement: crate::operations::pricing::UsageMeasurement,
     pub cost_micros: i64,
     pub payload_captured: bool,
     pub request_json: Option<String>,
@@ -78,11 +82,17 @@ pub struct Summary {
     pub input_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
     pub cost_micros: Option<i64>,
+    pub missing_pricing_count: i64,
+    pub incomplete_usage_count: i64,
+    pub measured_cost_count: i64,
     pub series: Vec<SummaryPoint>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SummaryPoint {
+    pub missing_pricing_count: i64,
+    pub incomplete_usage_count: i64,
+    pub measured_cost_count: i64,
     pub bucket: i64,
     pub requests: i64,
     pub errors: i64,
@@ -176,7 +186,7 @@ fn bucket_seconds(span: i64) -> i64 {
 /// terminal usage report was lost; and a failure that settled as no tokens and no
 /// cost is the same fact from the other side. A partial settlement — a stream that
 /// broke after it had reported usage — keeps its real numbers.
-const MEASURED_USAGE: &str = "(error_kind IS NULL OR (error_kind <> 'usage_unavailable' AND (input_tokens + output_tokens > 0 OR cost_micros > 0)))";
+const MEASURED_COST: &str = "(pricing_status IN ('priced','explicit_free') OR (pricing_status='legacy' AND (error_kind IS NULL OR (error_kind <> 'usage_unavailable' AND (input_tokens + output_tokens > 0 OR cost_micros > 0)))))";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RequestListItem {
@@ -216,6 +226,10 @@ pub struct RequestListItem {
     /// Whether the provider request was streamed, as decided at admission. `None`
     /// when nothing recorded that decision — never a guessed `false`.
     pub stream: Option<bool>,
+    #[serde(default)]
+    pub pricing_status: crate::operations::pricing::PricingStatus,
+    #[serde(default)]
+    pub usage_measurement: crate::operations::pricing::UsageMeasurement,
     pub cost_micros: i64,
 }
 
@@ -860,7 +874,7 @@ impl ObservationStore {
 
 /// Bump whenever `request_events` changes shape. A mismatch drops the projection
 /// and asks the caller to re-derive it from the record system.
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 8;
 
 fn initialize(path: &Path) -> Result<bool> {
     let connection = Connection::open(path).context("failed to open DuckDB observation store")?;
@@ -912,7 +926,9 @@ fn initialize(path: &Path) -> Result<bool> {
             source_ip VARCHAR,
             response_headers_ms BIGINT,
             first_event_ms BIGINT,
-            first_text_ms BIGINT
+            first_text_ms BIGINT,
+            pricing_status VARCHAR NOT NULL DEFAULT 'legacy',
+            usage_measurement_json VARCHAR NOT NULL DEFAULT '{}'
         );
         CREATE INDEX IF NOT EXISTS idx_request_events_started ON request_events(started_at);
         CREATE INDEX IF NOT EXISTS idx_request_events_external ON request_events(request_id);
@@ -965,7 +981,7 @@ fn insert_batch(connection: &Connection, events: &[Box<RequestEvent>]) -> Result
 
 fn insert(connection: &Connection, event: &RequestEvent) -> Result<()> {
     connection.execute(
-        "INSERT OR REPLACE INTO request_events VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT OR REPLACE INTO request_events VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         params![
             event.id,
             event.request_id,
@@ -995,7 +1011,9 @@ fn insert(connection: &Connection, event: &RequestEvent) -> Result<()> {
             event.source_ip,
             event.response_headers_ms,
             event.first_event_ms,
-            event.first_text_ms
+            event.first_text_ms,
+            event.pricing_status.as_str(),
+            serde_json::to_string(&event.usage_measurement)?
         ],
     )?;
     Ok(())
@@ -1017,12 +1035,12 @@ fn query_summary_for(
     let window = SummaryWindow::resolve(filter, time::OffsetDateTime::now_utc().unix_timestamp());
     let mut summary = connection.query_row(
         &format!(
-            "SELECT count(*),count(*) FILTER (WHERE error_kind IS NOT NULL OR status_code >= 400),coalesce(quantile_cont(latency_ms,0.95),0),sum(input_tokens) FILTER (WHERE {MEASURED_USAGE}),sum(output_tokens) FILTER (WHERE {MEASURED_USAGE}),sum(cost_micros) FILTER (WHERE {MEASURED_USAGE}) FROM request_events WHERE started_at >= ? AND (? IS NULL OR started_at < ?) AND (? IS NULL OR project_id=?)"
+            "SELECT count(*),count(*) FILTER (WHERE error_kind IS NOT NULL OR status_code >= 400),coalesce(quantile_cont(latency_ms,0.95),0),sum(input_tokens) FILTER (WHERE json_extract(usage_measurement_json,'$.input_tokens')='true' AND json_extract(usage_measurement_json,'$.version')='1' AND (pricing_status<>'legacy' OR error_kind IS NULL OR (error_kind<>'usage_unavailable' AND (input_tokens+output_tokens>0 OR cost_micros>0)))),sum(output_tokens) FILTER (WHERE json_extract(usage_measurement_json,'$.output_tokens')='true' AND json_extract(usage_measurement_json,'$.version')='1' AND (pricing_status<>'legacy' OR error_kind IS NULL OR (error_kind<>'usage_unavailable' AND (input_tokens+output_tokens>0 OR cost_micros>0)))),sum(cost_micros) FILTER (WHERE {MEASURED_COST}),count(*) FILTER (WHERE pricing_status='missing_price'),count(*) FILTER (WHERE pricing_status='incomplete_usage'),count(*) FILTER (WHERE {MEASURED_COST}) FROM request_events WHERE started_at >= ? AND (? IS NULL OR started_at < ?) AND (? IS NULL OR project_id=?)"
         ),
         params![window.from, window.until, window.until, project_id, project_id],
         |row| Ok(Summary {
             requests: row.get(0)?, errors: row.get(1)?, error_rate: 0.0,
-            p95_latency_ms: row.get(2)?, input_tokens: row.get(3)?, output_tokens: row.get(4)?, cost_micros: row.get(5)?, series: vec![],
+            p95_latency_ms: row.get(2)?, input_tokens: row.get(3)?, output_tokens: row.get(4)?, cost_micros: row.get(5)?, missing_pricing_count: row.get(6)?, incomplete_usage_count: row.get(7)?, measured_cost_count: row.get(8)?, series: vec![],
         }),
     )?;
     summary.error_rate = if summary.requests == 0 {
@@ -1031,7 +1049,7 @@ fn query_summary_for(
         summary.errors as f64 / summary.requests as f64
     };
     let mut statement = connection.prepare(&format!(
-        "SELECT CAST(floor(started_at/?)*? AS BIGINT) AS bucket,count(*),count(*) FILTER (WHERE error_kind IS NOT NULL OR status_code >= 400),avg(latency_ms),sum(input_tokens) FILTER (WHERE {MEASURED_USAGE}),sum(output_tokens) FILTER (WHERE {MEASURED_USAGE}),sum(cost_micros) FILTER (WHERE {MEASURED_USAGE}) FROM request_events WHERE started_at >= ? AND (? IS NULL OR started_at < ?) AND (? IS NULL OR project_id=?) GROUP BY bucket ORDER BY bucket"
+        "SELECT CAST(floor(started_at/?)*? AS BIGINT) AS bucket,count(*),count(*) FILTER (WHERE error_kind IS NOT NULL OR status_code >= 400),avg(latency_ms),sum(input_tokens) FILTER (WHERE json_extract(usage_measurement_json,'$.input_tokens')='true' AND json_extract(usage_measurement_json,'$.version')='1' AND (pricing_status<>'legacy' OR error_kind IS NULL OR (error_kind<>'usage_unavailable' AND (input_tokens+output_tokens>0 OR cost_micros>0)))),sum(output_tokens) FILTER (WHERE json_extract(usage_measurement_json,'$.output_tokens')='true' AND json_extract(usage_measurement_json,'$.version')='1' AND (pricing_status<>'legacy' OR error_kind IS NULL OR (error_kind<>'usage_unavailable' AND (input_tokens+output_tokens>0 OR cost_micros>0)))),sum(cost_micros) FILTER (WHERE {MEASURED_COST}),count(*) FILTER (WHERE pricing_status='missing_price'),count(*) FILTER (WHERE pricing_status='incomplete_usage'),count(*) FILTER (WHERE {MEASURED_COST}) FROM request_events WHERE started_at >= ? AND (? IS NULL OR started_at < ?) AND (? IS NULL OR project_id=?) GROUP BY bucket ORDER BY bucket"
     ))?;
     let points = statement.query_map(
         params![
@@ -1045,6 +1063,9 @@ fn query_summary_for(
         ],
         |row| {
             Ok(SummaryPoint {
+                missing_pricing_count: row.get(7)?,
+                incomplete_usage_count: row.get(8)?,
+                measured_cost_count: row.get(9)?,
                 bucket: row.get(0)?,
                 requests: row.get(1)?,
                 errors: row.get(2)?,
@@ -1110,7 +1131,7 @@ fn query_list(connection: &Connection, filter: &RequestFilter) -> Result<Vec<Req
     prepare_request_facets(connection, filter)?;
     let limit = filter.limit.unwrap_or(100).clamp(1, 500) as i64;
     let mut statement = connection.prepare(
-        "SELECT id,request_id,started_at,endpoint,provider,requested_model,resolved_model,status_code,error_kind,api_key_id,latency_ms,input_tokens,output_tokens,cost_micros,ttft_ms,cached_tokens,cache_write_tokens,reasoning_tokens,stream,response_headers_ms,first_event_ms,first_text_ms FROM request_events WHERE (? IS NULL OR project_id=?) AND (? IS NULL OR status_code=?) AND (? IS NULL OR status_code IN (SELECT value FROM request_filter_status_codes)) AND (? IS NULL OR provider=?) AND (? IS NULL OR provider IN (SELECT value FROM request_filter_providers)) AND (? IS NULL OR requested_model=? OR resolved_model=?) AND (? IS NULL OR requested_model IN (SELECT value FROM request_filter_models) OR resolved_model IN (SELECT value FROM request_filter_models)) AND (? IS NULL OR api_key_id=?) AND (? IS NULL OR api_key_id IN (SELECT value FROM request_filter_api_key_ids)) AND (? IS NULL OR started_at>=?) AND (? IS NULL OR started_at<=?) ORDER BY started_at DESC,id DESC LIMIT ? OFFSET ?",
+        "SELECT id,request_id,started_at,endpoint,provider,requested_model,resolved_model,status_code,error_kind,api_key_id,latency_ms,input_tokens,output_tokens,cost_micros,ttft_ms,cached_tokens,cache_write_tokens,reasoning_tokens,stream,response_headers_ms,first_event_ms,first_text_ms,pricing_status,usage_measurement_json FROM request_events WHERE (? IS NULL OR project_id=?) AND (? IS NULL OR status_code=?) AND (? IS NULL OR status_code IN (SELECT value FROM request_filter_status_codes)) AND (? IS NULL OR provider=?) AND (? IS NULL OR provider IN (SELECT value FROM request_filter_providers)) AND (? IS NULL OR requested_model=? OR resolved_model=?) AND (? IS NULL OR requested_model IN (SELECT value FROM request_filter_models) OR resolved_model IN (SELECT value FROM request_filter_models)) AND (? IS NULL OR api_key_id=?) AND (? IS NULL OR api_key_id IN (SELECT value FROM request_filter_api_key_ids)) AND (? IS NULL OR started_at>=?) AND (? IS NULL OR started_at<=?) ORDER BY started_at DESC,id DESC LIMIT ? OFFSET ?",
     )?;
     let rows = statement.query_map(
         params![
@@ -1151,6 +1172,10 @@ fn query_list(connection: &Connection, filter: &RequestFilter) -> Result<Vec<Req
                 latency_ms: row.get(10)?,
                 input_tokens: row.get(11)?,
                 output_tokens: row.get(12)?,
+                pricing_status: row.get::<_, String>(22)?.parse().unwrap_or_default(),
+                usage_measurement: crate::operations::pricing::UsageMeasurement::parse(
+                    &row.get::<_, String>(23)?,
+                ),
                 cost_micros: row.get(13)?,
                 ttft_ms: row.get(14)?,
                 cached_tokens: row.get(15)?,
@@ -1238,6 +1263,10 @@ fn query_one(
         input_tokens: row.get(15)?,
         output_tokens: row.get(16)?,
         cached_tokens: row.get(17)?,
+        usage_measurement: crate::operations::pricing::UsageMeasurement::parse(
+            &row.get::<_, String>(30)?,
+        ),
+        pricing_status: row.get::<_, String>(29)?.parse().unwrap_or_default(),
         cost_micros: row.get(18)?,
         payload_captured: row.get(19)?,
         request_json: row.get(20)?,
@@ -1288,6 +1317,8 @@ mod tests {
             cache_write_tokens: 0,
             reasoning_tokens: 0,
             stream: None,
+            usage_measurement: crate::operations::pricing::UsageMeasurement::measured(),
+            pricing_status: Default::default(),
             cost_micros: 3,
             payload_captured: false,
             request_json: None,
@@ -1424,6 +1455,8 @@ mod tests {
             cache_write_tokens: 0,
             reasoning_tokens: 0,
             stream: None,
+            usage_measurement: crate::operations::pricing::UsageMeasurement::measured(),
+            pricing_status: Default::default(),
             cost_micros: 3,
             payload_captured: false,
             request_json: None,
@@ -2302,6 +2335,8 @@ mod tests {
             cache_write_tokens: 0,
             reasoning_tokens: 0,
             stream: None,
+            usage_measurement: crate::operations::pricing::UsageMeasurement::measured(),
+            pricing_status: Default::default(),
             cost_micros: 0,
             payload_captured: false,
             request_json: None,

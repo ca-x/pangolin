@@ -94,8 +94,6 @@ struct Row {
     proxy_secret_envelope: Option<String>,
     proxy_reuse_connections: bool,
     proxy_preset_id: Option<String>,
-    input_price_micros: i64,
-    output_price_micros: i64,
     priority: i32,
     credential_priority: i32,
     provider_priority: i32,
@@ -147,7 +145,7 @@ pub async fn candidates(
         .map_err(|_| Error::Configuration)?;
     let rows = Row::find_by_statement(statement(r#"
         SELECT m.id AS model_id,p.id AS provider_id,c.id AS credential_id,m.public_name,m.upstream_name,m.capabilities,
-        p.name AS provider_name,p.kind AS provider_kind,p.base_url,c.credential_type,c.secret_envelope,m.input_price_micros,m.output_price_micros,m.priority,
+        p.name AS provider_name,p.kind AS provider_kind,p.base_url,c.credential_type,c.secret_envelope,m.priority,
         p.priority AS provider_priority,
         m.enabled AS model_enabled,m.discovery_managed,p.enabled AS provider_enabled,p.settings_json,
         m.catalog_metadata_json,m.disable_developer_settings_inheritance,
@@ -486,8 +484,6 @@ pub async fn candidates(
                 proxy_secret_envelope: row.proxy_secret_envelope,
                 proxy_reuse_connections: row.proxy_reuse_connections,
                 proxy_preset_id: row.proxy_preset_id,
-                input_price_micros: row.input_price_micros,
-                output_price_micros: row.output_price_micros,
             },
             provider_id: row.provider_id,
             model_id: row.model_id,

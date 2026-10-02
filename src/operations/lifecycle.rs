@@ -1,7 +1,7 @@
 use super::{
     id,
     logging::{self, Level},
-    pricing::{self, Price, Usage},
+    pricing::{self, Price, PricingStatus, Usage, UsageMeasurement},
     sql,
 };
 use crate::providers::diagnostics::{self, AffinityDiagnostic, ConversionDiagnostic};
@@ -210,8 +210,14 @@ impl Request {
         let mut price = pricing::snapshot(&ctx.state.db, candidate, ctx.ratio).await?;
         if !billable {
             price.components.clear();
+            price.pricing_status = PricingStatus::ExplicitFree;
         }
         let hard=ctx.key.budget_micros.is_some()||ctx.profile_id.is_some()&&ctx.state.db.query_one(sql("SELECT 1 AS present FROM api_key_profiles WHERE id=? AND budget_micros IS NOT NULL",vec![ctx.profile_id.clone().into()])).await?.is_some();
+        if billable && hard && price.pricing_status == PricingStatus::MissingPrice {
+            return Err(ApiError::BadRequest(
+                "hard-budget requests require a configured price".into(),
+            ));
+        }
         let bound = if !billable {
             0
         } else if hard {
@@ -226,6 +232,16 @@ impl Request {
         let transaction = ctx.state.db.begin().await?;
         // This first write acquires SQLite's writer lock before reading shared budgets.
         transaction.execute(sql("INSERT INTO execution_facts(id,request_id,provider_id,model_id,credential_id,attempt,price_json,reserved_micros,started_at) VALUES(?,?,?,?,?,?,?,?,?)",vec![execution.clone().into(),ctx.id.clone().into(),candidate.provider_id.clone().into(),candidate.model_id.clone().into(),candidate.credential_id.clone().into(),(number as i64).into(),serde_json::to_string(&price).map_err(|e|ApiError::Internal(e.into()))?.into(),bound.into(),started_at.into()])).await?;
+        let current_hard=transaction.query_one(sql("SELECT 1 AS present FROM api_keys k LEFT JOIN api_key_profiles p ON p.id=k.profile_id AND p.project_id=k.project_id WHERE k.id=? AND k.project_id=? AND (k.budget_micros IS NOT NULL OR p.budget_micros IS NOT NULL)",vec![ctx.key.id.clone().into(),ctx.key.project_id.clone().into()])).await?.is_some();
+        if billable && current_hard {
+            if price.pricing_status == PricingStatus::MissingPrice {
+                return Err(ApiError::BadRequest(
+                    "hard-budget requests require a configured price".into(),
+                ));
+            }
+            // The non-budget estimate may have suppressed a request-side bound error.
+            price.upper_bound(tokens, payload, &ctx.endpoint)?;
+        }
         let allowed=transaction.query_one(sql("SELECT k.id FROM api_keys k WHERE k.id=? AND k.enabled=1 AND (k.budget_micros IS NULL OR k.spent_micros+(SELECT COALESCE(SUM(e.reserved_micros),0) FROM execution_facts e JOIN request_facts r ON r.id=e.request_id WHERE r.api_key_id=k.id AND e.status='running')<=k.budget_micros) AND (k.profile_id IS NULL OR NOT EXISTS(SELECT 1 FROM api_key_profiles p WHERE p.id=k.profile_id AND p.budget_micros IS NOT NULL AND (SELECT COALESCE(SUM(spent_micros),0) FROM api_keys WHERE profile_id=p.id)+(SELECT COALESCE(SUM(e.reserved_micros),0) FROM execution_facts e JOIN request_facts r ON r.id=e.request_id WHERE r.profile_id=p.id AND e.status='running')>p.budget_micros))",vec![ctx.key.id.clone().into()])).await?;
         if allowed.is_none() {
             return Err(ApiError::RateLimited(
@@ -256,6 +272,24 @@ impl Request {
         if ctx.level != Level::Off {
             transaction.execute(sql("INSERT INTO request_executions(id,request_id,provider_id,provider_name,credential_id,attempt,model,status,credential_suffix,started_at) SELECT ?,?,?,?,?,?,?,'running',suffix,? FROM channel_credentials WHERE id=?",vec![execution.clone().into(),ctx.id.clone().into(),candidate.provider_id.clone().into(),candidate.target.provider_name.clone().into(),candidate.credential_id.clone().into(),(number as i64).into(),candidate.target.upstream_name.clone().into(),started_at.into(),candidate.credential_id.clone().into()])).await?;
         }
+        transaction
+            .execute(sql(
+                "UPDATE execution_facts SET pricing_status=? WHERE id=?",
+                vec![
+                    price.pricing_status.as_str().into(),
+                    execution.clone().into(),
+                ],
+            ))
+            .await?;
+        transaction
+            .execute(sql(
+                "UPDATE request_executions SET pricing_status=? WHERE id=?",
+                vec![
+                    price.pricing_status.as_str().into(),
+                    execution.clone().into(),
+                ],
+            ))
+            .await?;
         transaction.commit().await?;
         Ok(Attempt {
             context: ctx.clone(),
@@ -264,6 +298,7 @@ impl Request {
             price,
             usage: Usage::default(),
             final_usage: false,
+            terminal_usage: false,
             provider: candidate.target.provider_name.clone(),
             provider_id: candidate.provider_id.clone(),
             credential_id: candidate.credential_id.clone(),
@@ -303,6 +338,7 @@ pub struct Attempt {
     price: Price,
     pub usage: Usage,
     final_usage: bool,
+    terminal_usage: bool,
     provider: String,
     provider_id: String,
     credential_id: String,
@@ -347,6 +383,7 @@ impl Attempt {
         self.reserved = 0;
         self.usage.reported = true;
         self.final_usage = true;
+        self.terminal_usage = true;
         self.context
             .state
             .db
@@ -375,7 +412,8 @@ impl Attempt {
             value,
             self.context.endpoint == "/v1/messages",
         ));
-        self.final_usage = self.usage.reported;
+        self.terminal_usage = self.usage.reported;
+        self.final_usage = self.terminal_usage && self.price.complete_usage(&self.usage);
         self.body = self.context.level.body(value);
     }
     pub fn media(&mut self, endpoint: &str, payload: &Value) {
@@ -386,10 +424,12 @@ impl Attempt {
             .all(|c| matches!(c.kind.as_str(), "flat" | "unit"));
         if let Ok(units) = pricing::media_units(endpoint, payload) {
             self.usage.units = units;
+            self.usage.presence.units = true;
             self.usage.reported |= priced;
         } else if self.price.components.iter().all(|c| c.kind == "flat") {
             self.usage.reported = true;
         }
+        self.terminal_usage |= self.usage.reported;
         self.final_usage |= self.usage.reported;
     }
     pub fn stream_event(&mut self, event_name: &str, data: &str, terminal: bool) {
@@ -468,11 +508,12 @@ impl Attempt {
                     }
                     _ => false,
                 });
-        self.final_usage |= parsed.reported && final_report;
+        self.terminal_usage |= parsed.reported && final_report;
         if let Some(value) = value.as_ref() {
             self.usage
                 .merge_event(value, self.context.endpoint == "/v1/messages");
         }
+        self.final_usage = self.terminal_usage && self.price.complete_usage(&self.usage);
         self.capture_stream_envelope(event_name, data, value.as_ref(), terminal);
     }
     fn capture_stream_envelope(
@@ -673,6 +714,7 @@ impl Attempt {
         if self.settled {
             return Ok(());
         }
+        self.final_usage &= self.price.complete_usage(&self.usage);
         let ctx = &self.context;
         let (mut cost, mut items) = if self.usage.reported || status == "succeeded" {
             match self.price.calculate(&self.usage) {
@@ -692,6 +734,14 @@ impl Attempt {
             cost = self.reserved;
             items.clear();
         }
+        let pricing_status = if self.price.pricing_status == PricingStatus::MissingPrice {
+            PricingStatus::MissingPrice
+        } else if self.final_usage {
+            self.price.pricing_status
+        } else {
+            PricingStatus::IncompleteUsage
+        };
+        let usage_measurement = UsageMeasurement::from_usage(&self.usage, self.terminal_usage);
         let txn = ctx.state.db.begin().await?;
         let changed = txn
             .execute(sql(
@@ -755,6 +805,28 @@ impl Attempt {
             vec![kind.into(), savings.into(),self.usage.image_input.into(),self.usage.image_output.into(), usage_id.clone().into()],
         ))
         .await?;
+        txn.execute(sql(
+            "UPDATE usage_logs SET usage_measurement_json=? WHERE id=?",
+            vec![
+                serde_json::to_string(&usage_measurement)
+                    .map_err(|e| ApiError::Internal(e.into()))?
+                    .into(),
+                usage_id.clone().into(),
+            ],
+        ))
+        .await?;
+        for table in ["execution_facts", "request_executions", "usage_logs"] {
+            let column = if table == "usage_logs" {
+                "execution_id"
+            } else {
+                "id"
+            };
+            txn.execute(sql(
+                format!("UPDATE {table} SET pricing_status=? WHERE {column}=?"),
+                vec![pricing_status.as_str().into(), self.id.clone().into()],
+            ))
+            .await?;
+        }
         if kind == "conservative" {
             txn.execute(sql("INSERT INTO usage_cost_items(id,usage_log_id,quantity,subtotal_micros) VALUES(?,?,1,?)",vec![id().into(),usage_id.clone().into(),cost.into()])).await?;
         }
@@ -825,6 +897,8 @@ impl Attempt {
                     cache_write_tokens: self.usage.cache_write,
                     reasoning_tokens: self.usage.reasoning,
                     stream: ctx.stream,
+                    usage_measurement: usage_measurement.clone(),
+                    pricing_status,
                     cost_micros: cost,
                     payload_captured: ctx.request_json.is_some(),
                     request_json: ctx.request_json.clone(),
@@ -848,6 +922,7 @@ impl Drop for Attempt {
             price: self.price.clone(),
             usage: self.usage.clone(),
             final_usage: self.final_usage,
+            terminal_usage: self.terminal_usage,
             provider: self.provider.clone(),
             provider_id: self.provider_id.clone(),
             credential_id: self.credential_id.clone(),

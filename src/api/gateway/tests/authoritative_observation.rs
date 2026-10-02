@@ -244,6 +244,7 @@ async fn the_gemini_streaming_endpoint_shape_is_recorded_as_streamed() {
             public_name: "gemini-public".into(),
             upstream_name: "gemini-model".into(),
             capabilities: None,
+            pricing_configured: None,
             input_price_micros: None,
             output_price_micros: None,
             priority: Some(0),

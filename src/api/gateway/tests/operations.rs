@@ -9082,6 +9082,8 @@ fn projected(
         cache_write_tokens: 0,
         reasoning_tokens: 0,
         stream: None,
+        usage_measurement: crate::operations::pricing::UsageMeasurement::measured(),
+        pricing_status: Default::default(),
         cost_micros,
         payload_captured: false,
         request_json: None,
@@ -9958,6 +9960,8 @@ fn aged_event(request_id: &str, project: &str) -> RequestEvent {
         cache_write_tokens: 0,
         reasoning_tokens: 0,
         stream: None,
+        usage_measurement: crate::operations::pricing::UsageMeasurement::measured(),
+        pricing_status: Default::default(),
         cost_micros: 0,
         payload_captured: true,
         request_json: Some(r#"{"messages":[{"role":"user","content":"pinned"}]}"#.into()),
@@ -13655,6 +13659,7 @@ async fn reference_conversion_diagnostics_normalization_is_explicit_and_metadata
             public_name: "public".into(),
             upstream_name: "actual".into(),
             capabilities: None,
+            pricing_configured: None,
             input_price_micros: None,
             output_price_micros: None,
             priority: None,
@@ -14063,4 +14068,732 @@ async fn reference_conversion_diagnostics_anthropic_string_stop_is_actual_and_na
         "native and text-only checked adapters must not invent normalization"
     );
     assert!(!rows.to_string().contains("private"));
+}
+
+#[tokio::test]
+async fn reference_pricing_status_separates_paid_free_missing_and_partial() {
+    for (configured, rate, usage, expected, expected_cost) in [
+        (
+            true,
+            1_000_000,
+            json!({"prompt_tokens":2,"completion_tokens":3}),
+            "priced",
+            Some(5),
+        ),
+        (
+            true,
+            0,
+            json!({"prompt_tokens":0,"completion_tokens":0}),
+            "explicit_free",
+            Some(0),
+        ),
+        (
+            false,
+            0,
+            json!({"prompt_tokens":2,"completion_tokens":3}),
+            "missing_price",
+            Some(0),
+        ),
+        (
+            true,
+            1_000_000,
+            json!({"completion_tokens":3}),
+            "incomplete_usage",
+            None,
+        ),
+        (
+            true,
+            1_000_000,
+            json!({"prompt_tokens":0,"completion_tokens":0}),
+            "priced",
+            Some(0),
+        ),
+    ] {
+        let f = fixture(Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let usage = usage.clone();
+                async move { Json(json!({"choices":[{"message":{"content":"ok"}}],"usage":usage})) }
+            }),
+        ))
+        .await;
+        sql(
+            &f,
+            "UPDATE models SET pricing_configured=?,input_price_micros=?,output_price_micros=?",
+            vec![configured.into(), rate.into(), rate.into()],
+        )
+        .await;
+        let response = request(&f, "/v1/chat/completions", chat()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let row=f.state.db.query_one(ops::sql("SELECT u.pricing_status,u.settlement_kind,u.total_cost_micros,e.pricing_status AS execution_status,x.pricing_status AS visible_status FROM usage_logs u JOIN execution_facts e ON e.id=u.execution_id JOIN request_executions x ON x.id=e.id",vec![])).await.unwrap().unwrap();
+        assert_eq!(
+            row.try_get::<String>("", "pricing_status").unwrap(),
+            expected
+        );
+        assert_eq!(
+            row.try_get::<String>("", "execution_status").unwrap(),
+            expected
+        );
+        assert_eq!(
+            row.try_get::<String>("", "visible_status").unwrap(),
+            expected
+        );
+        if expected == "incomplete_usage" {
+            assert_eq!(
+                row.try_get::<String>("", "settlement_kind").unwrap(),
+                "conservative"
+            );
+        }
+        if let Some(expected_cost) = expected_cost {
+            assert_eq!(
+                row.try_get::<i64>("", "total_cost_micros").unwrap(),
+                expected_cost
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn reference_missing_price_budget_rejects_before_inference_and_free_is_admitted() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let upstream = calls.clone();
+    let f=fixture(Router::new().route("/v1/chat/completions",post(move || {let calls=upstream.clone();async move {calls.fetch_add(1,Ordering::SeqCst);Json(json!({"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":0,"completion_tokens":0}}))}}))).await;
+    sql(&f, "UPDATE api_keys SET budget_micros=1000", vec![]).await;
+    let response = request(&f, "/v1/chat/completions", chat()).await;
+    assert_ne!(response.status(), StatusCode::OK);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    sql(&f, "UPDATE models SET pricing_configured=1", vec![]).await;
+    assert_eq!(
+        request(&f, "/v1/chat/completions", chat()).await.status(),
+        StatusCode::OK
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        count(
+            &f,
+            "SELECT COUNT(*) AS n FROM usage_logs WHERE pricing_status='explicit_free'"
+        )
+        .await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn reference_pricing_unrelated_model_edit_preserves_rates_and_configuration() {
+    let f = fixture(success()).await;
+    let cookie = owner(&f).await;
+    sql(
+        &f,
+        "UPDATE models SET input_price_micros=12,output_price_micros=34,pricing_configured=1",
+        vec![],
+    )
+    .await;
+    let model = f
+        .state
+        .db
+        .query_one(ops::sql(
+            "SELECT id,provider_id,public_name,upstream_name FROM models LIMIT 1",
+            vec![],
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    let id: String = model.try_get("", "id").unwrap();
+    let path = format!(
+        "/api/admin/v1/projects/{}/operations/models",
+        db::DEFAULT_PROJECT_ID
+    );
+    let response=admin(&f,&cookie,http::Method::POST,&path,json!({"id":id,"provider_id":model.try_get::<String>("","provider_id").unwrap(),"public_name":"renamed","upstream_name":model.try_get::<String>("","upstream_name").unwrap()}),true).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(count(&f,"SELECT COUNT(*) AS n FROM models WHERE public_name='renamed' AND input_price_micros=12 AND output_price_micros=34 AND pricing_configured=1").await,1);
+}
+
+#[tokio::test]
+async fn reference_pricing_model_create_clone_and_backup_preserve_provenance() {
+    let f = fixture(success()).await;
+    let cookie = owner(&f).await;
+    let base = format!(
+        "/api/admin/v1/projects/{}/operations",
+        db::DEFAULT_PROJECT_ID
+    );
+    for (name, extra, configured) in [
+        ("reference-manual", json!({}), false),
+        ("reference-free", json!({"pricing_configured":true}), true),
+        ("reference-paid", json!({"input_price_micros":7}), true),
+    ] {
+        let mut body =
+            json!({"id":name,"provider_id":f.providers[0],"public_name":name,"upstream_name":name});
+        body.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        assert_eq!(
+            admin(
+                &f,
+                &cookie,
+                http::Method::POST,
+                &format!("{base}/models"),
+                body,
+                true
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        let row = f
+            .state
+            .db
+            .query_one(ops::sql(
+                "SELECT pricing_configured FROM models WHERE id=?",
+                vec![name.into()],
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.try_get::<bool>("", "pricing_configured").unwrap(),
+            configured
+        );
+    }
+    assert_eq!(admin(&f,&cookie,http::Method::POST,&format!("{base}/models"),json!({"provider_id":f.providers[0],"public_name":"contradiction","upstream_name":"contradiction","pricing_configured":false,"output_price_micros":1}),true).await.status(),StatusCode::BAD_REQUEST);
+    let rows = json_body(
+        admin(
+            &f,
+            &cookie,
+            http::Method::GET,
+            &format!("{base}/models"),
+            Value::Null,
+            false,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        rows["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == "reference-free")
+            .unwrap()["pricing_configured"],
+        true
+    );
+    // A paid operator version with zero legacy rates must survive channel clone.
+    let source = f
+        .state
+        .db
+        .query_one(ops::sql(
+            "SELECT id FROM models WHERE provider_id=? AND public_name='public'",
+            vec![f.providers[0].clone().into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get::<String>("", "id")
+        .unwrap();
+    let price=admin(&f,&cookie,http::Method::POST,&format!("{base}/prices"),json!({"model_id":source,"provider_id":f.providers[0],"components":[{"kind":"input","unit_size":1,"unit_price_micros":17}]}),true).await;
+    assert_eq!(price.status(), StatusCode::OK);
+    let clone = json_body(
+        admin(
+            &f,
+            &cookie,
+            http::Method::POST,
+            &format!("{base}/channel-clone"),
+            json!({"source_id":f.providers[0],"name":"reference-priced-clone"}),
+            true,
+        )
+        .await,
+    )
+    .await;
+    let cloned = clone["id"].as_str().unwrap();
+    assert_eq!(count(&f,&format!("SELECT COUNT(*) AS n FROM model_prices p JOIN models m ON m.id=p.model_id JOIN model_price_components c ON c.price_id=p.id WHERE m.provider_id='{cloned}' AND p.provider_id='{cloned}' AND p.origin='operator' AND c.unit_price_micros=17")).await,1);
+    assert_eq!(count(&f,&format!("SELECT COUNT(*) AS n FROM models WHERE provider_id='{cloned}' AND public_name='public' AND pricing_configured=0 AND input_price_micros=0 AND output_price_micros=0")).await,1);
+    let artifact = ops::backup::export(
+        &f.state,
+        db::DEFAULT_PROJECT_ID,
+        &Selection {
+            resources: vec![
+                "providers".into(),
+                "models".into(),
+                "model_prices".into(),
+                "model_price_components".into(),
+            ],
+        },
+    )
+    .await
+    .unwrap();
+    sql(
+        &f,
+        "UPDATE models SET pricing_configured=0 WHERE id='reference-free'",
+        vec![],
+    )
+    .await;
+    ops::backup::restore(
+        &f.state,
+        db::DEFAULT_PROJECT_ID,
+        &artifact,
+        Conflict::Overwrite,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        count(
+            &f,
+            "SELECT COUNT(*) AS n FROM models WHERE id='reference-free' AND pricing_configured=1"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        count(
+            &f,
+            "SELECT COUNT(*) AS n FROM model_price_components WHERE unit_price_micros=17"
+        )
+        .await,
+        2
+    );
+}
+
+#[tokio::test]
+async fn reference_pricing_projection_unknowns_and_rebuild_preserve_status() {
+    let f = fixture(success()).await;
+    let cookie = owner(&f).await;
+    assert_eq!(
+        request(&f, "/v1/chat/completions", chat()).await.status(),
+        StatusCode::OK
+    );
+    sql(&f, "UPDATE models SET pricing_configured=1", vec![]).await;
+    assert_eq!(
+        request(&f, "/v1/chat/completions", chat()).await.status(),
+        StatusCode::OK
+    );
+    ops::instance_backup::rebuild_projection(&f.state)
+        .await
+        .unwrap();
+    let summary = f
+        .state
+        .observations
+        .summary_for(db::DEFAULT_PROJECT_ID.into(), Default::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&summary).unwrap()["missing_pricing_count"],
+        1
+    );
+    assert_eq!(summary.cost_micros, Some(0));
+    let rows = f
+        .state
+        .observations
+        .list(RequestFilter {
+            project_id: Some(db::DEFAULT_PROJECT_ID.into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(
+        rows.iter()
+            .any(|row| serde_json::to_value(row).unwrap()["pricing_status"] == "missing_price")
+    );
+    assert!(
+        rows.iter()
+            .any(|row| serde_json::to_value(row).unwrap()["pricing_status"] == "explicit_free")
+    );
+    let analytics = json_body(
+        admin(
+            &f,
+            &cookie,
+            http::Method::GET,
+            &format!(
+                "/api/admin/v1/projects/{}/analytics?dimension=model",
+                db::DEFAULT_PROJECT_ID
+            ),
+            Value::Null,
+            false,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(analytics["data"][0]["missing_pricing_count"], 1);
+    assert_eq!(analytics["data"][0]["cost_micros"], 0);
+    assert_eq!(analytics["data"][0]["measured_cost_count"], 1);
+}
+
+#[tokio::test]
+async fn reference_pricing_restart_preserves_legacy_and_conservative_spend_once() {
+    let mut f = fixture(success()).await;
+    let path = f._directory.path().join("reference-price-reopen.sqlite");
+    let url = format!("sqlite://{}?mode=rwc", path.display());
+    f.state.db = db::connect(&url).await.unwrap();
+    let (key, _) = db::create_api_key(
+        &f.state.db,
+        &ApiKeyInput {
+            name: "restart".into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    sql(&f,"INSERT INTO request_facts(id,project_id,api_key_id,log_level,started_at) VALUES('reference-recovery',?,?,'off',0);",vec![db::DEFAULT_PROJECT_ID.into(),key.id.clone().into()]).await;
+    sql(&f,"INSERT INTO execution_facts(id,request_id,attempt,price_json,pricing_status,reserved_micros,contacted,started_at) VALUES('reference-recovery-execution','reference-recovery',1,'{\"pricing_status\":\"priced\"}','priced',1234,1,0)",vec![]).await;
+    sql(&f,"INSERT INTO request_facts(id,project_id,api_key_id,log_level,status,started_at) VALUES('reference-history',?,?,'off','succeeded',0)",vec![db::DEFAULT_PROJECT_ID.into(),key.id.into()]).await;
+    sql(&f,"INSERT INTO execution_facts(id,request_id,attempt,price_json,status,started_at) VALUES('reference-history-execution','reference-history',1,'{}','succeeded',0); INSERT INTO usage_logs(id,execution_id,total_cost_micros,created_at) VALUES('reference-history-usage','reference-history-execution',99,0)",vec![]).await;
+    f.state.db.clone().close().await.unwrap();
+    f.state.db = db::connect(&url).await.unwrap();
+    ops::runtime::recover(&f.state).await.unwrap();
+    ops::runtime::recover(&f.state).await.unwrap();
+    assert_eq!(
+        count(&f, "SELECT SUM(spent_micros) AS n FROM api_keys").await,
+        1234
+    );
+    assert_eq!(count(&f,"SELECT COUNT(*) AS n FROM usage_logs WHERE execution_id='reference-recovery-execution' AND total_cost_micros=1234 AND settlement_kind='interrupted' AND pricing_status='incomplete_usage'").await,1);
+    assert_eq!(count(&f,"SELECT COUNT(*) AS n FROM usage_logs WHERE id='reference-history-usage' AND total_cost_micros=99 AND pricing_status='legacy'").await,1);
+}
+
+#[tokio::test]
+async fn reference_pricing_cache_breakdown_presence_controls_settlement() {
+    for supplied in [false, true] {
+        let mut usage = json!({"prompt_tokens":2,"completion_tokens":3});
+        if supplied {
+            usage["prompt_tokens_details"] = json!({"cached_tokens":0});
+        }
+        let f = fixture(Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let usage = usage.clone();
+                async move { Json(json!({"choices":[{"message":{"content":"ok"}}],"usage":usage})) }
+            }),
+        ))
+        .await;
+        let cookie = owner(&f).await;
+        sql(
+            &f,
+            "UPDATE providers SET enabled=0 WHERE id<>?",
+            vec![f.providers[0].clone().into()],
+        )
+        .await;
+        let model = f
+            .state
+            .db
+            .query_one(ops::sql(
+                "SELECT id FROM models WHERE provider_id=?",
+                vec![f.providers[0].clone().into()],
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get::<String>("", "id")
+            .unwrap();
+        let price=admin(&f,&cookie,http::Method::POST,&format!("/api/admin/v1/projects/{}/operations/prices",db::DEFAULT_PROJECT_ID),json!({"model_id":model,"components":[{"kind":"input","unit_size":1,"unit_price_micros":10},{"kind":"output","unit_size":1,"unit_price_micros":10},{"kind":"cache_read","unit_size":1,"unit_price_micros":1}]}),true).await;
+        assert_eq!(price.status(), StatusCode::OK);
+        assert_eq!(
+            request(&f, "/v1/chat/completions", chat()).await.status(),
+            StatusCode::OK
+        );
+        let row = f
+            .state
+            .db
+            .query_one(ops::sql(
+                "SELECT pricing_status,settlement_kind,total_cost_micros FROM usage_logs",
+                vec![],
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.try_get::<String>("", "pricing_status").unwrap(),
+            if supplied {
+                "priced"
+            } else {
+                "incomplete_usage"
+            }
+        );
+        assert_eq!(
+            row.try_get::<String>("", "settlement_kind").unwrap(),
+            if supplied { "reported" } else { "conservative" }
+        );
+        if supplied {
+            assert_eq!(row.try_get::<i64>("", "total_cost_micros").unwrap(), 50);
+        }
+    }
+}
+
+#[tokio::test]
+async fn reference_missing_price_budget_profile_expired_price_and_setup_are_read_only() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let upstream = calls.clone();
+    let f=fixture(Router::new().route("/v1/chat/completions",post(move ||{let calls=upstream.clone();async move {calls.fetch_add(1,Ordering::SeqCst);Json(json!({"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":0,"completion_tokens":0}}))}}))).await;
+    let cookie = owner(&f).await;
+    let key = db::authenticate_api_key(&f.state.db, &f.token, None)
+        .await
+        .unwrap()
+        .unwrap();
+    sql(&f,"INSERT INTO api_key_profiles(id,project_id,name,budget_micros,created_at,updated_at) VALUES('reference-budget',?,'budget',1000,0,0); UPDATE api_keys SET profile_id='reference-budget';",vec![db::DEFAULT_PROJECT_ID.into()]).await;
+    sql(&f,"INSERT INTO model_prices(id,model_id,version,valid_from,valid_until,created_at) SELECT 'expired-'||id,id,1,0,1,0 FROM models; INSERT INTO model_price_components(id,price_id,kind,unit_price_micros) SELECT 'expired-component-'||id,id,'flat',0 FROM model_prices",vec![]).await;
+    let before = count(&f, "SELECT COUNT(*) AS n FROM model_prices").await;
+    let setup=json_body(admin(&f,&cookie,http::Method::GET,&format!("/api/admin/v1/projects/{}/api-keys/{}/client-models?endpoint=%2Fv1%2Fchat%2Fcompletions",db::DEFAULT_PROJECT_ID,key.id),Value::Null,false).await).await;
+    assert_eq!(setup["models"].as_array().unwrap().len(), 0);
+    assert_eq!(
+        count(&f, "SELECT COUNT(*) AS n FROM model_prices").await,
+        before
+    );
+    assert_eq!(
+        count(&f, "SELECT COUNT(*) AS n FROM execution_facts").await,
+        0
+    );
+    assert_ne!(
+        request(&f, "/v1/chat/completions", chat()).await.status(),
+        StatusCode::OK
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    sql(&f, "UPDATE models SET pricing_configured=1", vec![]).await;
+    assert_eq!(
+        request(&f, "/v1/chat/completions", chat()).await.status(),
+        StatusCode::OK
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn reference_pricing_catalog_import_requires_usable_typed_price_facts() {
+    let f = fixture(success()).await;
+    for (index, input, output, currency, unit, configured) in [
+        (0, None, None, "USD", "per_million_tokens", false),
+        (1, Some(0.0), Some(0.0), "USD", "per_million_tokens", true),
+        (2, Some(2.0), Some(3.0), "USD", "per_million_tokens", true),
+        (3, Some(2.0), None, "USD", "per_million_tokens", false),
+        (4, Some(2.0), Some(3.0), "USD", "per_image", false),
+    ] {
+        let mut catalog = crate::catalog::builtin().clone();
+        catalog.models.truncate(1);
+        let card = &mut catalog.models[0];
+        card.cost_defaults.input = input;
+        card.cost_defaults.output = output;
+        card.cost_defaults.currency = Some(currency.into());
+        card.cost_defaults.unit = Some(unit.into());
+        let defaults = db::catalog_model_defaults_from(&catalog, &catalog.models[0].id).unwrap();
+        assert_eq!(defaults.pricing_configured, configured);
+        let name = format!("reference-catalog-{index}");
+        let tx = f.state.db.begin().await.unwrap();
+        let model = db::create_model_in(
+            &tx,
+            &ModelInput {
+                provider_id: f.providers[0].clone(),
+                public_name: name.clone(),
+                upstream_name: name,
+                capabilities: None,
+                pricing_configured: None,
+                input_price_micros: None,
+                output_price_micros: None,
+                priority: None,
+            },
+            db::DEFAULT_PROJECT_ID,
+            &defaults,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(model.pricing_configured, configured);
+        if configured {
+            assert_eq!(
+                model.input_price_micros,
+                (input.unwrap() * 1_000_000.0) as i64
+            );
+        } else {
+            assert_eq!(model.input_price_micros, 0);
+        }
+    }
+}
+
+#[tokio::test]
+async fn reference_pricing_anthropic_derived_input_does_not_trust_missing_cache_counts() {
+    for complete in [false, true] {
+        let mut usage = json!({"input_tokens":2,"output_tokens":3});
+        if complete {
+            usage["cache_read_input_tokens"] = json!(0);
+            usage["cache_creation_input_tokens"] = json!(0);
+        }
+        let f=fixture(Router::new().route("/v1/messages",post(move ||{let usage=usage.clone();async move {Json(json!({"type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":usage}))}}))).await;
+        sql(&f,"UPDATE providers SET kind='anthropic'; UPDATE models SET pricing_configured=1,input_price_micros=1000000,output_price_micros=1000000",vec![]).await;
+        assert_eq!(request(&f,"/v1/messages",json!({"model":"public","messages":[{"role":"user","content":"hello"}],"max_tokens":16})).await.status(),StatusCode::OK);
+        let row = f
+            .state
+            .db
+            .query_one(ops::sql(
+                "SELECT pricing_status,settlement_kind,total_cost_micros FROM usage_logs",
+                vec![],
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.try_get::<String>("", "pricing_status").unwrap(),
+            if complete {
+                "priced"
+            } else {
+                "incomplete_usage"
+            }
+        );
+        assert_eq!(
+            row.try_get::<String>("", "settlement_kind").unwrap(),
+            if complete { "reported" } else { "conservative" }
+        );
+        if complete {
+            assert_eq!(row.try_get::<i64>("", "total_cost_micros").unwrap(), 5);
+        }
+    }
+}
+
+#[tokio::test]
+async fn reference_pricing_zero_rate_absent_counter_remains_unmeasured() {
+    let f = fixture(Router::new().route(
+        "/v1/chat/completions",
+        post(|| async {
+            Json(json!({"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":2}}))
+        }),
+    ))
+    .await;
+    sql(
+        &f,
+        "UPDATE models SET pricing_configured=1,input_price_micros=1000000,output_price_micros=0",
+        vec![],
+    )
+    .await;
+    assert_eq!(
+        request(&f, "/v1/chat/completions", chat()).await.status(),
+        StatusCode::OK
+    );
+    let row = f
+        .state
+        .db
+        .query_one(ops::sql(
+            "SELECT pricing_status,usage_measurement_json,total_cost_micros FROM usage_logs",
+            vec![],
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row.try_get::<String>("", "pricing_status").unwrap(),
+        "priced"
+    );
+    assert_eq!(row.try_get::<i64>("", "total_cost_micros").unwrap(), 2);
+    let flags: Value =
+        serde_json::from_str(&row.try_get::<String>("", "usage_measurement_json").unwrap())
+            .unwrap();
+    assert_eq!(flags["input_tokens"], true);
+    assert_eq!(flags["output_tokens"], false);
+    let cookie = owner(&f).await;
+    let usage = json_body(
+        admin(
+            &f,
+            &cookie,
+            http::Method::GET,
+            &format!(
+                "/api/admin/v1/projects/{}/operations/usage",
+                db::DEFAULT_PROJECT_ID
+            ),
+            Value::Null,
+            false,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(usage["data"][0]["usage_measurement"]["input_tokens"], true);
+    assert_eq!(
+        usage["data"][0]["usage_measurement"]["output_tokens"],
+        false
+    );
+    let artifact = ops::backup::export(
+        &f.state,
+        db::DEFAULT_PROJECT_ID,
+        &Selection {
+            resources: vec![
+                "request_facts".into(),
+                "execution_facts".into(),
+                "usage_logs".into(),
+            ],
+        },
+    )
+    .await
+    .unwrap();
+    ops::backup::restore(
+        &f.state,
+        db::DEFAULT_PROJECT_ID,
+        &artifact,
+        Conflict::Overwrite,
+    )
+    .await
+    .unwrap();
+    let restored = f
+        .state
+        .db
+        .query_one(ops::sql(
+            "SELECT usage_measurement_json FROM usage_logs",
+            vec![],
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(
+            &restored
+                .try_get::<String>("", "usage_measurement_json")
+                .unwrap()
+        )
+        .unwrap(),
+        flags
+    );
+    ops::instance_backup::rebuild_projection(&f.state)
+        .await
+        .unwrap();
+    let summary = f
+        .state
+        .observations
+        .summary_for(db::DEFAULT_PROJECT_ID.into(), Default::default())
+        .await
+        .unwrap();
+    assert_eq!(summary.input_tokens, Some(2));
+    assert_eq!(summary.output_tokens, None);
+    assert_eq!(summary.cost_micros, Some(2));
+}
+
+#[tokio::test]
+async fn reference_pricing_cut_stream_presence_is_not_terminal_measurement() {
+    let f=fixture(Router::new().route("/v1/chat/completions",post(||async {([(header::CONTENT_TYPE,"text/event-stream")],"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":3}}\n\ndata: [DONE]\n\n")}))).await;
+    sql(&f,"UPDATE models SET pricing_configured=1,input_price_micros=1000000,output_price_micros=1000000",vec![]).await;
+    let response = request(&f, "/v1/chat/completions", streaming()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    to_bytes(response.into_body(), 8192).await.unwrap();
+    let row = f
+        .state
+        .db
+        .query_one(ops::sql(
+            "SELECT usage_measurement_json,pricing_status,settlement_kind FROM usage_logs",
+            vec![],
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    let flags: Value =
+        serde_json::from_str(&row.try_get::<String>("", "usage_measurement_json").unwrap())
+            .unwrap();
+    assert_eq!(flags["input_tokens"], false);
+    assert_eq!(flags["output_tokens"], false);
+    assert_eq!(
+        row.try_get::<String>("", "pricing_status").unwrap(),
+        "incomplete_usage"
+    );
+    assert_eq!(
+        row.try_get::<String>("", "settlement_kind").unwrap(),
+        "conservative"
+    );
+    ops::instance_backup::rebuild_projection(&f.state)
+        .await
+        .unwrap();
+    let summary = f
+        .state
+        .observations
+        .summary_for(db::DEFAULT_PROJECT_ID.into(), Default::default())
+        .await
+        .unwrap();
+    assert_eq!(summary.input_tokens, None);
+    assert_eq!(summary.output_tokens, None);
 }

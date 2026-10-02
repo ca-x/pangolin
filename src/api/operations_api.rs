@@ -24,6 +24,27 @@ struct ModelRulesInput {
     reasoning_effort: Option<std::collections::BTreeMap<String, String>>,
 }
 
+fn pricing_flag(value: &Value) -> Result<Option<bool>, ApiError> {
+    match value.get("pricing_configured") {
+        None => Ok(None),
+        Some(Value::Bool(flag)) => Ok(Some(*flag)),
+        _ => Err(ApiError::BadRequest(
+            "pricing_configured must be a Boolean".into(),
+        )),
+    }
+}
+
+fn model_price_value(value: &Value, name: &str, fallback: i64) -> Result<i64, ApiError> {
+    match value.get(name) {
+        None => Ok(fallback),
+        Some(value) => value.as_i64().filter(|rate| *rate >= 0).ok_or_else(|| {
+            ApiError::BadRequest(format!(
+                "{name} must be a nonnegative integer micro-USD rate"
+            ))
+        }),
+    }
+}
+
 fn validate_model_rules(value: &Value) -> Result<(), ApiError> {
     if value.to_string().len() > 64 * 1024 {
         return Err(ApiError::BadRequest("invalid model rules".into()));
@@ -1489,7 +1510,7 @@ fn query(resource: &str) -> Result<(&'static str, &'static str, &'static str), A
         "models" => (
             "models",
             "provider_id IN (SELECT id FROM providers WHERE project_id=?)",
-            "json_object('id',id,'provider_id',provider_id,'provider_name',(SELECT name FROM providers WHERE id=models.provider_id),'public_name',public_name,'upstream_name',upstream_name,'capabilities',json(capabilities),'input_price_micros',input_price_micros,'output_price_micros',output_price_micros,'priority',priority,'enabled',enabled,'lifecycle',lifecycle,'disable_developer_settings_inheritance',disable_developer_settings_inheritance,'catalog_metadata_raw',catalog_metadata_json,'created_at',created_at)",
+            "json_object('id',id,'provider_id',provider_id,'provider_name',(SELECT name FROM providers WHERE id=models.provider_id),'public_name',public_name,'upstream_name',upstream_name,'capabilities',json(capabilities),'pricing_configured',json(CASE WHEN pricing_configured=1 THEN 'true' ELSE 'false' END),'input_price_micros',input_price_micros,'output_price_micros',output_price_micros,'priority',priority,'enabled',enabled,'lifecycle',lifecycle,'disable_developer_settings_inheritance',disable_developer_settings_inheritance,'catalog_metadata_raw',catalog_metadata_json,'created_at',created_at)",
         ),
         "associations" => (
             "model_associations",
@@ -1545,12 +1566,12 @@ fn query(resource: &str) -> Result<(&'static str, &'static str, &'static str), A
         "executions" => (
             "request_executions",
             "request_id IN (SELECT r.id FROM requests r JOIN traces t ON t.id=r.trace_id WHERE t.project_id=?)",
-            "json_object('id',id,'request_id',request_id,'provider_id',provider_id,'provider_name',provider_name,'credential_suffix',credential_suffix,'attempt',attempt,'model',model,'status',status,'retry_reason',retry_reason,'latency_ms',latency_ms,'response_headers_ms',response_headers_ms,'first_event_ms',first_event_ms,'first_text_ms',first_text_ms,'first_token_at',first_token_at,'http_status',http_status,'error_kind',error_kind,'conversion_diagnostics',conversion_diagnostics_json,'affinity_diagnostics',affinity_diagnostics_json)",
+            "json_object('id',id,'request_id',request_id,'provider_id',provider_id,'provider_name',provider_name,'credential_suffix',credential_suffix,'attempt',attempt,'model',model,'status',status,'pricing_status',pricing_status,'retry_reason',retry_reason,'latency_ms',latency_ms,'response_headers_ms',response_headers_ms,'first_event_ms',first_event_ms,'first_text_ms',first_text_ms,'first_token_at',first_token_at,'http_status',http_status,'error_kind',error_kind,'conversion_diagnostics',conversion_diagnostics_json,'affinity_diagnostics',affinity_diagnostics_json)",
         ),
         "usage" => (
             "usage_logs",
             "execution_id IN (SELECT e.id FROM execution_facts e JOIN request_facts r ON r.id=e.request_id WHERE r.project_id=?)",
-            "json_object('id',id,'execution_id',execution_id,'input_tokens',input_tokens,'output_tokens',output_tokens,'cache_read_tokens',cache_read_tokens,'cache_write_tokens',cache_write_tokens,'reasoning_tokens',reasoning_tokens,'request_units',request_units,'cost_micros',total_cost_micros,'settlement_kind',settlement_kind,'cache_savings_micros',cache_savings_micros,'price_id',price_id,'created_at',created_at)",
+            "json_object('id',id,'execution_id',execution_id,'input_tokens',input_tokens,'output_tokens',output_tokens,'cache_read_tokens',cache_read_tokens,'cache_write_tokens',cache_write_tokens,'reasoning_tokens',reasoning_tokens,'request_units',request_units,'cost_micros',total_cost_micros,'usage_measurement',json(usage_measurement_json),'pricing_status',pricing_status,'cost_measured',json(CASE WHEN pricing_status IN ('priced','explicit_free') THEN 'true' ELSE 'false' END),'settlement_kind',settlement_kind,'cache_savings_micros',cache_savings_micros,'price_id',price_id,'created_at',created_at)",
         ),
         "cost-items" => (
             "usage_cost_items",
@@ -1777,6 +1798,10 @@ fn documents(rows: Vec<sea_orm::QueryResult>) -> Result<Vec<Value>, ApiError> {
         .map(|r| {
             let mut document: Value = serde_json::from_str(&r.try_get::<String>("", "document")?)
                 .map_err(|e| ApiError::Internal(e.into()))?;
+            if let Some(flags) = document.get_mut("usage_measurement") {
+                *flags = serde_json::to_value(pricing::UsageMeasurement::parse(&flags.to_string()))
+                    .map_err(|e| ApiError::Internal(e.into()))?;
+            }
             crate::providers::diagnostics::sanitize_document(&mut document);
             Ok(document)
         })
@@ -2188,6 +2213,7 @@ async fn batch_create_models(
                 public_name: row.public_name.trim().to_owned(),
                 upstream_name: row.upstream_name.trim().to_owned(),
                 capabilities: None,
+                pricing_configured: None,
                 input_price_micros: None,
                 output_price_micros: None,
                 priority: None,
@@ -2567,11 +2593,11 @@ async fn detail(
             .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("trace has no id")))?
             .to_owned();
         let requests=documents(state.db.query_all(sql("SELECT json_object('id',id,'public_id',COALESCE(json_extract(request_metadata_json,'$.external_id'),id),'protocol',protocol,'endpoint',endpoint,'model',requested_model,'status',status,'source_ip',source_ip,'started_at',started_at,'finished_at',finished_at) AS document FROM requests WHERE trace_id=? ORDER BY started_at",vec![trace_id.clone().into()])).await?)?;
-        let executions=documents(state.db.query_all(sql("SELECT json_object('id',id,'request_id',request_id,'provider_id',provider_id,'provider_name',provider_name,'attempt',attempt,'model',model,'status',status,'retry_reason',retry_reason,'latency_ms',latency_ms,'started_at',started_at,'finished_at',finished_at,'http_status',http_status,'error_kind',error_kind,'conversion_diagnostics',conversion_diagnostics_json,'affinity_diagnostics',affinity_diagnostics_json) AS document FROM request_executions WHERE request_id IN (SELECT id FROM requests WHERE trace_id=?) ORDER BY started_at",vec![trace_id.clone().into()])).await?)?;
+        let executions=documents(state.db.query_all(sql("SELECT json_object('id',id,'request_id',request_id,'provider_id',provider_id,'provider_name',provider_name,'attempt',attempt,'model',model,'status',status,'pricing_status',pricing_status,'retry_reason',retry_reason,'latency_ms',latency_ms,'started_at',started_at,'finished_at',finished_at,'http_status',http_status,'error_kind',error_kind,'conversion_diagnostics',conversion_diagnostics_json,'affinity_diagnostics',affinity_diagnostics_json) AS document FROM request_executions WHERE request_id IN (SELECT id FROM requests WHERE trace_id=?) ORDER BY started_at",vec![trace_id.clone().into()])).await?)?;
         // Tokens and money per execution, and the price components each charge was
         // made of. Without these the console can only show a total, which cannot
         // be checked against the price that produced it.
-        let usage=documents(state.db.query_all(sql("SELECT json_object('execution_id',u.execution_id,'model_id',u.model_id,'input_tokens',u.input_tokens,'output_tokens',u.output_tokens,'cache_read_tokens',u.cache_read_tokens,'cache_write_tokens',u.cache_write_tokens,'reasoning_tokens',u.reasoning_tokens,'total_cost_micros',u.total_cost_micros,'created_at',u.created_at) AS document FROM usage_logs u JOIN execution_facts e ON e.id=u.execution_id JOIN requests r ON r.id=e.request_id WHERE r.trace_id=? ORDER BY u.created_at",vec![trace_id.clone().into()])).await?)?;
+        let usage=documents(state.db.query_all(sql("SELECT json_object('execution_id',u.execution_id,'model_id',u.model_id,'input_tokens',u.input_tokens,'output_tokens',u.output_tokens,'cache_read_tokens',u.cache_read_tokens,'cache_write_tokens',u.cache_write_tokens,'reasoning_tokens',u.reasoning_tokens,'usage_measurement',json(u.usage_measurement_json),'pricing_status',u.pricing_status,'settlement_kind',u.settlement_kind,'cost_measured',json(CASE WHEN u.pricing_status IN ('priced','explicit_free') THEN 'true' ELSE 'false' END),'total_cost_micros',u.total_cost_micros,'created_at',u.created_at) AS document FROM usage_logs u JOIN execution_facts e ON e.id=u.execution_id JOIN requests r ON r.id=e.request_id WHERE r.trace_id=? ORDER BY u.created_at",vec![trace_id.clone().into()])).await?)?;
         let cost_items=documents(state.db.query_all(sql("SELECT json_object('execution_id',e.id,'kind',c.kind,'quantity',i.quantity,'unit_price_micros',c.unit_price_micros,'subtotal_micros',i.subtotal_micros) AS document FROM usage_cost_items i JOIN usage_logs u ON u.id=i.usage_log_id JOIN execution_facts e ON e.id=u.execution_id JOIN requests r ON r.id=e.request_id LEFT JOIN model_price_components c ON c.id=i.price_component_id WHERE r.trace_id=? ORDER BY e.id,i.id",vec![trace_id.clone().into()])).await?)?;
         return Ok(Json(
             json!({"trace":trace,"requests":requests,"executions":executions,"usage":usage,"cost_items":cost_items}),
@@ -2615,8 +2641,8 @@ async fn detail(
         // external id is caller-controlled, so binding the raw path segment here both
         // emptied the detail card for a legitimate external-id link and let a colliding
         // external id read another project's attempts, tokens and costs.
-        let executions = documents(state.db.query_all(sql("SELECT json_object('id',id,'request_id',request_id,'provider_id',provider_id,'provider_name',provider_name,'attempt',attempt,'model',model,'status',status,'retry_reason',retry_reason,'latency_ms',latency_ms,'started_at',started_at,'finished_at',finished_at,'http_status',http_status,'error_kind',error_kind,'conversion_diagnostics',conversion_diagnostics_json,'affinity_diagnostics',affinity_diagnostics_json) AS document FROM request_executions WHERE request_id=? ORDER BY attempt", vec![resolved_id.clone().into()])).await?)?;
-        let usage = documents(state.db.query_all(sql("SELECT json_object('execution_id',u.execution_id,'model_id',u.model_id,'input_tokens',u.input_tokens,'output_tokens',u.output_tokens,'cache_read_tokens',u.cache_read_tokens,'cache_write_tokens',u.cache_write_tokens,'reasoning_tokens',u.reasoning_tokens,'total_cost_micros',u.total_cost_micros,'created_at',u.created_at) AS document FROM usage_logs u JOIN execution_facts e ON e.id=u.execution_id WHERE e.request_id=? ORDER BY u.created_at", vec![resolved_id.clone().into()])).await?)?;
+        let executions = documents(state.db.query_all(sql("SELECT json_object('id',id,'request_id',request_id,'provider_id',provider_id,'provider_name',provider_name,'attempt',attempt,'model',model,'status',status,'pricing_status',pricing_status,'retry_reason',retry_reason,'latency_ms',latency_ms,'started_at',started_at,'finished_at',finished_at,'http_status',http_status,'error_kind',error_kind,'conversion_diagnostics',conversion_diagnostics_json,'affinity_diagnostics',affinity_diagnostics_json) AS document FROM request_executions WHERE request_id=? ORDER BY attempt", vec![resolved_id.clone().into()])).await?)?;
+        let usage = documents(state.db.query_all(sql("SELECT json_object('execution_id',u.execution_id,'model_id',u.model_id,'input_tokens',u.input_tokens,'output_tokens',u.output_tokens,'cache_read_tokens',u.cache_read_tokens,'cache_write_tokens',u.cache_write_tokens,'reasoning_tokens',u.reasoning_tokens,'usage_measurement',json(u.usage_measurement_json),'pricing_status',u.pricing_status,'settlement_kind',u.settlement_kind,'cost_measured',json(CASE WHEN u.pricing_status IN ('priced','explicit_free') THEN 'true' ELSE 'false' END),'total_cost_micros',u.total_cost_micros,'created_at',u.created_at) AS document FROM usage_logs u JOIN execution_facts e ON e.id=u.execution_id WHERE e.request_id=? ORDER BY u.created_at", vec![resolved_id.clone().into()])).await?)?;
         let cost_items = documents(state.db.query_all(sql("SELECT json_object('execution_id',e.id,'kind',c.kind,'quantity',i.quantity,'unit_price_micros',c.unit_price_micros,'subtotal_micros',i.subtotal_micros) AS document FROM usage_cost_items i JOIN usage_logs u ON u.id=i.usage_log_id JOIN execution_facts e ON e.id=u.execution_id LEFT JOIN model_price_components c ON c.id=i.price_component_id WHERE e.request_id=? ORDER BY e.id,i.id", vec![resolved_id.clone().into()])).await?)?;
         let row = state
             .db
@@ -2693,7 +2719,7 @@ async fn analytics(
         "project" => "r.project_id",
         _ => return Err(ApiError::BadRequest("unknown analytics dimension".into())),
     };
-    let rows=state.db.query_all(sql(format!("SELECT json_object('dimension',{dimension},'requests',COUNT(DISTINCT r.id),'attempts',COUNT(e.id),'errors',SUM(e.status!='succeeded'),'sample_count',COUNT(DISTINCT CASE WHEN e.status='succeeded' AND x.latency_ms>0 AND u.id IS NOT NULL THEN r.id END),'usage_measured',CASE WHEN COUNT(u.id)>0 THEN json('true') ELSE json('false') END,'input_tokens',COALESCE(SUM(u.input_tokens),0),'output_tokens',COALESCE(SUM(u.output_tokens),0),'cache_hit_tokens',COALESCE(SUM(u.cache_read_tokens),0),'cache_savings_micros',COALESCE(SUM(u.cache_savings_micros),0),'cost_micros',COALESCE(SUM(u.total_cost_micros),0),'latency_ms',AVG(x.latency_ms),'ttft_ms',AVG(x.first_text_ms),'tokens_per_second',AVG(CASE WHEN u.id IS NOT NULL AND x.latency_ms>0 THEN CAST(u.output_tokens AS REAL)*1000.0/x.latency_ms END)) AS document FROM request_facts r JOIN execution_facts e ON e.request_id=r.id LEFT JOIN usage_logs u ON u.execution_id=e.id LEFT JOIN request_executions x ON x.id=e.id WHERE r.project_id=? AND r.started_at>=? AND r.started_at<? AND (? IS NULL OR e.model_id=?) AND (? IS NULL OR e.provider_id=?) AND (? IS NULL OR r.api_key_id=?) GROUP BY {dimension} ORDER BY {dimension} LIMIT 500"),vec![project.into(),filter.from.unwrap_or(db::now()-86400*30).into(),filter.until.unwrap_or(db::now()+1).into(),filter.model.clone().into(),filter.model.into(),filter.provider.clone().into(),filter.provider.into(),filter.api_key.clone().into(),filter.api_key.into()])).await?;
+    let rows=state.db.query_all(sql(format!("SELECT json_object('dimension',{dimension},'requests',COUNT(DISTINCT r.id),'attempts',COUNT(e.id),'errors',SUM(e.status!='succeeded'),'sample_count',COUNT(DISTINCT CASE WHEN e.status='succeeded' AND x.latency_ms>0 AND json_extract(u.usage_measurement_json,'$.version')=1 AND json_type(u.usage_measurement_json,'$.output_tokens')='true' THEN r.id END),'usage_measured',CASE WHEN SUM(CASE WHEN json_extract(u.usage_measurement_json,'$.version')=1 AND (json_type(u.usage_measurement_json,'$.input_tokens')='true' OR json_type(u.usage_measurement_json,'$.output_tokens')='true') THEN 1 ELSE 0 END)>0 THEN json('true') ELSE json('false') END,'input_tokens',SUM(CASE WHEN json_type(u.usage_measurement_json,'$.input_tokens')='true' AND json_extract(u.usage_measurement_json,'$.version')=1 THEN u.input_tokens END),'output_tokens',SUM(CASE WHEN json_type(u.usage_measurement_json,'$.output_tokens')='true' AND json_extract(u.usage_measurement_json,'$.version')=1 THEN u.output_tokens END),'cache_hit_tokens',SUM(CASE WHEN json_type(u.usage_measurement_json,'$.cache_read_tokens')='true' AND json_extract(u.usage_measurement_json,'$.version')=1 THEN u.cache_read_tokens END),'cache_savings_micros',SUM(CASE WHEN u.pricing_status IN ('priced','explicit_free') THEN u.cache_savings_micros END),'missing_pricing_count',SUM(CASE WHEN u.pricing_status='missing_price' THEN 1 ELSE 0 END),'incomplete_usage_count',SUM(CASE WHEN u.pricing_status='incomplete_usage' THEN 1 ELSE 0 END),'measured_cost_count',SUM(CASE WHEN u.pricing_status IN ('priced','explicit_free') THEN 1 ELSE 0 END),'cost_measured',json(CASE WHEN SUM(CASE WHEN u.pricing_status IN ('priced','explicit_free') THEN 1 ELSE 0 END)>0 THEN 'true' ELSE 'false' END),'cost_micros',SUM(CASE WHEN u.pricing_status IN ('priced','explicit_free') THEN u.total_cost_micros END),'settled_cost_micros',COALESCE(SUM(u.total_cost_micros),0),'latency_ms',AVG(x.latency_ms),'ttft_ms',AVG(x.first_text_ms),'tokens_per_second',AVG(CASE WHEN json_extract(u.usage_measurement_json,'$.version')=1 AND json_type(u.usage_measurement_json,'$.output_tokens')='true' AND x.latency_ms>0 THEN CAST(u.output_tokens AS REAL)*1000.0/x.latency_ms END)) AS document FROM request_facts r JOIN execution_facts e ON e.request_id=r.id LEFT JOIN usage_logs u ON u.execution_id=e.id LEFT JOIN request_executions x ON x.id=e.id WHERE r.project_id=? AND r.started_at>=? AND r.started_at<? AND (? IS NULL OR e.model_id=?) AND (? IS NULL OR e.provider_id=?) AND (? IS NULL OR r.api_key_id=?) GROUP BY {dimension} ORDER BY {dimension} LIMIT 500"),vec![project.into(),filter.from.unwrap_or(db::now()-86400*30).into(),filter.until.unwrap_or(db::now()+1).into(),filter.model.clone().into(),filter.model.into(),filter.provider.clone().into(),filter.provider.into(),filter.api_key.clone().into(),filter.api_key.into()])).await?;
     let mut rows = documents(rows)?;
     if matches!(dimension_name, "provider" | "model") {
         add_performance_confidence(&mut rows);
@@ -3881,9 +3907,18 @@ async fn mutate(
                 ));
             }
             transaction.execute(sql("INSERT INTO channel_settings(provider_id,endpoint_mappings_json,model_rules_json,parameter_overrides_json,retry_statuses_json,auto_disable_policy_json,updated_at) SELECT ?,endpoint_mappings_json,model_rules_json,parameter_overrides_json,retry_statuses_json,auto_disable_policy_json,? FROM channel_settings WHERE provider_id=?",vec![resource_id.clone().into(),db::now().into(),source.into()])).await?;
-            let models=transaction.query_all(sql("SELECT public_name,upstream_name,capabilities,input_price_micros,output_price_micros,priority,enabled,catalog_metadata_json,disable_developer_settings_inheritance FROM models WHERE provider_id=? AND lifecycle='active' ORDER BY id",vec![source.into()])).await?;
+            let models=transaction.query_all(sql("SELECT id,pricing_configured,public_name,upstream_name,capabilities,input_price_micros,output_price_micros,priority,enabled,catalog_metadata_json,disable_developer_settings_inheritance FROM models WHERE provider_id=? AND lifecycle='active' ORDER BY id",vec![source.into()])).await?;
             for model in models {
-                transaction.execute(sql("INSERT INTO models(id,provider_id,public_name,upstream_name,capabilities,input_price_micros,output_price_micros,priority,enabled,created_at,catalog_metadata_json,disable_developer_settings_inheritance) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",vec![id().into(),resource_id.clone().into(),model.try_get::<String>("","public_name")?.into(),model.try_get::<String>("","upstream_name")?.into(),model.try_get::<String>("","capabilities")?.into(),model.try_get::<i64>("","input_price_micros")?.into(),model.try_get::<i64>("","output_price_micros")?.into(),model.try_get::<i64>("","priority")?.into(),model.try_get::<bool>("","enabled")?.into(),db::now().into(),model.try_get::<String>("","catalog_metadata_json")?.into(),model.try_get::<bool>("","disable_developer_settings_inheritance")?.into()])).await?;
+                let target_model = id();
+                transaction.execute(sql("INSERT INTO models(id,provider_id,public_name,upstream_name,capabilities,input_price_micros,output_price_micros,priority,enabled,created_at,catalog_metadata_json,disable_developer_settings_inheritance,pricing_configured) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",vec![target_model.clone().into(),resource_id.clone().into(),model.try_get::<String>("","public_name")?.into(),model.try_get::<String>("","upstream_name")?.into(),model.try_get::<String>("","capabilities")?.into(),model.try_get::<i64>("","input_price_micros")?.into(),model.try_get::<i64>("","output_price_micros")?.into(),model.try_get::<i64>("","priority")?.into(),model.try_get::<bool>("","enabled")?.into(),db::now().into(),model.try_get::<String>("","catalog_metadata_json")?.into(),model.try_get::<bool>("","disable_developer_settings_inheritance")?.into(),model.try_get::<bool>("","pricing_configured")?.into()])).await?;
+                pricing::clone_operator_versions(
+                    &transaction,
+                    &model.try_get::<String>("", "id")?,
+                    source,
+                    &target_model,
+                    &resource_id,
+                )
+                .await?;
             }
         }
         "channel-merge" => {
@@ -4188,14 +4223,22 @@ async fn mutate(
             // same precedence the single-channel path applies.
             let manual = db::ModelCatalogDefaults::manual();
             let resolved = catalog_defaults.as_ref().unwrap_or(&manual);
-            let input_price = catalog_defaults
-                .as_ref()
-                .map(|defaults| defaults.input_price_micros)
-                .unwrap_or_else(|| value["input_price_micros"].as_i64().unwrap_or(0).max(0));
-            let output_price = catalog_defaults
-                .as_ref()
-                .map(|defaults| defaults.output_price_micros)
-                .unwrap_or_else(|| value["output_price_micros"].as_i64().unwrap_or(0).max(0));
+            let input_price = if let Some(defaults) = &catalog_defaults {
+                defaults.input_price_micros
+            } else {
+                model_price_value(&value, "input_price_micros", 0)?
+            };
+            let output_price = if let Some(defaults) = &catalog_defaults {
+                defaults.output_price_micros
+            } else {
+                model_price_value(&value, "output_price_micros", 0)?
+            };
+            let configured = db::model_pricing_configured(
+                pricing_flag(&value)?,
+                input_price,
+                output_price,
+                resolved.pricing_configured,
+            )?;
             let capabilities = value["capabilities"].as_array().map(|list| {
                 list.iter()
                     .filter_map(|item| item.as_str().map(str::to_owned))
@@ -4241,6 +4284,7 @@ async fn mutate(
                         public_name: public_name.trim().to_owned(),
                         upstream_name: upstream_name.trim().to_owned(),
                         capabilities: capabilities.clone(),
+                        pricing_configured: Some(configured),
                         input_price_micros: Some(input_price),
                         output_price_micros: Some(output_price),
                         priority,
@@ -4271,6 +4315,8 @@ async fn mutate(
             {
                 return Err(ApiError::NotFound);
             }
+            let current = transaction
+                .query_one(sql("SELECT pricing_configured,input_price_micros,output_price_micros,catalog_metadata_json FROM models WHERE id=? AND provider_id IN (SELECT id FROM providers WHERE project_id=?)",vec![resource_id.clone().into(),project.clone().into()])).await?;
             let current_metadata = transaction
                 .query_one(sql(
                     "SELECT catalog_metadata_json FROM models WHERE id=? AND provider_id IN (SELECT id FROM providers WHERE project_id=?)",
@@ -4291,14 +4337,39 @@ async fn mutate(
             if !capabilities.is_array() {
                 return Err(ApiError::BadRequest("capabilities must be an array".into()));
             }
-            let input_price = catalog_defaults
-                .as_ref()
-                .map(|defaults| defaults.input_price_micros)
-                .unwrap_or_else(|| value["input_price_micros"].as_i64().unwrap_or(0).max(0));
-            let output_price = catalog_defaults
-                .as_ref()
-                .map(|defaults| defaults.output_price_micros)
-                .unwrap_or_else(|| value["output_price_micros"].as_i64().unwrap_or(0).max(0));
+            let input_price = if let Some(defaults) = &catalog_defaults {
+                defaults.input_price_micros
+            } else {
+                let prior = current
+                    .as_ref()
+                    .map(|row| row.try_get::<i64>("", "input_price_micros"))
+                    .transpose()?
+                    .unwrap_or(0);
+                model_price_value(&value, "input_price_micros", prior)?
+            };
+            let output_price = if let Some(defaults) = &catalog_defaults {
+                defaults.output_price_micros
+            } else {
+                let prior = current
+                    .as_ref()
+                    .map(|row| row.try_get::<i64>("", "output_price_micros"))
+                    .transpose()?
+                    .unwrap_or(0);
+                model_price_value(&value, "output_price_micros", prior)?
+            };
+            let configured = db::model_pricing_configured(
+                pricing_flag(&value)?,
+                input_price,
+                output_price,
+                catalog_defaults
+                    .as_ref()
+                    .map(|d| d.pricing_configured)
+                    .unwrap_or_else(|| {
+                        current.as_ref().is_some_and(|r| {
+                            r.try_get::<bool>("", "pricing_configured").unwrap_or(false)
+                        })
+                    }),
+            )?;
             let catalog_metadata = catalog_defaults
                 .as_ref()
                 .map(|defaults| defaults.metadata.clone())
@@ -4323,7 +4394,7 @@ async fn mutate(
                     "this channel already has a model with that name".into(),
                 ));
             }
-            let changed = transaction.execute(sql("INSERT INTO models(id,provider_id,public_name,upstream_name,capabilities,input_price_micros,output_price_micros,priority,enabled,created_at,catalog_metadata_json,disable_developer_settings_inheritance) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET provider_id=excluded.provider_id,public_name=excluded.public_name,upstream_name=excluded.upstream_name,capabilities=excluded.capabilities,input_price_micros=excluded.input_price_micros,output_price_micros=excluded.output_price_micros,priority=excluded.priority,enabled=excluded.enabled,catalog_metadata_json=excluded.catalog_metadata_json,disable_developer_settings_inheritance=excluded.disable_developer_settings_inheritance WHERE models.provider_id IN (SELECT id FROM providers WHERE project_id=?)",vec![resource_id.clone().into(),provider.into(),text(&value,"public_name")?.into(),text(&value,"upstream_name")?.into(),capabilities.to_string().into(),input_price.into(),output_price.into(),value["priority"].as_i64().unwrap_or(100).into(),value["enabled"].as_bool().unwrap_or(true).into(),db::now().into(),catalog_metadata.into(),value["disable_developer_settings_inheritance"].as_bool().unwrap_or(false).into(),project.clone().into()])).await?.rows_affected();
+            let changed = transaction.execute(sql("INSERT INTO models(id,provider_id,public_name,upstream_name,capabilities,input_price_micros,output_price_micros,priority,enabled,created_at,catalog_metadata_json,disable_developer_settings_inheritance,pricing_configured) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET provider_id=excluded.provider_id,public_name=excluded.public_name,upstream_name=excluded.upstream_name,capabilities=excluded.capabilities,input_price_micros=excluded.input_price_micros,output_price_micros=excluded.output_price_micros,priority=excluded.priority,enabled=excluded.enabled,catalog_metadata_json=excluded.catalog_metadata_json,disable_developer_settings_inheritance=excluded.disable_developer_settings_inheritance,pricing_configured=excluded.pricing_configured WHERE models.provider_id IN (SELECT id FROM providers WHERE project_id=?)",vec![resource_id.clone().into(),provider.into(),text(&value,"public_name")?.into(),text(&value,"upstream_name")?.into(),capabilities.to_string().into(),input_price.into(),output_price.into(),value["priority"].as_i64().unwrap_or(100).into(),value["enabled"].as_bool().unwrap_or(true).into(),db::now().into(),catalog_metadata.into(),value["disable_developer_settings_inheritance"].as_bool().unwrap_or(false).into(),configured.into(),project.clone().into()])).await?.rows_affected();
             if changed != 1 {
                 return Err(ApiError::Forbidden);
             }
@@ -4718,6 +4789,7 @@ async fn mutate(
             pricing::Price {
                 id: None,
                 model_id: model.into(),
+                pricing_status: Default::default(),
                 ratio_millionths: 1_000_000,
                 components: components.clone(),
             }
@@ -5352,6 +5424,7 @@ async fn client_models(
     {
         return Err(ApiError::Forbidden);
     }
+    let hard=key.budget_micros.is_some() || state.db.query_one(sql("SELECT 1 AS present FROM api_keys k JOIN api_key_profiles p ON p.id=k.profile_id AND p.project_id=k.project_id WHERE k.id=? AND k.project_id=? AND p.budget_micros IS NOT NULL",vec![key.id.clone().into(),project.clone().into()])).await?.is_some();
     let stream = endpoint.ends_with(":streamGenerateContent")
         || query
             .stream
@@ -5387,7 +5460,7 @@ async fn client_models(
         let mut payload = request_template.clone();
         payload["model"] = Value::String(name.to_owned());
         let profile = crate::orchestration::load_profile(&state.db, &key).await?;
-        let plan = match crate::orchestration::prepare(
+        let mut plan = match crate::orchestration::prepare(
             &state.db,
             &runtime,
             &key,
@@ -5404,6 +5477,22 @@ async fn client_models(
             ) => continue,
             Err(error) => return Err(error.into()),
         };
+        if hard {
+            let mut candidates = Vec::with_capacity(plan.candidates.len());
+            for candidate in plan.candidates {
+                if pricing::configured_for(
+                    &state.db,
+                    &candidate.model_id,
+                    &candidate.provider_id,
+                    &project,
+                )
+                .await?
+                {
+                    candidates.push(candidate);
+                }
+            }
+            plan.candidates = candidates;
+        }
         if plan.candidates.is_empty() {
             continue;
         }

@@ -467,6 +467,8 @@ pub(crate) async fn rebuild_projection(state: &AppState) -> Result<usize, ApiErr
                       CASE json_type(r.request_metadata_json, '$.stream')
                            WHEN 'true' THEN 1 WHEN 'false' THEN 0 END AS streamed,
                       COALESCE(u.total_cost_micros, 0) AS cost_micros,
+                      COALESCE(u.pricing_status,e.pricing_status,'legacy') AS pricing_status,
+                      COALESCE(u.usage_measurement_json,'{}') AS usage_measurement_json,
                       c.request_json AS request_json, c.response_json AS response_json
                FROM request_facts f
                LEFT JOIN requests r ON r.id = f.id
@@ -530,6 +532,13 @@ pub(crate) async fn rebuild_projection(state: &AppState) -> Result<usize, ApiErr
                 .ok()
                 .flatten()
                 .map(|value| value != 0),
+            usage_measurement: crate::operations::pricing::UsageMeasurement::parse(
+                &row.try_get::<String>("", "usage_measurement_json")?,
+            ),
+            pricing_status: row
+                .try_get::<String>("", "pricing_status")?
+                .parse()
+                .unwrap_or_default(),
             cost_micros: row.try_get("", "cost_micros").unwrap_or_default(),
             payload_captured: payload.is_some(),
             request_json: payload,
