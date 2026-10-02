@@ -31,3 +31,7 @@ Full-parity continuation order: `identity-access` → `request-orchestrator` →
 - The target is feature-range parity with AxonHub's currently implemented public behavior, including its request orchestration strengths. AxonHub's own Realtime API remains outside scope while it is marked Todo upstream.
 - AxonHub tests are semantic references. Pangolin ports observable contracts and invariants into Rust tests; it does not copy Go implementation code.
 - Single-node SQLite remains the authoritative deployment for this release. Redis/distributed coordination is represented by replaceable interfaces and local equivalents, not falsely advertised as multi-node support.
+
+## Reference adoption enhancements
+
+The seven module IDs, contracts and build order for the authorized Magpie/AstrLink-inspired continuation are recorded in [SPEC-reference-adoption](specs/SPEC-reference-adoption.md). They extend the existing gateway, request-orchestrator, trace-cost, operations and console modules; no parity capability is removed or renamed.
