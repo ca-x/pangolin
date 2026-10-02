@@ -118,15 +118,18 @@ fn request(
             .unwrap_or(&key);
         mapped.insert(destination.to_owned(), value);
     }
-    if let Some(reason) = litellm_core::chat_completions::chat_completions_decline_reason(
+    if litellm_core::chat_completions::chat_completions_decline_reason(
         model,
         Some(provider),
         messages.clone(),
         &mapped,
-    ) {
-        return Err(invalid(format!(
-            "unsupported {provider} transformation: {reason}"
-        )));
+    )
+    .is_some()
+    {
+        return Err(super::diagnostics::unsupported(
+            super::diagnostics::ConversionCode::UnsupportedRequestShape,
+            None,
+        ));
     }
     let messages: Vec<litellm_types::llms::openai::ChatMessage> =
         serde_json::from_value(messages).map_err(|_| invalid("unsupported chat messages"))?;

@@ -480,3 +480,32 @@ async fn task4_sigv4_matches_the_botocore_canonical_signature_fixture() {
         "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20240102/us-east-1/bedrock/aws4_request, SignedHeaders=content-type;host;x-amz-date;x-amz-security-token, Signature=55c027ef47527d3ad63f1735f9d099efdbc99f296ff914bd94e727e24ec0e464"
     );
 }
+
+#[test]
+fn reference_conversion_diagnostics_known_stream_rejections_use_fixed_code_and_path() {
+    for (transform, payload) in [
+        (
+            transforms::chat_to_gemini as fn(&Value) -> Result<Value, ApiError>,
+            json!({"model":"public","stream":true,"messages":[{"role":"user","content":"private stream sample"}]}),
+        ),
+        (
+            transforms::messages_to_chat,
+            json!({"model":"public","stream":true,"messages":[{"role":"user","content":"private stream sample"}]}),
+        ),
+        (
+            transforms::gemini_to_chat,
+            json!({"model":"public","stream":true,"contents":[{"role":"user","parts":[{"text":"private stream sample"}]}]}),
+        ),
+    ] {
+        let error = transform(&payload).unwrap_err();
+        let ApiError::Conversion(diagnostic) = &error else {
+            panic!("expected a typed conversion rejection")
+        };
+        let diagnostic = serde_json::to_value(diagnostic).unwrap();
+        assert_eq!(diagnostic["code"], "unsupported_streaming");
+        assert_eq!(diagnostic["phase"], "request");
+        assert_eq!(diagnostic["path"], "stream");
+        assert!(!diagnostic.to_string().contains("private"));
+        assert_eq!(error.public_parts().0, http::StatusCode::BAD_REQUEST);
+    }
+}

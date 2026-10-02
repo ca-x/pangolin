@@ -1,6 +1,7 @@
 //! Provider implementations are deliberately hidden behind this Pangolin boundary.
 //! No LiteLLM host, Python bridge or callback controls gateway orchestration.
 mod cloud;
+pub mod diagnostics;
 pub mod discovery;
 pub mod framing;
 #[cfg(test)]
@@ -451,7 +452,7 @@ pub fn ensure_fields(value: &Value, allowed: &[&str]) -> Result<(), ApiError> {
         .as_object()
         .ok_or_else(|| invalid("request must be a JSON object"))?;
     if let Some(key) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
-        return Err(invalid(format!("unsupported cross-protocol field: {key}")));
+        return Err(diagnostics::unsupported_field(key));
     }
     Ok(())
 }

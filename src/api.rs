@@ -214,6 +214,8 @@ impl AppState {
 pub enum ApiError {
     #[error("{0}")]
     BadRequest(String),
+    #[error("{0}")]
+    Conversion(Box<crate::providers::diagnostics::ConversionDiagnostic>),
     #[error("authentication required")]
     Unauthorized,
     #[error("permission denied")]
@@ -245,6 +247,11 @@ impl ApiError {
     /// Internal causes may contain database rows, credentials or stored payloads.
     pub(crate) fn public_parts(self) -> (StatusCode, &'static str, String) {
         match self {
+            Self::Conversion(diagnostic) => (
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                diagnostic.to_string(),
+            ),
             Self::BadRequest(message) => {
                 (StatusCode::BAD_REQUEST, "invalid_request_error", message)
             }
@@ -1162,6 +1169,7 @@ async fn call_anthropic_chat(
     endpoint: &str,
     mut accounting: Option<&mut crate::operations::lifecycle::Attempt>,
 ) -> anyhow::Result<Value> {
+    use crate::providers::diagnostics::{self, ConversionCode, ConversionDiagnostic, Phase};
     crate::providers::ensure_fields(
         payload,
         &[
@@ -1239,15 +1247,23 @@ async fn call_anthropic_chat(
                         for part in parts {
                             crate::providers::ensure_fields(part, &["type", "text"])?;
                             if part.get("type").and_then(Value::as_str) != Some("text") {
-                                anyhow::bail!(
-                                    "Anthropic bridge currently supports text content parts only"
-                                );
+                                return Err(diagnostics::unsupported(
+                                    ConversionCode::UnsupportedNontextContent,
+                                    Some("messages[].content"),
+                                )
+                                .into());
                             }
                             blocks.push(json!({"type":"text","text":part.get("text").and_then(Value::as_str).unwrap_or("")}));
                         }
                     }
                     Some(Value::Null) | None => {}
-                    _ => anyhow::bail!("message content must be text or text content parts"),
+                    _ => {
+                        return Err(diagnostics::unsupported(
+                            ConversionCode::UnsupportedNontextContent,
+                            Some("messages[].content"),
+                        )
+                        .into());
+                    }
                 }
                 if role == "assistant"
                     && let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array)
@@ -1281,7 +1297,7 @@ async fn call_anthropic_chat(
                 }
                 push_anthropic_message(&mut messages, role, blocks);
             }
-            _ => anyhow::bail!("unsupported OpenAI message role `{role}`"),
+            _ => anyhow::bail!("unsupported OpenAI message role"),
         }
     }
     let mut request = Map::new();
@@ -1312,7 +1328,11 @@ async fn call_anthropic_chat(
         for tool in tools {
             crate::providers::ensure_fields(tool, &["type", "function"])?;
             if tool["type"] != "function" {
-                anyhow::bail!("only function tools are supported");
+                return Err(diagnostics::unsupported(
+                    ConversionCode::UnsupportedTools,
+                    Some("tools"),
+                )
+                .into());
             }
             let function = tool
                 .get("function")
@@ -1362,6 +1382,11 @@ async fn call_anthropic_chat(
     {
         request = value.as_object().expect("LiteLLM emits an object").clone();
     }
+    if let Some(accounting) = accounting.as_deref_mut() {
+        for diagnostic in diagnostics::normalizations(payload, false, false) {
+            accounting.conversion(diagnostic)?;
+        }
+    }
     let request = client
         .post(upstream_url(&target.base_url, endpoint))
         .headers(headers.clone())
@@ -1379,8 +1404,12 @@ async fn call_anthropic_chat(
         accounting.response_headers();
     }
     let bytes = gateway::read_body(upstream).await?;
-    let body: Value = serde_json::from_slice(&bytes)
-        .map_err(|_| std::io::Error::other("upstream JSON response is invalid"))?;
+    let body: Value = serde_json::from_slice(&bytes).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "upstream JSON response is invalid",
+        )
+    })?;
     if status.is_success()
         && let Some(accounting) = accounting
     {
@@ -1406,7 +1435,12 @@ async fn call_anthropic_chat(
             Some("text" | "tool_use")
         )
     }) {
-        anyhow::bail!("unsupported Anthropic response content block");
+        return Err(ApiError::Conversion(Box::new(ConversionDiagnostic::new(
+            Phase::Response,
+            ConversionCode::UnsupportedResponseShape,
+            Some("content"),
+        )))
+        .into());
     }
     for block in &content {
         crate::providers::ensure_fields(

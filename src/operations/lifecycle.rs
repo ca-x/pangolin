@@ -4,6 +4,7 @@ use super::{
     pricing::{self, Price, Usage},
     sql,
 };
+use crate::providers::diagnostics::{self, AffinityDiagnostic, ConversionDiagnostic};
 use crate::{
     api::{ApiError, AppState},
     db,
@@ -280,6 +281,12 @@ impl Request {
             contacted: false,
             http_status: None,
             response_id: None,
+            conversion_diagnostics: vec![],
+            affinity_diagnostics: ctx
+                .affinity
+                .as_ref()
+                .map(|binding| vec![binding.diagnostic.clone()])
+                .unwrap_or_default(),
         })
     }
 }
@@ -313,6 +320,8 @@ pub struct Attempt {
     contacted: bool,
     http_status: Option<u16>,
     response_id: Option<String>,
+    conversion_diagnostics: Vec<ConversionDiagnostic>,
+    affinity_diagnostics: Vec<AffinityDiagnostic>,
 }
 
 fn first_token_at_ms(attempt_started_at: i64, ttft_ms: Option<i64>) -> Option<i64> {
@@ -320,6 +329,12 @@ fn first_token_at_ms(attempt_started_at: i64, ttft_ms: Option<i64>) -> Option<i6
 }
 
 impl Attempt {
+    pub fn conversion(&mut self, diagnostic: ConversionDiagnostic) -> Result<(), ApiError> {
+        diagnostics::push_conversion(&mut self.conversion_diagnostics, diagnostic)
+    }
+    pub fn has_contacted(&self) -> bool {
+        self.contacted
+    }
     /// Records the upstream status this attempt actually saw. A rejection also
     /// releases the reservation; an accepted response does not, so a `2xx` that is
     /// not `200` is recorded here without changing how it settles.
@@ -589,19 +604,34 @@ impl Attempt {
             AttemptOutcome::UpstreamFailure => "failed",
             AttemptOutcome::LocalFailure => "local_failure",
         };
-        self.settle(status).await?;
+        if self.settled {
+            return Ok(());
+        }
         if let Some(binding) = &self.context.affinity {
-            self.context
+            let events = self
+                .context
                 .state
                 .orchestrator
                 .affinity_rules
                 .finish(
                     binding,
                     &self.candidate_id,
+                    &self.provider_id,
                     matches!(outcome, AttemptOutcome::Success),
                 )
                 .await;
+            for event in events {
+                tracing::debug!(
+                    request_id = self.context.id,
+                    execution_id = self.id,
+                    stage = "affinity",
+                    reason = event.reason.code(),
+                    "routing decision"
+                );
+                diagnostics::push_affinity(&mut self.affinity_diagnostics, event)?;
+            }
         }
+        self.settle(status).await?;
         let health = if !matches!(outcome, AttemptOutcome::LocalFailure) {
             super::runtime::health_for(
                 &self.context.state,
@@ -743,7 +773,7 @@ impl Attempt {
         .await?;
         let latency = self.started.elapsed().as_millis() as i64;
         if ctx.level != Level::Off {
-            txn.execute(sql("UPDATE request_executions SET status=?,finished_at=?,latency_ms=?,first_token_at=?,response_headers_ms=?,first_event_ms=?,first_text_ms=?,retry_reason=?,http_status=?,error_kind=? WHERE id=?",vec![status.into(),db::now().into(),latency.into(),first_token_at_ms(self.started_at,self.ttft).into(),self.response_headers_ms.into(),self.first_event_ms.into(),self.ttft.into(),(status!="succeeded").then_some(status.to_owned()).into(),http_status.into(),error_kind.clone().into(),self.id.clone().into()])).await?;
+            txn.execute(sql("UPDATE request_executions SET status=?,finished_at=?,latency_ms=?,first_token_at=?,response_headers_ms=?,first_event_ms=?,first_text_ms=?,retry_reason=?,http_status=?,error_kind=?,conversion_diagnostics_json=?,affinity_diagnostics_json=? WHERE id=?",vec![status.into(),db::now().into(),latency.into(),first_token_at_ms(self.started_at,self.ttft).into(),self.response_headers_ms.into(),self.first_event_ms.into(),self.ttft.into(),(status!="succeeded").then_some(status.to_owned()).into(),http_status.into(),error_kind.clone().into(),serde_json::to_string(&self.conversion_diagnostics).map_err(|e|ApiError::Internal(e.into()))?.into(),serde_json::to_string(&self.affinity_diagnostics).map_err(|e|ApiError::Internal(e.into()))?.into(),self.id.clone().into()])).await?;
             txn.execute(sql(
                 "UPDATE requests SET status=?,finished_at=? WHERE id=?",
                 vec![status.into(), db::now().into(), ctx.id.clone().into()],
@@ -833,6 +863,8 @@ impl Drop for Attempt {
             contacted: self.contacted,
             http_status: self.http_status,
             response_id: self.response_id.clone(),
+            conversion_diagnostics: self.conversion_diagnostics.clone(),
+            affinity_diagnostics: self.affinity_diagnostics.clone(),
         };
         self.settled = true;
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {

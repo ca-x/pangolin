@@ -1,5 +1,6 @@
 use super::*;
 use crate::orchestration::{self, AttemptGuard, AttemptOutcome, policy::ErrorMode, stream as sse};
+use crate::providers::diagnostics::{self, ConversionCode, ConversionDiagnostic, Phase};
 use futures_util::StreamExt;
 use std::time::Duration;
 use zeroize::Zeroizing;
@@ -483,7 +484,6 @@ async fn execute_inner(
                     extra_headers.insert(name, value.clone());
                 }
             }
-            contacted = true;
             let upstream_client = state.upstream_client(target).await?;
             if endpoint == "/v1/chat/completions" && target.provider_kind == "anthropic" {
                 let mapped_endpoint = if candidate.endpoint == endpoint {
@@ -491,7 +491,7 @@ async fn execute_inner(
                 } else {
                     &candidate.endpoint
                 };
-                let value = match call_anthropic_chat(
+                let result = call_anthropic_chat(
                     &upstream_client,
                     target,
                     &payload,
@@ -500,8 +500,9 @@ async fn execute_inner(
                     mapped_endpoint,
                     Some(&mut attempt),
                 )
-                .await
-                {
+                .await;
+                contacted |= attempt.has_contacted();
+                let value = match result {
                     Ok(value) => value,
                     Err(error) => {
                         if let Some(http) = error.downcast_ref::<AnthropicHttpError>() {
@@ -523,12 +524,33 @@ async fn execute_inner(
                         if error.downcast_ref::<reqwest::Error>().is_some()
                             || error.downcast_ref::<std::io::Error>().is_some()
                         {
+                            if error.downcast_ref::<std::io::Error>().is_some_and(|cause| {
+                                cause.kind() == std::io::ErrorKind::InvalidData
+                            }) {
+                                attempt.conversion(ConversionDiagnostic::new(
+                                    Phase::Response,
+                                    ConversionCode::UnsupportedResponseShape,
+                                    Some("content"),
+                                ))?;
+                            }
                             attempt.finish(AttemptOutcome::UpstreamFailure).await?;
                             if candidate.retry.transport {
                                 continue;
                             }
                             return Err(ApiError::Upstream("upstream transport failed".into()));
                         }
+                        let phase = if attempt.has_contacted() {
+                            Phase::Response
+                        } else {
+                            Phase::Request
+                        };
+                        let cause = error.downcast_ref::<ApiError>();
+                        let diagnostic = ConversionDiagnostic::rejection(
+                            phase,
+                            cause.unwrap_or(&ApiError::BadRequest(String::new())),
+                        );
+                        attempt.conversion(diagnostic)?;
+                        attempt.finish(AttemptOutcome::LocalFailure).await?;
                         return Err(ApiError::BadRequest(
                             "unsupported Anthropic request or response shape".into(),
                         ));
@@ -552,7 +574,7 @@ async fn execute_inner(
                     &trace_id,
                 ));
             }
-            let mut prepared = crate::providers::prepare_routed(
+            let prepared = crate::providers::prepare_routed(
                 target,
                 crate::providers::Route {
                     protocol: endpoint,
@@ -567,9 +589,31 @@ async fn execute_inner(
                 extra_headers,
                 &headers,
             )
-            .await?;
+            .await;
+            let mut prepared = match prepared {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    if diagnostics::cross_protocol(&target.provider_kind, endpoint) {
+                        attempt
+                            .conversion(ConversionDiagnostic::rejection(Phase::Request, &error))?;
+                    }
+                    attempt.finish(AttemptOutcome::LocalFailure).await?;
+                    return Err(error);
+                }
+            };
+            for diagnostic in diagnostics::normalizations(
+                &payload,
+                !diagnostics::cross_protocol(&target.provider_kind, endpoint),
+                matches!(target.provider_kind.as_str(), "gemini" | "vertex" | "gcp"),
+            ) {
+                attempt.conversion(diagnostic)?;
+            }
             if streaming && !prepared.response.identity() {
-                return Err(ApiError::BadRequest("cross-protocol streaming is unsupported for this provider; use its native endpoint".into()));
+                let error =
+                    diagnostics::unsupported(ConversionCode::UnsupportedStreaming, Some("stream"));
+                attempt.conversion(ConversionDiagnostic::rejection(Phase::Request, &error))?;
+                attempt.finish(AttemptOutcome::LocalFailure).await?;
+                return Err(error);
             }
             let method = if let Wire::Task { id, delete, .. } = &input.wire {
                 prepared.url.push('/');
@@ -588,6 +632,7 @@ async fn execute_inner(
                 .request(method, &prepared.url)
                 .headers(prepared.headers);
             attempt.contacted().await?;
+            contacted = true;
             let upstream = match request.body(outbound).send().await {
                 Ok(upstream) => upstream,
                 Err(_) => {
@@ -758,12 +803,22 @@ async fn execute_inner(
             };
             let mut response_json = serde_json::from_slice::<Value>(&bytes).ok();
             if !prepared.response.identity() {
-                let value =
-                    prepared
-                        .response
-                        .apply(response_json.take().ok_or_else(|| {
-                            ApiError::Upstream("provider response is not JSON".into())
-                        })?)?;
+                let converted = match response_json.take() {
+                    Some(value) => prepared.response.apply(value),
+                    None => Err(ApiError::Upstream("provider response is not JSON".into())),
+                };
+                let value = match converted {
+                    Ok(value) => value,
+                    Err(error) => {
+                        attempt.conversion(ConversionDiagnostic::new(
+                            Phase::Response,
+                            ConversionCode::UnsupportedResponseShape,
+                            Some(prepared.response.diagnostic_path()),
+                        ))?;
+                        attempt.finish(AttemptOutcome::LocalFailure).await?;
+                        return Err(error);
+                    }
+                };
                 bytes = serde_json::to_vec(&value).map_err(|e| ApiError::Internal(e.into()))?;
                 response_json = Some(value);
             }

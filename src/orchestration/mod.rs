@@ -513,6 +513,13 @@ pub async fn prepare(
         .affinity_rules
         .select(db, key, headers, &payload, endpoint, &mut candidates)
         .await?;
+    if let Some(binding) = &affinity {
+        decisions.push(Decision {
+            stage: "affinity",
+            candidate: binding.diagnostic.provider_id.clone(),
+            reason: binding.diagnostic.reason.code(),
+        });
+    }
     for candidate in &candidates {
         decisions.push(Decision {
             stage: "strategy",

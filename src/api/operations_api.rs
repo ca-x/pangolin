@@ -1545,7 +1545,7 @@ fn query(resource: &str) -> Result<(&'static str, &'static str, &'static str), A
         "executions" => (
             "request_executions",
             "request_id IN (SELECT r.id FROM requests r JOIN traces t ON t.id=r.trace_id WHERE t.project_id=?)",
-            "json_object('id',id,'request_id',request_id,'provider_id',provider_id,'provider_name',provider_name,'credential_suffix',credential_suffix,'attempt',attempt,'model',model,'status',status,'retry_reason',retry_reason,'latency_ms',latency_ms,'response_headers_ms',response_headers_ms,'first_event_ms',first_event_ms,'first_text_ms',first_text_ms,'first_token_at',first_token_at,'http_status',http_status,'error_kind',error_kind)",
+            "json_object('id',id,'request_id',request_id,'provider_id',provider_id,'provider_name',provider_name,'credential_suffix',credential_suffix,'attempt',attempt,'model',model,'status',status,'retry_reason',retry_reason,'latency_ms',latency_ms,'response_headers_ms',response_headers_ms,'first_event_ms',first_event_ms,'first_text_ms',first_text_ms,'first_token_at',first_token_at,'http_status',http_status,'error_kind',error_kind,'conversion_diagnostics',conversion_diagnostics_json,'affinity_diagnostics',affinity_diagnostics_json)",
         ),
         "usage" => (
             "usage_logs",
@@ -1775,8 +1775,10 @@ async fn list(
 fn documents(rows: Vec<sea_orm::QueryResult>) -> Result<Vec<Value>, ApiError> {
     rows.into_iter()
         .map(|r| {
-            serde_json::from_str(&r.try_get::<String>("", "document")?)
-                .map_err(|e| ApiError::Internal(e.into()))
+            let mut document: Value = serde_json::from_str(&r.try_get::<String>("", "document")?)
+                .map_err(|e| ApiError::Internal(e.into()))?;
+            crate::providers::diagnostics::sanitize_document(&mut document);
+            Ok(document)
         })
         .collect()
 }
@@ -2565,7 +2567,7 @@ async fn detail(
             .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("trace has no id")))?
             .to_owned();
         let requests=documents(state.db.query_all(sql("SELECT json_object('id',id,'public_id',COALESCE(json_extract(request_metadata_json,'$.external_id'),id),'protocol',protocol,'endpoint',endpoint,'model',requested_model,'status',status,'source_ip',source_ip,'started_at',started_at,'finished_at',finished_at) AS document FROM requests WHERE trace_id=? ORDER BY started_at",vec![trace_id.clone().into()])).await?)?;
-        let executions=documents(state.db.query_all(sql("SELECT json_object('id',id,'request_id',request_id,'provider_id',provider_id,'provider_name',provider_name,'attempt',attempt,'model',model,'status',status,'retry_reason',retry_reason,'latency_ms',latency_ms,'started_at',started_at,'finished_at',finished_at,'http_status',http_status,'error_kind',error_kind) AS document FROM request_executions WHERE request_id IN (SELECT id FROM requests WHERE trace_id=?) ORDER BY started_at",vec![trace_id.clone().into()])).await?)?;
+        let executions=documents(state.db.query_all(sql("SELECT json_object('id',id,'request_id',request_id,'provider_id',provider_id,'provider_name',provider_name,'attempt',attempt,'model',model,'status',status,'retry_reason',retry_reason,'latency_ms',latency_ms,'started_at',started_at,'finished_at',finished_at,'http_status',http_status,'error_kind',error_kind,'conversion_diagnostics',conversion_diagnostics_json,'affinity_diagnostics',affinity_diagnostics_json) AS document FROM request_executions WHERE request_id IN (SELECT id FROM requests WHERE trace_id=?) ORDER BY started_at",vec![trace_id.clone().into()])).await?)?;
         // Tokens and money per execution, and the price components each charge was
         // made of. Without these the console can only show a total, which cannot
         // be checked against the price that produced it.
@@ -2613,7 +2615,7 @@ async fn detail(
         // external id is caller-controlled, so binding the raw path segment here both
         // emptied the detail card for a legitimate external-id link and let a colliding
         // external id read another project's attempts, tokens and costs.
-        let executions = documents(state.db.query_all(sql("SELECT json_object('id',id,'request_id',request_id,'provider_id',provider_id,'provider_name',provider_name,'attempt',attempt,'model',model,'status',status,'retry_reason',retry_reason,'latency_ms',latency_ms,'started_at',started_at,'finished_at',finished_at,'http_status',http_status,'error_kind',error_kind) AS document FROM request_executions WHERE request_id=? ORDER BY attempt", vec![resolved_id.clone().into()])).await?)?;
+        let executions = documents(state.db.query_all(sql("SELECT json_object('id',id,'request_id',request_id,'provider_id',provider_id,'provider_name',provider_name,'attempt',attempt,'model',model,'status',status,'retry_reason',retry_reason,'latency_ms',latency_ms,'started_at',started_at,'finished_at',finished_at,'http_status',http_status,'error_kind',error_kind,'conversion_diagnostics',conversion_diagnostics_json,'affinity_diagnostics',affinity_diagnostics_json) AS document FROM request_executions WHERE request_id=? ORDER BY attempt", vec![resolved_id.clone().into()])).await?)?;
         let usage = documents(state.db.query_all(sql("SELECT json_object('execution_id',u.execution_id,'model_id',u.model_id,'input_tokens',u.input_tokens,'output_tokens',u.output_tokens,'cache_read_tokens',u.cache_read_tokens,'cache_write_tokens',u.cache_write_tokens,'reasoning_tokens',u.reasoning_tokens,'total_cost_micros',u.total_cost_micros,'created_at',u.created_at) AS document FROM usage_logs u JOIN execution_facts e ON e.id=u.execution_id WHERE e.request_id=? ORDER BY u.created_at", vec![resolved_id.clone().into()])).await?)?;
         let cost_items = documents(state.db.query_all(sql("SELECT json_object('execution_id',e.id,'kind',c.kind,'quantity',i.quantity,'unit_price_micros',c.unit_price_micros,'subtotal_micros',i.subtotal_micros) AS document FROM usage_cost_items i JOIN usage_logs u ON u.id=i.usage_log_id JOIN execution_facts e ON e.id=u.execution_id LEFT JOIN model_price_components c ON c.id=i.price_component_id WHERE e.request_id=? ORDER BY e.id,i.id", vec![resolved_id.clone().into()])).await?)?;
         let row = state

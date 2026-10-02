@@ -2667,3 +2667,165 @@ async fn reference_privacy_review_anthropic_search_replay_requires_string_carrie
         ));
     }
 }
+
+#[tokio::test]
+async fn reference_affinity_diagnostics_controlled_expiry_late_completion_and_release() {
+    use crate::providers::diagnostics::AffinityReason;
+    let f = database_fixture().await;
+    add_model(&f, "a", "public", "actual-a").await;
+    add_model(&f, "b", "public", "actual-b").await;
+    sql(&f,"UPDATE projects SET settings_json=?",vec![json!({"version":1,"affinity_rules":[{"id":"test","mode":"prefer","source":{"kind":"pointer","value":"/user"},"ttl_secs":60}]}).to_string().into()]).await;
+    let now = Arc::new(std::sync::atomic::AtomicU64::new(1000));
+    let clock = now.clone();
+    let cache = affinity::Cache::with_test_clock(move || {
+        Duration::from_secs(clock.load(Ordering::Relaxed))
+    });
+    let body = json!({"model":"public","user":"private cursor"});
+    let candidates = plan(&f, body.clone()).await.unwrap().candidates;
+    let mut ordered = candidates.clone();
+    let first = cache
+        .select(
+            &f.db,
+            &f.key,
+            &HeaderMap::new(),
+            &body,
+            "/v1/chat/completions",
+            &mut ordered,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.diagnostic.reason, AffinityReason::First);
+    let established = cache
+        .finish(
+            &first,
+            &candidates[0].id(),
+            &candidates[0].provider_id,
+            true,
+        )
+        .await;
+    assert_eq!(established[0].reason, AffinityReason::Established);
+    assert_eq!(established[0].expires_at, Some(1060));
+    let hit = cache
+        .select(
+            &f.db,
+            &f.key,
+            &HeaderMap::new(),
+            &body,
+            "/v1/chat/completions",
+            &mut ordered,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(hit.diagnostic.reason, AffinityReason::Hit);
+    assert!(
+        cache
+            .finish(&hit, &candidates[0].id(), &candidates[0].provider_id, true)
+            .await
+            .is_empty()
+    );
+    now.store(1061, Ordering::Relaxed);
+    let expired = cache
+        .select(
+            &f.db,
+            &f.key,
+            &HeaderMap::new(),
+            &body,
+            "/v1/chat/completions",
+            &mut ordered,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(expired.diagnostic.reason, AffinityReason::Expired);
+    let changed = cache
+        .finish(
+            &expired,
+            &candidates[1].id(),
+            &candidates[1].provider_id,
+            true,
+        )
+        .await;
+    assert_eq!(changed[0].reason, AffinityReason::Established);
+    let late = cache
+        .finish(
+            &first,
+            &candidates[0].id(),
+            &candidates[0].provider_id,
+            false,
+        )
+        .await;
+    assert_eq!(late.len(), 1);
+    assert_eq!(late[0].reason, AffinityReason::CandidateFailed);
+    assert!(
+        cache
+            .finish(
+                &first,
+                &candidates[0].id(),
+                &candidates[0].provider_id,
+                true
+            )
+            .await
+            .is_empty()
+    );
+    let selected = cache
+        .select(
+            &f.db,
+            &f.key,
+            &HeaderMap::new(),
+            &body,
+            "/v1/chat/completions",
+            &mut ordered,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        selected.diagnostic.provider_id,
+        Some(candidates[1].provider_id.clone())
+    );
+    let released = cache
+        .finish(
+            &selected,
+            &candidates[1].id(),
+            &candidates[1].provider_id,
+            false,
+        )
+        .await;
+    assert_eq!(
+        released
+            .iter()
+            .map(|event| event.reason)
+            .collect::<Vec<_>>(),
+        [AffinityReason::CandidateFailed, AffinityReason::Released]
+    );
+    let new_scope = cache
+        .select(
+            &f.db,
+            &f.key,
+            &HeaderMap::new(),
+            &json!({"model":"public","user":"other cursor"}),
+            "/v1/chat/completions",
+            &mut ordered,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(new_scope.fingerprint, first.fingerprint);
+    let mut other_key = f.key.clone();
+    other_key.id = "other-key".into();
+    let other = cache
+        .select(
+            &f.db,
+            &other_key,
+            &HeaderMap::new(),
+            &body,
+            "/v1/chat/completions",
+            &mut ordered,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(other.fingerprint, first.fingerprint);
+}

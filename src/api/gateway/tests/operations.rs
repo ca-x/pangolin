@@ -13427,3 +13427,446 @@ async fn reference_privacy_preview_denial_limits_auth_and_samples_never_persist(
     );
     assert_eq!(seen.load(Ordering::Relaxed), 0);
 }
+
+async fn reference_diagnostic_executions(f: &Fixture, cookie: &str) -> Value {
+    json_body(
+        admin(
+            f,
+            cookie,
+            http::Method::GET,
+            &format!(
+                "/api/admin/v1/projects/{}/operations/executions",
+                db::DEFAULT_PROJECT_ID
+            ),
+            Value::Null,
+            false,
+        )
+        .await,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn reference_conversion_diagnostics_rejected_request_is_safe_uncontacted_and_uncharged() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counted = calls.clone();
+    let f = fixture(Router::new().fallback(post(move || {
+        counted.fetch_add(1, Ordering::Relaxed);
+        async { Json(json!({"unexpected":true})) }
+    })))
+    .await;
+    let cookie = owner(&f).await;
+    sql(&f, "UPDATE providers SET kind='gemini'", vec![]).await;
+    for (index, payload) in [
+        json!({"model":"public","messages":[{"role":"user","content":"private diagnostic sample"}],"tools":[{"type":"function","function":{"name":"private_tool","parameters":{}}}]}),
+        json!({"model":"public","messages":[{"role":"user","content":"private diagnostic sample"}],"private_field_secret":"private field value"}),
+        json!({"model":"public","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://private.invalid/image"}}]}]}),
+    ].into_iter().enumerate() {
+        let response = request(&f, "/v1/chat/completions", payload).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let public = json_body(response).await;
+        assert!(!public.to_string().contains("private"));
+        let rows = reference_diagnostic_executions(&f, &cookie).await;
+        assert_eq!(rows["data"].as_array().unwrap().len(), index + 1, "public: {public}");
+        let code = match index { 0 => "unsupported_tools", 1 => "unsupported_request_shape", _ => "unsupported_nontext_content" };
+        let diagnostic = rows["data"].as_array().unwrap().iter()
+            .map(|row| &row["conversion_diagnostics"][0]).find(|item| item["code"] == code).unwrap();
+        assert_eq!(diagnostic["phase"], "request");
+        assert_eq!(diagnostic["code"], code);
+        if index == 0 { assert_eq!(diagnostic["path"], "tools"); }
+        assert!(!rows.to_string().contains("private"));
+    }
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
+    let fact = f
+        .state
+        .db
+        .query_one(ops::sql(
+            "SELECT SUM(contacted) AS contacted FROM execution_facts",
+            vec![],
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(fact.try_get::<i64>("", "contacted").unwrap(), 0);
+    let cost = f
+        .state
+        .db
+        .query_one(ops::sql(
+            "SELECT SUM(total_cost_micros) AS cost FROM usage_logs",
+            vec![],
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(cost.try_get::<i64>("", "cost").unwrap(), 0);
+}
+
+#[tokio::test]
+async fn reference_conversion_diagnostics_native_fields_and_response_attempt_isolation() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counted = calls.clone();
+    let f = fixture(Router::new().fallback(post(move |Json(body): Json<Value>| {
+        let attempt = counted.fetch_add(1, Ordering::Relaxed);
+        async move {
+            if body.get("messages").is_some() {
+                return (StatusCode::OK, Json(body));
+            }
+            if attempt == 1 {
+                return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error":{"message":"busy"}})));
+            }
+            (StatusCode::OK, Json(json!({"candidates":[{"content":{"role":"model","parts":[{"inlineData":{"mimeType":"private_mime","data":"private response bytes"}}]},"finishReason":"STOP"}]})))
+        }
+    }))).await;
+    let cookie = owner(&f).await;
+    let native = json!({"model":"public","messages":[{"role":"user","content":"hello"}],"native_extension":{"opaque":"private native value"}});
+    let response = request(&f, "/v1/chat/completions", native).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        json_body(response).await["native_extension"]["opaque"],
+        "private native value"
+    );
+    let rows = reference_diagnostic_executions(&f, &cookie).await;
+    assert_eq!(rows["data"][0]["conversion_diagnostics"], json!([]));
+    sql(&f, "UPDATE providers SET kind='gemini'", vec![]).await;
+    let response = request(&f, "/v1/chat/completions", chat()).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let rows = reference_diagnostic_executions(&f, &cookie).await;
+    let data = rows["data"].as_array().unwrap();
+    assert_eq!(data.len(), 3);
+    let failed = data
+        .iter()
+        .find(|row| row["conversion_diagnostics"][0]["phase"] == "response")
+        .unwrap();
+    assert_eq!(failed["attempt"], 2);
+    assert_eq!(
+        failed["conversion_diagnostics"][0]["code"],
+        "unsupported_response_shape"
+    );
+    let rejected = data.iter().find(|row| row["http_status"] == 503).unwrap();
+    assert_eq!(rejected["conversion_diagnostics"], json!([]));
+    assert!(!rows.to_string().contains("private"));
+    assert_eq!(calls.load(Ordering::Relaxed), 3);
+}
+
+#[tokio::test]
+async fn reference_affinity_diagnostics_first_hit_establishment_and_ineligible_are_actual() {
+    let f = fixture(success()).await;
+    let cookie = owner(&f).await;
+    sql(&f, "UPDATE projects SET settings_json=? WHERE id=?", vec![
+        json!({"version":1,"affinity_rules":[{"id":"scope-rule","mode":"prefer","source":{"kind":"pointer","value":"/metadata/user_id"},"ttl_secs":60,"release_on_failure":true}]}).to_string().into(),
+        db::DEFAULT_PROJECT_ID.into(),
+    ]).await;
+    let mut payload = chat();
+    payload["metadata"] = json!({"user_id":"private affinity cursor"});
+    assert_eq!(
+        request(&f, "/v1/chat/completions", payload.clone())
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    let first = reference_diagnostic_executions(&f, &cookie).await;
+    let explanation = &first["data"][0]["affinity_diagnostics"];
+    assert_eq!(explanation[0]["reason"], "first");
+    assert_eq!(explanation[1]["reason"], "established");
+    let provider = first["data"][0]["provider_id"].as_str().unwrap().to_owned();
+    assert_eq!(explanation[1]["provider_id"], provider);
+    assert_eq!(explanation[0]["scope_digest"].as_str().unwrap().len(), 64);
+    assert_eq!(
+        request(&f, "/v1/chat/completions", payload.clone())
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    let hit = reference_diagnostic_executions(&f, &cookie).await;
+    assert!(
+        hit["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["affinity_diagnostics"][0]["reason"] == "hit")
+    );
+    sql(
+        &f,
+        "UPDATE providers SET enabled=0 WHERE id=?",
+        vec![provider.into()],
+    )
+    .await;
+    assert_eq!(
+        request(&f, "/v1/chat/completions", payload).await.status(),
+        StatusCode::OK
+    );
+    let changed = reference_diagnostic_executions(&f, &cookie).await;
+    assert!(
+        changed["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["affinity_diagnostics"][0]["reason"] == "ineligible")
+    );
+    assert!(!changed.to_string().contains("private affinity cursor"));
+}
+
+#[tokio::test]
+async fn reference_conversion_diagnostics_normalization_is_explicit_and_metadata_survives_reopen() {
+    let mut f = fixture(Router::new().fallback(post(|| async { Json(json!({"candidates":[{"content":{"role":"model","parts":[{"text":"OK"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1,"totalTokenCount":2}})) }))).await;
+    let base: String = f
+        .state
+        .db
+        .query_one(ops::sql("SELECT base_url FROM providers LIMIT 1", vec![]))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "base_url")
+        .unwrap();
+    let url = format!(
+        "sqlite://{}?mode=rwc",
+        f._directory.path().join("diagnostics.sqlite").display()
+    );
+    f.state.db = db::connect(&url).await.unwrap();
+    f.token = db::create_api_key(
+        &f.state.db,
+        &ApiKeyInput {
+            name: "diagnostics".into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap()
+    .1;
+    let provider = db::create_provider(
+        &f.state.db,
+        &ProviderInput {
+            name: "gemini".into(),
+            kind: "gemini".into(),
+            base_url: base,
+            api_key: String::new(),
+        },
+        f.state
+            .secrets
+            .encrypt("private upstream credential")
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    db::create_model(
+        &f.state.db,
+        &ModelInput {
+            provider_id: provider.id.clone(),
+            public_name: "public".into(),
+            upstream_name: "actual".into(),
+            capabilities: None,
+            input_price_micros: None,
+            output_price_micros: None,
+            priority: None,
+        },
+        db::DEFAULT_PROJECT_ID,
+    )
+    .await
+    .unwrap();
+    sql(&f,"UPDATE projects SET settings_json=?",vec![json!({"version":1,"affinity_rules":[{"id":"trace-binding","mode":"prefer","source":{"kind":"trace"},"ttl_secs":60}]}).to_string().into()]).await;
+    let cookie = owner(&f).await;
+    let response = request(&f, "/v1/chat/completions", json!({"model":"public","messages":[{"role":"developer","content":"private developer message"},{"role":"user","content":"private user message"}],"stop":"private stop token"})).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    f.state.db.clone().close().await.unwrap();
+    f.state.db = db::connect(&url).await.unwrap();
+    let executions = reference_diagnostic_executions(&f, &cookie).await;
+    let execution = &executions["data"][0];
+    assert_eq!(
+        execution["conversion_diagnostics"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        execution["conversion_diagnostics"][0]["code"],
+        "roles_normalized"
+    );
+    assert_eq!(
+        execution["conversion_diagnostics"][1]["code"],
+        "stop_array_normalized"
+    );
+    assert!(!executions.to_string().contains("private"));
+    assert_eq!(execution["affinity_diagnostics"][0]["reason"], "first");
+    assert_eq!(
+        execution["affinity_diagnostics"][1]["reason"],
+        "established"
+    );
+    let request_id = execution["request_id"].as_str().unwrap();
+    let detail = json_body(
+        admin(
+            &f,
+            &cookie,
+            http::Method::GET,
+            &format!(
+                "/api/admin/v1/projects/{}/operations/requests/{request_id}",
+                db::DEFAULT_PROJECT_ID
+            ),
+            Value::Null,
+            false,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        detail["executions"][0]["conversion_diagnostics"],
+        execution["conversion_diagnostics"]
+    );
+    let trace = json_body(
+        admin(
+            &f,
+            &cookie,
+            http::Method::GET,
+            &format!(
+                "/api/admin/v1/projects/{}/operations/trace-detail/trace-test",
+                db::DEFAULT_PROJECT_ID
+            ),
+            Value::Null,
+            false,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        trace["executions"][0]["conversion_diagnostics"],
+        execution["conversion_diagnostics"]
+    );
+    sql(&f,"INSERT INTO projects(id,name,slug,is_default,enabled,created_at,updated_at) VALUES('diagnostic-other','Other','diagnostic-other',0,1,0,0)",vec![]).await;
+    for (resource, id) in [
+        ("executions", execution["id"].as_str().unwrap()),
+        ("requests", request_id),
+        ("trace-detail", "trace-test"),
+    ] {
+        let foreign = admin(
+            &f,
+            &cookie,
+            http::Method::GET,
+            &format!("/api/admin/v1/projects/diagnostic-other/operations/{resource}/{id}"),
+            Value::Null,
+            false,
+        )
+        .await;
+        assert_eq!(foreign.status(), StatusCode::NOT_FOUND);
+    }
+    assert_eq!(count(&f,"SELECT COUNT(*) AS n FROM request_contents WHERE request_json IS NOT NULL OR response_json IS NOT NULL").await, 0);
+    assert_eq!(
+        count(
+            &f,
+            "SELECT COUNT(*) AS n FROM audit_events WHERE details LIKE '%private%'"
+        )
+        .await,
+        0
+    );
+    sql(
+        &f,
+        "UPDATE request_executions SET conversion_diagnostics_json=?,affinity_diagnostics_json=?",
+        vec![
+            json!([{"phase":"request","code":"unsupported_tools","reason":"private legacy cause"}])
+                .to_string()
+                .into(),
+            json!("private legacy cursor").to_string().into(),
+        ],
+    )
+    .await;
+    let unsafe_old = reference_diagnostic_executions(&f, &cookie).await;
+    assert_eq!(unsafe_old["data"][0]["conversion_diagnostics"], json!([]));
+    assert_eq!(unsafe_old["data"][0]["affinity_diagnostics"], json!([]));
+    assert!(!unsafe_old.to_string().contains("private"));
+}
+
+#[tokio::test]
+async fn reference_affinity_diagnostics_profile_alias_strict_hit_and_disabled_key() {
+    let f = fixture(success()).await;
+    let cookie = owner(&f).await;
+    sql(&f,"UPDATE projects SET settings_json=?",vec![json!({"version":1,"affinity_rules":[{"id":"alias","mode":"strict","source":{"kind":"pointer","value":"/user"},"ttl_secs":60}]}).to_string().into()]).await;
+    sql(&f,"INSERT INTO api_key_profiles(id,project_id,name,created_at,updated_at) VALUES('diagnostic-profile',?,'diagnostic',0,0)",vec![db::DEFAULT_PROJECT_ID.into()]).await;
+    sql(&f,"INSERT INTO api_key_profile_model_mappings(id,profile_id,source_model,target_model) VALUES('diagnostic-map','diagnostic-profile','client-alias','public')",vec![]).await;
+    sql(
+        &f,
+        "UPDATE api_keys SET profile_id='diagnostic-profile'",
+        vec![],
+    )
+    .await;
+    let mut payload = chat();
+    payload["user"] = json!("private alias cursor");
+    assert_eq!(
+        request(&f, "/v1/chat/completions", payload.clone())
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    payload["model"] = json!("client-alias");
+    assert_eq!(
+        request(&f, "/v1/chat/completions", payload.clone())
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    let rows = reference_diagnostic_executions(&f, &cookie).await;
+    let entries = rows["data"].as_array().unwrap();
+    let first = entries
+        .iter()
+        .find(|row| row["affinity_diagnostics"][0]["reason"] == "first")
+        .unwrap();
+    let hit = entries
+        .iter()
+        .find(|row| row["affinity_diagnostics"][0]["reason"] == "hit")
+        .unwrap();
+    assert_eq!(hit["provider_id"], first["provider_id"]);
+    assert_eq!(
+        hit["affinity_diagnostics"][0]["scope_digest"],
+        first["affinity_diagnostics"][0]["scope_digest"]
+    );
+    sql(&f, "UPDATE api_keys SET enabled=0", vec![]).await;
+    assert_eq!(
+        request(&f, "/v1/chat/completions", payload).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        count(&f, "SELECT COUNT(*) AS n FROM request_executions").await,
+        2
+    );
+    assert!(!rows.to_string().contains("private alias cursor"));
+}
+
+#[tokio::test]
+async fn reference_conversion_diagnostics_uncontacted_hard_budget_keeps_spend_zero() {
+    let f = fixture(Router::new()).await;
+    let cookie = owner(&f).await;
+    sql(&f, "UPDATE providers SET kind='gemini'", vec![]).await;
+    sql(
+        &f,
+        "UPDATE models SET input_price_micros=1000000,output_price_micros=1000000",
+        vec![],
+    )
+    .await;
+    sql(&f, "UPDATE api_keys SET budget_micros=1000000", vec![]).await;
+    let response = request(&f,"/v1/chat/completions",json!({"model":"public","messages":[{"role":"user","content":"hello"}],"tools":[{"type":"function","function":{"name":"tool","parameters":{}}}]})).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        count(&f, "SELECT SUM(spent_micros) AS n FROM api_keys").await,
+        0
+    );
+    assert_eq!(
+        count(&f, "SELECT SUM(total_cost_micros) AS n FROM usage_logs").await,
+        0
+    );
+    assert_eq!(
+        count(&f, "SELECT SUM(contacted) AS n FROM execution_facts").await,
+        0
+    );
+    assert_eq!(
+        count(
+            &f,
+            "SELECT COUNT(*) AS n FROM execution_facts WHERE status='running'"
+        )
+        .await,
+        0
+    );
+    let executions = reference_diagnostic_executions(&f, &cookie).await;
+    assert_eq!(
+        executions["data"][0]["conversion_diagnostics"][0]["code"],
+        "unsupported_tools"
+    );
+    assert_eq!(executions["data"][0]["status"], "local_failure");
+}

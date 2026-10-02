@@ -1,3 +1,4 @@
+use super::diagnostics::{ConversionCode, unsupported};
 use super::{ensure_fields, invalid};
 use crate::api::ApiError;
 use serde_json::{Value, json};
@@ -65,6 +66,14 @@ impl ResponseTransform {
             }
         }
     }
+    pub fn diagnostic_path(&self) -> &'static str {
+        match self {
+            Self::GeminiChat(_) => "candidates[].content.parts",
+            Self::ChatGemini | Self::ChatMessages(_) => "choices[].message",
+            Self::Antigravity(inner) => inner.diagnostic_path(),
+            _ => "response",
+        }
+    }
     pub fn identity(&self) -> bool {
         matches!(self, Self::Identity)
     }
@@ -97,13 +106,19 @@ fn text_content(value: &Value) -> Result<String, ApiError> {
     }
     value
         .as_array()
-        .ok_or_else(|| invalid("only text content is supported by this transformation"))?
+        .ok_or_else(|| {
+            unsupported(
+                ConversionCode::UnsupportedNontextContent,
+                Some("messages[].content"),
+            )
+        })?
         .iter()
         .map(|part| {
             ensure_fields(part, &["type", "text"])?;
             if part["type"] != "text" {
-                return Err(invalid(
-                    "non-text content requires the native provider endpoint",
+                return Err(unsupported(
+                    ConversionCode::UnsupportedNontextContent,
+                    Some("messages[].content"),
                 ));
             }
             part["text"]
@@ -122,10 +137,12 @@ fn gemini_text(content: &Value) -> Result<String, ApiError> {
         .iter()
         .map(|part| {
             ensure_fields(part, &["text"])?;
-            part["text"]
-                .as_str()
-                .map(str::to_owned)
-                .ok_or_else(|| invalid("non-text Gemini part requires native endpoint"))
+            part["text"].as_str().map(str::to_owned).ok_or_else(|| {
+                unsupported(
+                    ConversionCode::UnsupportedNontextContent,
+                    Some("contents[].parts"),
+                )
+            })
         })
         .collect()
 }
@@ -146,8 +163,9 @@ pub fn chat_to_gemini(body: &Value) -> Result<Value, ApiError> {
         ],
     )?;
     if body["stream"] == true {
-        return Err(invalid(
-            "cross-protocol Gemini streaming is unsupported; use native streamGenerateContent",
+        return Err(unsupported(
+            ConversionCode::UnsupportedStreaming,
+            Some("stream"),
         ));
     }
     let mut contents = vec![];
@@ -201,8 +219,9 @@ pub fn gemini_to_chat(body: &Value) -> Result<Value, ApiError> {
         ],
     )?;
     if body["stream"] == true {
-        return Err(invalid(
-            "cross-protocol Gemini streaming requires native Gemini channel",
+        return Err(unsupported(
+            ConversionCode::UnsupportedStreaming,
+            Some("stream"),
         ));
     }
     let mut messages = vec![];
@@ -262,8 +281,9 @@ pub fn messages_to_chat(body: &Value) -> Result<Value, ApiError> {
         ],
     )?;
     if body["stream"] == true {
-        return Err(invalid(
-            "cross-protocol Messages streaming requires native Anthropic channel",
+        return Err(unsupported(
+            ConversionCode::UnsupportedStreaming,
+            Some("stream"),
         ));
     }
     let mut messages = vec![];

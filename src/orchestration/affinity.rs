@@ -1,5 +1,6 @@
 //! Rule-driven affinity. Identifiers are scoped and hashed before entering a cache.
 use super::{Candidate, Error, Result};
+use crate::providers::diagnostics::{AffinityDiagnostic, AffinityReason, safe_identity};
 use crate::{db, models::ApiKeyCredential};
 use litellm_cache::{BaseCache, CacheEntry, CacheKwargs};
 use litellm_cache_memory::InMemoryCache;
@@ -70,11 +71,17 @@ fn yes() -> bool {
 #[derive(Clone)]
 pub struct Binding {
     pub fingerprint: String,
+    pub rule_id: String,
+    pub diagnostic: AffinityDiagnostic,
+    sequence: u64,
     pub ttl_secs: u64,
     pub release_on_failure: bool,
 }
 pub struct Cache {
     backend: Arc<dyn BaseCache<Value = CacheEntry>>,
+    local: Option<Arc<InMemoryCache<CacheEntry>>>,
+    sequence: std::sync::atomic::AtomicU64,
+    completed_sequences: moka::sync::Cache<String, u64>,
     pub hits: std::sync::atomic::AtomicU64,
     generation: std::sync::atomic::AtomicU64,
     project_generations: std::sync::Mutex<std::collections::HashMap<String, u64>>,
@@ -84,20 +91,25 @@ pub struct Cache {
 }
 impl Default for Cache {
     fn default() -> Self {
-        let backend: Arc<dyn BaseCache<Value = CacheEntry>> = Arc::new(InMemoryCache::new(
+        let local = Arc::new(InMemoryCache::new(
             Some(10000),
             Some(Duration::from_secs(1800)),
         ));
+        let backend: Arc<dyn BaseCache<Value = CacheEntry>> = local.clone();
+        let local = Some(local);
         #[cfg(feature = "redis-affinity")]
-        let backend = std::env::var("PANGOLIN_AFFINITY_REDIS_URL")
+        let (backend, local) = std::env::var("PANGOLIN_AFFINITY_REDIS_URL")
             .ok()
             .and_then(|url| {
                 litellm_cache_redis::RedisCache::new(&url, Some(Duration::from_secs(1800))).ok()
             })
-            .map(|v| Arc::new(v) as Arc<dyn BaseCache<Value = CacheEntry>>)
-            .unwrap_or(backend);
+            .map(|v| (Arc::new(v) as Arc<dyn BaseCache<Value = CacheEntry>>, None))
+            .unwrap_or((backend, local));
         Self {
             backend,
+            local,
+            sequence: Default::default(),
+            completed_sequences: moka::sync::Cache::builder().max_capacity(10000).build(),
             hits: Default::default(),
             generation: Default::default(),
             project_generations: Default::default(),
@@ -106,6 +118,19 @@ impl Default for Cache {
     }
 }
 impl Cache {
+    #[cfg(test)]
+    pub fn with_test_clock(clock: impl Fn() -> Duration + Send + Sync + 'static) -> Self {
+        let local = Arc::new(InMemoryCache::with_clock(
+            Some(10000),
+            Some(Duration::from_secs(1800)),
+            clock,
+        ));
+        Self {
+            backend: local.clone(),
+            local: Some(local),
+            ..Self::default()
+        }
+    }
     pub fn diagnostic_counts(&self) -> (u64, u64) {
         (
             self.hits.load(std::sync::atomic::Ordering::Relaxed),
@@ -275,40 +300,95 @@ impl Cache {
             )
             .to_hex()
             .to_string();
+            // Snapshot the local cache's own expiry before get removes an expired
+            // entry. Redis does not expose this observation through BaseCache;
+            // do not fabricate an expiry when its backend cannot measure one.
+            let expires_at = self.expires_at(&fingerprint);
+            let mut diagnostic = AffinityDiagnostic {
+                rule_id: safe_identity(&rule.id),
+                scope_digest: fingerprint.clone(),
+                reason: AffinityReason::First,
+                provider_id: None,
+                expires_at: None,
+            };
             if let Ok(Some(entry)) = self
                 .backend
                 .async_get_cache(&fingerprint, &CacheKwargs::default())
                 .await
             {
                 if let Some(index) = candidates.iter().position(|c| entry.response == c.id()) {
+                    diagnostic.reason = AffinityReason::Hit;
+                    diagnostic.provider_id = Some(safe_identity(&candidates[index].provider_id));
+                    diagnostic.expires_at = expires_at;
                     candidates[..=index].rotate_right(1);
                     if rule.mode == Mode::Strict {
-                        candidates.truncate(1)
+                        candidates.truncate(1);
                     }
                     self.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 } else {
-                    // Authoritative eligibility always overrides cache state, including explicit disable.
+                    // Authoritative eligibility overrides every cache observation.
+                    diagnostic.reason = AffinityReason::Ineligible;
                     let _ = self.backend.async_delete_cache(&fingerprint).await;
                     if rule.mode == Mode::Strict {
+                        tracing::debug!(
+                            stage = "affinity",
+                            reason = "ineligible",
+                            "routing decision"
+                        );
                         return Err(Error::Admission("affinity_channel_unavailable"));
                     }
                 }
+            } else if expires_at.is_some_and(|expiry| expiry <= db::now()) {
+                diagnostic.reason = AffinityReason::Expired;
+                diagnostic.expires_at = expires_at;
             }
             return Ok(Some(Binding {
                 fingerprint,
+                rule_id: diagnostic.rule_id.clone(),
+                diagnostic,
+                sequence: self
+                    .sequence
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    + 1,
                 ttl_secs: rule.ttl_secs,
                 release_on_failure: rule.release_on_failure,
             }));
         }
         Ok(None)
     }
-    pub async fn finish(&self, binding: &Binding, candidate: &str, success: bool) {
+    fn expires_at(&self, key: &str) -> Option<i64> {
+        self.local
+            .as_ref()?
+            .expires_at(key)
+            .ok()
+            .flatten()
+            .and_then(|expiry| i64::try_from(expiry.as_secs()).ok())
+    }
+    pub async fn finish(
+        &self,
+        binding: &Binding,
+        candidate: &str,
+        provider: &str,
+        success: bool,
+    ) -> Vec<AffinityDiagnostic> {
+        let event = |reason, expires_at| AffinityDiagnostic {
+            rule_id: binding.rule_id.clone(),
+            scope_digest: binding.fingerprint.clone(),
+            reason,
+            provider_id: Some(safe_identity(provider)),
+            expires_at,
+        };
+        let mut diagnostics = if success {
+            vec![]
+        } else {
+            vec![event(AffinityReason::CandidateFailed, None)]
+        };
         let Some(lock) = self.switch_lock(&binding.fingerprint) else {
-            return;
+            return diagnostics;
         };
         let Ok(_guard) = tokio::time::timeout(Duration::from_secs(2), lock.lock_owned()).await
         else {
-            return;
+            return diagnostics;
         };
         let current = self
             .backend
@@ -316,15 +396,27 @@ impl Cache {
             .await
             .ok()
             .flatten();
+        // The sequence is process-local and only orders this derived cache's
+        // writes, never authorization or durable facts. Late success/failure
+        // cannot replace/release a newer successful decision.
+        if self
+            .completed_sequences
+            .get(&binding.fingerprint)
+            .is_some_and(|sequence| sequence > binding.sequence)
+        {
+            return diagnostics;
+        }
         if success
             && current
                 .as_ref()
                 .is_some_and(|entry| entry.response == candidate)
         {
-            return;
+            self.completed_sequences
+                .insert(binding.fingerprint.clone(), binding.sequence);
+            return diagnostics;
         }
         if success {
-            let _ = self
+            if self
                 .backend
                 .async_set_cache(
                     &binding.fingerprint,
@@ -337,14 +429,31 @@ impl Cache {
                         ..Default::default()
                     },
                 )
-                .await;
+                .await
+                .is_ok()
+            {
+                self.completed_sequences
+                    .insert(binding.fingerprint.clone(), binding.sequence);
+                diagnostics.push(event(
+                    AffinityReason::Established,
+                    self.expires_at(&binding.fingerprint),
+                ));
+            }
         } else if binding.release_on_failure
             && current
                 .as_ref()
                 .is_some_and(|entry| entry.response == candidate)
+            && self
+                .backend
+                .async_delete_cache(&binding.fingerprint)
+                .await
+                .is_ok()
         {
-            let _ = self.backend.async_delete_cache(&binding.fingerprint).await;
+            self.completed_sequences
+                .insert(binding.fingerprint.clone(), binding.sequence);
+            diagnostics.push(event(AffinityReason::Released, None));
         }
+        diagnostics
     }
 }
 
@@ -367,7 +476,16 @@ mod tests {
     {
         let cache = Arc::new(Cache::default());
         let binding = Binding {
-            fingerprint: "hashed-scope".into(),
+            fingerprint: blake3::hash(b"hashed-scope").to_hex().to_string(),
+            rule_id: "test".into(),
+            diagnostic: AffinityDiagnostic {
+                rule_id: "test".into(),
+                scope_digest: blake3::hash(b"hashed-scope").to_hex().to_string(),
+                reason: AffinityReason::First,
+                provider_id: None,
+                expires_at: None,
+            },
+            sequence: 1,
             ttl_secs: 60,
             release_on_failure: true,
         };
@@ -376,14 +494,14 @@ mod tests {
             let cache = cache.clone();
             let binding = binding.clone();
             tasks.push(tokio::spawn(async move {
-                cache.finish(&binding, "a", true).await
+                cache.finish(&binding, "a", "provider-a", true).await
             }));
         }
         for task in tasks {
-            task.await.unwrap()
+            task.await.unwrap();
         }
-        cache.finish(&binding, "b", true).await;
-        cache.finish(&binding, "a", false).await;
+        cache.finish(&binding, "b", "provider-b", true).await;
+        cache.finish(&binding, "a", "provider-a", false).await;
         assert_eq!(
             cache
                 .backend
@@ -394,7 +512,7 @@ mod tests {
                 .response,
             "b"
         );
-        cache.finish(&binding, "b", false).await;
+        cache.finish(&binding, "b", "provider-b", false).await;
         assert!(
             cache
                 .backend
