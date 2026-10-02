@@ -184,7 +184,7 @@ describe('the key table reports the state admission enforces', () => {
     expect(within(dialog).getByRole('combobox', { name: 'Owner' })).toHaveValue('')
   })
 
-  it('keeps an in-flight create bound to the project that submitted it', async () => {
+  it('keeps an in-flight create bound to its project and clears its token after a project switch', async () => {
     const post = deferred()
     const base = apiMock({ projects: [project, otherProject] })
     const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
@@ -202,8 +202,9 @@ describe('the key table reports the state admission enforces', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Project B' }))
     post.release()
 
-    const secretDialog = await screen.findByRole('dialog', { name: 'API key created' })
-    expect(within(secretDialog).getByText('pg_project_a_once')).toBeInTheDocument()
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Create API key' })).not.toBeInTheDocument())
+    expect(screen.queryByRole('dialog', { name: 'API key created' })).not.toBeInTheDocument()
+    expect(screen.queryByText('pg_project_a_once')).not.toBeInTheDocument()
     expect(sent(fetchMock)[0][0]).toBe('/api/admin/v1/projects/p1/api-keys')
     expect(sent(fetchMock).some(([path]) => String(path).includes('/projects/p2/'))).toBe(false)
   })

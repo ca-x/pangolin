@@ -258,3 +258,57 @@ describe('OIDC provider policy and branding administration', () => {
     })).toBe(true))
   })
 })
+
+describe('safe key client onboarding', () => {
+  const project = { id: 'project-a', name: 'Project A', slug: 'project-a', enabled: true, is_default: true }
+  const key = { id: 'key-a', name: 'Client key', key_prefix: 'pg_test', scopes: ['gateway:use'], enabled: true, key_type: 'service', expires_at: null, budget_micros: null, spent_micros: 0, last_used_at: null, profile_id: null, allowed_ips_json: '[]', denied_ips_json: '[]', lifecycle: 'active' }
+  beforeEach(async () => { await i18n.changeLanguage('en'); localStorage.clear() })
+  function setup() {
+    let keys: typeof key[] = []
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input)
+      if (path.endsWith('/projects')) return response([project])
+      if (path.includes('/permissions')) return response(['api_key:manage'])
+      if (path.includes('/client-models?')) return response({ models: [{ id: 'public' }] })
+      if (path.endsWith('/rotate') && init?.method === 'POST') return response({ key, token: 'rotated-secret' })
+      if (path.endsWith('/api-keys')) {
+        if (init?.method === 'POST') { keys = [key]; return response({ key, token: 'created-secret', mode: 'generated' }) }
+        return response(keys)
+      }
+      return response({ data: [] })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    render(<QueryClientProvider client={client}><MemoryRouter><ProjectProvider><AccessPage /><ConfirmHost /></ProjectProvider></MemoryRouter></QueryClientProvider>)
+    return { client, fetchMock }
+  }
+  async function createKey() {
+    await userEvent.click(await screen.findByRole('button', { name: 'Create API key' }))
+    await userEvent.type(screen.getByLabelText(/Key name/), 'Client key')
+    await userEvent.click(screen.getByRole('button', { name: 'Save' }))
+    await screen.findByText(/wire_api/)
+  }
+  it('shows a create token once, drops mutation token state, and reconnects using the environment', async () => {
+    const { client, fetchMock } = setup()
+    await createKey()
+    expect(screen.getByText(/wire_api/)).toHaveTextContent('created-secret')
+    await userEvent.click(screen.getByRole('button', { name: 'Close' }))
+    await userEvent.click(await screen.findByRole('button', { name: 'Connect Client key' }))
+    expect(await screen.findByText(/wire_api/)).toHaveTextContent('env_key = "PANGOLIN_API_KEY"')
+    expect(screen.queryByText(/created-secret/)).not.toBeInTheDocument()
+    await waitFor(() => expect(JSON.stringify(client.getMutationCache().getAll().map((mutation) => mutation.state.data))).not.toContain('created-secret'))
+    expect(fetchMock.mock.calls.some(([path]) => String(path).includes('/recovery'))).toBe(false)
+    expect(JSON.stringify(Object.entries(localStorage))).not.toContain('created-secret')
+  })
+  it('offers the rotated token and setup while retaining one-time close semantics', async () => {
+    setup()
+    await createKey()
+    await userEvent.click(screen.getByRole('button', { name: 'Close' }))
+    await userEvent.click(await screen.findByRole('button', { name: 'Rotate Client key' }))
+    const confirmation = await screen.findByRole('dialog')
+    await userEvent.click(within(confirmation).getByRole('button', { name: 'Rotate' }))
+    expect(await screen.findByText(/wire_api/)).toHaveTextContent('rotated-secret')
+    await userEvent.click(screen.getByRole('button', { name: 'Close' }))
+    expect(screen.queryByText(/rotated-secret/)).not.toBeInTheDocument()
+  })
+})

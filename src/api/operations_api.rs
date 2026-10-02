@@ -146,6 +146,10 @@ pub(super) fn router(state: AppState) -> Router<AppState> {
         .layer(axum::extract::DefaultBodyLimit::max(128 * 1024));
     Router::new()
         .route(
+            "/api/admin/v1/projects/{project}/api-keys/{key}/client-models",
+            get(client_models),
+        )
+        .route(
             "/api/admin/v1/settings/request-logging",
             get(log_policy).put(set_log_policy),
         )
@@ -5231,4 +5235,142 @@ async fn retry_backup(
     let user = actor(&state, &headers, Some(&project), true).await?;
     let id = backup::retry_as(&state, &project, &job, Some(&user)).await?;
     Ok(Json(json!({"id":id})))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClientModelsQuery {
+    endpoint: String,
+    stream: Option<bool>,
+}
+
+/// Read-only setup projection. Console authentication is never used as routing
+/// input or converted to gateway credentials; the target key remains the policy
+/// principal, and no admission, last-use write or external I/O is performed.
+async fn client_models(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((project, key_id)): Path<(String, String)>,
+    Query(query): Query<ClientModelsQuery>,
+) -> Result<Json<Value>, ApiError> {
+    // This browser setup read delegates the *target* key's routing policy from a
+    // session, just like Playground. Never fall back to bearer authentication:
+    // that normal path updates last_used_at and is not a read-only setup action.
+    let mut session_headers = headers.clone();
+    session_headers.remove(http::header::AUTHORIZATION);
+    session_headers.remove("x-api-key");
+    let principal = actor_for(
+        &state,
+        &session_headers,
+        Some(&project),
+        "api_key:manage",
+        false,
+    )
+    .await?;
+    if principal.kind != crate::access::PrincipalKind::Session {
+        return Err(ApiError::Forbidden);
+    }
+    let endpoint = query.endpoint.as_str();
+    if !matches!(
+        endpoint,
+        "/v1/responses"
+            | "/v1/messages"
+            | "/v1/chat/completions"
+            | "/v1beta/models:generateContent"
+            | "/v1beta/models:streamGenerateContent"
+    ) {
+        return Err(ApiError::BadRequest("unsupported client endpoint".into()));
+    }
+    let enabled = state
+        .db
+        .query_one(sql(
+            "SELECT id FROM projects WHERE id=? AND enabled=1",
+            vec![project.clone().into()],
+        ))
+        .await?;
+    if enabled.is_none() {
+        return Err(ApiError::NotFound);
+    }
+    let key = db::api_key_credential_by_id(&state.db, &project, &key_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    let scopes = serde_json::from_str::<Vec<String>>(&key.scopes).unwrap_or_default();
+    if !scopes
+        .iter()
+        .any(|scope| matches!(scope.as_str(), "gateway" | "gateway:use" | "*"))
+        || key
+            .budget_micros
+            .is_some_and(|budget| key.spent_micros >= budget)
+    {
+        return Err(ApiError::Forbidden);
+    }
+    let stream = endpoint.ends_with(":streamGenerateContent")
+        || query
+            .stream
+            .unwrap_or(matches!(endpoint, "/v1/responses" | "/v1/messages"));
+    // A setup read has no operator cookie, bearer, sample or affinity header.
+    let context_headers = HeaderMap::new();
+    let visible = crate::orchestration::visible_models_with_metadata_for(
+        &state.db,
+        &key,
+        &context_headers,
+        &[endpoint],
+    )
+    .await?;
+    // Isolated transient runtime prevents setup from advancing routing counters,
+    // circuits or sticky state belonging to real requests.
+    let runtime = crate::orchestration::Runtime::default();
+    let mut models = Vec::new();
+    for mut model in visible {
+        let Some(name) = model["id"].as_str() else {
+            continue;
+        };
+        let payload = match endpoint {
+            "/v1/responses" => json!({"model":name,"input":"Hello","stream":stream}),
+            "/v1/messages" => {
+                json!({"model":name,"messages":[{"role":"user","content":"Hello"}],"max_tokens":1024,"stream":stream})
+            }
+            "/v1/chat/completions" => {
+                json!({"model":name,"messages":[{"role":"user","content":"Hello"}],"stream":stream})
+            }
+            _ => {
+                json!({"model":name,"contents":[{"role":"user","parts":[{"text":"Hello"}]}],"stream":stream})
+            }
+        };
+        let profile = crate::orchestration::load_profile(&state.db, &key).await?;
+        let plan = match crate::orchestration::prepare(
+            &state.db,
+            &runtime,
+            &key,
+            profile,
+            payload,
+            &context_headers,
+            endpoint,
+        )
+        .await
+        {
+            Ok(plan) => plan,
+            Err(
+                crate::orchestration::Error::Forbidden | crate::orchestration::Error::Invalid(_),
+            ) => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if plan.candidates.is_empty() {
+            continue;
+        }
+        let cards = plan
+            .candidates
+            .iter()
+            .map(|candidate| candidate.model_card.clone())
+            .collect::<Vec<_>>();
+        // Metadata describes the candidates that actually support this setup shape.
+        if let Some(card) = crate::catalog::types::ModelCardProjection::aggregate(&cards) {
+            model["metadata"] =
+                serde_json::to_value(card).map_err(|error| ApiError::Internal(error.into()))?;
+        } else if let Some(object) = model.as_object_mut() {
+            object.remove("metadata");
+        }
+        models.push(model);
+    }
+    Ok(Json(json!({"models":models})))
 }

@@ -6,6 +6,7 @@ import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 import { api, type AnalyticsRow, type Document } from '../api'
 import { confirmAction, EmptyState, EnabledPill, InlineQueryError, Modal, SecretInput, SelectField, SkeletonRows } from '../components'
+import { ClientSetupDialog } from './ClientSetupDialog'
 import { AllowedModelsEditor, ProfileMappingsEditor, RoutingPolicyEditor } from './documentEditors'
 import { UNMEASURED, formatCount, formatMicros } from '../observability'
 import { projectOperationPath, useProject } from '../project'
@@ -456,14 +457,17 @@ function KeysPanel() {
   const [scopeError, setScopeError] = useState<string | null>(null)
   const [createError, setCreateError] = useState<string | null>(null)
   const [usageKey, setUsageKey] = useState<{ projectId: string; key: ScopedKey } | null>(null)
-  const [token, setToken] = useState<{ value: string; title: string; description: string } | null>(null)
+  const [token, setToken] = useState<{ value: string; title: string; description: string; projectId: string; keyId: string; keyName: string } | null>(null)
+  const [setupKey, setSetupKey] = useState<{ projectId: string; key: ScopedKey } | null>(null)
+  const activeProject = useRef(project.id)
+  activeProject.current = project.id
   const [profile, setProfile] = useState('__none__')
   // The profile options and the bulk selection both belong to a project, so both are
   // dropped when the project changes: the selection names keys of the project it was
   // made in, and the panel is kept mounted across a project switch now, so it would
   // otherwise stand over another project's rows and offer to act on ids that are not
   // on screen. Keeping the array identity when it is already empty avoids a re-render.
-  useEffect(() => { setProfile('__none__'); setEditProfile('__none__'); setOwner(''); setOwnerError(null); setUsageKey(null); setSelected((current) => current.length ? [] : current) }, [project.id])
+  useEffect(() => { setProfile('__none__'); setEditProfile('__none__'); setOwner(''); setOwnerError(null); setUsageKey(null); setToken(null); create.reset(); rotate.reset(); setSetupKey(null); setSelected((current) => current.length ? [] : current) }, [project.id])
   const [editProfile, setEditProfile] = useState('__none__')
   const path = keysPath(project.id)
   const query = useQuery({ queryKey: ['keys', project.id], queryFn: () => api<ScopedKey[]>(path) })
@@ -478,17 +482,20 @@ function KeysPanel() {
   }))
   type CreateKeyMutation = { projectId: string; body: unknown }
   const create = useMutation({
+    gcTime: 0,
     mutationFn: ({ projectId, body }: CreateKeyMutation) => api<{ key: ScopedKey; token?: string; mode: string }>(keysPath(projectId), { method: 'POST', body: JSON.stringify(body) }),
-    onSuccess: (data, variables) => { void client.invalidateQueries({ queryKey: ['keys', variables.projectId] }); setOpen(false); if (data.token) setToken({ value: data.token, title: t('keyCreated'), description: t('keyCreatedHint') }); else toast.success(t('importComplete')) },
+    onSuccess: (data, variables) => { void client.invalidateQueries({ queryKey: ['keys', variables.projectId] }); setOpen(false); if (data.token && activeProject.current === variables.projectId) setToken({ value: data.token, title: t('keyCreated'), description: t('keyCreatedHint'), projectId: variables.projectId, keyId: data.key.id, keyName: data.key.name }); else if (!data.token) toast.success(t('importComplete')); create.reset() },
     onError: (error: Error) => setCreateError(error.message),
   })
   const update = useMutation({ mutationFn: ({ projectId, id, body }: { projectId: string; id: string; body: unknown }) => api(`${keysPath(projectId)}/${id}`, { method: 'PATCH', body: JSON.stringify(body) }), onSuccess: (_, variables) => { setEditing(null); setEditProfile('__none__'); void client.invalidateQueries({ queryKey: ['keys', variables.projectId] }) }, onError: (error: Error) => toast.error(error.message) })
   type KeyAction = { projectId: string; projectName: string; keyId: string; keyName: string }
   const rotate = useMutation({
+    gcTime: 0,
     mutationFn: ({ projectId, keyId }: KeyAction) => api<{ key: ScopedKey; token: string }>(`${keysPath(projectId)}/${keyId}/rotate`, { method: 'POST' }),
     onSuccess: async (data, variables) => {
       await client.invalidateQueries({ queryKey: ['keys', variables.projectId] })
-      setToken({ value: data.token, title: t('keyRotated'), description: t('keyRotatedHint', { name: variables.keyName, project: variables.projectName }) })
+      if (activeProject.current === variables.projectId) setToken({ value: data.token, title: t('keyRotated'), description: t('keyRotatedHint', { name: variables.keyName, project: variables.projectName }), projectId: variables.projectId, keyId: data.key.id, keyName: variables.keyName })
+      rotate.reset()
     },
     onError: (error: Error) => toast.error(error.message),
   })
@@ -629,6 +636,7 @@ function KeysPanel() {
                     </Table.Td>
                     <Table.Td>
                       <Group gap={4} justify="flex-end" wrap="nowrap">
+                        <Button variant="subtle" size="compact-sm" disabled={state !== 'usable' || !key.scopes?.some((scope) => ['gateway', 'gateway:use', '*'].includes(scope))} title={t('clientKeyUnavailable')} aria-label={`${t('clientConnect')} ${key.name}`} onClick={() => setSetupKey({ projectId: project.id, key })}>{t('clientConnect')}</Button>
                         <Button variant="subtle" size="compact-sm" leftSection={<BarChart3 size={15} />} aria-label={`${t('usage')} ${key.name}`} onClick={() => setUsageKey({ projectId: project.id, key })}>{t('usage')}</Button>
                         {key.lifecycle !== 'archived' && <>
                           <Button variant="subtle" size="compact-sm" leftSection={<RotateCw size={15} />} aria-label={`${t('rotate')} ${key.name}`} onClick={() => { const action = { projectId: project.id, projectName: project.name, keyId: key.id, keyName: key.name }; confirmAction({ title: t('rotateKeyTitle', { name: action.keyName }), body: t('rotateKeyBody', { project: action.projectName }), confirmLabel: t('rotate'), onConfirm: () => rotate.mutateAsync(action) }) }}>{t('rotate')}</Button>
@@ -716,12 +724,8 @@ function KeysPanel() {
           </Stack>
         </form>
       </Modal>
-      <Modal open={Boolean(token)} onOpenChange={(value) => !value && setToken(null)} title={token?.title || t('keyCreated')} description={token?.description || t('keyCreatedHint')}>
-        <Stack gap="md">
-          <Code block>{token?.value}</Code>
-          <Button onClick={() => token && navigator.clipboard.writeText(token.value)}>{t('copy')}</Button>
-        </Stack>
-      </Modal>
+      {token && token.projectId === project.id && <ClientSetupDialog key={`token:${token.projectId}:${token.keyId}`} projectId={token.projectId} keyId={token.keyId} keyName={token.keyName} token={token.value} title={token.title} description={token.description} onClose={() => { setToken(null); create.reset(); rotate.reset() }} />}
+      {setupKey && setupKey.projectId === project.id && <ClientSetupDialog key={`setup:${setupKey.projectId}:${setupKey.key.id}`} projectId={setupKey.projectId} keyId={setupKey.key.id} keyName={setupKey.key.name} onClose={() => setSetupKey(null)} />}
       {usageKey && <KeyUsageDialog key={`${usageKey.projectId}:${usageKey.key.id}`} projectId={usageKey.projectId} apiKey={usageKey.key} onClose={() => setUsageKey(null)} />}
     </>
   )

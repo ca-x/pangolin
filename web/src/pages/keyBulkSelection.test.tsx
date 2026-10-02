@@ -263,7 +263,7 @@ describe('api keys can be selected and acted on together', () => {
     expect(vi.mocked(toast.success)).toHaveBeenCalledTimes(1)
   })
 
-  it('keeps a confirmed rotate attributed to the project and key where it started', async () => {
+  it('keeps rotate bound to its original key and clears the token after a project switch', async () => {
     const otherProject = { id: 'p2', name: 'Project B', slug: 'project-b', owner_user_id: 'u1', is_default: false, enabled: true }
     const fetchMock = vi.fn((input: RequestInfo | URL) => {
       const path = String(input)
@@ -282,10 +282,10 @@ describe('api keys can be selected and acted on together', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Project B' }))
     await userEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Rotate' }))
 
-    await screen.findByText('pg_p1_rotated')
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
+    expect(screen.queryByText('pg_p1_rotated')).not.toBeInTheDocument()
     const call = fetchMock.mock.calls.find(([input]) => String(input).endsWith('/projects/p1/api-keys/k1/rotate'))
     expect(call).toBeTruthy()
-    expect(within(screen.getByRole('dialog')).getByText(/ci-runner/)).toBeInTheDocument()
-    expect(within(screen.getByRole('dialog')).getByText(/Project A/)).toBeInTheDocument()
+    expect(fetchMock.mock.calls.some(([input]) => String(input).endsWith('/projects/p2/api-keys/k1/rotate'))).toBe(false)
   })
 })

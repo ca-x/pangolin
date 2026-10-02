@@ -12617,3 +12617,206 @@ async fn reference_inventory_review_fingerprint_tracks_only_discovery_inputs() {
         capture(&f).await.config_fingerprint
     );
 }
+
+async fn client_models_read(f: &Fixture, cookie: &str, endpoint: &str) -> axum::response::Response {
+    let key = f
+        .state
+        .db
+        .query_one(ops::sql("SELECT id FROM api_keys LIMIT 1", vec![]))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get::<String>("", "id")
+        .unwrap();
+    admin(
+        f,
+        cookie,
+        http::Method::GET,
+        &format!(
+            "/api/admin/v1/projects/{}/api-keys/{}/client-models?endpoint={endpoint}",
+            db::DEFAULT_PROJECT_ID,
+            key
+        ),
+        Value::Null,
+        false,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn reference_client_models_scope_lifecycle_and_read_only() {
+    let f = fixture(success()).await;
+    let cookie = owner(&f).await;
+    let key = db::authenticate_api_key(&f.state.db, &f.token, None)
+        .await
+        .unwrap()
+        .unwrap();
+    sql(&f, "UPDATE api_keys SET last_used_at=NULL", vec![]).await;
+    let before_jobs = count(&f, "SELECT COUNT(*) AS n FROM operation_jobs").await;
+    let before_audit = count(&f, "SELECT COUNT(*) AS n FROM audit_events").await;
+    let response = client_models_read(&f, &cookie, "/v1/chat/completions").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(body["models"][0]["id"], "public");
+    for secret in [
+        &f.token,
+        &key.key_hash,
+        "key_hash",
+        "token",
+        "secret_envelope",
+    ] {
+        assert!(!body.to_string().contains(secret));
+    }
+    assert_eq!(
+        count(
+            &f,
+            "SELECT COUNT(*) AS n FROM api_keys WHERE last_used_at IS NOT NULL"
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        count(&f, "SELECT COUNT(*) AS n FROM operation_jobs").await,
+        before_jobs
+    );
+    assert_eq!(
+        count(&f, "SELECT COUNT(*) AS n FROM audit_events").await,
+        before_audit
+    );
+    assert_eq!(
+        client_models_read(&f, &cookie, "/v1/embeddings")
+            .await
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    for update in [
+        "enabled=0",
+        "expires_at=1",
+        "lifecycle='archived'",
+        "scopes='[\"project:read\"]'",
+        "budget_micros=0",
+    ] {
+        sql(&f, "UPDATE api_keys SET enabled=1,expires_at=NULL,lifecycle='active',scopes='[\"gateway\"]',budget_micros=NULL", vec![]).await;
+        sql(&f, &format!("UPDATE api_keys SET {update}"), vec![]).await;
+        let path = format!(
+            "/api/admin/v1/projects/{}/api-keys/{}/client-models?endpoint=/v1/chat/completions",
+            db::DEFAULT_PROJECT_ID,
+            key.id
+        );
+        assert_ne!(
+            admin(&f, &cookie, http::Method::GET, &path, Value::Null, false)
+                .await
+                .status(),
+            StatusCode::OK,
+            "{update}"
+        );
+    }
+    sql(&f,"INSERT INTO projects(id,name,slug,is_default,enabled,created_at,updated_at) VALUES('setup-foreign','Foreign','setup-foreign',0,1,1,1)",vec![]).await;
+    let foreign = admin(
+        &f,
+        &cookie,
+        http::Method::GET,
+        &format!(
+            "/api/admin/v1/projects/setup-foreign/api-keys/{}/client-models?endpoint=/v1/responses",
+            key.id
+        ),
+        Value::Null,
+        false,
+    )
+    .await;
+    assert_eq!(foreign.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn reference_client_models_profile_alias_and_stream_policy() {
+    let f = fixture(success()).await;
+    let cookie = owner(&f).await;
+    sql(&f,"INSERT INTO api_key_profiles(id,project_id,name,routing_policy_json,created_at,updated_at) VALUES('setup-profile',?,'setup','{\"version\":1,\"allowed_endpoints\":[\"/v1/chat/completions\"]}',0,0)",vec![db::DEFAULT_PROJECT_ID.into()]).await;
+    sql(&f, "UPDATE api_keys SET profile_id='setup-profile'", vec![]).await;
+    sql(&f,"INSERT INTO api_key_profile_model_mappings(id,profile_id,source_model,target_model) VALUES('setup-mapping','setup-profile','client-alias','public')",vec![]).await;
+    sql(&f,"INSERT INTO api_key_profile_allowed_models(profile_id,model_pattern,match_type) VALUES('setup-profile','client-alias','exact')",vec![]).await;
+    let response = client_models_read(&f, &cookie, "/v1/chat/completions").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(body["models"].as_array().unwrap().len(), 1);
+    assert_eq!(body["models"][0]["id"], "client-alias");
+    assert_eq!(
+        json_body(client_models_read(&f, &cookie, "/v1/responses").await).await["models"],
+        json!([])
+    );
+    sql(
+        &f,
+        "UPDATE channel_settings SET model_rules_json='{\"version\":1,\"stream\":false}'",
+        vec![],
+    )
+    .await;
+    assert_eq!(
+        json_body(client_models_read(&f, &cookie, "/v1/chat/completions&stream=true").await).await
+            ["models"],
+        json!([])
+    );
+    assert_eq!(
+        json_body(client_models_read(&f, &cookie, "/v1/chat/completions&stream=false").await).await
+            ["models"][0]["id"],
+        "client-alias"
+    );
+}
+
+#[tokio::test]
+async fn reference_client_models_principal_project_and_adapter_boundaries() {
+    let f = fixture(success()).await;
+    let cookie = owner(&f).await;
+    let key = db::authenticate_api_key(&f.state.db, &f.token, None)
+        .await
+        .unwrap()
+        .unwrap();
+    let path = format!(
+        "/api/admin/v1/projects/{}/api-keys/{}/client-models?endpoint=/v1/responses",
+        db::DEFAULT_PROJECT_ID,
+        key.id
+    );
+    sql(&f, "UPDATE api_keys SET last_used_at=NULL", vec![]).await;
+    let response = router(f.state.clone())
+        .oneshot(
+            Request::get(&path)
+                .header("authorization", format!("Bearer {}", f.token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        count(
+            &f,
+            "SELECT COUNT(*) AS n FROM api_keys WHERE last_used_at IS NOT NULL"
+        )
+        .await,
+        0
+    );
+    sql(&f, "UPDATE projects SET enabled=0", vec![]).await;
+    assert_eq!(
+        client_models_read(&f, &cookie, "/v1/responses")
+            .await
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    sql(&f, "UPDATE projects SET enabled=1", vec![]).await;
+    // Provider support, not a metadata `streaming=true`, decides real CLI routes.
+    sql(&f, "UPDATE providers SET kind='anthropic'", vec![]).await;
+    sql(&f,"UPDATE models SET catalog_metadata_json='{\"version\":1,\"card\":{\"capabilities\":{\"streaming\":true}}}'",vec![]).await;
+    assert_eq!(
+        json_body(client_models_read(&f, &cookie, "/v1/responses&stream=true").await).await["models"],
+        json!([])
+    );
+    assert_eq!(
+        json_body(client_models_read(&f, &cookie, "/v1/messages&stream=true").await).await["models"]
+            [0]["id"],
+        "public"
+    );
+    sql(&f, "UPDATE models SET enabled=0", vec![]).await;
+    assert_eq!(
+        json_body(client_models_read(&f, &cookie, "/v1/messages&stream=true").await).await["models"],
+        json!([])
+    );
+}
