@@ -26,7 +26,7 @@ The user explicitly requested `ddia-principles`. Apply the existing [full-parity
 - Composite ownership constraints and short consistent reads prevent cross-project references and mixing old inventory with newly rotated credentials.
 - Perform external I/O first, then revalidate meaningful identity/configuration and lease fence inside atomic activation/audit; retries have durable operation identities.
 - Validity uses actual credential/discovery inputs, not generic wall-clock `updated_at`; label/priority/routing-only edits do not invalidate supplier observations. Instant measures durations; wall time labels dates and expiry.
-- Additive versioned fields/defaults preserve old data and immutable financial history. Unknown quantity/price facts remain distinct from measured zero.
+- Additive versioned fields/defaults preserve old data and immutable financial history. Unknown quantity/price facts remain distinct from measured zero. Version-30 usage measurement metadata stores closed Boolean trust flags independently of pricing status; historical empty metadata is unspecified, numeric compatibility columns remain intact, and scoped/live/rebuilt measured projections exclude unknown placeholders.
 - Provider observations and analytical projections may be stale/partial, while authorization and budgets fail closed. The supported system remains single-node, without a distributed consistency or consensus claim.
 
 ## Commands
