@@ -7,6 +7,7 @@ Module id: `probe-measurement`. Shared authority: `specs/SPEC-reference-adoption
 - Existing first-event timeout, terminal detection and irreversible stream commitment remain intact. Historical probe header timing is retained under response_headers_ms; historical first-event times are not relabeled first text.
 - Manual probe accepts a configured conversational endpoint, optional credential_id and stream boolean; omitted options preserve provider-family defaults. Validate project/provider/model/credential/endpoint eligibility before enqueue and before I/O; use saved endpoint/proxy settings.
 - Bound probe response to 1 MiB and total execution to 30 seconds; use known stable error codes, no saved raw response. Verify output shape and protocol terminal rather than accepting arbitrary HTTP-200 JSON. Persist results through existing durable job fencing and health behavior.
+- Probe output-token measurements require a trustworthy final protocol report. Intermediate progress counters, including initial Anthropic output0, stay unmeasured when no final output usage arrives. Genuine final zero stays measured; nonstream or missing-first-text replies have no fabricated token generation rate.
 - Console exposes protocol/credential/stream selection and the three distinct measurements with useful unknown/error/loading states.
 
 ## Commands
