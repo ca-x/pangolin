@@ -5,6 +5,7 @@ pub mod discovery;
 pub mod framing;
 #[cfg(test)]
 mod tests;
+pub mod timing;
 pub mod tokens;
 mod transforms;
 mod upstream;

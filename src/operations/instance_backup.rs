@@ -448,14 +448,10 @@ pub(crate) async fn rebuild_projection(state: &AppState) -> Result<usize, ApiErr
                       e.http_status AS http_status,
                       e.error_kind AS error_kind,
                       COALESCE(e.latency_ms, 0) AS latency_ms,
-                      -- `first_token_at` is milliseconds since the epoch, built as
-                      -- `started_at * 1000 + elapsed`. Subtracting the second-based
-                      -- `started_at` and multiplying the difference by 1000 — as
-                      -- this read used to — reported a first byte a thousand
-                      -- centuries away. The analytics breakdown has always used
-                      -- this form.
-                      CASE WHEN e.first_token_at IS NULL THEN NULL
-                           ELSE e.first_token_at - e.started_at * 1000 END AS ttft_ms,
+                      e.response_headers_ms AS response_headers_ms,
+                      e.first_event_ms AS first_event_ms,
+                      e.first_text_ms AS first_text_ms,
+                      e.first_text_ms AS ttft_ms,
                       COALESCE(u.input_tokens, 0) AS input_tokens,
                       COALESCE(u.output_tokens, 0) AS output_tokens,
                       COALESCE(u.cache_read_tokens, 0) AS cached_tokens,
@@ -518,6 +514,9 @@ pub(crate) async fn rebuild_projection(state: &AppState) -> Result<usize, ApiErr
             error_kind: row.try_get("", "error_kind").ok().flatten(),
             latency_ms: row.try_get("", "latency_ms").unwrap_or_default(),
             ttft_ms: row.try_get("", "ttft_ms").ok().flatten(),
+            response_headers_ms: row.try_get("", "response_headers_ms").ok().flatten(),
+            first_event_ms: row.try_get("", "first_event_ms").ok().flatten(),
+            first_text_ms: row.try_get("", "first_text_ms").ok().flatten(),
             input_tokens: row.try_get("", "input_tokens").unwrap_or_default(),
             output_tokens: row.try_get("", "output_tokens").unwrap_or_default(),
             cached_tokens: row.try_get("", "cached_tokens").unwrap_or_default(),

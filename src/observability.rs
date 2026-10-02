@@ -42,6 +42,12 @@ pub struct RequestEvent {
     pub error_kind: Option<String>,
     pub latency_ms: i64,
     pub ttft_ms: Option<i64>,
+    #[serde(default)]
+    pub response_headers_ms: Option<i64>,
+    #[serde(default)]
+    pub first_event_ms: Option<i64>,
+    #[serde(default)]
+    pub first_text_ms: Option<i64>,
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub cached_tokens: i64,
@@ -194,9 +200,11 @@ pub struct RequestListItem {
     /// Which key made the request, so the log can be filtered by it.
     pub api_key_id: Option<String>,
     pub latency_ms: i64,
-    /// Time to the first streamed byte, or `None` when none was measured: a
-    /// non-stream response legitimately has no first byte to time.
+    /// First visible text in a streamed response, when observed.
     pub ttft_ms: Option<i64>,
+    pub response_headers_ms: Option<i64>,
+    pub first_event_ms: Option<i64>,
+    pub first_text_ms: Option<i64>,
     pub input_tokens: i64,
     pub output_tokens: i64,
     /// Cache-read tokens the provider reported for this request.
@@ -852,7 +860,7 @@ impl ObservationStore {
 
 /// Bump whenever `request_events` changes shape. A mismatch drops the projection
 /// and asks the caller to re-derive it from the record system.
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 fn initialize(path: &Path) -> Result<bool> {
     let connection = Connection::open(path).context("failed to open DuckDB observation store")?;
@@ -901,7 +909,10 @@ fn initialize(path: &Path) -> Result<bool> {
             -- Nullable: a stream decision nobody recorded is NULL, never a false.
             stream BOOLEAN,
             -- Appended: the direct peer recorded by SQLite, never a forwarding header.
-            source_ip VARCHAR
+            source_ip VARCHAR,
+            response_headers_ms BIGINT,
+            first_event_ms BIGINT,
+            first_text_ms BIGINT
         );
         CREATE INDEX IF NOT EXISTS idx_request_events_started ON request_events(started_at);
         CREATE INDEX IF NOT EXISTS idx_request_events_external ON request_events(request_id);
@@ -954,7 +965,7 @@ fn insert_batch(connection: &Connection, events: &[Box<RequestEvent>]) -> Result
 
 fn insert(connection: &Connection, event: &RequestEvent) -> Result<()> {
     connection.execute(
-        "INSERT OR REPLACE INTO request_events VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT OR REPLACE INTO request_events VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         params![
             event.id,
             event.request_id,
@@ -981,7 +992,10 @@ fn insert(connection: &Connection, event: &RequestEvent) -> Result<()> {
             event.cache_write_tokens,
             event.reasoning_tokens,
             event.stream,
-            event.source_ip
+            event.source_ip,
+            event.response_headers_ms,
+            event.first_event_ms,
+            event.first_text_ms
         ],
     )?;
     Ok(())
@@ -1096,7 +1110,7 @@ fn query_list(connection: &Connection, filter: &RequestFilter) -> Result<Vec<Req
     prepare_request_facets(connection, filter)?;
     let limit = filter.limit.unwrap_or(100).clamp(1, 500) as i64;
     let mut statement = connection.prepare(
-        "SELECT id,request_id,started_at,endpoint,provider,requested_model,resolved_model,status_code,error_kind,api_key_id,latency_ms,input_tokens,output_tokens,cost_micros,ttft_ms,cached_tokens,cache_write_tokens,reasoning_tokens,stream FROM request_events WHERE (? IS NULL OR project_id=?) AND (? IS NULL OR status_code=?) AND (? IS NULL OR status_code IN (SELECT value FROM request_filter_status_codes)) AND (? IS NULL OR provider=?) AND (? IS NULL OR provider IN (SELECT value FROM request_filter_providers)) AND (? IS NULL OR requested_model=? OR resolved_model=?) AND (? IS NULL OR requested_model IN (SELECT value FROM request_filter_models) OR resolved_model IN (SELECT value FROM request_filter_models)) AND (? IS NULL OR api_key_id=?) AND (? IS NULL OR api_key_id IN (SELECT value FROM request_filter_api_key_ids)) AND (? IS NULL OR started_at>=?) AND (? IS NULL OR started_at<=?) ORDER BY started_at DESC,id DESC LIMIT ? OFFSET ?",
+        "SELECT id,request_id,started_at,endpoint,provider,requested_model,resolved_model,status_code,error_kind,api_key_id,latency_ms,input_tokens,output_tokens,cost_micros,ttft_ms,cached_tokens,cache_write_tokens,reasoning_tokens,stream,response_headers_ms,first_event_ms,first_text_ms FROM request_events WHERE (? IS NULL OR project_id=?) AND (? IS NULL OR status_code=?) AND (? IS NULL OR status_code IN (SELECT value FROM request_filter_status_codes)) AND (? IS NULL OR provider=?) AND (? IS NULL OR provider IN (SELECT value FROM request_filter_providers)) AND (? IS NULL OR requested_model=? OR resolved_model=?) AND (? IS NULL OR requested_model IN (SELECT value FROM request_filter_models) OR resolved_model IN (SELECT value FROM request_filter_models)) AND (? IS NULL OR api_key_id=?) AND (? IS NULL OR api_key_id IN (SELECT value FROM request_filter_api_key_ids)) AND (? IS NULL OR started_at>=?) AND (? IS NULL OR started_at<=?) ORDER BY started_at DESC,id DESC LIMIT ? OFFSET ?",
     )?;
     let rows = statement.query_map(
         params![
@@ -1143,6 +1157,9 @@ fn query_list(connection: &Connection, filter: &RequestFilter) -> Result<Vec<Req
                 cache_write_tokens: row.get(16)?,
                 reasoning_tokens: row.get(17)?,
                 stream: row.get(18)?,
+                response_headers_ms: row.get(19)?,
+                first_event_ms: row.get(20)?,
+                first_text_ms: row.get(21)?,
             })
         },
     )?;
@@ -1230,6 +1247,9 @@ fn query_one(
         reasoning_tokens: row.get(23)?,
         stream: row.get(24)?,
         source_ip: row.get(25)?,
+        response_headers_ms: row.get(26)?,
+        first_event_ms: row.get(27)?,
+        first_text_ms: row.get(28)?,
     }))
 }
 
@@ -1259,6 +1279,9 @@ mod tests {
             error_kind: None,
             latency_ms: 42,
             ttft_ms: None,
+            response_headers_ms: None,
+            first_event_ms: None,
+            first_text_ms: None,
             input_tokens: 10,
             output_tokens: 4,
             cached_tokens: 0,
@@ -1392,6 +1415,9 @@ mod tests {
             error_kind: None,
             latency_ms: 42,
             ttft_ms: None,
+            response_headers_ms: None,
+            first_event_ms: None,
+            first_text_ms: None,
             input_tokens: 10,
             output_tokens: 4,
             cached_tokens: 0,
@@ -2267,6 +2293,9 @@ mod tests {
             error_kind: None,
             latency_ms: 0,
             ttft_ms: None,
+            response_headers_ms: None,
+            first_event_ms: None,
+            first_text_ms: None,
             input_tokens: 0,
             output_tokens: 0,
             cached_tokens: 0,

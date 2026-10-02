@@ -7538,7 +7538,7 @@ async fn task5_probe_quota_collector_and_invalid_schedule_isolation() {
 }
 
 #[tokio::test]
-async fn channel_probe_uses_the_requested_model_and_refuses_a_model_from_another_channel() {
+async fn reference_probe_uses_the_requested_model_and_refuses_a_model_from_another_channel() {
     let f = fixture(Router::new().route(
         "/v1/chat/completions",
         post(|Json(body): Json<Value>| async move {
@@ -7559,7 +7559,7 @@ async fn channel_probe_uses_the_requested_model_and_refuses_a_model_from_another
     let cookie = owner(&f).await;
     sql(
         &f,
-        "INSERT INTO models(id,provider_id,public_name,upstream_name,capabilities,priority,enabled,created_at) VALUES('probe-chosen',?,'chosen','chosen-upstream','[]',0,1,1)",
+        "INSERT INTO models(id,provider_id,public_name,upstream_name,capabilities,priority,enabled,created_at) VALUES('probe-chosen',?,'chosen','chosen-upstream','[\"chat\"]',0,1,1)",
         vec![f.providers[0].clone().into()],
     )
     .await;
@@ -7598,12 +7598,7 @@ async fn channel_probe_uses_the_requested_model_and_refuses_a_model_from_another
     );
     assert!(probe.try_get::<bool>("", "success").unwrap());
     assert_eq!(probe.try_get::<i64>("", "output_tokens").unwrap(), 5);
-    assert!(
-        probe
-            .try_get::<Option<i64>>("", "ttft_ms")
-            .unwrap()
-            .is_some()
-    );
+    assert_eq!(probe.try_get::<Option<i64>>("", "ttft_ms").unwrap(), None);
 
     let foreign_model = f
         .state
@@ -7630,7 +7625,7 @@ async fn channel_probe_uses_the_requested_model_and_refuses_a_model_from_another
     let refusal = json_body(refused).await;
     assert_eq!(
         refusal["error"]["message"],
-        json!("model is not enabled for this channel")
+        json!("probe model or credential is not enabled for this channel")
     );
 }
 
@@ -9078,6 +9073,9 @@ fn projected(
         error_kind: None,
         latency_ms: 12,
         ttft_ms: None,
+        response_headers_ms: None,
+        first_event_ms: None,
+        first_text_ms: None,
         input_tokens,
         output_tokens,
         cached_tokens: 0,
@@ -9951,6 +9949,9 @@ fn aged_event(request_id: &str, project: &str) -> RequestEvent {
         error_kind: None,
         latency_ms: 12,
         ttft_ms: None,
+        response_headers_ms: None,
+        first_event_ms: None,
+        first_text_ms: None,
         input_tokens: 1,
         output_tokens: 1,
         cached_tokens: 0,
@@ -10662,4 +10663,789 @@ async fn a_model_can_be_created_on_several_channels_atomically() {
     )
     .await;
     assert_eq!(edit.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn reference_probe_rejects_ineligible_selection_before_network() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counted = calls.clone();
+    let f = fixture(Router::new().route(
+        "/v1/chat/completions",
+        post(move || {
+            counted.fetch_add(1, Ordering::Relaxed);
+            async { Json(json!({"choices":[{"message":{"content":"OK"}}]})) }
+        }),
+    ))
+    .await;
+    let cookie = owner(&f).await;
+    let project = db::DEFAULT_PROJECT_ID;
+    let path = format!("/api/admin/v1/projects/{project}/operations/probe");
+    let model: String = f
+        .state
+        .db
+        .query_one(ops::sql(
+            "SELECT id FROM models WHERE provider_id=? LIMIT 1",
+            vec![f.providers[0].clone().into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "id")
+        .unwrap();
+    sql(
+        &f,
+        "UPDATE models SET capabilities='[\"chat\"]' WHERE id=?",
+        vec![model.clone().into()],
+    )
+    .await;
+    let foreign_credential: String = f
+        .state
+        .db
+        .query_one(ops::sql(
+            "SELECT id FROM channel_credentials WHERE provider_id=? LIMIT 1",
+            vec![f.providers[1].clone().into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "id")
+        .unwrap();
+    for extra in [
+        json!({"credential_id":foreign_credential}),
+        json!({"endpoint":"/v1/embeddings"}),
+        json!({"endpoint":"/v1/responses"}),
+        json!({"stream":"yes"}),
+    ] {
+        let mut body = json!({"provider_id":f.providers[0],"model_id":model});
+        body.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        assert_eq!(
+            admin(&f, &cookie, http::Method::POST, &path, body, true)
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+    sql(
+        &f,
+        "UPDATE models SET enabled=0 WHERE id=?",
+        vec![model.clone().into()],
+    )
+    .await;
+    assert_eq!(
+        admin(
+            &f,
+            &cookie,
+            http::Method::POST,
+            &path,
+            json!({"provider_id":f.providers[0],"model_id":model}),
+            true
+        )
+        .await
+        .status(),
+        StatusCode::BAD_REQUEST
+    );
+    sql(
+        &f,
+        "UPDATE models SET enabled=1 WHERE id=?",
+        vec![model.clone().into()],
+    )
+    .await;
+    sql(
+        &f,
+        "UPDATE channel_settings SET model_rules_json='[]' WHERE provider_id=?",
+        vec![f.providers[0].clone().into()],
+    )
+    .await;
+    assert_eq!(
+        admin(
+            &f,
+            &cookie,
+            http::Method::POST,
+            &path,
+            json!({"provider_id":f.providers[0],"model_id":model}),
+            true
+        )
+        .await
+        .status(),
+        StatusCode::BAD_REQUEST
+    );
+    sql(&f, "UPDATE channel_settings SET model_rules_json='{\"version\":1}',endpoint_mappings_json='[]' WHERE provider_id=?", vec![f.providers[0].clone().into()]).await;
+    assert_eq!(
+        admin(
+            &f,
+            &cookie,
+            http::Method::POST,
+            &path,
+            json!({"provider_id":f.providers[0],"model_id":model}),
+            true
+        )
+        .await
+        .status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        count(
+            &f,
+            "SELECT COUNT(*) AS n FROM operation_jobs WHERE kind='probe'"
+        )
+        .await,
+        0
+    );
+}
+
+#[tokio::test]
+async fn reference_probe_uses_saved_path_and_rejects_unrelated_http_200() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counted = calls.clone();
+    let f = fixture(Router::new().route(
+        "/custom/chat",
+        post(move || {
+            counted.fetch_add(1, Ordering::Relaxed);
+            async { Json(json!({"unrelated":"object"})) }
+        }),
+    ))
+    .await;
+    let model: String = f
+        .state
+        .db
+        .query_one(ops::sql(
+            "SELECT id FROM models WHERE provider_id=? LIMIT 1",
+            vec![f.providers[0].clone().into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "id")
+        .unwrap();
+    sql(
+        &f,
+        "UPDATE channel_settings SET endpoint_mappings_json=? WHERE provider_id=?",
+        vec![
+            json!({"version":1,"paths":{"/v1/chat/completions":"/custom/chat"}})
+                .to_string()
+                .into(),
+            f.providers[0].clone().into(),
+        ],
+    )
+    .await;
+    ops::jobs::enqueue(
+        &f.state.db,
+        Some(db::DEFAULT_PROJECT_ID),
+        "probe",
+        "reference-invalid-json",
+        &json!({"provider_id":f.providers[0],"model_id":model}),
+        db::now(),
+    )
+    .await
+    .unwrap();
+    let claim = ops::jobs::claim(&f.state.db, "worker", db::now(), 120)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(ops::runtime::execute(&f.state, &claim).await.is_err());
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    let row = f.state.db.query_one(ops::sql("SELECT error_code,endpoint,stream,first_text_ms,response_headers_ms FROM channel_probes WHERE provider_id=?",vec![f.providers[0].clone().into()])).await.unwrap().unwrap();
+    assert_eq!(
+        row.try_get::<String>("", "error_code").unwrap(),
+        "invalid_response"
+    );
+    assert_eq!(
+        row.try_get::<String>("", "endpoint").unwrap(),
+        "/v1/chat/completions"
+    );
+    assert!(!row.try_get::<bool>("", "stream").unwrap());
+    assert_eq!(
+        row.try_get::<Option<i64>>("", "first_text_ms").unwrap(),
+        None
+    );
+    assert!(
+        row.try_get::<Option<i64>>("", "response_headers_ms")
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn reference_probe_stream_records_headers_event_text_and_terminal() {
+    let events = concat!(
+        "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n",
+        ": heartbeat\n\n",
+        "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"hidden\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"content\":\"OK\"}}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let f = fixture(Router::new().route(
+        "/v1/chat/completions",
+        post(move || async move { ([(header::CONTENT_TYPE, "text/event-stream")], events) }),
+    ))
+    .await;
+    let model: String = f
+        .state
+        .db
+        .query_one(ops::sql(
+            "SELECT id FROM models WHERE provider_id=? LIMIT 1",
+            vec![f.providers[0].clone().into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "id")
+        .unwrap();
+    ops::jobs::enqueue(
+        &f.state.db,
+        Some(db::DEFAULT_PROJECT_ID),
+        "probe",
+        "reference-stream",
+        &json!({"provider_id":f.providers[0],"model_id":model,"stream":true}),
+        db::now(),
+    )
+    .await
+    .unwrap();
+    let claim = ops::jobs::claim(&f.state.db, "worker", db::now(), 120)
+        .await
+        .unwrap()
+        .unwrap();
+    ops::runtime::execute(&f.state, &claim).await.unwrap();
+    let row = f.state.db.query_one(ops::sql("SELECT response_headers_ms,first_event_ms,first_text_ms,ttft_ms,success FROM channel_probes WHERE provider_id=?",vec![f.providers[0].clone().into()])).await.unwrap().unwrap();
+    let headers = row.try_get::<i64>("", "response_headers_ms").unwrap();
+    let event = row.try_get::<i64>("", "first_event_ms").unwrap();
+    let text = row.try_get::<i64>("", "first_text_ms").unwrap();
+    assert!(headers <= event && event <= text);
+    assert_eq!(row.try_get::<i64>("", "ttft_ms").unwrap(), text);
+    assert!(row.try_get::<bool>("", "success").unwrap());
+    let cookie = owner(&f).await;
+    let listed = json_body(
+        admin(
+            &f,
+            &cookie,
+            http::Method::GET,
+            &format!(
+                "/api/admin/v1/projects/{}/operations/probes?provider_id={}",
+                db::DEFAULT_PROJECT_ID,
+                f.providers[0]
+            ),
+            Value::Null,
+            false,
+        )
+        .await,
+    )
+    .await;
+    let public = &listed["data"][0];
+    assert_eq!(public["stream"], json!(true));
+    assert_eq!(public["endpoint"], json!("/v1/chat/completions"));
+    for field in ["response_headers_ms", "first_event_ms", "first_text_ms"] {
+        assert!(
+            public[field].as_i64().is_some(),
+            "missing {field} in scoped probe read"
+        );
+    }
+}
+
+#[tokio::test]
+async fn reference_probe_stream_without_terminal_is_fenced_failure() {
+    let f = fixture(Router::new().route(
+        "/v1/chat/completions",
+        post(|| async {
+            (
+                [(header::CONTENT_TYPE, "text/event-stream")],
+                "data: {\"choices\":[{\"delta\":{\"content\":\"OK\"}}]}\n\n",
+            )
+        }),
+    ))
+    .await;
+    let model: String = f
+        .state
+        .db
+        .query_one(ops::sql(
+            "SELECT id FROM models WHERE provider_id=? LIMIT 1",
+            vec![f.providers[0].clone().into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "id")
+        .unwrap();
+    ops::jobs::enqueue(
+        &f.state.db,
+        Some(db::DEFAULT_PROJECT_ID),
+        "probe",
+        "reference-interrupted",
+        &json!({"provider_id":f.providers[0],"model_id":model,"stream":true}),
+        db::now(),
+    )
+    .await
+    .unwrap();
+    let claim = ops::jobs::claim(&f.state.db, "worker", db::now(), 120)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(ops::runtime::execute(&f.state, &claim).await.is_err());
+    let row = f
+        .state
+        .db
+        .query_one(ops::sql(
+            "SELECT error_code,first_text_ms,success FROM channel_probes WHERE provider_id=?",
+            vec![f.providers[0].clone().into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row.try_get::<String>("", "error_code").unwrap(),
+        "missing_terminal"
+    );
+    assert!(
+        row.try_get::<Option<i64>>("", "first_text_ms")
+            .unwrap()
+            .is_some()
+    );
+    assert!(!row.try_get::<bool>("", "success").unwrap());
+}
+
+#[tokio::test]
+async fn reference_timing_gateway_tool_only_stream_has_no_first_text() {
+    let events = concat!(
+        "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{}\"}}]}}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let f = fixture(Router::new().route(
+        "/v1/chat/completions",
+        post(move || async move { ([(header::CONTENT_TYPE, "text/event-stream")], events) }),
+    ))
+    .await;
+    let response = request(&f, "/v1/chat/completions", streaming()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let row = f.state.db.query_one(ops::sql("SELECT status,response_headers_ms,first_event_ms,first_text_ms,first_token_at FROM request_executions ORDER BY started_at DESC LIMIT 1",vec![])).await.unwrap().unwrap();
+    assert_eq!(row.try_get::<String>("", "status").unwrap(), "succeeded");
+    assert!(
+        row.try_get::<Option<i64>>("", "response_headers_ms")
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        row.try_get::<Option<i64>>("", "first_event_ms")
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        row.try_get::<Option<i64>>("", "first_text_ms").unwrap(),
+        None
+    );
+    assert_eq!(
+        row.try_get::<Option<i64>>("", "first_token_at").unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
+async fn reference_probe_rechecks_selection_after_enqueue_and_before_io() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counted = calls.clone();
+    let f = fixture(Router::new().route(
+        "/v1/chat/completions",
+        post(move || {
+            counted.fetch_add(1, Ordering::Relaxed);
+            async { Json(json!({"choices":[{"message":{"content":"OK"}}]})) }
+        }),
+    ))
+    .await;
+    let model: String = f
+        .state
+        .db
+        .query_one(ops::sql(
+            "SELECT id FROM models WHERE provider_id=? LIMIT 1",
+            vec![f.providers[0].clone().into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "id")
+        .unwrap();
+    ops::jobs::enqueue(
+        &f.state.db,
+        Some(db::DEFAULT_PROJECT_ID),
+        "probe",
+        "reference-disabled-after-enqueue",
+        &json!({"provider_id":f.providers[0],"model_id":model}),
+        db::now(),
+    )
+    .await
+    .unwrap();
+    sql(
+        &f,
+        "UPDATE models SET enabled=0 WHERE id=?",
+        vec![model.into()],
+    )
+    .await;
+    let claim = ops::jobs::claim(&f.state.db, "worker", db::now(), 120)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(ops::runtime::execute(&f.state, &claim).await.is_err());
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        count(&f, "SELECT COUNT(*) AS n FROM channel_probes").await,
+        0
+    );
+}
+
+#[tokio::test]
+async fn reference_probe_enforces_one_mib_response_limit() {
+    let oversized = "x".repeat(1024 * 1024 + 1);
+    let f = fixture(Router::new().route(
+        "/v1/chat/completions",
+        post(move || {
+            let oversized = oversized.clone();
+            async move { ([(header::CONTENT_TYPE, "application/json")], oversized) }
+        }),
+    ))
+    .await;
+    let model: String = f
+        .state
+        .db
+        .query_one(ops::sql(
+            "SELECT id FROM models WHERE provider_id=? LIMIT 1",
+            vec![f.providers[0].clone().into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "id")
+        .unwrap();
+    ops::jobs::enqueue(
+        &f.state.db,
+        Some(db::DEFAULT_PROJECT_ID),
+        "probe",
+        "reference-oversize",
+        &json!({"provider_id":f.providers[0],"model_id":model}),
+        db::now(),
+    )
+    .await
+    .unwrap();
+    let claim = ops::jobs::claim(&f.state.db, "worker", db::now(), 120)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(ops::runtime::execute(&f.state, &claim).await.is_err());
+    let row = f
+        .state
+        .db
+        .query_one(ops::sql(
+            "SELECT error_code,success FROM channel_probes WHERE provider_id=?",
+            vec![f.providers[0].clone().into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row.try_get::<String>("", "error_code").unwrap(),
+        "invalid_response"
+    );
+    assert!(!row.try_get::<bool>("", "success").unwrap());
+}
+
+#[tokio::test]
+async fn reference_timing_gateway_first_text_follows_role_and_reasoning() {
+    let events = concat!(
+        "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"private\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"content\":\"OK\"}}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let f = fixture(Router::new().route(
+        "/v1/chat/completions",
+        post(move || async move { ([(header::CONTENT_TYPE, "text/event-stream")], events) }),
+    ))
+    .await;
+    let response = request(&f, "/v1/chat/completions", streaming()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let row = f.state.db.query_one(ops::sql("SELECT response_headers_ms,first_event_ms,first_text_ms,first_token_at FROM request_executions ORDER BY started_at DESC LIMIT 1",vec![])).await.unwrap().unwrap();
+    let headers = row.try_get::<i64>("", "response_headers_ms").unwrap();
+    let event = row.try_get::<i64>("", "first_event_ms").unwrap();
+    let text = row.try_get::<i64>("", "first_text_ms").unwrap();
+    assert!(headers <= event && event <= text);
+    assert!(
+        row.try_get::<Option<i64>>("", "first_token_at")
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn reference_probe_accepts_responses_messages_and_gemini_native_output() {
+    let f = fixture(Router::new()
+        .route("/v1/responses",post(|| async {
+            Json(json!({"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"OK"}]}]}))
+        }))
+        .route("/v1/messages",post(|| async {
+            Json(json!({"stop_reason":"end_turn","content":[{"type":"text","text":"OK"}]}))
+        }))
+        .route("/v1beta/models/a-model:generateContent",post(|| async {
+            Json(json!({"candidates":[{"content":{"parts":[{"text":"OK"}]},"finishReason":"STOP"}]}))
+        }))).await;
+    let model: String = f
+        .state
+        .db
+        .query_one(ops::sql(
+            "SELECT id FROM models WHERE provider_id=? LIMIT 1",
+            vec![f.providers[0].clone().into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "id")
+        .unwrap();
+    let credential: String = f
+        .state
+        .db
+        .query_one(ops::sql(
+            "SELECT id FROM channel_credentials WHERE provider_id=? LIMIT 1",
+            vec![f.providers[0].clone().into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "id")
+        .unwrap();
+    for (kind, capability, endpoint) in [
+        ("openai", "responses", "/v1/responses"),
+        ("anthropic", "messages", "/v1/messages"),
+        ("gemini", "gemini", "/v1beta/models:generateContent"),
+    ] {
+        sql(
+            &f,
+            "UPDATE providers SET kind=? WHERE id=?",
+            vec![kind.into(), f.providers[0].clone().into()],
+        )
+        .await;
+        sql(
+            &f,
+            "UPDATE models SET capabilities=? WHERE id=?",
+            vec![json!([capability]).to_string().into(), model.clone().into()],
+        )
+        .await;
+        ops::jobs::enqueue(&f.state.db,Some(db::DEFAULT_PROJECT_ID),"probe",&format!("reference-{kind}"),&json!({"provider_id":f.providers[0],"model_id":model,"credential_id":credential,"endpoint":endpoint}),db::now()).await.unwrap();
+        let claim = ops::jobs::claim(&f.state.db, "worker", db::now(), 120)
+            .await
+            .unwrap()
+            .unwrap();
+        ops::runtime::execute(&f.state, &claim).await.unwrap();
+        ops::jobs::finish(&f.state.db, &claim, db::now(), true)
+            .await
+            .unwrap();
+        let row = f
+            .state
+            .db
+            .query_one(ops::sql(
+                "SELECT success,credential_id,ttft_ms,endpoint FROM channel_probes WHERE id=?",
+                vec![format!("{}:{}", claim.id, claim.attempts).into()],
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(row.try_get::<bool>("", "success").unwrap());
+        assert_eq!(
+            row.try_get::<String>("", "credential_id").unwrap(),
+            credential
+        );
+        assert_eq!(row.try_get::<String>("", "endpoint").unwrap(), endpoint);
+        assert_eq!(row.try_get::<Option<i64>>("", "ttft_ms").unwrap(), None);
+    }
+}
+
+#[tokio::test]
+async fn reference_probe_lost_fence_discards_interrupted_result() {
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let start = Arc::new(tokio::sync::Mutex::new(Some(started_tx)));
+    let release = Arc::new(tokio::sync::Mutex::new(Some(release_rx)));
+    let f = fixture(Router::new().route("/v1/chat/completions",post(move || {
+        let start = start.clone();
+        let release = release.clone();
+        async move {
+            let stream = async_stream::stream! {
+                yield Ok::<_,std::io::Error>(Bytes::from_static(b"data: {\"choices\":[{\"delta\":{\"content\":\"OK\"}}]}\n\n"));
+                if let Some(sender) = start.lock().await.take() { let _ = sender.send(()); }
+                if let Some(receiver) = release.lock().await.take() { let _ = receiver.await; }
+                yield Ok::<_,std::io::Error>(Bytes::from_static(b"data: [DONE]\n\n"));
+            };
+            ([(header::CONTENT_TYPE,"text/event-stream")],Body::from_stream(stream))
+        }
+    }))).await;
+    let model: String = f
+        .state
+        .db
+        .query_one(ops::sql(
+            "SELECT id FROM models WHERE provider_id=? LIMIT 1",
+            vec![f.providers[0].clone().into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "id")
+        .unwrap();
+    ops::jobs::enqueue(
+        &f.state.db,
+        Some(db::DEFAULT_PROJECT_ID),
+        "probe",
+        "reference-stale-fence",
+        &json!({"provider_id":f.providers[0],"model_id":model,"stream":true}),
+        db::now(),
+    )
+    .await
+    .unwrap();
+    let claim = ops::jobs::claim(&f.state.db, "worker", db::now(), 120)
+        .await
+        .unwrap()
+        .unwrap();
+    let state = f.state.clone();
+    let worker_claim = claim.clone();
+    let work = tokio::spawn(async move { ops::runtime::execute(&state, &worker_claim).await });
+    started_rx.await.unwrap();
+    sql(
+        &f,
+        "UPDATE operation_jobs SET owner='stolen' WHERE id=?",
+        vec![claim.id.clone().into()],
+    )
+    .await;
+    release_tx.send(()).unwrap();
+    assert!(work.await.unwrap().is_err());
+    assert_eq!(
+        count(&f, "SELECT COUNT(*) AS n FROM channel_probes").await,
+        0
+    );
+}
+
+#[tokio::test]
+async fn reference_probe_terminal_only_has_no_first_text() {
+    let f = fixture(Router::new().route(
+        "/v1/chat/completions",
+        post(|| async {
+            (
+                [(header::CONTENT_TYPE, "text/event-stream")],
+                "data: [DONE]\n\n",
+            )
+        }),
+    ))
+    .await;
+    let model: String = f
+        .state
+        .db
+        .query_one(ops::sql(
+            "SELECT id FROM models WHERE provider_id=? LIMIT 1",
+            vec![f.providers[0].clone().into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "id")
+        .unwrap();
+    ops::jobs::enqueue(
+        &f.state.db,
+        Some(db::DEFAULT_PROJECT_ID),
+        "probe",
+        "reference-terminal-only",
+        &json!({"provider_id":f.providers[0],"model_id":model,"stream":true}),
+        db::now(),
+    )
+    .await
+    .unwrap();
+    let claim = ops::jobs::claim(&f.state.db, "worker", db::now(), 120)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(ops::runtime::execute(&f.state, &claim).await.is_err());
+    let row = f.state.db.query_one(ops::sql("SELECT error_code,first_event_ms,first_text_ms FROM channel_probes WHERE provider_id=?",vec![f.providers[0].clone().into()])).await.unwrap().unwrap();
+    assert_eq!(
+        row.try_get::<String>("", "error_code").unwrap(),
+        "empty_response"
+    );
+    assert!(
+        row.try_get::<Option<i64>>("", "first_event_ms")
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        row.try_get::<Option<i64>>("", "first_text_ms").unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
+async fn reference_probe_native_stream_protocols_require_their_own_terminal() {
+    let f = fixture(Router::new()
+        .route("/v1/responses",post(|| async {
+            ([(header::CONTENT_TYPE,"text/event-stream")],concat!(
+                "data: {\"type\":\"response.created\"}\n\n",
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"OK\"}\n\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
+            ))
+        }))
+        .route("/v1/messages",post(|| async {
+            ([(header::CONTENT_TYPE,"text/event-stream")],concat!(
+                "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{}}\n\n",
+                "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"OK\"}}\n\n",
+                "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+            ))
+        }))
+        .route("/v1beta/models/a-model:streamGenerateContent",post(|| async {
+            ([(header::CONTENT_TYPE,"text/event-stream")],concat!(
+                "data: {\"candidates\":[{\"content\":{\"parts\":[{\"thought\":true,\"text\":\"hidden\"}]}}]}\n\n",
+                "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"OK\"}]},\"finishReason\":\"STOP\"}]}\n\n"
+            ))
+        }))).await;
+    let model: String = f
+        .state
+        .db
+        .query_one(ops::sql(
+            "SELECT id FROM models WHERE provider_id=? LIMIT 1",
+            vec![f.providers[0].clone().into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "id")
+        .unwrap();
+    for (kind, capability, endpoint) in [
+        ("openai", "responses", "/v1/responses"),
+        ("anthropic", "messages", "/v1/messages"),
+        ("gemini", "gemini", "/v1beta/models:streamGenerateContent"),
+    ] {
+        sql(
+            &f,
+            "UPDATE providers SET kind=? WHERE id=?",
+            vec![kind.into(), f.providers[0].clone().into()],
+        )
+        .await;
+        sql(
+            &f,
+            "UPDATE models SET capabilities=? WHERE id=?",
+            vec![json!([capability]).to_string().into(), model.clone().into()],
+        )
+        .await;
+        ops::jobs::enqueue(&f.state.db,Some(db::DEFAULT_PROJECT_ID),"probe",&format!("reference-native-stream-{kind}"),&json!({"provider_id":f.providers[0],"model_id":model,"endpoint":endpoint,"stream":true}),db::now()).await.unwrap();
+        let claim = ops::jobs::claim(&f.state.db, "worker", db::now(), 120)
+            .await
+            .unwrap()
+            .unwrap();
+        ops::runtime::execute(&f.state, &claim).await.unwrap();
+        ops::jobs::finish(&f.state.db, &claim, db::now(), true)
+            .await
+            .unwrap();
+        let row = f.state.db.query_one(ops::sql("SELECT success,first_event_ms,first_text_ms,ttft_ms FROM channel_probes WHERE id=?",vec![format!("{}:{}",claim.id,claim.attempts).into()])).await.unwrap().unwrap();
+        assert!(row.try_get::<bool>("", "success").unwrap());
+        assert!(
+            row.try_get::<Option<i64>>("", "first_event_ms")
+                .unwrap()
+                .is_some()
+        );
+        let first_text = row.try_get::<i64>("", "first_text_ms").unwrap();
+        assert_eq!(row.try_get::<i64>("", "ttft_ms").unwrap(), first_text);
+    }
 }

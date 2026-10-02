@@ -569,6 +569,7 @@ async fn execute_inner(
             // covers every later branch: the encoding refusal, the failure paths and
             // the stream/non-stream successes.
             attempt.observed_status(status.as_u16());
+            attempt.response_headers();
             if upstream
                 .headers()
                 .get_all(header::CONTENT_ENCODING)
@@ -633,7 +634,7 @@ async fn execute_inner(
                             ));
                         }
                     };
-                attempt.first_byte();
+                attempt.first_event(&first.data);
                 if let Some(scope) = &websocket_scope {
                     let pinned = state
                         .orchestrator
@@ -660,6 +661,7 @@ async fn execute_inner(
                     let mut event=first;
                     loop {
                         let terminal=terminal_state.terminal(&event,endpoint);
+                        attempt.first_event(&event.data);
                         attempt.stream_event(&event.event,&event.data,terminal);
                         let failed=sse::failed(&event);
                         if let Some(response)=sse::completed_response(&event)
@@ -852,6 +854,9 @@ pub(super) async fn discovery_response(
             error_kind: None,
             latency_ms: 0,
             ttft_ms: None,
+            response_headers_ms: None,
+            first_event_ms: None,
+            first_text_ms: None,
             input_tokens: 0,
             output_tokens: 0,
             cached_tokens: 0,

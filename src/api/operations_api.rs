@@ -1533,7 +1533,7 @@ fn query(resource: &str) -> Result<(&'static str, &'static str, &'static str), A
         "executions" => (
             "request_executions",
             "request_id IN (SELECT r.id FROM requests r JOIN traces t ON t.id=r.trace_id WHERE t.project_id=?)",
-            "json_object('id',id,'request_id',request_id,'provider_id',provider_id,'provider_name',provider_name,'credential_suffix',credential_suffix,'attempt',attempt,'model',model,'status',status,'retry_reason',retry_reason,'latency_ms',latency_ms,'first_token_at',first_token_at,'http_status',http_status,'error_kind',error_kind)",
+            "json_object('id',id,'request_id',request_id,'provider_id',provider_id,'provider_name',provider_name,'credential_suffix',credential_suffix,'attempt',attempt,'model',model,'status',status,'retry_reason',retry_reason,'latency_ms',latency_ms,'response_headers_ms',response_headers_ms,'first_event_ms',first_event_ms,'first_text_ms',first_text_ms,'first_token_at',first_token_at,'http_status',http_status,'error_kind',error_kind)",
         ),
         "usage" => (
             "usage_logs",
@@ -1553,7 +1553,7 @@ fn query(resource: &str) -> Result<(&'static str, &'static str, &'static str), A
         "probes" => (
             "channel_probes",
             "provider_id IN (SELECT id FROM providers WHERE project_id=?)",
-            "json_object('id',id,'provider_id',provider_id,'model',model,'success',success,'status_code',status_code,'latency_ms',latency_ms,'ttft_ms',ttft_ms,'output_tokens',output_tokens,'probed_at',probed_at,'error',error_code)",
+            "json_object('id',id,'provider_id',provider_id,'model',model,'success',success,'status_code',status_code,'latency_ms',latency_ms,'response_headers_ms',response_headers_ms,'first_event_ms',first_event_ms,'first_text_ms',first_text_ms,'ttft_ms',ttft_ms,'endpoint',endpoint,'stream',json(CASE WHEN stream IS NULL THEN 'null' WHEN stream=1 THEN 'true' ELSE 'false' END),'credential_id',credential_id,'output_tokens',output_tokens,'probed_at',probed_at,'error',error_code)",
         ),
         "quotas" => (
             "provider_quota_snapshots",
@@ -2673,7 +2673,7 @@ async fn analytics(
         "project" => "r.project_id",
         _ => return Err(ApiError::BadRequest("unknown analytics dimension".into())),
     };
-    let rows=state.db.query_all(sql(format!("SELECT json_object('dimension',{dimension},'requests',COUNT(DISTINCT r.id),'attempts',COUNT(e.id),'errors',SUM(e.status!='succeeded'),'sample_count',COUNT(DISTINCT CASE WHEN e.status='succeeded' AND x.latency_ms>0 AND u.id IS NOT NULL THEN r.id END),'usage_measured',CASE WHEN COUNT(u.id)>0 THEN json('true') ELSE json('false') END,'input_tokens',COALESCE(SUM(u.input_tokens),0),'output_tokens',COALESCE(SUM(u.output_tokens),0),'cache_hit_tokens',COALESCE(SUM(u.cache_read_tokens),0),'cache_savings_micros',COALESCE(SUM(u.cache_savings_micros),0),'cost_micros',COALESCE(SUM(u.total_cost_micros),0),'latency_ms',AVG(x.latency_ms),'ttft_ms',AVG(x.first_token_at-x.started_at*1000),'tokens_per_second',AVG(CASE WHEN u.id IS NOT NULL AND x.latency_ms>0 THEN CAST(u.output_tokens AS REAL)*1000.0/x.latency_ms END)) AS document FROM request_facts r JOIN execution_facts e ON e.request_id=r.id LEFT JOIN usage_logs u ON u.execution_id=e.id LEFT JOIN request_executions x ON x.id=e.id WHERE r.project_id=? AND r.started_at>=? AND r.started_at<? AND (? IS NULL OR e.model_id=?) AND (? IS NULL OR e.provider_id=?) AND (? IS NULL OR r.api_key_id=?) GROUP BY {dimension} ORDER BY {dimension} LIMIT 500"),vec![project.into(),filter.from.unwrap_or(db::now()-86400*30).into(),filter.until.unwrap_or(db::now()+1).into(),filter.model.clone().into(),filter.model.into(),filter.provider.clone().into(),filter.provider.into(),filter.api_key.clone().into(),filter.api_key.into()])).await?;
+    let rows=state.db.query_all(sql(format!("SELECT json_object('dimension',{dimension},'requests',COUNT(DISTINCT r.id),'attempts',COUNT(e.id),'errors',SUM(e.status!='succeeded'),'sample_count',COUNT(DISTINCT CASE WHEN e.status='succeeded' AND x.latency_ms>0 AND u.id IS NOT NULL THEN r.id END),'usage_measured',CASE WHEN COUNT(u.id)>0 THEN json('true') ELSE json('false') END,'input_tokens',COALESCE(SUM(u.input_tokens),0),'output_tokens',COALESCE(SUM(u.output_tokens),0),'cache_hit_tokens',COALESCE(SUM(u.cache_read_tokens),0),'cache_savings_micros',COALESCE(SUM(u.cache_savings_micros),0),'cost_micros',COALESCE(SUM(u.total_cost_micros),0),'latency_ms',AVG(x.latency_ms),'ttft_ms',AVG(x.first_text_ms),'tokens_per_second',AVG(CASE WHEN u.id IS NOT NULL AND x.latency_ms>0 THEN CAST(u.output_tokens AS REAL)*1000.0/x.latency_ms END)) AS document FROM request_facts r JOIN execution_facts e ON e.request_id=r.id LEFT JOIN usage_logs u ON u.execution_id=e.id LEFT JOIN request_executions x ON x.id=e.id WHERE r.project_id=? AND r.started_at>=? AND r.started_at<? AND (? IS NULL OR e.model_id=?) AND (? IS NULL OR e.provider_id=?) AND (? IS NULL OR r.api_key_id=?) GROUP BY {dimension} ORDER BY {dimension} LIMIT 500"),vec![project.into(),filter.from.unwrap_or(db::now()-86400*30).into(),filter.until.unwrap_or(db::now()+1).into(),filter.model.clone().into(),filter.model.into(),filter.provider.clone().into(),filter.provider.into(),filter.api_key.clone().into(),filter.api_key.into()])).await?;
     let mut rows = documents(rows)?;
     if matches!(dimension_name, "provider" | "model") {
         add_performance_confidence(&mut rows);
@@ -4778,19 +4778,12 @@ async fn mutate(
                 return Err(ApiError::NotFound);
             }
             if resource == "probe" {
-                let model = text(&value, "model_id")?;
-                if transaction
-                    .query_one(sql(
-                        "SELECT m.id FROM models m JOIN providers p ON p.id=m.provider_id WHERE m.id=? AND m.provider_id=? AND p.project_id=? AND p.enabled=1 AND m.enabled=1 AND m.lifecycle='active'",
-                        vec![model.into(), provider.into(), project.clone().into()],
-                    ))
-                    .await?
-                    .is_none()
-                {
-                    return Err(ApiError::BadRequest(
-                        "model is not enabled for this channel".into(),
-                    ));
-                }
+                crate::operations::runtime::validate_probe_selection(
+                    &transaction,
+                    &project,
+                    &value,
+                )
+                .await?;
             }
             let job_kind = if resource == "model-sync" {
                 "model_sync"

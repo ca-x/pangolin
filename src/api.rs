@@ -1372,6 +1372,7 @@ async fn call_anthropic_chat(
     let status = upstream.status();
     if let Some(accounting) = accounting.as_deref_mut() {
         accounting.observed_status(status.as_u16());
+        accounting.response_headers();
     }
     let bytes = gateway::read_body(upstream).await?;
     let body: Value = serde_json::from_slice(&bytes)

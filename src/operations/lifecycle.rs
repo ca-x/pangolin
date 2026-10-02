@@ -271,6 +271,8 @@ impl Request {
             started: Instant::now(),
             started_at,
             ttft: None,
+            response_headers_ms: None,
+            first_event_ms: None,
             body: None,
             settled: false,
             recover_on_drop: true,
@@ -302,6 +304,8 @@ pub struct Attempt {
     started: Instant,
     started_at: i64,
     ttft: Option<i64>,
+    response_headers_ms: Option<i64>,
+    first_event_ms: Option<i64>,
     body: Option<String>,
     settled: bool,
     recover_on_drop: bool,
@@ -533,8 +537,19 @@ impl Attempt {
             body.push('\n');
         }
     }
-    pub fn first_byte(&mut self) {
-        self.ttft = Some(self.started.elapsed().as_millis() as i64)
+    pub fn response_headers(&mut self) {
+        self.response_headers_ms
+            .get_or_insert(self.started.elapsed().as_millis() as i64);
+    }
+    pub fn first_event(&mut self, data: &str) {
+        self.first_event_ms
+            .get_or_insert(self.started.elapsed().as_millis() as i64);
+        if self.ttft.is_none()
+            && serde_json::from_str::<Value>(data)
+                .is_ok_and(|value| crate::providers::timing::visible_text(&value))
+        {
+            self.ttft = Some(self.started.elapsed().as_millis() as i64);
+        }
     }
     fn capture_response_id(&mut self, value: &Value) {
         if let Some(id) = value
@@ -714,7 +729,7 @@ impl Attempt {
         .await?;
         let latency = self.started.elapsed().as_millis() as i64;
         if ctx.level != Level::Off {
-            txn.execute(sql("UPDATE request_executions SET status=?,finished_at=?,latency_ms=?,first_token_at=?,retry_reason=?,http_status=?,error_kind=? WHERE id=?",vec![status.into(),db::now().into(),latency.into(),first_token_at_ms(self.started_at,self.ttft).into(),(status!="succeeded").then_some(status.to_owned()).into(),http_status.into(),error_kind.clone().into(),self.id.clone().into()])).await?;
+            txn.execute(sql("UPDATE request_executions SET status=?,finished_at=?,latency_ms=?,first_token_at=?,response_headers_ms=?,first_event_ms=?,first_text_ms=?,retry_reason=?,http_status=?,error_kind=? WHERE id=?",vec![status.into(),db::now().into(),latency.into(),first_token_at_ms(self.started_at,self.ttft).into(),self.response_headers_ms.into(),self.first_event_ms.into(),self.ttft.into(),(status!="succeeded").then_some(status.to_owned()).into(),http_status.into(),error_kind.clone().into(),self.id.clone().into()])).await?;
             txn.execute(sql(
                 "UPDATE requests SET status=?,finished_at=? WHERE id=?",
                 vec![status.into(), db::now().into(), ctx.id.clone().into()],
@@ -752,6 +767,9 @@ impl Attempt {
                     error_kind: error_kind.clone(),
                     latency_ms: latency,
                     ttft_ms: self.ttft,
+                    response_headers_ms: self.response_headers_ms,
+                    first_event_ms: self.first_event_ms,
+                    first_text_ms: self.ttft,
                     input_tokens: self.usage.input,
                     output_tokens: self.usage.output,
                     cached_tokens: self.usage.cache_read,
@@ -792,6 +810,8 @@ impl Drop for Attempt {
             started: self.started,
             started_at: self.started_at,
             ttft: self.ttft,
+            response_headers_ms: self.response_headers_ms,
+            first_event_ms: self.first_event_ms,
             body: self.body.take(),
             settled: false,
             recover_on_drop: false,

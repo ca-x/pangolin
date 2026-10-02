@@ -414,79 +414,504 @@ async fn target(
         .to_string(),
     ))
 }
-async fn probe(state: &AppState, claim: &jobs::Claim, payload: &Value) -> Result<(), ApiError> {
-    let project = claim.project_id.as_deref().ok_or(ApiError::Forbidden)?;
+pub(crate) struct ProbeSelection {
+    target: crate::models::RouteTarget,
+    credential: String,
+    endpoint: String,
+    path: String,
+    stream: bool,
+}
+
+pub(crate) async fn validate_probe_selection<C: ConnectionTrait>(
+    connection: &C,
+    project: &str,
+    payload: &Value,
+) -> Result<ProbeSelection, ApiError> {
     let provider = payload["provider_id"].as_str().ok_or(ApiError::NotFound)?;
-    let model_id = payload["model_id"].as_str().ok_or(ApiError::NotFound)?;
-    let (target, credential, secret) = target(state, project, provider, Some(model_id)).await?;
-    let endpoint = match target.provider_kind.as_str() {
-        "anthropic" => "/v1/messages",
-        "gemini" => "/v1beta/models:generateContent",
-        _ => "/v1/chat/completions",
+    let model = payload["model_id"].as_str().ok_or(ApiError::NotFound)?;
+    let credential = match payload.get("credential_id") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(id)) if !id.is_empty() => Some(id.as_str()),
+        _ => return Err(ApiError::BadRequest("invalid probe credential".into())),
     };
-    let request = match target.provider_kind.as_str() {
-        "gemini" => {
-            json!({"model":target.upstream_name,"contents":[{"role":"user","parts":[{"text":"Reply OK"}]}],"generationConfig":{"maxOutputTokens":8}})
+    let requested_endpoint = match payload.get("endpoint") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(endpoint)) => Some(endpoint.as_str()),
+        _ => return Err(ApiError::BadRequest("invalid probe endpoint".into())),
+    };
+    let requested_stream = match payload.get("stream") {
+        None | Some(Value::Null) => None,
+        Some(Value::Bool(stream)) => Some(*stream),
+        _ => return Err(ApiError::BadRequest("invalid probe stream choice".into())),
+    };
+    let row = connection.query_one(sql(
+        "SELECT p.name,p.kind,p.base_url,c.id AS credential_id,c.credential_type,c.secret_envelope,m.public_name,m.upstream_name,m.capabilities,s.endpoint_mappings_json,s.model_rules_json,s.proxy_url,s.proxy_username,s.proxy_secret_envelope,COALESCE(s.proxy_reuse_connections,1) AS proxy_reuse_connections,s.proxy_preset_id FROM providers p JOIN models m ON m.provider_id=p.id AND m.id=? AND m.enabled=1 AND m.lifecycle='active' JOIN channel_credentials c ON c.provider_id=p.id AND c.enabled=1 LEFT JOIN channel_settings s ON s.provider_id=p.id WHERE p.id=? AND p.project_id=? AND p.enabled=1 AND (? IS NULL OR c.id=?) ORDER BY c.priority,c.id LIMIT 1",
+        vec![model.into(),provider.into(),project.into(),credential.into(),credential.into()],
+    )).await?.ok_or_else(|| ApiError::BadRequest("probe model or credential is not enabled for this channel".into()))?;
+    let kind: String = row.try_get("", "kind")?;
+    let endpoint = requested_endpoint.unwrap_or(match kind.as_str() {
+        "anthropic" => "/v1/messages",
+        "gemini" | "vertex" | "gcp" => "/v1beta/models:generateContent",
+        _ => "/v1/chat/completions",
+    });
+    if !matches!(
+        endpoint,
+        "/v1/chat/completions"
+            | "/v1/responses"
+            | "/v1/messages"
+            | "/v1beta/models:generateContent"
+            | "/v1beta/models:streamGenerateContent"
+    ) {
+        return Err(ApiError::BadRequest("unsupported probe endpoint".into()));
+    }
+    let stream = requested_stream.unwrap_or(endpoint == "/v1beta/models:streamGenerateContent");
+    if matches!(
+        endpoint,
+        "/v1beta/models:generateContent" | "/v1beta/models:streamGenerateContent"
+    ) && stream != (endpoint == "/v1beta/models:streamGenerateContent")
+    {
+        return Err(ApiError::BadRequest(
+            "Gemini probe stream must match endpoint".into(),
+        ));
+    }
+    let capabilities: Vec<String> =
+        serde_json::from_str(&row.try_get::<String>("", "capabilities")?)
+            .map_err(|_| ApiError::BadRequest("invalid model capabilities".into()))?;
+    if !crate::providers::supports(&kind, &capabilities, endpoint, stream) {
+        return Err(ApiError::BadRequest(
+            "model does not support probe endpoint or stream".into(),
+        ));
+    }
+    let rules: Value = serde_json::from_str(
+        &row.try_get::<Option<String>>("", "model_rules_json")?
+            .unwrap_or_else(|| "{\"version\":1}".into()),
+    )
+    .map_err(|_| ApiError::BadRequest("invalid channel model rules".into()))?;
+    if !rules.is_object() || rules["version"] != 1 {
+        return Err(ApiError::BadRequest("invalid channel model rules".into()));
+    }
+    if stream && rules["stream"] == false {
+        return Err(ApiError::BadRequest(
+            "streaming is disabled for this channel".into(),
+        ));
+    }
+    let mappings: Value = serde_json::from_str(
+        &row.try_get::<Option<String>>("", "endpoint_mappings_json")?
+            .unwrap_or_else(|| "{\"version\":1}".into()),
+    )
+    .map_err(|_| ApiError::BadRequest("invalid endpoint mappings".into()))?;
+    if !mappings.is_object() || mappings["version"] != 1 {
+        return Err(ApiError::BadRequest("invalid endpoint mappings".into()));
+    }
+    let path = mappings
+        .pointer(&format!(
+            "/paths/{}",
+            endpoint.replace('~', "~0").replace('/', "~1")
+        ))
+        .and_then(Value::as_str)
+        .unwrap_or(endpoint);
+    if !path.starts_with('/') || path.starts_with("//") || path.contains(['?', '#']) {
+        return Err(ApiError::BadRequest(
+            "invalid probe endpoint mapping".into(),
+        ));
+    }
+    Ok(ProbeSelection {
+        target: crate::models::RouteTarget {
+            public_name: row.try_get("", "public_name")?,
+            upstream_name: row.try_get("", "upstream_name")?,
+            provider_name: row.try_get("", "name")?,
+            provider_kind: kind,
+            base_url: row.try_get("", "base_url")?,
+            credential_type: row.try_get("", "credential_type")?,
+            secret_envelope: row.try_get("", "secret_envelope")?,
+            proxy_url: row.try_get("", "proxy_url")?,
+            proxy_username: row.try_get("", "proxy_username")?,
+            proxy_secret_envelope: row.try_get("", "proxy_secret_envelope")?,
+            proxy_reuse_connections: row.try_get("", "proxy_reuse_connections")?,
+            proxy_preset_id: row.try_get("", "proxy_preset_id")?,
+            input_price_micros: 0,
+            output_price_micros: 0,
+        },
+        credential: row.try_get("", "credential_id")?,
+        endpoint: endpoint.into(),
+        path: path.into(),
+        stream,
+    })
+}
+
+#[derive(Default)]
+struct ProbeMeasurement {
+    started: Option<Instant>,
+    status_code: Option<i32>,
+    response_headers_ms: Option<i64>,
+    first_event_ms: Option<i64>,
+    first_text_ms: Option<i64>,
+    output_tokens: Option<i64>,
+}
+
+fn probe_error_status(status: reqwest::StatusCode) -> &'static str {
+    match status.as_u16() {
+        401 | 403 => "authentication",
+        429 => "rate_limited",
+        404 => "model_unavailable",
+        _ => "upstream_http",
+    }
+}
+
+fn probe_shape(endpoint: &str, value: &Value) -> bool {
+    match endpoint {
+        "/v1/chat/completions" => value["choices"].is_array(),
+        "/v1/responses" => value["status"].is_string() && value["output"].is_array(),
+        "/v1/messages" => value["content"].is_array() && value["stop_reason"].is_string(),
+        "/v1beta/models:generateContent" => value["candidates"].is_array(),
+        _ => false,
+    }
+}
+
+fn probe_output(endpoint: &str, value: &Value) -> bool {
+    match endpoint {
+        "/v1/chat/completions" => value["choices"].as_array().is_some_and(|choices| {
+            choices.iter().any(|choice| {
+                choice["message"].is_object()
+                    && (choice["message"]["content"]
+                        .as_str()
+                        .is_some_and(|text| !text.trim().is_empty())
+                        || choice["message"]["tool_calls"]
+                            .as_array()
+                            .is_some_and(|calls| !calls.is_empty()))
+            })
+        }),
+        "/v1/responses" => {
+            value["status"] == "completed"
+                && value["output"].as_array().is_some_and(|items| {
+                    items.iter().any(|item| {
+                        item["type"] == "function_call"
+                            || item["content"].as_array().is_some_and(|parts| {
+                                parts.iter().any(|part| {
+                                    part["type"] == "output_text"
+                                        && part["text"]
+                                            .as_str()
+                                            .is_some_and(|text| !text.trim().is_empty())
+                                })
+                            })
+                    })
+                })
+        }
+        "/v1/messages" => value["content"].as_array().is_some_and(|parts| {
+            parts.iter().any(|part| {
+                part["type"] == "tool_use"
+                    || part["type"] == "text"
+                        && part["text"]
+                            .as_str()
+                            .is_some_and(|text| !text.trim().is_empty())
+            })
+        }),
+        "/v1beta/models:generateContent" => {
+            value["candidates"].as_array().is_some_and(|candidates| {
+                candidates.iter().any(|candidate| {
+                    candidate["content"]["parts"]
+                        .as_array()
+                        .is_some_and(|parts| {
+                            parts.iter().any(|part| {
+                                part.get("functionCall").is_some()
+                                    || part["thought"] != true
+                                        && part["text"]
+                                            .as_str()
+                                            .is_some_and(|text| !text.trim().is_empty())
+                            })
+                        })
+                })
+            })
+        }
+        _ => false,
+    }
+}
+
+fn probe_stream_shape(endpoint: &str, value: &Value) -> bool {
+    if matches!(value["type"].as_str(), Some("ping" | "heartbeat")) {
+        return true;
+    }
+    match endpoint {
+        "/v1/chat/completions" => value["choices"].is_array(),
+        "/v1/responses" => value["type"]
+            .as_str()
+            .is_some_and(|kind| kind.starts_with("response.")),
+        "/v1/messages" => matches!(
+            value["type"].as_str(),
+            Some(
+                "message_start"
+                    | "message_delta"
+                    | "message_stop"
+                    | "content_block_start"
+                    | "content_block_delta"
+                    | "content_block_stop"
+            )
+        ),
+        "/v1beta/models:streamGenerateContent" => {
+            value["candidates"].is_array() || value["usageMetadata"].is_object()
+        }
+        _ => false,
+    }
+}
+
+fn probe_stream_output(endpoint: &str, value: &Value) -> bool {
+    crate::providers::timing::visible_text(value)
+        || match endpoint {
+            "/v1/chat/completions" => value["choices"].as_array().is_some_and(|choices| {
+                choices.iter().any(|choice| {
+                    choice["delta"]["tool_calls"]
+                        .as_array()
+                        .is_some_and(|calls| !calls.is_empty())
+                })
+            }),
+            "/v1/responses" => {
+                matches!(
+                    value["type"].as_str(),
+                    Some("response.function_call_arguments.delta" | "response.output_item.added")
+                ) && (value["type"] != "response.output_item.added"
+                    || value["item"]["type"] == "function_call")
+            }
+            "/v1/messages" => {
+                value["type"] == "content_block_start"
+                    && value["content_block"]["type"] == "tool_use"
+            }
+            "/v1beta/models:streamGenerateContent" => {
+                value["candidates"].as_array().is_some_and(|candidates| {
+                    candidates.iter().any(|candidate| {
+                        candidate["content"]["parts"]
+                            .as_array()
+                            .is_some_and(|parts| {
+                                parts.iter().any(|part| part.get("functionCall").is_some())
+                            })
+                    })
+                })
+            }
+            _ => false,
+        }
+}
+
+async fn probe_json(response: reqwest::Response) -> Result<Value, &'static str> {
+    let mut chunks = response.bytes_stream();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = chunks.next().await {
+        let chunk = chunk.map_err(|_| "network")?;
+        if bytes.len().saturating_add(chunk.len()) > 1024 * 1024 {
+            return Err("invalid_response");
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&bytes).map_err(|_| "invalid_response")
+}
+
+async fn probe_response(
+    state: &AppState,
+    selection: &ProbeSelection,
+    secret: &str,
+    measured: &mut ProbeMeasurement,
+) -> Result<(), &'static str> {
+    let endpoint = selection.endpoint.as_str();
+    // Anthropic chat uses the gateway's native Messages upstream protocol. The
+    // selected public endpoint remains Chat in the persisted probe record.
+    let wire_endpoint =
+        if selection.target.provider_kind == "anthropic" && endpoint == "/v1/chat/completions" {
+            "/v1/messages"
+        } else {
+            endpoint
+        };
+    let wire_path = if wire_endpoint != endpoint && selection.path == endpoint {
+        wire_endpoint
+    } else {
+        &selection.path
+    };
+    let request = match wire_endpoint {
+        "/v1/responses" => {
+            json!({"model":selection.target.upstream_name,"input":"Reply OK","max_output_tokens":8,"stream":selection.stream})
+        }
+        "/v1/messages" => {
+            json!({"model":selection.target.upstream_name,"messages":[{"role":"user","content":"Reply OK"}],"max_tokens":8,"stream":selection.stream})
+        }
+        "/v1beta/models:generateContent" | "/v1beta/models:streamGenerateContent" => {
+            json!({"model":selection.target.upstream_name,"contents":[{"role":"user","parts":[{"text":"Reply OK"}]}],"generationConfig":{"maxOutputTokens":8},"stream":selection.stream})
         }
         _ => {
-            json!({"model":target.upstream_name,"messages":[{"role":"user","content":"Reply OK"}],"max_tokens":8})
+            json!({"model":selection.target.upstream_name,"messages":[{"role":"user","content":"Reply OK"}],"max_tokens":8,"stream":selection.stream})
         }
     };
     let prepared = crate::providers::prepare_routed(
-        &target,
+        &selection.target,
         crate::providers::Route {
-            protocol: endpoint,
-            path: endpoint,
+            protocol: wire_endpoint,
+            path: wire_path,
             native_version: None,
         },
         &request,
-        &secret,
+        secret,
         http::HeaderMap::new(),
         &http::HeaderMap::new(),
     )
-    .await?;
-    let started = Instant::now();
-    let response = state
-        .upstream_client(&target)
-        .await?
+    .await
+    .map_err(|_| "invalid_response")?;
+    if selection.stream && !prepared.response.identity() {
+        return Err("invalid_response");
+    }
+    let client = state
+        .upstream_client(&selection.target)
+        .await
+        .map_err(|_| "network")?;
+    measured.started = Some(Instant::now());
+    let started = measured.started.expect("probe send has a clock origin");
+    let response = client
         .post(prepared.url)
         .headers(prepared.headers)
         .json(&prepared.payload)
-        .timeout(Duration::from_secs(30))
         .send()
-        .await;
-    let ttft = response
-        .as_ref()
-        .ok()
-        .map(|_| started.elapsed().as_millis() as i64);
-    let code = response
-        .as_ref()
-        .ok()
-        .map(|r| i32::from(r.status().as_u16()));
-    let mut success = response.as_ref().is_ok_and(|r| r.status().is_success());
-    let body = if let Ok(response) = response {
-        bounded_json(response).await.ok()
+        .await
+        .map_err(|_| "network")?;
+    measured
+        .response_headers_ms
+        .get_or_insert(started.elapsed().as_millis() as i64);
+    measured.status_code = Some(i32::from(response.status().as_u16()));
+    if !response.status().is_success() {
+        return Err(probe_error_status(response.status()));
+    }
+    if selection.stream {
+        if !response
+            .headers()
+            .get(http::header::CONTENT_TYPE)
+            .is_some_and(|content| {
+                content
+                    .to_str()
+                    .is_ok_and(|text| text.starts_with("text/event-stream"))
+            })
+        {
+            return Err("invalid_response");
+        }
+        let bytes_seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = bytes_seen.clone();
+        let transport_failed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let transport_flag = transport_failed.clone();
+        let chunks = response.bytes_stream().map(move |chunk| {
+            let chunk = chunk.map_err(|_| {
+                transport_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                std::io::Error::other("probe transport")
+            })?;
+            if counter
+                .fetch_add(chunk.len(), std::sync::atomic::Ordering::Relaxed)
+                .saturating_add(chunk.len())
+                > 1024 * 1024
+            {
+                return Err(std::io::Error::other("probe response limit"));
+            }
+            Ok(chunk)
+        });
+        let mut frames = Box::pin(crate::providers::framing::frames(chunks));
+        let mut terminal = crate::orchestration::stream::TerminalState::new(&request);
+        let mut events = 0;
+        let mut output = false;
+        while let Some(frame) = frames.next().await {
+            let frame = frame.map_err(|_| {
+                if transport_failed.load(std::sync::atomic::Ordering::Relaxed) {
+                    "network"
+                } else {
+                    "invalid_response"
+                }
+            })?;
+            events += 1;
+            if events > 2048 {
+                return Err("invalid_response");
+            }
+            let Some(data) = frame.data else { continue };
+            measured
+                .first_event_ms
+                .get_or_insert(started.elapsed().as_millis() as i64);
+            let event = eventsource_stream::Event {
+                event: frame.event.unwrap_or_else(|| "message".into()),
+                data,
+                ..Default::default()
+            };
+            if crate::orchestration::stream::failed(&event) {
+                return Err("invalid_response");
+            }
+            if let Ok(value) = serde_json::from_str::<Value>(&event.data) {
+                if !probe_stream_shape(endpoint, &value) {
+                    return Err("invalid_response");
+                }
+                if measured.first_text_ms.is_none()
+                    && crate::providers::timing::visible_text(&value)
+                {
+                    measured.first_text_ms = Some(started.elapsed().as_millis() as i64);
+                }
+                output |= probe_stream_output(endpoint, &value);
+                let usage = super::pricing::Usage::parse(&value);
+                if usage.reported {
+                    measured.output_tokens = Some(usage.output);
+                }
+            } else if event.data.trim() != "[DONE]" {
+                return Err("invalid_response");
+            }
+            if terminal.terminal(&event, endpoint) {
+                return if output {
+                    Ok(())
+                } else {
+                    Err("empty_response")
+                };
+            }
+        }
+        Err("missing_terminal")
     } else {
-        None
-    };
-    success &= body
-        .as_ref()
-        .is_some_and(|v| v.get("error").is_none() && v.is_object());
-    let output = body
-        .as_ref()
-        .map(|v| super::pricing::Usage::parse(v).output);
-    let elapsed = started.elapsed().as_millis() as i64;
+        let raw = probe_json(response).await?;
+        if raw.get("error").is_some() {
+            return Err("invalid_response");
+        }
+        let value = prepared
+            .response
+            .apply(raw)
+            .map_err(|_| "invalid_response")?;
+        if !probe_shape(wire_endpoint, &value) {
+            return Err("invalid_response");
+        }
+        if !probe_output(wire_endpoint, &value) {
+            return Err("empty_response");
+        }
+        let usage = super::pricing::Usage::parse(&value);
+        if usage.reported {
+            measured.output_tokens = Some(usage.output);
+        }
+        Ok(())
+    }
+}
+
+async fn probe(state: &AppState, claim: &jobs::Claim, payload: &Value) -> Result<(), ApiError> {
+    let project = claim.project_id.as_deref().ok_or(ApiError::Forbidden)?;
+    // Recheck selection after queueing and before any upstream I/O. An operator may
+    // disable a credential, model or provider while this durable job is pending.
+    let selection = validate_probe_selection(&state.db, project, payload).await?;
+    let secret = crate::oauth::credential_secret(
+        &selection.target.credential_type,
+        state.secrets.decrypt(&selection.target.secret_envelope)?,
+    )?
+    .to_string();
+    let mut measured = ProbeMeasurement::default();
+    let result = tokio::time::timeout(
+        Duration::from_secs(30),
+        probe_response(state, &selection, &secret, &mut measured),
+    )
+    .await
+    .unwrap_or(Err("timeout"));
+    let success = result.is_ok();
+    let error = result.err();
+    let provider = payload["provider_id"].as_str().ok_or(ApiError::NotFound)?;
     let tx = state.db.begin().await?;
     jobs::fence(&tx, claim).await?;
-    tx.execute(sql("INSERT INTO channel_probes(id,provider_id,credential_id,model,success,status_code,latency_ms,ttft_ms,output_tokens,error_code,probed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO NOTHING",vec![format!("{}:{}",claim.id,claim.attempts).into(),provider.into(),credential.into(),target.upstream_name.into(),success.into(),code.into(),elapsed.into(),ttft.into(),output.into(),(!success).then_some("probe_failed").into(),db::now().into()])).await?;
+    tx.execute(sql("INSERT INTO channel_probes(id,provider_id,credential_id,model,endpoint,stream,success,status_code,latency_ms,response_headers_ms,first_event_ms,first_text_ms,ttft_ms,output_tokens,error_code,probed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO NOTHING",vec![format!("{}:{}",claim.id,claim.attempts).into(),provider.into(),selection.credential.into(),selection.target.upstream_name.into(),selection.endpoint.into(),selection.stream.into(),success.into(),measured.status_code.into(),measured.started.map(|started| started.elapsed().as_millis() as i64).into(),measured.response_headers_ms.into(),measured.first_event_ms.into(),measured.first_text_ms.into(),measured.first_text_ms.into(),measured.output_tokens.into(),error.into(),db::now().into()])).await?;
     tx.commit().await?;
     health(
         state,
         project,
         provider,
         success,
-        code.map(|v| v as u16),
-        "probe_failed",
+        measured.status_code.map(|code| code as u16),
+        error.unwrap_or("probe_failed"),
     )
     .await?;
     if success {
