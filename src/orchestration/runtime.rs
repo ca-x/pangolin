@@ -534,7 +534,7 @@ impl Drop for Permit {
         }
         if self.outcome == Some(true) {
             let elapsed = self.started.elapsed().as_micros().min(u64::MAX as u128) as u64;
-            let _ = self.resource.latency_us.fetch_update(
+            let _ = self.resource.latency_us.try_update(
                 Ordering::Relaxed,
                 Ordering::Relaxed,
                 |previous| {
