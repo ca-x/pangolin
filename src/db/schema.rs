@@ -1052,6 +1052,53 @@ ALTER TABLE providers ADD COLUMN priority INTEGER NOT NULL DEFAULT 100 CHECK(pri
 CREATE INDEX IF NOT EXISTS idx_providers_project_priority ON providers(project_id,enabled,priority);
 "#;
 
+/// Visibility is credential-specific and relationally bound to its provider's
+/// project. Existing probe TTFT measured response headers, not generated text.
+const V29_REFERENCE_ADOPTION: &str = r#"
+CREATE UNIQUE INDEX idx_providers_id_project ON providers(id,project_id);
+CREATE UNIQUE INDEX idx_channel_credentials_id_provider ON channel_credentials(id,provider_id);
+CREATE TABLE credential_model_snapshots (
+    credential_id TEXT NOT NULL PRIMARY KEY,
+    provider_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    credential_fingerprint TEXT NOT NULL,
+    provider_config_fingerprint TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('known','stale')),
+    last_success_at INTEGER,
+    last_attempt_at INTEGER NOT NULL,
+    last_error_code TEXT,
+    FOREIGN KEY(provider_id,project_id) REFERENCES providers(id,project_id) ON DELETE CASCADE,
+    FOREIGN KEY(credential_id,provider_id) REFERENCES channel_credentials(id,provider_id) ON DELETE CASCADE
+);
+CREATE TABLE credential_model_availability (
+    credential_id TEXT NOT NULL REFERENCES credential_model_snapshots(credential_id) ON DELETE CASCADE,
+    upstream_name TEXT NOT NULL CHECK(
+        length(CAST(upstream_name AS BLOB)) BETWEEN 1 AND 256
+        AND instr(upstream_name,char(0))=0
+        AND upstream_name NOT GLOB '*[^A-Za-z0-9._/:-]*'
+    ),
+    metadata_json TEXT NOT NULL DEFAULT '{}' CHECK(json_valid(metadata_json)),
+    PRIMARY KEY(credential_id,upstream_name)
+);
+ALTER TABLE channel_probes ADD COLUMN endpoint TEXT;
+ALTER TABLE channel_probes ADD COLUMN stream INTEGER CHECK(stream IS NULL OR stream IN (0,1));
+ALTER TABLE channel_probes ADD COLUMN response_headers_ms INTEGER CHECK(response_headers_ms IS NULL OR response_headers_ms>=0);
+ALTER TABLE channel_probes ADD COLUMN first_event_ms INTEGER CHECK(first_event_ms IS NULL OR first_event_ms>=0);
+ALTER TABLE channel_probes ADD COLUMN first_text_ms INTEGER CHECK(first_text_ms IS NULL OR first_text_ms>=0);
+UPDATE channel_probes SET response_headers_ms=ttft_ms,ttft_ms=NULL;
+ALTER TABLE request_executions ADD COLUMN response_headers_ms INTEGER CHECK(response_headers_ms IS NULL OR response_headers_ms>=0);
+ALTER TABLE request_executions ADD COLUMN first_event_ms INTEGER CHECK(first_event_ms IS NULL OR first_event_ms>=0);
+ALTER TABLE request_executions ADD COLUMN first_text_ms INTEGER CHECK(first_text_ms IS NULL OR first_text_ms>=0);
+ALTER TABLE request_executions ADD COLUMN conversion_diagnostics_json TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(conversion_diagnostics_json));
+ALTER TABLE request_executions ADD COLUMN affinity_diagnostics_json TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(affinity_diagnostics_json));
+ALTER TABLE request_executions ADD COLUMN pricing_status TEXT NOT NULL DEFAULT 'legacy' CHECK(pricing_status IN ('legacy','priced','explicit_free','missing_price','incomplete_usage'));
+ALTER TABLE execution_facts ADD COLUMN pricing_status TEXT NOT NULL DEFAULT 'legacy' CHECK(pricing_status IN ('legacy','priced','explicit_free','missing_price','incomplete_usage'));
+ALTER TABLE usage_logs ADD COLUMN pricing_status TEXT NOT NULL DEFAULT 'legacy' CHECK(pricing_status IN ('legacy','priced','explicit_free','missing_price','incomplete_usage'));
+ALTER TABLE models ADD COLUMN pricing_configured INTEGER NOT NULL DEFAULT 0 CHECK(pricing_configured IN (0,1));
+UPDATE models SET pricing_configured=1 WHERE input_price_micros>0 OR output_price_micros>0;
+ALTER TABLE prompt_protection_rules ADD COLUMN allowlist_json TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(allowlist_json));
+"#;
+
 #[derive(FromQueryResult)]
 struct Count {
     count: i64,
@@ -1558,6 +1605,25 @@ pub async fn migrate(db: &DatabaseConnection) -> Result<()> {
             .await?;
         transaction.commit().await?;
     }
+    let reference_adoption_applied = Count::find_by_statement(statement(
+        "SELECT COUNT(*) AS count FROM schema_migrations WHERE version=29",
+    ))
+    .one(db)
+    .await?
+    .is_some_and(|row| row.count > 0);
+    if !reference_adoption_applied {
+        let transaction = db.begin().await?;
+        transaction
+            .execute_unprepared(V29_REFERENCE_ADOPTION)
+            .await
+            .context("failed to add reference adoption metadata")?;
+        transaction
+            .execute(statement(
+                "INSERT INTO schema_migrations(version,applied_at) VALUES(29,unixepoch())",
+            ))
+            .await?;
+        transaction.commit().await?;
+    }
     Ok(())
 }
 
@@ -1588,6 +1654,299 @@ mod tests {
         db.query_one(statement(sql)).await.unwrap().unwrap()
     }
 
+    // Reconstruct the last released schema so upgrade assertions exercise rows
+    // written without any reference-adoption defaults or constraints.
+    async fn reference_legacy_database(db: &DatabaseConnection) {
+        migrate(db).await.unwrap();
+        if scalar(
+            db,
+            "SELECT COUNT(*) AS count FROM schema_migrations WHERE version=29",
+        )
+        .await
+            == 1
+        {
+            db.execute_unprepared(
+                "DROP TABLE credential_model_availability;
+                 DROP TABLE credential_model_snapshots;
+                 DROP INDEX idx_providers_id_project;
+                 DROP INDEX idx_channel_credentials_id_provider;",
+            )
+            .await
+            .unwrap();
+            for (table, columns) in [
+                (
+                    "channel_probes",
+                    &[
+                        "endpoint",
+                        "stream",
+                        "response_headers_ms",
+                        "first_event_ms",
+                        "first_text_ms",
+                    ][..],
+                ),
+                (
+                    "request_executions",
+                    &[
+                        "response_headers_ms",
+                        "first_event_ms",
+                        "first_text_ms",
+                        "conversion_diagnostics_json",
+                        "affinity_diagnostics_json",
+                        "pricing_status",
+                    ][..],
+                ),
+                ("execution_facts", &["pricing_status"][..]),
+                ("usage_logs", &["pricing_status"][..]),
+                ("models", &["pricing_configured"][..]),
+                ("prompt_protection_rules", &["allowlist_json"][..]),
+            ] {
+                for column in columns {
+                    db.execute_unprepared(&format!("ALTER TABLE {table} DROP COLUMN {column}"))
+                        .await
+                        .unwrap();
+                }
+            }
+            db.execute_unprepared("DELETE FROM schema_migrations WHERE version=29")
+                .await
+                .unwrap();
+        }
+        db.execute_unprepared(r#"
+            INSERT INTO projects(id,name,slug,created_at,updated_at) VALUES('reference-a','A','reference-a',1,1),('reference-b','B','reference-b',1,1);
+            INSERT INTO providers(id,name,kind,base_url,project_id,enabled,created_at,updated_at)
+            VALUES('reference-pa','A','openai','https://example.test','reference-a',0,1,1),('reference-pb','B','openai','https://example.test','reference-b',1,1,1);
+            INSERT INTO channel_credentials(id,provider_id,secret_envelope,enabled,created_at,updated_at)
+            VALUES('reference-ca','reference-pa','encrypted-fixture',0,1,1),('reference-cb','reference-pb','encrypted-fixture',1,1,1);
+            INSERT INTO models(id,provider_id,public_name,upstream_name,input_price_micros,output_price_micros,enabled,discovery_managed,created_at)
+            VALUES('reference-paid','reference-pa','paid','paid',123,456,0,0,1),('reference-zero','reference-pb','zero','zero',0,0,1,1,1);
+            INSERT INTO model_prices(id,model_id,version,valid_from,created_at) VALUES('reference-price','reference-paid',1,1,1);
+            INSERT INTO model_price_components(id,price_id,kind,unit_price_micros) VALUES('reference-component','reference-price','input',123);
+            INSERT INTO request_facts(id,project_id,log_level,status,started_at,finished_at) VALUES('reference-fact','reference-a','metadata','succeeded',1,2);
+            INSERT INTO execution_facts(id,request_id,attempt,status,price_json,config_json,reserved_micros,started_at,finished_at)
+            VALUES('reference-ef','reference-fact',1,'succeeded','{"price":123}','{"model":"paid"}',789,1,2);
+            INSERT INTO usage_logs(id,execution_id,model_id,price_id,input_tokens,total_cost_micros,created_at)
+            VALUES('reference-usage','reference-ef','reference-paid','reference-price',3,369,2);
+            INSERT INTO usage_cost_items(id,usage_log_id,price_component_id,quantity,subtotal_micros)
+            VALUES('reference-item','reference-usage','reference-component',3,369);
+            INSERT INTO traces(id,project_id,started_at) VALUES('reference-trace','reference-a',1);
+            INSERT INTO requests(id,trace_id,protocol,endpoint,started_at) VALUES('reference-request','reference-trace','openai','/v1/chat/completions',1);
+            INSERT INTO request_executions(id,request_id,attempt,status,started_at) VALUES('reference-execution','reference-request',1,'succeeded',1);
+            INSERT INTO channel_probes(id,provider_id,credential_id,success,ttft_ms,latency_ms,output_tokens,probed_at)
+            VALUES('reference-probe','reference-pa','reference-ca',1,42,99,5,1),('reference-unknown','reference-pa',NULL,0,NULL,99,NULL,1);
+            INSERT INTO prompt_protection_rules(id,project_id,name,content_pattern,action,enabled,created_at,updated_at)
+            VALUES('reference-rule','reference-a','rule','secret','deny',0,1,1);
+        "#).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reference_schema_upgrade_preserves_facts() {
+        let directory = tempfile::tempdir().unwrap();
+        let url = format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("reference.db").display()
+        );
+        let db = crate::db::connect(&url).await.unwrap();
+        reference_legacy_database(&db).await;
+        db.close().await.unwrap();
+        let db = crate::db::connect(&url).await.unwrap();
+        assert_eq!(scalar(&db, "SELECT COUNT(*) AS count FROM pragma_table_info('request_executions') WHERE name IN ('first_text_ms','conversion_diagnostics_json','pricing_status')").await, 3);
+        let row = one(&db, "SELECT response_headers_ms,ttft_ms,first_event_ms,first_text_ms,endpoint,stream,latency_ms,output_tokens FROM channel_probes WHERE id='reference-probe'").await;
+        assert_eq!(row.try_get::<i64>("", "response_headers_ms").unwrap(), 42);
+        for column in ["ttft_ms", "first_event_ms", "first_text_ms", "stream"] {
+            assert_eq!(row.try_get::<Option<i64>>("", column).unwrap(), None);
+        }
+        assert_eq!(row.try_get::<Option<String>>("", "endpoint").unwrap(), None);
+        assert_eq!(row.try_get::<i64>("", "latency_ms").unwrap(), 99);
+        assert_eq!(row.try_get::<i64>("", "output_tokens").unwrap(), 5);
+        assert_eq!(scalar(&db, "SELECT COUNT(*) AS count FROM channel_probes WHERE id='reference-unknown' AND response_headers_ms IS NULL").await, 1);
+        assert_eq!(scalar(&db, "SELECT COUNT(*) AS count FROM models WHERE (id='reference-paid' AND pricing_configured=1 AND input_price_micros=123 AND output_price_micros=456 AND enabled=0 AND discovery_managed=0) OR (id='reference-zero' AND pricing_configured=0 AND enabled=1 AND discovery_managed=1)").await, 2);
+        assert_eq!(
+            scalar(
+                &db,
+                "SELECT COUNT(*) AS count FROM providers WHERE id='reference-pa' AND enabled=0"
+            )
+            .await,
+            1
+        );
+        assert_eq!(scalar(&db, "SELECT COUNT(*) AS count FROM channel_credentials WHERE id='reference-ca' AND enabled=0").await, 1);
+        assert_eq!(scalar(&db, "SELECT COUNT(*) AS count FROM usage_logs WHERE total_cost_micros=369 AND input_tokens=3 AND price_id='reference-price' AND pricing_status='legacy'").await, 1);
+        assert_eq!(scalar(&db, "SELECT COUNT(*) AS count FROM usage_cost_items WHERE quantity=3 AND subtotal_micros=369").await, 1);
+        assert_eq!(scalar(&db, "SELECT COUNT(*) AS count FROM execution_facts WHERE reserved_micros=789 AND price_json='{\"price\":123}' AND config_json='{\"model\":\"paid\"}' AND pricing_status='legacy' AND status='succeeded'").await, 1);
+        assert_eq!(scalar(&db, "SELECT COUNT(*) AS count FROM model_prices WHERE id='reference-price' AND version=1 AND schedule_json='{\"version\":1}'").await, 1);
+        assert_eq!(scalar(&db, "SELECT COUNT(*) AS count FROM model_price_components WHERE id='reference-component' AND unit_price_micros=123").await, 1);
+        assert_eq!(scalar(&db, "SELECT COUNT(*) AS count FROM prompt_protection_rules WHERE enabled=0 AND allowlist_json='[]'").await, 1);
+        assert_eq!(scalar(&db, "SELECT COUNT(*) AS count FROM request_executions WHERE pricing_status='legacy' AND conversion_diagnostics_json='[]' AND affinity_diagnostics_json='[]' AND response_headers_ms IS NULL AND first_event_ms IS NULL AND first_text_ms IS NULL").await, 1);
+        for sql in [
+            "UPDATE channel_probes SET stream=2",
+            "UPDATE models SET pricing_configured=2",
+            "UPDATE prompt_protection_rules SET allowlist_json='invalid'",
+            "UPDATE request_executions SET conversion_diagnostics_json='invalid'",
+            "UPDATE request_executions SET affinity_diagnostics_json='invalid'",
+            "UPDATE model_prices SET version=2",
+            "UPDATE model_price_components SET unit_price_micros=999",
+        ] {
+            assert!(
+                db.execute_unprepared(sql).await.is_err(),
+                "must reject {sql}"
+            );
+        }
+        for table in ["channel_probes", "request_executions"] {
+            for column in ["response_headers_ms", "first_event_ms", "first_text_ms"] {
+                assert!(
+                    db.execute_unprepared(&format!("UPDATE {table} SET {column}=-1"))
+                        .await
+                        .is_err()
+                );
+            }
+        }
+        for table in ["request_executions", "execution_facts", "usage_logs"] {
+            assert!(
+                db.execute_unprepared(&format!("UPDATE {table} SET pricing_status='invented'"))
+                    .await
+                    .is_err()
+            );
+            for status in [
+                "legacy",
+                "priced",
+                "explicit_free",
+                "missing_price",
+                "incomplete_usage",
+            ] {
+                db.execute_unprepared(&format!("UPDATE {table} SET pricing_status='{status}'"))
+                    .await
+                    .unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn reference_schema_rejects_cross_project_inventory() {
+        let db = memory_database().await;
+        reference_legacy_database(&db).await;
+        migrate(&db).await.unwrap();
+        // Reject both mismatched project ownership and a credential from a
+        // different provider before any primary-key duplicate can mask the FK.
+        for (credential, provider, project) in [
+            ("reference-ca", "reference-pa", "reference-b"),
+            ("reference-ca", "reference-pb", "reference-b"),
+            ("reference-cb", "reference-pa", "reference-a"),
+        ] {
+            assert!(db.execute(statement(format!(
+                "INSERT INTO credential_model_snapshots(credential_id,provider_id,project_id,credential_fingerprint,provider_config_fingerprint,status,last_attempt_at) VALUES('{credential}','{provider}','{project}','revision','revision','known',1)"
+            ))).await.is_err());
+        }
+        db.execute_unprepared("INSERT INTO credential_model_snapshots(credential_id,provider_id,project_id,credential_fingerprint,provider_config_fingerprint,status,last_attempt_at) VALUES('reference-ca','reference-pa','reference-a','credential-revision','config-revision','known',1),('reference-cb','reference-pb','reference-b','credential-revision','config-revision','stale',1)").await.unwrap();
+        for sql in [
+            "UPDATE credential_model_snapshots SET project_id='reference-b' WHERE credential_id='reference-ca'",
+            "UPDATE credential_model_snapshots SET provider_id='reference-pb' WHERE credential_id='reference-ca'",
+            "UPDATE providers SET project_id='reference-b' WHERE id='reference-pa'",
+            "UPDATE channel_credentials SET provider_id='reference-pb' WHERE id='reference-ca'",
+            "UPDATE credential_model_snapshots SET status='unknown'",
+            "UPDATE credential_model_snapshots SET last_attempt_at=NULL",
+            "INSERT INTO credential_model_snapshots(credential_id,provider_id,project_id,credential_fingerprint,provider_config_fingerprint,status,last_attempt_at) VALUES('missing','reference-pa','reference-a','revision','revision','known',1)",
+        ] {
+            assert!(
+                db.execute_unprepared(sql).await.is_err(),
+                "must reject {sql}"
+            );
+        }
+        for name in ["gpt-4.1", "vendor/model:revision", &"a".repeat(256)] {
+            db.execute(statement(format!("INSERT INTO credential_model_availability(credential_id,upstream_name) VALUES('reference-ca','{name}')"))).await.unwrap();
+        }
+        for name in [
+            "",
+            "space model",
+            "日本語",
+            "invalid@model",
+            &"a".repeat(257),
+            "nul\0suffix",
+        ] {
+            assert!(db.execute(Statement::from_sql_and_values(DbBackend::Sqlite, "INSERT INTO credential_model_availability(credential_id,upstream_name) VALUES('reference-ca',?)", [name.into()])).await.is_err(), "must reject invalid identifier");
+        }
+        for sql in [
+            "INSERT INTO credential_model_availability(credential_id,upstream_name) VALUES('reference-ca','gpt-4.1')",
+            "INSERT INTO credential_model_availability(credential_id,upstream_name) VALUES('missing','gpt-4.1')",
+            "UPDATE credential_model_availability SET metadata_json='invalid'",
+        ] {
+            assert!(
+                db.execute_unprepared(sql).await.is_err(),
+                "must reject {sql}"
+            );
+        }
+        assert_eq!(scalar(&db, "SELECT COUNT(*) AS count FROM credential_model_availability WHERE metadata_json='{}'").await, 3);
+        db.execute_unprepared("DELETE FROM channel_credentials WHERE id='reference-ca'")
+            .await
+            .unwrap();
+        assert_eq!(scalar(&db, "SELECT COUNT(*) AS count FROM credential_model_snapshots WHERE credential_id='reference-ca'").await, 0);
+        assert_eq!(
+            scalar(
+                &db,
+                "SELECT COUNT(*) AS count FROM credential_model_availability"
+            )
+            .await,
+            0
+        );
+        db.execute_unprepared("INSERT INTO credential_model_availability(credential_id,upstream_name) VALUES('reference-cb','gpt-4.1'); DELETE FROM providers WHERE id='reference-pb';").await.unwrap();
+        assert_eq!(
+            scalar(
+                &db,
+                "SELECT COUNT(*) AS count FROM credential_model_snapshots"
+            )
+            .await,
+            0
+        );
+        assert_eq!(
+            scalar(
+                &db,
+                "SELECT COUNT(*) AS count FROM credential_model_availability"
+            )
+            .await,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn reference_schema_is_idempotent() {
+        let directory = tempfile::tempdir().unwrap();
+        let url = format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("reference.db").display()
+        );
+        let db = crate::db::connect(&url).await.unwrap();
+        reference_legacy_database(&db).await;
+        migrate(&db).await.unwrap();
+        assert_eq!(
+            scalar(&db, "SELECT MAX(version) AS count FROM schema_migrations").await,
+            29
+        );
+        db.execute_unprepared("UPDATE channel_probes SET response_headers_ms=12,ttft_ms=8,first_event_ms=6,first_text_ms=8 WHERE id='reference-probe'; UPDATE models SET pricing_configured=1 WHERE id='reference-zero'").await.unwrap();
+        let tables = scalar(
+            &db,
+            "SELECT COUNT(*) AS count FROM sqlite_master WHERE type='table'",
+        )
+        .await;
+        db.close().await.unwrap();
+        let db = crate::db::connect(&url).await.unwrap();
+        migrate(&db).await.unwrap();
+        assert_eq!(
+            scalar(
+                &db,
+                "SELECT COUNT(*) AS count FROM schema_migrations WHERE version=29"
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            scalar(
+                &db,
+                "SELECT COUNT(*) AS count FROM sqlite_master WHERE type='table'"
+            )
+            .await,
+            tables
+        );
+        assert_eq!(scalar(&db, "SELECT COUNT(*) AS count FROM channel_probes WHERE id='reference-probe' AND response_headers_ms=12 AND ttft_ms=8 AND first_event_ms=6 AND first_text_ms=8").await, 1);
+        assert_eq!(scalar(&db, "SELECT COUNT(*) AS count FROM models WHERE id='reference-zero' AND pricing_configured=1").await, 1);
+    }
+
     #[tokio::test]
     async fn fresh_database_has_v2_schema_seeds_foreign_keys_and_indexes() {
         let db = memory_database().await;
@@ -1595,7 +1954,7 @@ mod tests {
 
         assert_eq!(
             scalar(&db, "SELECT MAX(version) AS count FROM schema_migrations").await,
-            28
+            29
         );
         assert_eq!(
             scalar(
@@ -1921,7 +2280,7 @@ mod tests {
 
         assert_eq!(
             scalar(&db, "SELECT COUNT(*) AS count FROM schema_migrations").await,
-            25
+            26
         );
         assert_eq!(
             scalar(
@@ -2363,7 +2722,7 @@ mod tests {
 
         assert_eq!(
             scalar(&db, "SELECT MAX(version) AS count FROM schema_migrations").await,
-            28
+            29
         );
         assert_eq!(
             scalar(
@@ -2483,7 +2842,7 @@ mod tests {
 
         assert_eq!(
             scalar(&db, "SELECT MAX(version) AS count FROM schema_migrations").await,
-            28
+            29
         );
         assert_eq!(
             scalar(
