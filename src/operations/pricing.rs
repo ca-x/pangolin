@@ -90,6 +90,11 @@ impl UsageMeasurement {
         }
     }
 
+    pub fn valid_sql(column: &str) -> String {
+        format!(
+            "(json_type({column})='object' AND json_type({column},'$.version')='integer' AND json_extract({column},'$.version')=1 AND NOT EXISTS(SELECT 1 FROM json_each({column}) f WHERE f.key NOT IN ('version','input_tokens','output_tokens','cache_read_tokens','cache_write_tokens','reasoning_tokens','request_units','image_input_tokens','image_output_tokens') OR (f.key<>'version' AND f.type NOT IN ('true','false','null'))) AND NOT EXISTS(SELECT 1 FROM json_each({column}) f GROUP BY f.key HAVING COUNT(*)>1))"
+        )
+    }
     pub fn parse(value: &str) -> Self {
         serde_json::from_str::<Self>(value)
             .ok()
@@ -128,6 +133,8 @@ pub struct Usage {
     pub image_output: i64,
     #[serde(default)]
     pub reported: bool,
+    #[serde(default)]
+    pub invalid: bool,
 }
 fn number(value: &Value, names: &[&str]) -> i64 {
     names
@@ -216,9 +223,25 @@ impl Usage {
                 "/prompt_tokens_details/cache_creation_tokens",
             ],
         );
-        let mut input = number(v, &["/input_tokens", "/prompt_tokens", "/promptTokenCount"]);
-        // Anthropic reports uncached input separately; OpenAI and Gemini include cache hits.
-        if anthropic {
+        let gemini = v.get("promptTokenCount").is_some()
+            || v.get("candidatesTokenCount").is_some()
+            || v.get("totalTokenCount").is_some();
+        let input_known = if gemini {
+            present(&["/promptTokenCount"])
+        } else {
+            present(&["/input_tokens", "/prompt_tokens"])
+                && (!anthropic
+                    || (present(&["/cache_read_input_tokens"])
+                        && present(&["/cache_creation_input_tokens"])))
+        };
+        let mut input = if gemini {
+            number(v, &["/promptTokenCount"])
+        } else {
+            number(v, &["/input_tokens", "/prompt_tokens"])
+        };
+        // Native Gemini totals already include cache hits; client protocol hints
+        // cannot change the source counter used by total subtraction.
+        if anthropic && !gemini {
             input = input
                 .checked_add(read)
                 .and_then(|total| total.checked_add(write))
@@ -227,7 +250,16 @@ impl Usage {
                     0
                 });
         }
-        let output = if v.get("totalTokenCount").is_some() {
+        let output_known = if v.get("totalTokenCount").is_some() {
+            present(&["/totalTokenCount"]) && present(&["/promptTokenCount"])
+        } else if gemini {
+            present(&["/candidatesTokenCount"]) && present(&["/thoughtsTokenCount"])
+        } else {
+            present(&["/output_tokens", "/completion_tokens"])
+        };
+        let output = if v.get("totalTokenCount").is_some() && !output_known {
+            0
+        } else if v.get("totalTokenCount").is_some() {
             let total = number(v, &["/totalTokenCount"]);
             if total < input {
                 reported = false;
@@ -236,31 +268,21 @@ impl Usage {
                 total - input
             }
         } else {
-            number(
-                v,
-                &[
-                    "/output_tokens",
-                    "/completion_tokens",
-                    "/candidatesTokenCount",
-                ],
-            )
+            (if gemini {
+                number(v, &["/candidatesTokenCount"])
+            } else {
+                number(v, &["/output_tokens", "/completion_tokens"])
+            })
             .checked_add(number(v, &["/thoughtsTokenCount"]))
             .unwrap_or_else(|| {
                 reported = false;
                 0
             })
         };
-        Self {
+        let mut result = Self {
             presence: UsagePresence {
-                input: present(&["/input_tokens", "/prompt_tokens", "/promptTokenCount"])
-                    && (!anthropic
-                        || (present(&["/cache_read_input_tokens"])
-                            && present(&["/cache_creation_input_tokens"]))),
-                output: present(&[
-                    "/output_tokens",
-                    "/completion_tokens",
-                    "/candidatesTokenCount",
-                ]) || (present(&["/totalTokenCount"]) && present(&["/promptTokenCount"])),
+                input: input_known,
+                output: output_known,
                 cache_read: present(&[
                     "/cache_read_input_tokens",
                     "/input_tokens_details/cached_tokens",
@@ -319,9 +341,52 @@ impl Usage {
                 ],
             ),
             reported,
+            invalid: !supplied.is_empty() && !reported,
+        };
+        if result.validate_quantities().is_err() {
+            result.invalidate();
         }
+        result
+    }
+    fn invalidate(&mut self) {
+        self.invalid = true;
+        self.reported = false;
+        self.presence = UsagePresence::default();
+    }
+    pub fn validate_quantities(&self) -> Result<(), ApiError> {
+        if self.invalid
+            || [
+                self.input,
+                self.output,
+                self.cache_read,
+                self.cache_write,
+                self.cache_write_1h,
+                self.reasoning,
+                self.units,
+                self.image_input,
+                self.image_output,
+            ]
+            .iter()
+            .any(|value| *value < 0)
+            || self
+                .cache_read
+                .checked_add(self.cache_write)
+                .is_none_or(|sum| sum > self.input)
+            || self.cache_write_1h > self.cache_write
+            || self.reasoning > self.output
+        {
+            return Err(invalid());
+        }
+        Ok(())
     }
     pub fn merge(&mut self, other: Self) {
+        if self.invalid {
+            return;
+        }
+        if other.invalid {
+            self.invalidate();
+            return;
+        }
         if !other.reported {
             return;
         }
@@ -345,9 +410,19 @@ impl Usage {
         self.presence.image_input |= other.presence.image_input;
         self.presence.image_output |= other.presence.image_output;
         self.reported = true;
+        if self.validate_quantities().is_err() {
+            self.invalidate();
+        }
     }
     pub fn merge_event(&mut self, value: &Value, anthropic: bool) {
         let parsed = Self::parse_for(value, anthropic);
+        if self.invalid {
+            return;
+        }
+        if parsed.invalid {
+            self.invalidate();
+            return;
+        }
         if !parsed.reported {
             return;
         }
@@ -365,15 +440,23 @@ impl Usage {
                 if v.get("cache_creation_input_tokens").is_some() {
                     self.cache_write = parsed.cache_write;
                 }
-                self.input = fresh
-                    .saturating_add(self.cache_read)
-                    .saturating_add(self.cache_write);
+                let Some(total) = fresh
+                    .checked_add(self.cache_read)
+                    .and_then(|value| value.checked_add(self.cache_write))
+                else {
+                    self.invalidate();
+                    return;
+                };
+                self.input = total;
                 self.output = self.output.max(parsed.output);
                 self.presence.input |= parsed.presence.input;
                 self.presence.output |= parsed.presence.output;
                 self.presence.cache_read |= parsed.presence.cache_read;
                 self.presence.cache_write |= parsed.presence.cache_write;
                 self.reported |= parsed.reported;
+                if self.validate_quantities().is_err() {
+                    self.invalidate();
+                }
                 return;
             }
             let mut output_only = parsed;
@@ -514,25 +597,7 @@ impl Price {
     }
     pub fn calculate(&self, u: &Usage) -> Result<(i64, Vec<CostItem>), ApiError> {
         self.validate()?;
-        if [
-            u.input,
-            u.output,
-            u.cache_read,
-            u.cache_write,
-            u.cache_write_1h,
-            u.reasoning,
-            u.units,
-        ]
-        .iter()
-        .any(|n| *n < 0)
-            || u.cache_read
-                .checked_add(u.cache_write)
-                .is_none_or(|total| total > u.input)
-            || u.cache_write_1h > u.cache_write
-            || u.reasoning > u.output
-        {
-            return Err(invalid());
-        }
+        u.validate_quantities()?;
         let has = |kind: &str| self.components.iter().any(|c| c.kind == kind);
         let mut items = vec![];
         let mut total = 0i64;
@@ -681,6 +746,12 @@ pub fn media_units(endpoint: &str, payload: &Value) -> Result<i64, ApiError> {
     }
     Ok(units)
 }
+fn confirmed_price_sql(alias: &str) -> String {
+    format!(
+        "({alias}.origin='operator' AND ({alias}.operator_confirmed=1 OR EXISTS(SELECT 1 FROM audit_events a JOIN models proof_model ON proof_model.id={alias}.model_id JOIN providers proof_provider ON proof_provider.id=proof_model.provider_id WHERE a.resource_type='operations' AND a.action='prices.save' AND a.resource_id={alias}.id AND CASE WHEN json_valid(a.details) THEN json_extract(a.details,'$.project_id') END=proof_provider.project_id)))"
+    )
+}
+
 pub async fn snapshot(
     db: &DatabaseConnection,
     candidate: &Candidate,
@@ -701,7 +772,7 @@ pub async fn snapshot(
     let configured =
         model.try_get::<bool>("", "pricing_configured")? || input_rate > 0 || output_rate > 0;
     let captured_at = db::now();
-    let row=tx.query_one(sql("SELECT id,currency,schedule_json FROM model_prices WHERE model_id=? AND origin='operator' AND (provider_id=? OR provider_id IS NULL) AND valid_from<=? AND (valid_until IS NULL OR valid_until>?) ORDER BY provider_id IS NULL,version DESC LIMIT 1",vec![candidate.model_id.clone().into(),candidate.provider_id.clone().into(),captured_at.into(),captured_at.into()])).await?;
+    let row=tx.query_one(sql(format!("SELECT id,currency,schedule_json FROM model_prices WHERE model_id=? AND {} AND (provider_id=? OR provider_id IS NULL) AND valid_from<=? AND (valid_until IS NULL OR valid_until>?) ORDER BY provider_id IS NULL,version DESC LIMIT 1",confirmed_price_sql("model_prices")),vec![candidate.model_id.clone().into(),candidate.provider_id.clone().into(),captured_at.into(),captured_at.into()])).await?;
     if let Some(row) = &row
         && row.try_get::<String>("", "currency")? != "USD"
     {
@@ -839,14 +910,14 @@ pub async fn clone_operator_versions<C: ConnectionTrait>(
     target_provider: &str,
 ) -> Result<(), ApiError> {
     let captured_at = db::now();
-    let rows=db.query_all(sql("SELECT id,provider_id,version,currency,valid_from,valid_until,schedule_json FROM model_prices WHERE model_id=? AND origin='operator' AND (provider_id=? OR provider_id IS NULL) AND valid_from<=? AND (valid_until IS NULL OR valid_until>?)",vec![source_model.into(),source_provider.into(),captured_at.into(),captured_at.into()])).await?;
+    let rows=db.query_all(sql(format!("SELECT id,provider_id,version,currency,valid_from,valid_until,schedule_json FROM model_prices WHERE model_id=? AND {} AND (provider_id=? OR provider_id IS NULL) AND valid_from<=? AND (valid_until IS NULL OR valid_until>?)",confirmed_price_sql("model_prices")),vec![source_model.into(),source_provider.into(),captured_at.into(),captured_at.into()])).await?;
     for row in rows {
         let source: String = row.try_get("", "id")?;
         let target = super::id();
         let provider = row
             .try_get::<Option<String>>("", "provider_id")?
             .map(|_| target_provider.to_owned());
-        db.execute(sql("INSERT INTO model_prices(id,model_id,provider_id,version,currency,valid_from,valid_until,schedule_json,created_at,origin) VALUES(?,?,?,?,?,?,?,?,?,'operator')",vec![target.clone().into(),target_model.into(),provider.into(),row.try_get::<i64>("","version")?.into(),row.try_get::<String>("","currency")?.into(),row.try_get::<i64>("","valid_from")?.into(),row.try_get::<Option<i64>>("","valid_until")?.into(),row.try_get::<String>("","schedule_json")?.into(),captured_at.into()])).await?;
+        db.execute(sql("INSERT INTO model_prices(id,model_id,provider_id,version,currency,valid_from,valid_until,schedule_json,created_at,origin,operator_confirmed) VALUES(?,?,?,?,?,?,?,?,?,'operator',1)",vec![target.clone().into(),target_model.into(),provider.into(),row.try_get::<i64>("","version")?.into(),row.try_get::<String>("","currency")?.into(),row.try_get::<i64>("","valid_from")?.into(),row.try_get::<Option<i64>>("","valid_until")?.into(),row.try_get::<String>("","schedule_json")?.into(),captured_at.into()])).await?;
         for component in db.query_all(sql("SELECT kind,unit_size,unit_price_micros,tiers_json FROM model_price_components WHERE price_id=?",vec![source.into()])).await? {
             db.execute(sql("INSERT INTO model_price_components(id,price_id,kind,unit_size,unit_price_micros,tiers_json) VALUES(?,?,?,?,?,?)",vec![super::id().into(),target.clone().into(),component.try_get::<String>("","kind")?.into(),component.try_get::<i64>("","unit_size")?.into(),component.try_get::<i64>("","unit_price_micros")?.into(),component.try_get::<String>("","tiers_json")?.into()])).await?;
         }
@@ -862,5 +933,5 @@ pub async fn configured_for<C: ConnectionTrait>(
     project: &str,
 ) -> Result<bool, ApiError> {
     let now = db::now();
-    Ok(db.query_one(sql("SELECT m.id FROM models m JOIN providers original ON original.id=m.provider_id JOIN providers p ON p.project_id=original.project_id WHERE m.id=? AND p.id=? AND p.project_id=? AND (m.pricing_configured=1 OR m.input_price_micros>0 OR m.output_price_micros>0 OR EXISTS(SELECT 1 FROM model_prices v WHERE v.model_id=m.id AND v.origin='operator' AND v.currency='USD' AND (v.provider_id=p.id OR v.provider_id IS NULL) AND v.valid_from<=? AND (v.valid_until IS NULL OR v.valid_until>?) AND EXISTS(SELECT 1 FROM model_price_components c WHERE c.price_id=v.id)))",vec![model.into(),provider.into(),project.into(),now.into(),now.into()])).await?.is_some())
+    Ok(db.query_one(sql(format!("SELECT m.id FROM models m JOIN providers original ON original.id=m.provider_id JOIN providers p ON p.project_id=original.project_id WHERE m.id=? AND p.id=? AND p.project_id=? AND (m.pricing_configured=1 OR m.input_price_micros>0 OR m.output_price_micros>0 OR EXISTS(SELECT 1 FROM model_prices v WHERE v.model_id=m.id AND {} AND v.currency='USD' AND (v.provider_id=p.id OR v.provider_id IS NULL) AND v.valid_from<=? AND (v.valid_until IS NULL OR v.valid_until>?) AND EXISTS(SELECT 1 FROM model_price_components c WHERE c.price_id=v.id)))",confirmed_price_sql("v")),vec![model.into(),provider.into(),project.into(),now.into(),now.into()])).await?.is_some())
 }

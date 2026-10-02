@@ -682,7 +682,10 @@ impl ObservationStore {
     pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::Acquire)
     }
-    pub fn record_at(&self, event: RequestEvent, generation: u64) {
+    pub fn record_at(&self, mut event: RequestEvent, generation: u64) {
+        event.usage_measurement = crate::operations::pricing::UsageMeasurement::parse(
+            &serde_json::to_string(&event.usage_measurement).unwrap_or_default(),
+        );
         if generation != self.generation() {
             self.dropped
                 .stale_generation

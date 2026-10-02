@@ -1104,6 +1104,20 @@ ALTER TABLE usage_logs ADD COLUMN usage_measurement_json TEXT NOT NULL DEFAULT '
 CHECK(json_valid(usage_measurement_json) AND length(CAST(usage_measurement_json AS BLOB))<=512);
 "#;
 
+const V31_OPERATOR_PRICE_CONFIRMATION: &str = r#"
+ALTER TABLE model_prices ADD COLUMN operator_confirmed INTEGER NOT NULL DEFAULT 0 CHECK(operator_confirmed IN (0,1));
+CREATE INDEX idx_audit_price_save_resource ON audit_events(resource_id)
+WHERE action='prices.save' AND resource_type='operations';
+DROP TRIGGER immutable_price_update;
+UPDATE model_prices SET operator_confirmed=1
+WHERE origin='operator' AND EXISTS (
+    SELECT 1 FROM audit_events a JOIN models m ON m.id=model_prices.model_id JOIN providers p ON p.id=m.provider_id
+    WHERE a.action='prices.save' AND a.resource_type='operations' AND a.resource_id=model_prices.id
+    AND CASE WHEN json_valid(a.details) THEN json_extract(a.details,'$.project_id') END=p.project_id
+);
+CREATE TRIGGER immutable_price_update BEFORE UPDATE ON model_prices BEGIN SELECT RAISE(ABORT,'price versions are immutable'); END;
+"#;
+
 #[derive(FromQueryResult)]
 struct Count {
     count: i64,
@@ -1648,6 +1662,47 @@ pub async fn migrate(db: &DatabaseConnection) -> Result<()> {
             .await?;
         transaction.commit().await?;
     }
+    let operator_confirmation_applied = Count::find_by_statement(statement(
+        "SELECT COUNT(*) AS count FROM schema_migrations WHERE version=31",
+    ))
+    .one(db)
+    .await?
+    .is_some_and(|row| row.count > 0);
+    if !operator_confirmation_applied {
+        let transaction = db.begin().await?;
+        transaction
+            .execute_unprepared(V31_OPERATOR_PRICE_CONFIRMATION)
+            .await
+            .context("failed to preserve proven operator price confirmation")?;
+        transaction
+            .execute(statement(
+                "INSERT INTO schema_migrations(version,applied_at) VALUES(31,unixepoch())",
+            ))
+            .await?;
+        transaction.commit().await?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) async fn install_pre_origin_test_schema(db: &DatabaseConnection) -> Result<()> {
+    db.execute_unprepared("PRAGMA foreign_keys=ON").await?;
+    db.execute_unprepared(MIGRATION_LEDGER).await?;
+    for (version, schema) in [
+        (2, BASE_SCHEMA),
+        (2, V2_SCHEMA),
+        (3, V3_ACCESS_SCHEMA),
+        (4, V4_OIDC_BROWSER_BINDING),
+        (5, V5_RESPONSE_SESSIONS),
+        (6, V6_PROTOCOL_TASKS),
+        (7, V7_CATALOG),
+    ] {
+        db.execute_unprepared(schema).await?;
+        db.execute(statement(format!(
+            "INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES({version},0)"
+        )))
+        .await?;
+    }
     Ok(())
 }
 
@@ -1682,6 +1737,15 @@ mod tests {
     // written without any reference-adoption defaults or constraints.
     async fn reference_legacy_database(db: &DatabaseConnection) {
         migrate(db).await.unwrap();
+        if scalar(
+            db,
+            "SELECT COUNT(*) AS count FROM schema_migrations WHERE version=31",
+        )
+        .await
+            == 1
+        {
+            db.execute_unprepared("DROP INDEX idx_audit_price_save_resource; ALTER TABLE model_prices DROP COLUMN operator_confirmed; DELETE FROM schema_migrations WHERE version=31").await.unwrap();
+        }
         if scalar(
             db,
             "SELECT COUNT(*) AS count FROM schema_migrations WHERE version=30",
@@ -1985,7 +2049,7 @@ mod tests {
         migrate(&db).await.unwrap();
         assert_eq!(
             scalar(&db, "SELECT MAX(version) AS count FROM schema_migrations").await,
-            30
+            31
         );
         db.execute_unprepared("UPDATE channel_probes SET response_headers_ms=12,ttft_ms=8,first_event_ms=6,first_text_ms=8 WHERE id='reference-probe'; UPDATE models SET pricing_configured=1 WHERE id='reference-zero'").await.unwrap();
         let tables = scalar(
@@ -2023,7 +2087,7 @@ mod tests {
 
         assert_eq!(
             scalar(&db, "SELECT MAX(version) AS count FROM schema_migrations").await,
-            30
+            31
         );
         assert_eq!(
             scalar(
@@ -2349,7 +2413,7 @@ mod tests {
 
         assert_eq!(
             scalar(&db, "SELECT COUNT(*) AS count FROM schema_migrations").await,
-            27
+            28
         );
         assert_eq!(
             scalar(
@@ -2791,7 +2855,7 @@ mod tests {
 
         assert_eq!(
             scalar(&db, "SELECT MAX(version) AS count FROM schema_migrations").await,
-            30
+            31
         );
         assert_eq!(
             scalar(
@@ -2911,7 +2975,7 @@ mod tests {
 
         assert_eq!(
             scalar(&db, "SELECT MAX(version) AS count FROM schema_migrations").await,
-            30
+            31
         );
         assert_eq!(
             scalar(

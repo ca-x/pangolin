@@ -714,13 +714,17 @@ impl Attempt {
         if self.settled {
             return Ok(());
         }
+        if self.usage.validate_quantities().is_err() {
+            self.usage.reported = false;
+            self.final_usage = false;
+        }
         self.final_usage &= self.price.complete_usage(&self.usage);
         let ctx = &self.context;
         let (mut cost, mut items) = if self.usage.reported || status == "succeeded" {
             match self.price.calculate(&self.usage) {
                 Ok(value) => value,
                 Err(_) => {
-                    self.usage.reported = false;
+                    // Monetary failure does not erase independently valid terminal quantities.
                     self.final_usage = false;
                     (0, vec![])
                 }

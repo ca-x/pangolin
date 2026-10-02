@@ -13,6 +13,10 @@ use crate::{crypto, models::*};
 
 mod schema;
 
+#[cfg(test)]
+pub(crate) use schema::install_pre_origin_test_schema;
+#[cfg(test)]
+pub(crate) use schema::migrate as migrate_existing_for_test;
 pub use schema::{DEFAULT_PROJECT_ID, SYSTEM_OWNER_ROLE_ID};
 
 pub async fn connect(url: &str) -> Result<DatabaseConnection> {

@@ -419,6 +419,16 @@ pub async fn restore_with_strategies_as(
                     }
                 }
             }
+            if *table == "usage_logs"
+                && let Some(metadata) = object.get_mut("usage_measurement_json")
+            {
+                *metadata = Value::String(
+                    serde_json::to_string(&super::pricing::UsageMeasurement::parse(
+                        metadata.as_str().unwrap_or_default(),
+                    ))
+                    .map_err(|e| ApiError::Internal(e.into()))?,
+                );
+            }
             let natural: &[&str] = match *table {
                 "providers" => &["name"],
                 "models" => &["provider_id", "public_name", "upstream_name"],
@@ -523,9 +533,19 @@ pub async fn restore_with_strategies_as(
                         .map(|key| value(&object[*key]))
                         .collect::<Result<Vec<_>, _>>()?;
                     let current=tx.query_one(sql(format!("SELECT json_object({expression}) AS document FROM {table} WHERE {where_pk}"),values)).await?.ok_or(ApiError::NotFound)?;
-                    let current: Value =
+                    let mut current: Value =
                         serde_json::from_str(&current.try_get::<String>("", "document")?)
                             .map_err(|e| ApiError::Internal(e.into()))?;
+                    if *table == "usage_logs"
+                        && let Some(metadata) = current.get_mut("usage_measurement_json")
+                    {
+                        *metadata = Value::String(
+                            serde_json::to_string(&super::pricing::UsageMeasurement::parse(
+                                metadata.as_str().unwrap_or_default(),
+                            ))
+                            .map_err(|e| ApiError::Internal(e.into()))?,
+                        );
+                    }
                     if current.as_object() == Some(object) {
                         continue;
                     } else {

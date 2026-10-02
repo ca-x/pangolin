@@ -497,12 +497,13 @@ async fn b37_pricing_channel_scope_wins_only_for_the_matching_channel() {
          ('price-channel-b','00000000-0000-0000-0000-000000000001','B','openai','https://b.invalid',1,0,0);
          INSERT INTO models(id,provider_id,public_name,upstream_name,created_at) VALUES
          ('price-model','price-channel-a','public','upstream',0);
-         INSERT INTO model_prices(id,model_id,provider_id,version,valid_from,created_at) VALUES
-         ('price-global','price-model',NULL,1,0,0),
-         ('price-channel','price-model','price-channel-a',1,0,0);
+         INSERT INTO model_prices(id,model_id,provider_id,version,valid_from,created_at,origin) VALUES
+         ('price-global','price-model',NULL,1,0,0,'operator'),
+         ('price-channel','price-model','price-channel-a',1,0,0,'operator');
          INSERT INTO model_price_components(id,price_id,kind,unit_size,unit_price_micros) VALUES
          ('component-global','price-global','input',1,10),
-         ('component-channel','price-channel','input',1,3);",
+         ('component-channel','price-channel','input',1,3);
+         INSERT INTO audit_events(id,action,resource_type,resource_id,details,created_at) VALUES('saved-global','prices.save','operations','price-global',json_object('project_id','00000000-0000-0000-0000-000000000001'),0),('saved-channel','prices.save','operations','price-channel',json_object('project_id','00000000-0000-0000-0000-000000000001'),0);",
     )
     .await
     .unwrap();
@@ -644,4 +645,51 @@ fn reference_pricing_overflowing_quantities_are_unreported() {
         !usage.reported,
         "a total below input cannot invent measured output zero"
     );
+}
+
+#[test]
+fn reference_pricing_review_i2_gemini_total_requires_input_for_output_derivation() {
+    let usage = pricing::Usage::parse(
+        &json!({"usageMetadata":{"candidatesTokenCount":3,"totalTokenCount":10}}),
+    );
+    assert!(
+        !usage.presence.output,
+        "candidate presence cannot certify total-minus-missing-input"
+    );
+    assert_eq!(usage.output, 0);
+}
+
+#[test]
+fn reference_pricing_review_i2_gemini_total_uses_its_native_input_counter() {
+    let usage = pricing::Usage::parse(
+        &json!({"usageMetadata":{"input_tokens":10,"promptTokenCount":3,"candidatesTokenCount":3,"totalTokenCount":10}}),
+    );
+    assert_eq!(
+        usage.input, 3,
+        "the normalized native counter must match subtraction trust"
+    );
+    assert_eq!(usage.output, 7);
+    assert!(usage.presence.input && usage.presence.output);
+}
+
+#[test]
+fn reference_pricing_review_i2_derived_output_requires_every_summand() {
+    let partial = pricing::Usage::parse(
+        &json!({"usageMetadata":{"promptTokenCount":3,"candidatesTokenCount":3}}),
+    );
+    assert!(
+        !partial.presence.output,
+        "an absent thoughts counter cannot become a trusted zero summand"
+    );
+    let complete = pricing::Usage::parse(
+        &json!({"usageMetadata":{"promptTokenCount":3,"candidatesTokenCount":3,"thoughtsTokenCount":0}}),
+    );
+    assert!(complete.presence.output);
+    assert_eq!(complete.output, 3);
+    let native = pricing::Usage::parse_for(
+        &json!({"usageMetadata":{"input_tokens":99,"promptTokenCount":3,"output_tokens":99,"candidatesTokenCount":3,"thoughtsTokenCount":0,"cachedContentTokenCount":1}}),
+        true,
+    );
+    assert_eq!((native.input, native.output), (3, 3));
+    assert!(native.presence.input && native.presence.output);
 }
