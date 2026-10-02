@@ -21,7 +21,7 @@ vi.mock('sonner', () => ({ toast: { success: vi.fn(), error: vi.fn(), info: vi.f
 const json = (value: unknown, status = 200) => Promise.resolve(new Response(JSON.stringify(value), { status, headers: { 'Content-Type': 'application/json' } }))
 const project = { id: 'p1', name: 'Project', slug: 'project', owner_user_id: 'u1', is_default: true, enabled: true }
 const channel = { id: 'c1', name: 'openai-prod', kind: 'openai', base_url: 'https://api.openai.com/v1', enabled: true }
-const model = { id: 'm1', provider_id: 'c1', public_name: 'fast', upstream_name: 'gpt-4o-mini', enabled: true, lifecycle: 'active' }
+const model = { id: 'm1', provider_id: 'c1', public_name: 'fast', upstream_name: 'gpt-4o-mini', enabled: true, lifecycle: 'active', capabilities: ['chat', 'responses'] }
 
 const renderPage = (fetchMock: ReturnType<typeof vi.fn>) => {
   vi.stubGlobal('fetch', fetchMock)
@@ -43,7 +43,9 @@ const mockApi = () => {
     if (path.endsWith('/projects')) return json([project])
     if (path.includes('/permissions')) return json(['*'])
     if (path.includes('operations/probe') && init?.method === 'POST') { probed = true; return json({ job_id: 'j1' }) }
-    if (path.includes('operations/probes')) return json({ data: probed ? [{ id: 'pr1', provider_id: 'c1', model: 'gpt-4o-mini', success: 1, status_code: 200, latency_ms: 110, ttft_ms: 10, output_tokens: 10, probed_at: 1_700_000_000, error: null }] : [], total: probed ? 1 : 0 })
+    if (path.includes('operations/credentials')) return json({ data: [{ id: 'key1', provider_id: 'c1', suffix: '1234', enabled: true }], total: 1 })
+    if (path.includes('operations/channel-settings')) return json({ data: [], total: 0 })
+    if (path.includes('operations/probes')) return json({ data: probed ? [{ id: 'pr1', provider_id: 'c1', model: 'gpt-4o-mini', success: 1, status_code: 200, latency_ms: 110, response_headers_ms: 2, first_event_ms: 5, first_text_ms: 10, stream: true, endpoint: '/v1/chat/completions', output_tokens: 10, probed_at: 1_700_000_000, error: null }] : [], total: probed ? 1 : 0 })
     if (path.includes('operations/health') || path.includes('operations/credential-health')) return json({ data: [], total: 0 })
     if (path.includes('operations/models')) return json({ data: [model], total: 1 })
     return json({ data: [channel], total: 1 })
@@ -63,12 +65,13 @@ describe('a channel can be probed from its own row', () => {
     await userEvent.click(await table.findByRole('button', { name: 'Test openai-prod' }))
     const dialog = await screen.findByRole('dialog')
 
+    await userEvent.click(await within(dialog).findByRole('switch', { name: 'Stream' }))
     await userEvent.click(within(dialog).getByRole('button', { name: 'Run probe' }))
 
     await waitFor(() => {
       const call = fetchMock.mock.calls.find(([input, init]) => String(input).includes('operations/probe') && (init as RequestInit | undefined)?.method === 'POST')
       expect(call).toBeTruthy()
-      expect(JSON.parse(String((call![1] as RequestInit).body))).toEqual({ provider_id: 'c1', model_id: 'm1' })
+      expect(JSON.parse(String((call![1] as RequestInit).body))).toEqual({ provider_id: 'c1', model_id: 'm1', credential_id: 'key1', endpoint: '/v1/chat/completions', stream: true })
     })
 
     // The outcome lands where the decision was made, with the model selected by
@@ -79,7 +82,7 @@ describe('a channel can be probed from its own row', () => {
     expect(within(dialog).getByText('Status code: 200')).toBeInTheDocument()
     expect(within(dialog).getByText('Success rate')).toBeInTheDocument()
     expect(within(dialog).getByText('100%')).toBeInTheDocument()
-    expect(within(dialog).getByText('Average TTFT')).toBeInTheDocument()
+    expect(within(dialog).getByText('Average first text')).toBeInTheDocument()
     expect(within(dialog).getByText('10 ms')).toBeInTheDocument()
     expect(within(dialog).getByText('Tokens/s')).toBeInTheDocument()
     expect(within(dialog).getByText('100.0')).toBeInTheDocument()

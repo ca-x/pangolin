@@ -12,6 +12,7 @@ import { ProviderIcon } from '../ProviderIcon'
 import { CHANNEL_PROVIDERS } from '../providers'
 import { projectOperationPath, useProject } from '../project'
 import { PageHeader, QueryError, ResourcePage, displayValue, formatDate } from './shared'
+import { ProbeForm } from './ProbeForm'
 import { useActiveTabInView, useRoutedTab } from './useRoutedTab'
 
 const CHANNEL_TABS = ['channels', 'credentials', 'channelPolicies', 'probes', 'quotas', 'presets'] as const
@@ -123,13 +124,28 @@ function ProbesPanel() {
   const errorLabel = useErrorCodeLabel()
   const { options: channelOptions } = useChannelOptions()
   const channelName = (value: unknown) => channelOptions.find((option) => option.value === String(value))?.label ?? displayValue(value)
-  const measured = (value: unknown) => typeof value === 'number' && value > 0 ? String(value) : '—'
-  const outcome = (value: unknown) => value === 1 || value === true
-  const rate = (value: unknown, row: Document) => {
-    if (typeof row.output_tokens !== 'number' || typeof row.latency_ms !== 'number' || typeof row.ttft_ms !== 'number') return UNMEASURED
-    return row.output_tokens >= 0 && row.latency_ms > row.ttft_ms ? (row.output_tokens * 1000 / (row.latency_ms - row.ttft_ms)).toFixed(1) : UNMEASURED
-  }
-  return <ResourcePage resource="probes" title={t('probes')} description={t('probesDescription')} empty={t('probeEmpty')} immutable columns={[{ key: 'provider_id', label: t('channel'), render: (value) => channelName(value) }, { key: 'model', label: t('model'), render: displayValue }, { key: 'success', label: t('status'), render: (value) => <Badge variant="light" color={outcome(value) ? 'green' : 'red'}>{t(outcome(value) ? 'statusSucceeded' : 'statusFailed')}</Badge> }, { key: 'status_code', label: t('statusCode'), render: (value) => measured(value) }, { key: 'latency_ms', label: t('latency'), render: (value) => measured(value) }, { key: 'ttft_ms', label: t('ttft'), render: (value) => measured(value) }, { key: 'tokens_per_second', label: t('tokensPerSecond'), render: rate }, { key: 'probed_at', label: t('time'), render: formatDate }, { key: 'error', label: t('probeError'), render: (value) => value ? errorLabel(String(value)) : '—' }]} />
+  const [provider, setProvider] = useState('')
+  const { project } = useProject()
+  useEffect(() => { setProvider('') }, [project.id])
+  return <ResourcePage resource="probes" title={t('probes')} description={t('probesDescription')} empty={t('probeEmpty')} immutable tableMinWidth={1260} mobileColumnLimit={14}
+    listQuery={provider ? { provider_id: provider } : {}}
+    filters={<Select label={t('probeHistoryChannel')} value={provider} onChange={(value) => setProvider(value || '')} data={[{ value: '', label: t('allChannels') }, ...channelOptions]} w={{ base: '100%', sm: 240 }} allowDeselect={false} />}
+    columns={[
+      { key: 'provider_id', label: t('channel'), render: (value) => channelName(value) },
+      { key: 'model', label: t('model'), render: displayValue },
+      { key: 'endpoint', label: t('probeProtocol'), render: displayValue },
+      { key: 'stream', label: t('stream'), render: (value) => value == null ? UNMEASURED : t(value ? 'yes' : 'no') },
+      { key: 'success', label: t('status'), render: (value) => <Badge variant="light" color={value === 1 || value === true ? 'green' : 'red'}>{t(value === 1 || value === true ? 'statusSucceeded' : 'statusFailed')}</Badge> },
+      { key: 'status_code', label: t('statusCode'), render: (value) => typeof value === 'number' && value > 0 ? String(value) : UNMEASURED },
+      { key: 'latency_ms', label: t('latency'), render: measuredTime },
+      { key: 'response_headers_ms', label: t('probeResponseHeaders'), render: measuredTime },
+      { key: 'first_event_ms', label: t('probeFirstEvent'), render: measuredTime },
+      { key: 'first_text_ms', label: t('probeFirstText'), render: measuredTime },
+      { key: 'output_tokens', label: t('outputTokens'), render: displayValue },
+      { key: 'tokens_per_second', label: t('tokensPerSecond'), render: (_value, row) => probeRate(row) == null ? UNMEASURED : probeRate(row)!.toFixed(1) },
+      { key: 'probed_at', label: t('time'), render: formatDate },
+      { key: 'error', label: t('probeError'), render: (value) => value ? errorLabel(String(value)) : UNMEASURED },
+    ]} />
 }
 
 function useChannelOptions() {
@@ -201,7 +217,7 @@ function useProbeModels() {
   return useQuery(modelsQuery(project.id))
 }
 
-type ProbeRow = { id?: string; provider_id?: string; model?: string | null; success?: number | boolean | null; status_code?: number | null; latency_ms?: number | null; ttft_ms?: number | null; output_tokens?: number | null; probed_at?: number | null; error?: string | null }
+type ProbeRow = { endpoint?: string | null; stream?: boolean | null; response_headers_ms?: number | null; first_event_ms?: number | null; first_text_ms?: number | null; id?: string; provider_id?: string; model?: string | null; success?: number | boolean | null; status_code?: number | null; latency_ms?: number | null; ttft_ms?: number | null; output_tokens?: number | null; probed_at?: number | null; error?: string | null }
 const probesQuery = (project: string, providerId: string) => ({
   queryKey: ['probe-history', project, providerId],
   queryFn: () => api<Paged<ProbeRow>>(projectOperationPath(project, 'probes') + `?limit=100&provider_id=${encodeURIComponent(providerId)}`),
@@ -291,7 +307,7 @@ function CredentialsPanel() {
   const retryOptions = () => void query.refetch()
   return (
     <>
-      <ResourcePage resource="credentials" title={t('credentials')} description={t('credentialsDescription')} empty={t('credentialEmpty')} selectable="credentials" createLabel={t('addApiKey')} secondaryAction={<Button variant="default" onClick={() => setOauthOpen(true)}>{t('addOauth')}</Button>} notice={<HealthNotice kind="credential" />} columns={[{ key: 'provider_name', label: t('channel') }, { key: 'suffix', label: t('suffix'), mono: true }, { key: 'credential_type', label: t('credentialType'), render: (value) => credentialType(value) }, { key: 'state', label: t('credentialState'), render: (value) => <Badge variant="light" color={value === 'unrecoverable' ? 'red' : 'green'}>{t(value === 'unrecoverable' ? 'credentialUnrecoverable' : 'credentialReady')}</Badge> }, { key: 'priority', label: t('priority') }, { key: 'health', label: t('credentialHealth'), render: (_value, row) => <HealthCell kind="credential" id={String(row.id)} /> }, { key: 'enabled', label: t('status'), render: (value) => <EnabledPill enabled={value} /> }]} rowActions={(row) => row.state === 'unrecoverable' ? <CredentialRecoveryAction row={row} /> : null} normalize={(values, editing) => ({ ...values, credential_type: editing?.credential_type ?? 'api_key', ...(editing ? { id: editing.id } : {}) })} fields={[{ key: 'provider_id', label: t('channel'), kind: 'select', required: true, options, error: optionsError, onRetry: retryOptions }, { key: 'secret', label: t('secret'), kind: 'secret', hint: t('secretUpdateHint'), omitWhenBlank: true }, { key: 'priority', label: t('priority'), kind: 'number', defaultValue: 100 }, { key: 'enabled', label: t('status'), kind: 'checkbox' }, { key: 'settings', label: t('advancedSettings'), kind: 'json', defaultValue: { version: 1 } }]} />
+      <ResourcePage resource="credentials" tableMinWidth={1260} mobileColumnLimit={10} title={t('credentials')} description={t('credentialsDescription')} empty={t('credentialEmpty')} selectable="credentials" createLabel={t('addApiKey')} secondaryAction={<Button variant="default" onClick={() => setOauthOpen(true)}>{t('addOauth')}</Button>} notice={<HealthNotice kind="credential" />} columns={[{ key: 'provider_name', label: t('channel') }, { key: 'suffix', label: t('suffix'), mono: true }, { key: 'credential_type', label: t('credentialType'), render: (value) => credentialType(value) }, { key: 'state', label: t('credentialState'), render: (value) => <Badge variant="light" color={value === 'unrecoverable' ? 'red' : 'green'}>{t(value === 'unrecoverable' ? 'credentialUnrecoverable' : 'credentialReady')}</Badge> }, { key: 'discovery_status', label: t('modelInventory'), render: (value) => <Text size="sm">{t(value === 'known' ? 'inventoryKnown' : value === 'stale' ? 'inventoryStale' : 'inventoryUnknown')}</Text> }, { key: 'discovery_model_count', label: t('inventoryCount'), render: displayValue }, { key: 'discovery_last_success_at', label: t('inventoryLastSuccess'), render: formatDate }, { key: 'priority', label: t('priority') }, { key: 'health', label: t('credentialHealth'), render: (_value, row) => <HealthCell kind="credential" id={String(row.id)} /> }, { key: 'enabled', label: t('status'), render: (value) => <EnabledPill enabled={value} /> }]} rowActions={(row) => row.state === 'unrecoverable' ? <CredentialRecoveryAction row={row} /> : null} normalize={(values, editing) => ({ ...values, credential_type: editing?.credential_type ?? 'api_key', ...(editing ? { id: editing.id } : {}) })} fields={[{ key: 'provider_id', label: t('channel'), kind: 'select', required: true, options, error: optionsError, onRetry: retryOptions }, { key: 'secret', label: t('secret'), kind: 'secret', hint: t('secretUpdateHint'), omitWhenBlank: true }, { key: 'priority', label: t('priority'), kind: 'number', defaultValue: 100 }, { key: 'enabled', label: t('status'), kind: 'checkbox' }, { key: 'settings', label: t('advancedSettings'), kind: 'json', defaultValue: { version: 1 } }]} />
       <Modal opened={oauthOpen} onClose={() => setOauthOpen(false)} title={t('providerOauth')} size="lg" closeOnClickOutside={false} closeButtonProps={{ 'aria-label': t('close') }}>
         {oauthOpen && <OAuthCredentialPanel options={options} optionsError={optionsError} retryOptions={retryOptions} onComplete={() => setOauthOpen(false)} />}
       </Modal>
@@ -490,14 +506,15 @@ function ModelRulesEditor({ name, label, value, setValid }: { name: string; labe
   </Stack>
 }
 
+const measuredTime = (value: unknown) => typeof value === 'number' && value >= 0 ? `${value} ms` : UNMEASURED
 const successfulProbe = (row: ProbeRow) => row.success === 1 || row.success === true
-const measuredAverage = (rows: ProbeRow[], field: 'latency_ms' | 'ttft_ms') => {
-  const values = rows.map((row) => row[field]).filter((value): value is number => typeof value === 'number' && (field === 'ttft_ms' ? value >= 0 : value > 0))
+const measuredAverage = (rows: ProbeRow[], field: 'latency_ms' | 'first_text_ms') => {
+  const values = rows.map((row) => row[field]).filter((value): value is number => typeof value === 'number' && value >= 0)
   return values.length ? Math.round(values.reduce((sum, value) => sum + value, 0) / values.length) : null
 }
 const probeRate = (row: ProbeRow) => {
-  if (typeof row.output_tokens !== 'number' || typeof row.latency_ms !== 'number' || typeof row.ttft_ms !== 'number') return null
-  return row.output_tokens >= 0 && row.latency_ms > row.ttft_ms ? row.output_tokens * 1000 / (row.latency_ms - row.ttft_ms) : null
+  if (row.stream !== true || typeof row.output_tokens !== 'number' || typeof row.latency_ms !== 'number' || typeof row.first_text_ms !== 'number') return null
+  return row.output_tokens >= 0 && row.first_text_ms >= 0 && row.latency_ms > row.first_text_ms ? row.output_tokens * 1000 / (row.latency_ms - row.first_text_ms) : null
 }
 
 function ProbeSparkline({ rows, name, failed, retry }: { rows: ProbeRow[]; name: string; failed: boolean; retry: () => void }) {
@@ -518,22 +535,23 @@ function ProbeHistory({ rows }: { rows: ProbeRow[] }) {
   if (!rows.length) return <Text size="sm" c="dimmed">{t('probeEmpty')}</Text>
   const successes = rows.filter(successfulProbe).length
   const latency = measuredAverage(rows, 'latency_ms')
-  const ttft = measuredAverage(rows, 'ttft_ms')
+  const ttft = measuredAverage(rows, 'first_text_ms')
   const rates = rows.map(probeRate).filter((value): value is number => value != null)
   const tokensPerSecond = rates.length ? rates.reduce((sum, value) => sum + value, 0) / rates.length : null
   const facts = [
     [t('successRate'), `${Math.round(successes / rows.length * 100)}%`],
     [t('averageLatency'), latency == null ? UNMEASURED : `${latency} ms`],
-    [t('averageTtft'), ttft == null ? UNMEASURED : `${ttft} ms`],
+    [t('probeAverageFirstText'), ttft == null ? UNMEASURED : `${ttft} ms`],
     [t('tokensPerSecond'), tokensPerSecond == null ? UNMEASURED : tokensPerSecond.toFixed(1)],
   ]
   return <Stack gap="sm">
     <Title order={3}>{t('probeHistory')}</Title>
     <SimpleGrid cols={{ base: 2, sm: 4 }} spacing="xs">{facts.map(([label, value]) => <Paper withBorder p="xs" key={label}><Text size="xs" c="dimmed">{label}</Text><Text fw={650} ff="monospace">{value}</Text></Paper>)}</SimpleGrid>
-    <Stack gap={4}>{[...rows].sort((left, right) => Number(right.probed_at || 0) - Number(left.probed_at || 0)).slice(0, 20).map((row) => <Group key={row.id || `${row.probed_at}-${row.model}`} justify="space-between" gap="xs" wrap="nowrap">
-      <Stack gap={0} style={{ minWidth: 0 }}><Text size="sm" fw={560} truncate>{row.model || UNMEASURED}</Text><Text size="xs" c="dimmed">{formatDate(row.probed_at)}</Text></Stack>
-      <Group gap="xs" wrap="nowrap"><Badge variant="light" color={successfulProbe(row) ? 'green' : 'red'}>{t(successfulProbe(row) ? 'statusSucceeded' : 'statusFailed')}</Badge><Text size="xs" ff="monospace">{row.latency_ms == null || row.latency_ms <= 0 ? UNMEASURED : `${row.latency_ms} ms`}</Text></Group>
-    </Group>)}</Stack>
+    <Stack gap="sm">{[...rows].sort((left, right) => Number(right.probed_at || 0) - Number(left.probed_at || 0)).slice(0, 20).map((row) => <Stack key={row.id || `${row.probed_at}-${row.model}`} gap={4}>
+      <Group justify="space-between" wrap="wrap"><Text size="sm" fw={560} style={{ overflowWrap: 'anywhere' }}>{row.model || UNMEASURED}</Text><Badge variant="light" color={successfulProbe(row) ? 'green' : 'red'}>{t(successfulProbe(row) ? 'statusSucceeded' : 'statusFailed')}</Badge></Group>
+      <Text size="sm" c="dimmed" style={{ overflowWrap: 'anywhere' }}>{row.endpoint || UNMEASURED} · {formatDate(row.probed_at)}</Text>
+      <SimpleGrid cols={{ base: 1, sm: 3 }} spacing="xs">{(['response_headers_ms', 'first_event_ms', 'first_text_ms'] as const).map((field, index) => <Text size="sm" key={field}>{t(['probeResponseHeaders', 'probeFirstEvent', 'probeFirstText'][index])}: {measuredTime(row[field])}</Text>)}</SimpleGrid>
+    </Stack>)}</Stack>
   </Stack>
 }
 
@@ -541,23 +559,12 @@ function ProbeRowAction({ id, name }: { id: string; name: string }) {
   const { t } = useTranslation()
   const { project } = useProject()
   const [open, setOpen] = useState(false)
+  useEffect(() => { setOpen(false) }, [project.id])
   const [baseline, setBaseline] = useState<number | null>(null)
   const [queued, setQueued] = useState(false)
-  const [model, setModel] = useState('')
   const query = useProbeHistory(id, open && queued)
-  const models = useProbeModels()
-  const availableModels = (models.data?.data || []).filter((item) => item.provider_id === id && item.enabled !== false && item.lifecycle !== 'archived')
-  useEffect(() => { if (open && !availableModels.some((item) => item.id === model)) setModel(availableModels[0]?.id || '') }, [open, model, availableModels])
   const rows = (query.data?.data || []).filter((row) => String(row.provider_id) === id)
   const newest = rows.reduce((value, row) => Math.max(value, Number(row.probed_at ?? 0)), 0)
-  const run = useMutation({
-    mutationFn: () => api(projectOperationPath(project.id, 'probe'), { method: 'POST', body: JSON.stringify({ provider_id: id, model_id: model }) }),
-    // The baseline is the newest record *before* this run, so the result shown is
-    // this probe's and not an older one; the read is repeated straight away because
-    // a fast job would otherwise wait for the polling interval.
-    onSuccess: () => { setBaseline(newest); setQueued(true); void query.refetch() },
-    onError: (error: Error) => toast.error(error.message),
-  })
   const result = rows
     .filter((row) => String(row.provider_id) === id && (baseline == null || Number(row.probed_at ?? 0) > baseline))
     .sort((left, right) => Number(right.probed_at ?? 0) - Number(left.probed_at ?? 0))[0]
@@ -568,14 +575,7 @@ function ProbeRowAction({ id, name }: { id: string; name: string }) {
     <Tooltip label={t('test')}><ActionIcon variant="subtle" color="gray" aria-label={`${t('test')} ${name}`} onClick={openDialog}><Play size={16} /></ActionIcon></Tooltip>
     <Modal opened={open} onClose={closeDialog} title={`${t('test')} ${name}`} closeButtonProps={{ 'aria-label': t('close') }}>
       <Stack gap="md">
-        <Group gap="sm" align="end" wrap="wrap">
-          <SelectField label={t('model')} value={model} onValueChange={setModel} options={availableModels.map((item) => ({ value: item.id, label: `${item.public_name || item.id}${item.upstream_name && item.upstream_name !== item.public_name ? ` → ${item.upstream_name}` : ''}` }))} />
-          <Button onClick={() => run.mutate()} loading={run.isPending} disabled={!model || models.isError}>{t('runProbe')}</Button>
-        </Group>
-        {models.isLoading && <Text size="sm" c="dimmed">{t('loading')}</Text>}
-        {!models.isLoading && !models.isError && availableModels.length === 0 && <Text size="sm" c="dimmed">{t('probeNoModels')}</Text>}
-        {models.isError && <InlineQueryError message={t('probeModelsUnavailable')} onRetry={() => void models.refetch()} />}
-        {run.isError && <InlineQueryError message={run.error.message} onRetry={() => run.mutate()} />}
+        {open && <ProbeForm providerId={id} onQueued={() => { setBaseline(newest); setQueued(true); void query.refetch() }} />}
         {query.isError ? <InlineQueryError message={t('probeResultsUnavailable')} onRetry={() => void query.refetch()} />
           : !queued ? null
             : !result ? <Text size="sm" c="dimmed">{t('probeWaiting')}</Text>
@@ -636,33 +636,23 @@ function BulkProbe() {
 }
 
 function Diagnostics({ quota = false }: { quota?: boolean }) {
+  return quota ? <QuotaDiagnostics /> : <Paper withBorder p="md" mb="md"><ProbeForm /></Paper>
+}
+function QuotaDiagnostics() {
   const { t } = useTranslation()
   const { project } = useProject()
   const { options, query } = useChannelOptions()
-  const models = useProbeModels()
   const [selected, setSelected] = useState('')
-  const [selectedModel, setSelectedModel] = useState('')
-  const current = selected || options[0]?.value || ''
-  const availableModels = (models.data?.data || []).filter((model) => model.provider_id === current && model.enabled !== false && model.lifecycle !== 'archived')
-  const currentModel = availableModels.some((model) => model.id === selectedModel) ? selectedModel : availableModels[0]?.id || ''
-  const run = useMutation({ mutationFn: ({ provider_id, model_id }: { provider_id: string; model_id?: string }) => api(projectOperationPath(project.id, quota ? 'quota' : 'probe'), { method: 'POST', body: JSON.stringify({ provider_id, ...(model_id ? { model_id } : {}) }) }), onSuccess: () => toast.success(t('jobQueued')), onError: (error: Error) => toast.error(error.message) })
-  return (
-    <Paper withBorder p="md" mb="md">
-      <form onSubmit={(event) => { event.preventDefault(); run.mutate({ provider_id: current, ...(quota ? {} : { model_id: currentModel }) }) }}>
-        <Group gap="md" align="end" wrap="wrap">
-          {/* The probe targets a channel, so a channel list that could not be read
-              is reported here rather than as an empty picker. */}
-          {query.isError
-            ? <InlineQueryError message={t('optionsUnavailable')} onRetry={() => void query.refetch()} />
-            : <SelectField label={t('channel')} value={current} onValueChange={setSelected} options={options} />}
-          {!quota && (models.isError ? <InlineQueryError message={t('probeModelsUnavailable')} onRetry={() => void models.refetch()} /> : <SelectField label={t('model')} value={currentModel} onValueChange={setSelectedModel} options={availableModels.map((model) => ({ value: model.id, label: `${model.public_name || model.id}${model.upstream_name && model.upstream_name !== model.public_name ? ` → ${model.upstream_name}` : ''}` }))} />)}
-          {!quota && models.isLoading && <Text size="sm" c="dimmed">{t('loading')}</Text>}
-          {!quota && !models.isLoading && !models.isError && availableModels.length === 0 && <Text size="sm" c="dimmed">{t('probeNoModels')}</Text>}
-          <Button type="submit" disabled={!current || query.isError || (!quota && (!currentModel || models.isError))}>{quota ? t('collectQuota') : t('runProbe')}</Button>
-        </Group>
-      </form>
-    </Paper>
-  )
+  const current = options.some((item) => item.value === selected) ? selected : options[0]?.value || ''
+  const run = useMutation({ mutationFn: () => api(projectOperationPath(project.id, 'quota'), { method: 'POST', body: JSON.stringify({ provider_id: current }) }), onSuccess: () => toast.success(t('jobQueued')), onError: (error: Error) => toast.error(error.message) })
+  return <Paper withBorder p="md" mb="md">
+    <form onSubmit={(event) => { event.preventDefault(); if (current && !query.isError) run.mutate() }}>
+      <Group gap="md" align="end" wrap="wrap">
+        {query.isError ? <InlineQueryError message={t('optionsUnavailable')} onRetry={() => void query.refetch()} /> : <SelectField label={t('channel')} value={current} onValueChange={setSelected} options={options} />}
+        <Button type="submit" loading={run.isPending} disabled={!current || query.isError}>{t('collectQuota')}</Button>
+      </Group>
+    </form>
+  </Paper>
 }
 
 function PresetsPanel() {

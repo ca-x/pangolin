@@ -31,7 +31,7 @@ describe('B58-B61 console workflows', () => {
     vi.stubGlobal('fetch', fetchMock)
     renderPage(<ChannelsPage />)
     await userEvent.click(await screen.findByRole('tab', { name: 'Credentials' }))
-    expect(await screen.findByText('Unrecoverable')).toBeInTheDocument()
+    expect(within(await screen.findByRole('region', { name: 'Credentials' })).getByText('Unrecoverable')).toBeInTheDocument()
     await userEvent.click(screen.getAllByRole('button', { name: 'Replace credential' }).at(-1)!)
     await vi.waitFor(() => expect(fetchMock.mock.calls.some(([input]) => String(input).includes('/recovery-token'))).toBe(true))
     const recoveryDialog = await screen.findByRole('dialog')

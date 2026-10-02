@@ -148,7 +148,7 @@ describe('the probes table says why a probe failed', () => {
     await userEvent.click(await screen.findByRole('tab', { name: 'Probes' }))
 
     expect(await screen.findByRole('columnheader', { name: 'Error' })).toBeInTheDocument()
-    expect(await screen.findByText('rate_limited')).toBeInTheDocument()
+    expect(within(await screen.findByRole('region', { name: 'Probes' })).getByText('rate_limited')).toBeInTheDocument()
   })
 })
 
