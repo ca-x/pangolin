@@ -407,11 +407,16 @@ impl Attempt {
         Ok(())
     }
     pub fn response(&mut self, value: &Value) {
-        self.capture_response_id(value);
-        self.usage.merge(Usage::parse_for(
+        self.response_with_usage(
             value,
-            self.context.endpoint == "/v1/messages",
-        ));
+            Usage::parse_for(value, self.context.endpoint == "/v1/messages"),
+        );
+    }
+    /// Capture the client response as before, while accounting for measured source
+    /// quantities supplied by the adapter boundary rather than synthesized fields.
+    pub fn response_with_usage(&mut self, value: &Value, usage: Usage) {
+        self.capture_response_id(value);
+        self.usage.merge(usage);
         self.terminal_usage = self.usage.reported;
         self.final_usage = self.terminal_usage && self.price.complete_usage(&self.usage);
         self.body = self.context.level.body(value);

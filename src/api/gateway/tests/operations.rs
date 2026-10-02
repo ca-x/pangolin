@@ -15639,3 +15639,183 @@ async fn reference_probe_final_output_bedrock_reads_native_optional_counter() {
         reference_probe_output_case("bedrock", "chat", "/v1/chat/completions", json!({"output":{"message":{"role":"assistant","content":[{"text":"OK"}]}},"stopReason":"end_turn","usage":usage}).to_string(), false, count).await;
     }
 }
+
+// Generic response transforms must not synthesize authoritative usage.
+async fn reference_gateway_source_usage_case(usage: Option<Value>, expected: (bool, &str, i64)) {
+    let mut raw =
+        json!({"candidates":[{"content":{"parts":[{"text":"OK"}]},"finishReason":"STOP"}]});
+    if let Some(usage) = usage {
+        raw["usageMetadata"] = usage;
+    }
+    let f = fixture(Router::new().fallback(post(move || {
+        let raw = raw.clone();
+        async move { Json(raw) }
+    })))
+    .await;
+    sql(&f, "UPDATE providers SET kind='gemini'", vec![]).await;
+    sql(
+        &f,
+        "UPDATE models SET pricing_configured=1,input_price_micros=0,output_price_micros=1000000",
+        vec![],
+    )
+    .await;
+    let response = request(&f, "/v1/chat/completions", chat()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let row=f.state.db.query_one(ops::sql("SELECT usage_measurement_json,pricing_status,output_tokens,total_cost_micros FROM usage_logs",vec![])).await.unwrap().unwrap();
+    let flags: Value =
+        serde_json::from_str(&row.try_get::<String>("", "usage_measurement_json").unwrap())
+            .unwrap();
+    assert_eq!(
+        (
+            flags["output_tokens"].as_bool().unwrap(),
+            row.try_get::<String>("", "pricing_status").unwrap(),
+            row.try_get::<i64>("", "output_tokens").unwrap()
+        ),
+        (expected.0, expected.1.to_owned(), expected.2)
+    );
+    if expected.0 {
+        assert_eq!(
+            row.try_get::<i64>("", "total_cost_micros").unwrap(),
+            expected.2
+        );
+    }
+}
+#[tokio::test]
+async fn reference_gateway_source_usage_missing_is_unmeasured() {
+    reference_gateway_source_usage_case(None, (false, "incomplete_usage", 0)).await;
+}
+#[tokio::test]
+async fn reference_gateway_source_usage_native_totals_include_thoughts() {
+    reference_gateway_source_usage_case(Some(json!({"promptTokenCount":3,"totalTokenCount":10,"candidatesTokenCount":2,"thoughtsTokenCount":5})),(true,"priced",7)).await;
+}
+
+#[tokio::test]
+async fn reference_gateway_source_usage_missing_keeps_live_and_terminal_budget_hold() {
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let started = Arc::new(Mutex::new(Some(started_tx)));
+    let release = Arc::new(Mutex::new(Some(release_rx)));
+    let f = fixture(Router::new().fallback(post(move || {
+        let started = started.clone();
+        let release = release.clone();
+        async move {
+            if let Some(tx) = started.lock().await.take() {
+                tx.send(()).unwrap();
+            }
+            if let Some(rx) = release.lock().await.take() {
+                rx.await.unwrap();
+            }
+            Json(
+                json!({"candidates":[{"content":{"parts":[{"text":"OK"}]},"finishReason":"STOP"}]}),
+            )
+        }
+    })))
+    .await;
+    sql(&f,"UPDATE providers SET kind='gemini'; UPDATE models SET pricing_configured=1,input_price_micros=0,output_price_micros=1000000; UPDATE api_keys SET budget_micros=100000",vec![]).await;
+    let response = request(
+        &f,
+        "/v1/chat/completions",
+        json!({"model":"public","messages":[{"role":"user","content":"hello"}],"max_tokens":16}),
+    );
+    let observed = async {
+        started_rx.await.unwrap();
+        assert!(count(&f,"SELECT SUM(reserved_micros) AS n FROM execution_facts WHERE status='running' AND contacted=1").await>0);
+        assert_eq!(
+            count(&f, "SELECT SUM(spent_micros) AS n FROM api_keys").await,
+            0
+        );
+        release_tx.send(()).unwrap();
+    };
+    let (response, ()) = tokio::join!(response, observed);
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(body["choices"][0]["message"]["content"], "OK");
+    // The client-facing compatibility envelope is unchanged; it is not usage evidence.
+    assert_eq!(body["usage"]["completion_tokens"], 0);
+    let row=f.state.db.query_one(ops::sql("SELECT u.total_cost_micros,u.pricing_status,u.settlement_kind,u.usage_measurement_json,e.reserved_micros FROM usage_logs u JOIN execution_facts e ON e.id=u.execution_id",vec![])).await.unwrap().unwrap();
+    assert_eq!(
+        row.try_get::<String>("", "pricing_status").unwrap(),
+        "incomplete_usage"
+    );
+    assert_eq!(
+        row.try_get::<String>("", "settlement_kind").unwrap(),
+        "conservative"
+    );
+    assert_eq!(
+        row.try_get::<i64>("", "total_cost_micros").unwrap(),
+        row.try_get::<i64>("", "reserved_micros").unwrap()
+    );
+    assert!(row.try_get::<i64>("", "total_cost_micros").unwrap() > 0);
+    let flags: Value =
+        serde_json::from_str(&row.try_get::<String>("", "usage_measurement_json").unwrap())
+            .unwrap();
+    assert_eq!(flags["output_tokens"], false);
+}
+
+#[tokio::test]
+async fn reference_gateway_source_usage_chat_transforms_keep_openai_counter_semantics() {
+    for endpoint in ["/v1/messages", "/v1beta/models/public:generateContent"] {
+        let f=fixture(Router::new().fallback(post(||async {Json(json!({"choices":[{"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":7,"total_tokens":10}}))}))).await;
+        sql(&f,"UPDATE models SET pricing_configured=1,input_price_micros=1000000,output_price_micros=1000000",vec![]).await;
+        let body = if endpoint == "/v1/messages" {
+            json!({"model":"public","messages":[{"role":"user","content":"hi"}],"max_tokens":16})
+        } else {
+            json!({"contents":[{"role":"user","parts":[{"text":"hi"}]}]})
+        };
+        let response = request(&f, endpoint, body).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let row=f.state.db.query_one(ops::sql("SELECT usage_measurement_json,input_tokens,output_tokens,total_cost_micros,pricing_status FROM usage_logs",vec![])).await.unwrap().unwrap();
+        let flags: Value =
+            serde_json::from_str(&row.try_get::<String>("", "usage_measurement_json").unwrap())
+                .unwrap();
+        assert_eq!(flags["input_tokens"], true, "{endpoint}");
+        assert_eq!(row.try_get::<i64>("", "input_tokens").unwrap(), 3);
+        assert_eq!(row.try_get::<i64>("", "output_tokens").unwrap(), 7);
+        assert_eq!(row.try_get::<i64>("", "total_cost_micros").unwrap(), 10);
+        assert_eq!(
+            row.try_get::<String>("", "pricing_status").unwrap(),
+            "priced"
+        );
+    }
+}
+#[tokio::test]
+async fn reference_gateway_source_usage_bedrock_keeps_optional_presence() {
+    for output in [None, Some(0), Some(7)] {
+        let mut usage = json!({"inputTokens":3,"cacheReadInputTokens":2,"cacheWriteInputTokens":1});
+        if let Some(output) = output {
+            usage["outputTokens"] = json!(output);
+            usage["totalTokens"] = json!(6 + output);
+        }
+        let f=fixture(Router::new().fallback(post(move || {let usage=usage.clone();async move {Json(json!({"output":{"message":{"role":"assistant","content":[{"text":"OK"}]}},"stopReason":"end_turn","usage":usage}))}}))).await;
+        let secret=f.state.secrets.encrypt(&json!({"region":"us-east-1","access_key_id":"mock-key","secret_access_key":"mock-secret"}).to_string()).unwrap();
+        sql(&f,"UPDATE providers SET kind='bedrock'; UPDATE models SET pricing_configured=1,input_price_micros=0,output_price_micros=1000000",vec![]).await;
+        sql(
+            &f,
+            "UPDATE channel_credentials SET secret_envelope=?",
+            vec![secret.into()],
+        )
+        .await;
+        assert_eq!(
+            request(&f, "/v1/chat/completions", chat()).await.status(),
+            StatusCode::OK
+        );
+        let row=f.state.db.query_one(ops::sql("SELECT usage_measurement_json,input_tokens,output_tokens,total_cost_micros,pricing_status FROM usage_logs",vec![])).await.unwrap().unwrap();
+        let flags: Value =
+            serde_json::from_str(&row.try_get::<String>("", "usage_measurement_json").unwrap())
+                .unwrap();
+        assert_eq!(flags["output_tokens"], output.is_some());
+        assert_eq!(row.try_get::<i64>("", "input_tokens").unwrap(), 6);
+        assert_eq!(
+            row.try_get::<i64>("", "output_tokens").unwrap(),
+            output.unwrap_or(0)
+        );
+        assert_eq!(
+            row.try_get::<String>("", "pricing_status").unwrap(),
+            if output.is_some() {
+                "priced"
+            } else {
+                "incomplete_usage"
+            }
+        );
+    }
+}

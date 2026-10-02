@@ -802,6 +802,13 @@ async fn execute_inner(
                 }
             };
             let mut response_json = serde_json::from_slice::<Value>(&bytes).ok();
+            let source_usage = if prepared.response.identity() {
+                None
+            } else {
+                response_json.as_ref().map(|value| {
+                    crate::providers::usage::response_usage(&prepared.response, value, endpoint)
+                })
+            };
             if !prepared.response.identity() {
                 let converted = match response_json.take() {
                     Some(value) => prepared.response.apply(value),
@@ -830,7 +837,11 @@ async fn execute_inner(
                 continue;
             }
             if let Some(value) = &response_json {
-                attempt.response(value);
+                if let Some(usage) = source_usage {
+                    attempt.response_with_usage(value, usage);
+                } else {
+                    attempt.response(value);
+                }
             }
             if crate::providers::is_media(endpoint) {
                 attempt.media(endpoint, &payload);
