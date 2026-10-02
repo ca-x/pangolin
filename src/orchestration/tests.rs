@@ -91,6 +91,7 @@ use std::{
 
 pub(super) fn candidate(id: &str, weight: u32) -> Candidate {
     Candidate {
+        model_card: None,
         target: RouteTarget {
             public_name: "public".into(),
             upstream_name: "actual".into(),
@@ -1729,4 +1730,358 @@ fn response_sessions_preserve_order_normalize_status_and_deny_cross_key_reads() 
     assert_eq!(body["input"].as_array().unwrap().len(), 3);
     assert!(body["input"][1].get("status").is_none());
     assert_eq!(body["instructions"], "new");
+}
+
+#[tokio::test]
+async fn reference_metadata_alias_is_conservative() {
+    let f = database_fixture().await;
+    for (name, vision, limit) in [
+        ("a", json!(true), json!(100)),
+        ("b", json!(false), json!(80)),
+        ("c", Value::Null, Value::Null),
+    ] {
+        let (_, model) = add_model(&f, name, "shared", name).await;
+        sql(&f, "UPDATE models SET catalog_metadata_json=? WHERE id=?", vec![json!({"card":{"developer":name,"capabilities":{"vision":vision,"tools":true},"limits":{"output":limit},"modalities":{"input":["text","image"]},"reasoning_levels":["low","high"]}}).to_string().into(), model.into()]).await;
+    }
+    let models = visible_models_with_metadata_for(
+        &f.db,
+        &f.key,
+        &HeaderMap::new(),
+        &["/v1/chat/completions"],
+    )
+    .await
+    .unwrap();
+    let metadata = &models[0]["metadata"];
+    assert_eq!(metadata["capabilities"]["vision"], false);
+    assert_eq!(metadata["capabilities"]["tools"], true);
+    assert!(metadata["limits"]["output"].is_null());
+    assert!(metadata["developer"].is_null());
+    sql(&f, "UPDATE providers SET enabled=0 WHERE name='c'", vec![]).await;
+    let models = visible_models_with_metadata_for(
+        &f.db,
+        &f.key,
+        &HeaderMap::new(),
+        &["/v1/chat/completions"],
+    )
+    .await
+    .unwrap();
+    assert_eq!(models[0]["metadata"]["limits"]["output"], 80);
+}
+
+#[tokio::test]
+async fn reference_capability_actual_image_tools_and_output() {
+    let f = database_fixture().await;
+    let (_, restrictive) = add_model(&f, "restrictive", "shared", "restrictive").await;
+    add_model(&f, "unknown", "shared", "unknown").await;
+    sql(
+        &f,
+        "UPDATE models SET catalog_metadata_json=? WHERE id=?",
+        vec![
+            json!({"card":{"capabilities":{"vision":false,"tools":false},"limits":{"output":80}}})
+                .to_string()
+                .into(),
+            restrictive.into(),
+        ],
+    )
+    .await;
+    for body in [
+        json!({"model":"shared","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://image.invalid/a"}}]}]}),
+        json!({"model":"shared","tools":[{"type":"function","function":{"name":"test"}}]}),
+        json!({"model":"shared","max_tokens":81}),
+    ] {
+        let result = plan(&f, body).await.unwrap();
+        assert_eq!(result.candidates.len(), 1);
+        assert_eq!(result.candidates[0].target.upstream_name, "unknown");
+    }
+    assert_eq!(plan(&f, json!({"model":"shared","messages":[{"role":"user","content":"image_url is plain text"}],"tools":[],"max_tokens":80})).await.unwrap().candidates.len(), 2);
+}
+
+async fn reference_inventory_seed(f: &DatabaseFixture, credential_id: &str, names: &[&str]) {
+    let credentials = crate::operations::model_inventory::credentials(&f.db, &f.key.project_id)
+        .await
+        .unwrap();
+    let credential = credentials
+        .iter()
+        .find(|credential| credential.id == credential_id)
+        .unwrap();
+    sql(f,"INSERT INTO credential_model_snapshots(credential_id,provider_id,project_id,credential_fingerprint,provider_config_fingerprint,status,last_success_at,last_attempt_at) VALUES(?,?,?,?,?,'known',1,1)",vec![credential.id.clone().into(),credential.provider.clone().into(),f.key.project_id.clone().into(),credential.fingerprint.clone().into(),credential.config_fingerprint.clone().into()]).await;
+    for name in names {
+        sql(
+            f,
+            "INSERT INTO credential_model_availability(credential_id,upstream_name) VALUES(?,?)",
+            vec![credential_id.into(), (*name).into()],
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn reference_inventory_resolved_alias_manual_unknown_and_rotation() {
+    let f = database_fixture().await;
+    let (provider, model) = add_model(&f, "inventory", "public", "virtual").await;
+    sql(&f,"INSERT INTO channel_credentials(id,provider_id,credential_type,secret_envelope,suffix,priority,enabled,created_at,updated_at) VALUES('inventory-second',?,'api_key',?,'',200,1,0,0)",vec![provider.clone().into(),f.secrets.encrypt("second").unwrap().into()]).await;
+    sql(
+        &f,
+        "UPDATE channel_settings SET model_rules_json=? WHERE provider_id=?",
+        vec![
+            json!({"version":1,"mappings":{"virtual":"actual"}})
+                .to_string()
+                .into(),
+            provider.clone().into(),
+        ],
+    )
+    .await;
+    reference_inventory_seed(&f, &provider, &["other"]).await;
+    reference_inventory_seed(&f, "inventory-second", &["actual"]).await;
+    let result = plan(&f, json!({"model":"public"})).await.unwrap();
+    assert_eq!(result.candidates.len(), 1);
+    assert_eq!(result.candidates[0].credential_id, "inventory-second");
+    sql(
+        &f,
+        "UPDATE models SET upstream_name='never-discovered' WHERE id=?",
+        vec![model.clone().into()],
+    )
+    .await;
+    assert_eq!(
+        plan(&f, json!({"model":"public"}))
+            .await
+            .unwrap()
+            .candidates
+            .len(),
+        2
+    );
+    sql(
+        &f,
+        "UPDATE models SET upstream_name='actual',discovery_managed=1 WHERE id=?",
+        vec![model.into()],
+    )
+    .await;
+    assert_eq!(
+        plan(&f, json!({"model":"public"}))
+            .await
+            .unwrap()
+            .candidates
+            .len(),
+        1
+    );
+    sql(
+        &f,
+        "UPDATE channel_credentials SET secret_envelope=? WHERE id='inventory-second'",
+        vec![f.secrets.encrypt("rotated").unwrap().into()],
+    )
+    .await;
+    assert!(
+        plan(&f, json!({"model":"public"}))
+            .await
+            .unwrap()
+            .candidates
+            .is_empty()
+    );
+    let inventory = crate::operations::model_inventory::load(&f.db, &f.key.project_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        inventory.credential_metadata("inventory-second")["discovery_status"],
+        "unknown"
+    );
+    assert!(inventory.credential_metadata("inventory-second")["discovery_model_count"].is_null());
+}
+
+#[tokio::test]
+async fn reference_metadata_scopes_endpoint_and_key_access() {
+    let f = database_fixture().await;
+    let (_, allowed) = add_model(&f, "allowed", "shared", "allowed").await;
+    let (disabled, _) = add_model(&f, "disabled", "shared", "disabled").await;
+    let (foreign, _) = add_model(&f, "foreign", "shared", "foreign").await;
+    let (_, wrong_endpoint) = add_model(&f, "embeddings", "shared", "embeddings").await;
+    sql(
+        &f,
+        "UPDATE models SET catalog_metadata_json=?",
+        vec![
+            json!({"card":{"capabilities":{"vision":false}}})
+                .to_string()
+                .into(),
+        ],
+    )
+    .await;
+    sql(
+        &f,
+        "UPDATE models SET catalog_metadata_json=? WHERE id=?",
+        vec![
+            json!({"card":{"capabilities":{"vision":true}}})
+                .to_string()
+                .into(),
+            allowed.into(),
+        ],
+    )
+    .await;
+    sql(
+        &f,
+        "UPDATE providers SET enabled=0 WHERE id=?",
+        vec![disabled.into()],
+    )
+    .await;
+    sql(&f,"INSERT INTO projects(id,name,slug,is_default,enabled,created_at,updated_at) VALUES('other','Other','other',0,1,0,0)",vec![]).await;
+    sql(
+        &f,
+        "UPDATE providers SET project_id='other' WHERE id=?",
+        vec![foreign.into()],
+    )
+    .await;
+    sql(
+        &f,
+        "UPDATE models SET capabilities='[\"embeddings\"]' WHERE id=?",
+        vec![wrong_endpoint.into()],
+    )
+    .await;
+    let models = visible_models_with_metadata_for(
+        &f.db,
+        &f.key,
+        &HeaderMap::new(),
+        &["/v1/chat/completions"],
+    )
+    .await
+    .unwrap();
+    assert_eq!(models.len(), 1);
+    assert_eq!(models[0]["metadata"]["capabilities"]["vision"], true);
+    sql(&f,"INSERT INTO api_key_profiles(id,project_id,name,created_at,updated_at) VALUES('reference-profile',?,'Reference',0,0)",vec![f.key.project_id.clone().into()]).await;
+    sql(
+        &f,
+        "UPDATE api_keys SET profile_id='reference-profile' WHERE id=?",
+        vec![f.key.id.clone().into()],
+    )
+    .await;
+    sql(&f,"INSERT INTO api_key_profile_allowed_models(profile_id,model_pattern,match_type) VALUES('reference-profile','different','exact')",vec![]).await;
+    assert!(
+        visible_models_with_metadata_for(
+            &f.db,
+            &f.key,
+            &HeaderMap::new(),
+            &["/v1/chat/completions"]
+        )
+        .await
+        .unwrap()
+        .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn reference_capability_uses_transformed_payload_and_keeps_model_immutable() {
+    let f = database_fixture().await;
+    let (provider, model) = add_model(&f, "restricted", "public", "actual").await;
+    sql(
+        &f,
+        "UPDATE models SET catalog_metadata_json=? WHERE id=?",
+        vec![
+            json!({"card":{"capabilities":{"tools":false}}})
+                .to_string()
+                .into(),
+            model.into(),
+        ],
+    )
+    .await;
+    sql(&f,"UPDATE channel_settings SET parameter_overrides_json=? WHERE provider_id=?",vec![json!({"version":1,"operations":[{"merge":{"tools":[{"type":"function","function":{"name":"injected"}}]}}]}).to_string().into(),provider.clone().into()]).await;
+    assert!(
+        plan(&f, json!({"model":"public"}))
+            .await
+            .unwrap()
+            .candidates
+            .is_empty()
+    );
+    sql(
+        &f,
+        "UPDATE channel_settings SET parameter_overrides_json=? WHERE provider_id=?",
+        vec![
+            json!({"version":1,"operations":[{"merge":{"model":"other"}}]})
+                .to_string()
+                .into(),
+            provider.into(),
+        ],
+    )
+    .await;
+    assert!(matches!(
+        plan(&f, json!({"model":"public"})).await,
+        Err(Error::Configuration)
+    ));
+}
+
+#[tokio::test]
+async fn reference_metadata_streaming_is_endpoint_and_rule_scoped() {
+    let f = database_fixture().await;
+    let (provider, model) = add_model(&f, "streaming", "public", "actual").await;
+    sql(
+        &f,
+        "UPDATE models SET catalog_metadata_json=? WHERE id=?",
+        vec![
+            json!({"card":{"capabilities":{"streaming":true}}})
+                .to_string()
+                .into(),
+            model.into(),
+        ],
+    )
+    .await;
+    sql(
+        &f,
+        "UPDATE channel_settings SET model_rules_json=? WHERE provider_id=?",
+        vec![
+            json!({"version":1,"stream":false}).to_string().into(),
+            provider.into(),
+        ],
+    )
+    .await;
+    let models = visible_models_with_metadata_for(
+        &f.db,
+        &f.key,
+        &HeaderMap::new(),
+        &["/v1/chat/completions"],
+    )
+    .await
+    .unwrap();
+    assert_eq!(models[0]["metadata"]["capabilities"]["streaming"], false);
+}
+
+#[tokio::test]
+async fn reference_capability_manual_card_fills_unknown_discovery_facts() {
+    let f = database_fixture().await;
+    let (provider, model) = add_model(&f, "manual", "public", "actual").await;
+    sql(
+        &f,
+        "UPDATE models SET catalog_metadata_json=? WHERE id=?",
+        vec![
+            json!({"card":{"capabilities":{"tools":false,"streaming":false}}})
+                .to_string()
+                .into(),
+            model.into(),
+        ],
+    )
+    .await;
+    reference_inventory_seed(&f, &provider, &["actual"]).await;
+    for request in [
+        json!({"model":"public","tools":[{"type":"function","function":{"name":"test"}}]}),
+        json!({"model":"public","stream":true}),
+    ] {
+        assert!(plan(&f, request).await.unwrap().candidates.is_empty());
+    }
+    sql(
+        &f,
+        "UPDATE credential_model_availability SET metadata_json=? WHERE credential_id=?",
+        vec![
+            json!({"card":{"capabilities":{"tools":true}}})
+                .to_string()
+                .into(),
+            provider.into(),
+        ],
+    )
+    .await;
+    assert_eq!(
+        plan(
+            &f,
+            json!({"model":"public","tools":[{"type":"function","function":{"name":"test"}}]})
+        )
+        .await
+        .unwrap()
+        .candidates
+        .len(),
+        0
+    );
 }

@@ -504,6 +504,7 @@ async fn b37_pricing_channel_scope_wins_only_for_the_matching_channel() {
     .await
     .unwrap();
     let candidate = |provider_id: &str| Candidate {
+        model_card: None,
         target: RouteTarget {
             public_name: "public".into(),
             upstream_name: "upstream".into(),

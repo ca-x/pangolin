@@ -219,7 +219,7 @@ async fn oauth_api_encrypts_the_token_and_never_returns_it() {
 }
 
 #[tokio::test]
-async fn antigravity_oauth_resolves_project_encrypts_and_refreshes_before_gateway_use() {
+async fn reference_inventory_oauth_refresh_preserves_facts_and_manual_rotation_invalidates() {
     let initial_access = Arc::new(format!("google-access-{}", Uuid::new_v4()));
     let refreshed_access = Arc::new(format!("google-refreshed-{}", Uuid::new_v4()));
     let refresh_token = Arc::new(format!("google-refresh-{}", Uuid::new_v4()));
@@ -394,6 +394,28 @@ async fn antigravity_oauth_resolves_project_encrypts_and_refreshes_before_gatewa
         ))
         .await
         .unwrap();
+    sql(
+        &f,
+        "UPDATE providers SET enabled=0 WHERE id<>?",
+        vec![provider.clone().into()],
+    )
+    .await;
+    let inventory_before =
+        crate::operations::model_inventory::credentials(&f.state.db, db::DEFAULT_PROJECT_ID)
+            .await
+            .unwrap();
+    let captured = inventory_before
+        .iter()
+        .find(|item| item.id == credential)
+        .unwrap();
+    sql(&f,"INSERT INTO credential_model_snapshots(credential_id,provider_id,project_id,credential_fingerprint,provider_config_fingerprint,status,last_success_at,last_attempt_at,last_error_code) VALUES(?,?,?,?,?,'stale',42,43,'model_sync_failed')",vec![credential.into(),provider.clone().into(),db::DEFAULT_PROJECT_ID.into(),captured.fingerprint.clone().into(),captured.config_fingerprint.clone().into()]).await;
+    sql(&f,"INSERT INTO credential_model_availability(credential_id,upstream_name) VALUES(?,'a-model')",vec![credential.into()]).await;
+    sql(
+        &f,
+        "UPDATE models SET discovery_managed=1 WHERE provider_id=?",
+        vec![provider.clone().into()],
+    )
+    .await;
     let gateway = request(&f, "/v1/chat/completions", chat()).await;
     let status = gateway.status();
     let body = to_bytes(gateway.into_body(), 64 * 1024).await.unwrap();
@@ -436,6 +458,36 @@ async fn antigravity_oauth_resolves_project_encrypts_and_refreshes_before_gatewa
         .try_get("", "n")
         .unwrap();
     assert_eq!(audit, 1);
+    let inventory = crate::operations::model_inventory::load(&f.state.db, db::DEFAULT_PROJECT_ID)
+        .await
+        .unwrap();
+    assert!(inventory.allows(credential, provider, "a-model", true));
+    let metadata = inventory.credential_metadata(credential);
+    assert_eq!(metadata["discovery_status"], "stale");
+    assert_eq!(metadata["discovery_last_success_at"], 42);
+    assert_eq!(metadata["discovery_error_code"], "model_sync_failed");
+    assert_eq!(
+        request(&f, "/v1/chat/completions", chat()).await.status(),
+        StatusCode::OK
+    );
+    assert_eq!(exchanges.load(Ordering::SeqCst), 2);
+    sql(
+        &f,
+        "UPDATE channel_credentials SET secret_envelope=? WHERE id=?",
+        vec![
+            f.state
+                .secrets
+                .encrypt(&f.state.secrets.decrypt(&refreshed_envelope).unwrap())
+                .unwrap()
+                .into(),
+            credential.into(),
+        ],
+    )
+    .await;
+    let inventory = crate::operations::model_inventory::load(&f.state.db, db::DEFAULT_PROJECT_ID)
+        .await
+        .unwrap();
+    assert!(!inventory.allows(credential, provider, "a-model", true));
     server.abort();
 }
 

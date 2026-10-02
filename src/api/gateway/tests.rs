@@ -258,6 +258,9 @@ async fn model_discovery_include_all_projects_only_typed_catalog_card_metadata()
                 "created": 42,
                 "owned_by": "pangolin",
                 "metadata": {
+                    "capabilities": {"streaming":null,"tools":null,"reasoning":null,"temperature":null,"vision":null,"json_schema":null,"web_search":null,"file_search":null,"computer_use":null,"caching":null,"batch":null},
+                    "modalities": {"input":null,"output":null},
+                    "reasoning_levels": null,
                     "developer": "openai",
                     "type": "chat",
                     "logo_key": "lobehub:OpenAI",
@@ -472,6 +475,9 @@ async fn model_discovery_include_all_keeps_mapping_and_visibility_policy_authori
     assert_eq!(
         body["data"][0]["metadata"],
         json!({
+            "capabilities": {"streaming":null,"tools":null,"reasoning":null,"temperature":null,"vision":null,"json_schema":null,"web_search":null,"file_search":null,"computer_use":null,"caching":null,"batch":null},
+            "modalities": {"input":null,"output":null},
+            "reasoning_levels": null,
             "developer": "openai",
             "type": "chat",
             "logo_key": "lobehub:OpenAI",
@@ -1092,4 +1098,47 @@ async fn anthropic_bridge_respects_endpoint_and_sanitized_header_overrides() {
     let body: Value =
         serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
     assert_eq!(body["choices"][0]["message"]["content"], "answer");
+}
+
+#[tokio::test]
+async fn reference_metadata_public_boolean_opt_in_preserves_default_shape() {
+    let f = fixture(Router::new()).await;
+    sql(
+        &f,
+        "UPDATE models SET catalog_metadata_json=?",
+        vec![
+            json!({"card":{"capabilities":{"vision":true}}})
+                .to_string()
+                .into(),
+        ],
+    )
+    .await;
+    for (query, metadata) in [
+        ("?include_metadata=true&endpoint=/v1/chat/completions", true),
+        ("?include=all", true),
+        ("?include_metadata=false", false),
+        ("", false),
+    ] {
+        let response = router(f.state.clone())
+            .oneshot(
+                Request::get(format!("/v1/models{query}"))
+                    .header("authorization", format!("Bearer {}", f.token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            body["data"][0].get("metadata").is_some(),
+            metadata,
+            "{query}"
+        );
+        if metadata {
+            assert_eq!(body["data"][0]["metadata"]["capabilities"]["vision"], true);
+        }
+    }
 }

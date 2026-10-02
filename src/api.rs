@@ -1069,7 +1069,9 @@ async fn gateway_models(
     // Only the explicit opt-in, or the instance default when omitted, widens it.
     let settings = crate::orchestration::model_settings(&state.db).await?;
     let include_all = query.include.as_deref() == Some("all")
-        || (query.include.is_none() && settings.default_model_api_include_all);
+        || query
+            .include_metadata
+            .unwrap_or(query.include.is_none() && settings.default_model_api_include_all);
     let models = if include_all {
         crate::orchestration::visible_models_with_metadata_for(
             &state.db,
@@ -1100,6 +1102,8 @@ struct GatewayModelsQuery {
     /// `all` opts into the bounded catalog-card projection. Unknown values are
     /// compatibility no-ops and never widen the response.
     include: Option<String>,
+    /// Explicit boolean alias for the bounded metadata opt-in.
+    include_metadata: Option<bool>,
 }
 
 async fn gateway_chat(

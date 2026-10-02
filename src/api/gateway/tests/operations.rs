@@ -11940,3 +11940,352 @@ async fn reference_probe_shorter_client_deadline_classifies_stream_body_timeout(
             .is_some()
     );
 }
+
+async fn reference_inventory_sync(f: &Fixture, key: &str) -> Result<(), crate::api::ApiError> {
+    ops::jobs::enqueue(
+        &f.state.db,
+        Some(db::DEFAULT_PROJECT_ID),
+        "model_sync",
+        key,
+        &json!({"provider_id":f.providers[0]}),
+        db::now(),
+    )
+    .await
+    .unwrap();
+    let claim = ops::jobs::claim(&f.state.db, "inventory", db::now(), 120)
+        .await
+        .unwrap()
+        .unwrap();
+    let result = ops::runtime::execute(&f.state, &claim).await;
+    ops::jobs::finish(&f.state.db, &claim, db::now(), true)
+        .await
+        .unwrap();
+    result
+}
+
+#[tokio::test]
+async fn reference_inventory_disjoint_keys_partial_failure_empty_and_manual() {
+    let phase = Arc::new(AtomicUsize::new(0));
+    let upstream_phase = phase.clone();
+    let f = fixture(Router::new().route("/models", get(move |headers: HeaderMap| {
+        let phase = upstream_phase.load(Ordering::SeqCst);
+        async move {
+            let second = headers.get("authorization").unwrap() == "Bearer second-key";
+            if phase == 3 || (phase == 1 && !second) { return StatusCode::BAD_GATEWAY.into_response(); }
+            Json(json!({"data":if phase == 2 {json!([])} else {json!([{"id":if second {"second-model"} else {"first-model"},"capabilities":{"vision":second}},{"id":"shared-model","capabilities":{"vision":second,"tools":second}}])}})).into_response()
+        }
+    }))).await;
+    let provider = f.providers[0].clone();
+    sql(
+        &f,
+        "UPDATE providers SET enabled=0 WHERE id<>?",
+        vec![provider.clone().into()],
+    )
+    .await;
+    sql(&f, "INSERT INTO channel_credentials(id,provider_id,credential_type,secret_envelope,suffix,priority,enabled,created_at,updated_at) VALUES('second-key',?,'api_key',?,'',200,1,0,0)", vec![provider.clone().into(), f.state.secrets.encrypt("second-key").unwrap().into()]).await;
+    reference_inventory_sync(&f, "first-inventory")
+        .await
+        .unwrap();
+    assert_eq!(
+        count(
+            &f,
+            "SELECT COUNT(*) AS n FROM credential_model_snapshots WHERE last_success_at IS NOT NULL"
+        )
+        .await,
+        2
+    );
+    let key = db::authenticate_api_key(&f.state.db, &f.token, None)
+        .await
+        .unwrap()
+        .unwrap();
+    for (model, credential) in [
+        ("first-model", provider.as_str()),
+        ("second-model", "second-key"),
+    ] {
+        let profile = crate::orchestration::load_profile(&f.state.db, &key)
+            .await
+            .unwrap();
+        let plan = crate::orchestration::prepare(
+            &f.state.db,
+            &crate::orchestration::Runtime::default(),
+            &key,
+            profile,
+            json!({"model":model}),
+            &HeaderMap::new(),
+            "/v1/chat/completions",
+        )
+        .await
+        .unwrap();
+        assert_eq!(plan.candidates.len(), 1);
+        assert_eq!(plan.candidates[0].credential_id, credential);
+    }
+    let profile = crate::orchestration::load_profile(&f.state.db, &key)
+        .await
+        .unwrap();
+    let image = json!({"model":"shared-model","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://image.invalid/a"}}]}]});
+    let plan = crate::orchestration::prepare(
+        &f.state.db,
+        &crate::orchestration::Runtime::default(),
+        &key,
+        profile,
+        image,
+        &HeaderMap::new(),
+        "/v1/chat/completions",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        plan.candidates.len(),
+        1,
+        "channel aggregate false must not remove the capable credential"
+    );
+    assert_eq!(plan.candidates[0].credential_id, "second-key");
+    let models = crate::orchestration::visible_models_with_metadata_for(
+        &f.state.db,
+        &key,
+        &HeaderMap::new(),
+        &["/v1/chat/completions"],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        models
+            .iter()
+            .find(|model| model["id"] == "shared-model")
+            .unwrap()["metadata"]["capabilities"]["vision"],
+        false
+    );
+    let cookie = owner(&f).await;
+    let listed = json_body(
+        admin(
+            &f,
+            &cookie,
+            http::Method::GET,
+            &format!(
+                "/api/admin/v1/projects/{}/operations/credentials",
+                db::DEFAULT_PROJECT_ID
+            ),
+            Value::Null,
+            false,
+        )
+        .await,
+    )
+    .await;
+    let second = listed["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == "second-key")
+        .unwrap();
+    assert_eq!(second["discovery_status"], "known");
+    assert_eq!(second["discovery_model_count"], 2);
+    assert!(second["discovery_last_success_at"].is_i64());
+    assert!(!listed.to_string().contains("secret_envelope"));
+    phase.store(1, Ordering::SeqCst);
+    reference_inventory_sync(&f, "partial-inventory")
+        .await
+        .unwrap();
+    assert_eq!(count(&f,"SELECT COUNT(*) AS n FROM credential_model_availability WHERE upstream_name='first-model'").await,1);
+    assert_eq!(
+        count(
+            &f,
+            "SELECT COUNT(*) AS n FROM credential_model_snapshots WHERE status='stale'"
+        )
+        .await,
+        1
+    );
+    phase.store(3, Ordering::SeqCst);
+    assert!(
+        reference_inventory_sync(&f, "all-failed-inventory")
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        count(
+            &f,
+            "SELECT COUNT(*) AS n FROM models WHERE discovery_managed=1 AND enabled=1"
+        )
+        .await,
+        3
+    );
+    assert_eq!(
+        count(
+            &f,
+            "SELECT COUNT(*) AS n FROM credential_model_availability"
+        )
+        .await,
+        4
+    );
+    phase.store(2, Ordering::SeqCst);
+    reference_inventory_sync(&f, "empty-inventory")
+        .await
+        .unwrap();
+    assert_eq!(
+        count(
+            &f,
+            "SELECT COUNT(*) AS n FROM models WHERE discovery_managed=1 AND enabled=1"
+        )
+        .await,
+        0
+    );
+    assert_eq!(count(&f,"SELECT COUNT(*) AS n FROM models WHERE discovery_managed=0 AND upstream_name='a-model' AND enabled=1").await,1);
+}
+
+#[tokio::test]
+async fn reference_inventory_disabled_project_does_not_fetch() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let hits = calls.clone();
+    let f = fixture(Router::new().route(
+        "/models",
+        get(move || {
+            hits.fetch_add(1, Ordering::SeqCst);
+            async { Json(json!({"data":[]})) }
+        }),
+    ))
+    .await;
+    ops::jobs::enqueue(
+        &f.state.db,
+        Some(db::DEFAULT_PROJECT_ID),
+        "model_sync",
+        "disabled-inventory",
+        &json!({"provider_id":f.providers[0]}),
+        db::now(),
+    )
+    .await
+    .unwrap();
+    sql(
+        &f,
+        "UPDATE projects SET enabled=0 WHERE id=?",
+        vec![db::DEFAULT_PROJECT_ID.into()],
+    )
+    .await;
+    let claim = ops::jobs::claim(&f.state.db, "disabled-inventory", db::now(), 120)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(ops::runtime::execute(&f.state, &claim).await.is_err());
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn reference_inventory_activation_rechecks_project_provider_key_config_and_lease() {
+    for race in [
+        "project",
+        "provider",
+        "disable-key",
+        "rotate-key",
+        "config",
+        "lease",
+    ] {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let incoming = entered.clone();
+        let outgoing = release.clone();
+        let f = fixture(Router::new().route(
+            "/models",
+            get(move || {
+                let incoming = incoming.clone();
+                let outgoing = outgoing.clone();
+                async move {
+                    incoming.notify_one();
+                    outgoing.notified().await;
+                    Json(json!({"data":[{"id":"raced-model"}]}))
+                }
+            }),
+        ))
+        .await;
+        ops::jobs::enqueue(
+            &f.state.db,
+            Some(db::DEFAULT_PROJECT_ID),
+            "model_sync",
+            race,
+            &json!({"provider_id":f.providers[0]}),
+            db::now(),
+        )
+        .await
+        .unwrap();
+        let claim = ops::jobs::claim(&f.state.db, "inventory-race", db::now(), 120)
+            .await
+            .unwrap()
+            .unwrap();
+        let state = f.state.clone();
+        let task = tokio::spawn(async move { ops::runtime::execute(&state, &claim).await });
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        match race {
+            "project"=>sql(&f,"UPDATE projects SET enabled=0 WHERE id=?",vec![db::DEFAULT_PROJECT_ID.into()]).await,
+            "provider"=>sql(&f,"UPDATE providers SET enabled=0 WHERE id=?",vec![f.providers[0].clone().into()]).await,
+            "disable-key"=>sql(&f,"UPDATE channel_credentials SET enabled=0 WHERE id=?",vec![f.providers[0].clone().into()]).await,
+            "rotate-key"=>sql(&f,"UPDATE channel_credentials SET secret_envelope=? WHERE id=?",vec![f.state.secrets.encrypt("rotated").unwrap().into(),f.providers[0].clone().into()]).await,
+            "config"=>sql(&f,r#"UPDATE channel_settings SET model_rules_json='{"version":1,"prefix":"changed-"}' WHERE provider_id=?"#,vec![f.providers[0].clone().into()]).await,
+            "lease"=>sql(&f,"UPDATE operation_jobs SET fence=fence+1 WHERE kind='model_sync'",vec![]).await,
+            _=>unreachable!(),
+        }
+        release.notify_one();
+        assert!(task.await.unwrap().is_err(), "{race}");
+        assert_eq!(
+            count(&f, "SELECT COUNT(*) AS n FROM credential_model_snapshots").await,
+            0,
+            "{race}"
+        );
+        assert_eq!(
+            count(
+                &f,
+                "SELECT COUNT(*) AS n FROM models WHERE upstream_name='raced-model'"
+            )
+            .await,
+            0,
+            "{race}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn reference_inventory_concurrency_is_bounded() {
+    let current = Arc::new(AtomicUsize::new(0));
+    let maximum = Arc::new(AtomicUsize::new(0));
+    let active = current.clone();
+    let peak = maximum.clone();
+    let f = fixture(Router::new().route(
+        "/models",
+        get(move || {
+            let active = active.clone();
+            let peak = peak.clone();
+            async move {
+                let count = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(count, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                active.fetch_sub(1, Ordering::SeqCst);
+                Json(json!({"data":[{"id":"concurrency-model"}]}))
+            }
+        }),
+    ))
+    .await;
+    for index in 0..8 {
+        sql(&f,"INSERT INTO channel_credentials(id,provider_id,credential_type,secret_envelope,suffix,priority,enabled,created_at,updated_at) VALUES(?,?,'api_key',?,'',200,1,0,0)",vec![format!("key-{index}").into(),f.providers[0].clone().into(),f.state.secrets.encrypt("more-key").unwrap().into()]).await;
+    }
+    reference_inventory_sync(&f, "concurrent").await.unwrap();
+    assert_eq!(
+        count(
+            &f,
+            "SELECT COUNT(*) AS n FROM credential_model_snapshots WHERE status='known'"
+        )
+        .await,
+        9
+    );
+    assert!((2..=4).contains(&maximum.load(Ordering::SeqCst)));
+}
+
+#[tokio::test]
+async fn reference_inventory_refresh_preserves_operator_alias_prices_and_protocols() {
+    let f = fixture(Router::new().route(
+        "/models",
+        get(|| async { Json(json!({"data":[{"id":"discovered"}]})) }),
+    ))
+    .await;
+    reference_inventory_sync(&f, "initial-alias").await.unwrap();
+    sql(&f,"UPDATE models SET public_name='operator-alias',input_price_micros=123,output_price_micros=456,capabilities='[\"responses\"]' WHERE upstream_name='discovered'",vec![]).await;
+    reference_inventory_sync(&f, "refresh-alias").await.unwrap();
+    assert_eq!(count(&f,"SELECT COUNT(*) AS n FROM models WHERE upstream_name='discovered' AND public_name='operator-alias' AND input_price_micros=123 AND output_price_micros=456 AND capabilities='[\"responses\"]' AND enabled=1").await,1);
+}

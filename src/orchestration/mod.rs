@@ -142,6 +142,7 @@ pub async fn normalize_auto_reasoning_effort(
 #[derive(Clone)]
 pub struct Candidate {
     pub target: RouteTarget,
+    pub model_card: Option<crate::catalog::types::ModelCardProjection>,
     pub provider_id: String,
     pub model_id: String,
     pub credential_id: String,
@@ -339,27 +340,13 @@ async fn visible_models_internal(
             if !candidates.is_empty() {
                 let mut model = serde_json::json!({"id":name,"object":"model","created":created,"owned_by":"pangolin"});
                 if include_metadata {
-                    // Candidate generation remains the authority: only after it
-                    // admits a target do we read and project that target's card.
-                    let mut card = None;
-                    for candidate in &candidates {
-                        let row = db
-                            .query_one(repository::statement(
-                                "SELECT m.catalog_metadata_json FROM models m JOIN providers p ON p.id=m.provider_id WHERE m.id=? AND p.project_id=?",
-                                vec![candidate.model_id.clone().into(), key.project_id.clone().into()],
-                            ))
-                            .await?;
-                        card = row
-                            .map(|row| row.try_get::<String>("", "catalog_metadata_json"))
-                            .transpose()?
-                            .as_deref()
-                            .and_then(crate::catalog::types::StoredModelMetadata::parse)
-                            .and_then(|metadata| metadata.card);
-                        if card.is_some() {
-                            break;
-                        }
-                    }
-                    if let Some(card) = card {
+                    let cards = candidates
+                        .iter()
+                        .map(|candidate| candidate.model_card.clone())
+                        .collect::<Vec<_>>();
+                    if let Some(card) =
+                        crate::catalog::types::ModelCardProjection::aggregate(&cards)
+                    {
                         model["metadata"] = serde_json::json!(card);
                     }
                 }
@@ -549,7 +536,17 @@ pub async fn prepare(
     let mut compatible = Vec::with_capacity(plan.candidates.len());
     for candidate in std::mem::take(&mut plan.candidates) {
         match plan.candidate_request(&candidate) {
-            Ok(_) => compatible.push(candidate),
+            Ok((payload, _)) => {
+                if capability_mismatch(&candidate, &payload)? {
+                    plan.decisions.push(Decision {
+                        stage: "capability",
+                        candidate: Some(candidate.id()),
+                        reason: "explicit_capability_mismatch",
+                    });
+                } else {
+                    compatible.push(candidate);
+                }
+            }
             Err(Error::Invalid(ANTHROPIC_COMPLETION_COUNT_ERROR)) => {
                 incompatible_completion_count = true;
                 plan.decisions.push(Decision {
@@ -566,6 +563,61 @@ pub async fn prepare(
         return Err(Error::Invalid(ANTHROPIC_COMPLETION_COUNT_ERROR));
     }
     Ok(plan)
+}
+
+/// Evaluate the transformed request, including injected/overridden structure.
+fn capability_mismatch(candidate: &Candidate, payload: &Value) -> Result<bool> {
+    let Some(card) = &candidate.model_card else {
+        return Ok(false);
+    };
+    let context = policy::context(
+        payload,
+        &HeaderMap::new(),
+        &candidate.protocol_endpoint,
+        None,
+    );
+    let image = context["has_image"] == true;
+    let tools = ["tools", "functions"].iter().any(|field| {
+        payload
+            .get(field)
+            .and_then(Value::as_array)
+            .is_some_and(|items| !items.is_empty())
+    }) || ["tool_choice", "function_call"].iter().any(|field| {
+        payload.get(field).is_some_and(|value| {
+            value.is_object()
+                || value
+                    .as_str()
+                    .is_some_and(|text| !matches!(text, "none" | "auto"))
+        })
+    });
+    let output = if crate::providers::capability(&candidate.protocol_endpoint) == "gemini" {
+        payload
+            .pointer("/generationConfig/maxOutputTokens")
+            .and_then(Value::as_u64)
+    } else if ["max_completion_tokens", "max_tokens", "max_output_tokens"]
+        .iter()
+        .any(|field| payload.get(field).is_some())
+    {
+        Some(u64::from(output_limit(payload)?))
+    } else {
+        None
+    };
+    Ok((image
+        && (card.capabilities.vision == Some(false)
+            || card
+                .modalities
+                .input
+                .as_ref()
+                .is_some_and(|values| !values.iter().any(|value| value == "image"))))
+        || ((context["stream"] == true
+            || candidate
+                .protocol_endpoint
+                .ends_with(":streamGenerateContent"))
+            && card.capabilities.streaming == Some(false))
+        || (tools && card.capabilities.tools == Some(false))
+        || output
+            .zip(card.limits.output)
+            .is_some_and(|(requested, limit)| requested > limit))
 }
 
 /// Shared by admission and protocol adapters; never infer a different output

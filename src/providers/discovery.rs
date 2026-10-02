@@ -6,10 +6,11 @@ use std::collections::BTreeSet;
 const MAX_DISCOVERY_BYTES: usize = 1024 * 1024;
 pub const MAX_DISCOVERED_MODELS: usize = 1000;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct DiscoveredModel {
     pub id: String,
     pub capabilities: Vec<String>,
+    pub card: Option<crate::catalog::types::ModelCardProjection>,
 }
 
 pub fn adapter_supported(kind: &str) -> bool {
@@ -142,6 +143,10 @@ fn parse(kind: &str, bytes: &[u8]) -> Result<Vec<DiscoveredModel>, ApiError> {
             models.push(DiscoveredModel {
                 id: id.to_owned(),
                 capabilities: vec!["chat".into()],
+                card: crate::catalog::types::StoredModelMetadata::parse(
+                    &serde_json::json!({"card": row, "logo_key":row.get("logo_key")}).to_string(),
+                )
+                .and_then(|metadata| metadata.card),
             });
         }
     }
@@ -159,7 +164,8 @@ mod tests {
             parse("openai", br#"{"data":[{"id":"gpt-4o"},{"id":"gpt-4o"}]}"#).unwrap(),
             vec![DiscoveredModel {
                 id: "gpt-4o".into(),
-                capabilities: vec!["chat".into()]
+                capabilities: vec!["chat".into()],
+                card: Some(crate::catalog::types::ModelCardProjection::default()),
             }]
         );
         assert_eq!(

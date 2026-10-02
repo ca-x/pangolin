@@ -5,6 +5,7 @@ pub mod instance_backup;
 pub mod jobs;
 pub mod lifecycle;
 pub mod logging;
+pub mod model_inventory;
 pub mod pricing;
 pub mod proxy;
 pub mod runtime;

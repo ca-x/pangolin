@@ -114,7 +114,7 @@ pub async fn execute(state: &AppState, claim: &jobs::Claim) -> Result<(), ApiErr
         "probe" => probe(state, claim, &payload).await,
         "quota" => quota(state, claim, &payload).await,
         "model_sync" => {
-            let result = model_sync(state, claim, &payload).await;
+            let result = super::model_inventory::sync(state, claim, &payload).await;
             if result.is_err() {
                 record_model_sync_error(state, claim, &payload).await?;
             }
@@ -134,76 +134,6 @@ pub async fn execute(state: &AppState, claim: &jobs::Claim) -> Result<(), ApiErr
         }
         _ => Err(ApiError::BadRequest("unsupported durable job kind".into())),
     }
-}
-
-async fn model_sync(
-    state: &AppState,
-    claim: &jobs::Claim,
-    payload: &Value,
-) -> Result<(), ApiError> {
-    let project = claim.project_id.as_deref().ok_or(ApiError::Forbidden)?;
-    let provider = payload["provider_id"].as_str().ok_or(ApiError::NotFound)?;
-    let row=state.db.query_one(sql("SELECT p.name,p.kind,p.base_url,c.credential_type,c.secret_envelope,s.proxy_url,s.proxy_username,s.proxy_secret_envelope,COALESCE(s.proxy_reuse_connections,1) AS proxy_reuse_connections,s.proxy_preset_id FROM providers p JOIN channel_credentials c ON c.provider_id=p.id AND c.enabled=1 LEFT JOIN channel_settings s ON s.provider_id=p.id WHERE p.id=? AND p.project_id=? AND p.enabled=1 ORDER BY c.priority,c.id LIMIT 1",vec![provider.into(),project.into()])).await?.ok_or(ApiError::NotFound)?;
-    let secret_envelope: String = row.try_get("", "secret_envelope")?;
-    let target = crate::models::RouteTarget {
-        public_name: String::new(),
-        upstream_name: String::new(),
-        provider_name: row.try_get("", "name")?,
-        provider_kind: row.try_get("", "kind")?,
-        base_url: row.try_get("", "base_url")?,
-        credential_type: row.try_get("", "credential_type")?,
-        secret_envelope: secret_envelope.clone(),
-        proxy_url: row.try_get("", "proxy_url")?,
-        proxy_username: row.try_get("", "proxy_username")?,
-        proxy_secret_envelope: row.try_get("", "proxy_secret_envelope")?,
-        proxy_reuse_connections: row.try_get("", "proxy_reuse_connections")?,
-        proxy_preset_id: row.try_get("", "proxy_preset_id")?,
-        input_price_micros: 0,
-        output_price_micros: 0,
-    };
-    let secret = crate::oauth::credential_secret(
-        &target.credential_type,
-        state.secrets.decrypt(&secret_envelope)?,
-    )?;
-    let client = state.upstream_client(&target).await?;
-    let discovered = crate::providers::discovery::models(
-        &client,
-        &target.provider_kind,
-        &target.base_url,
-        &secret,
-    )
-    .await?;
-
-    let discovered_names = json!(discovered.iter().map(|model| &model.id).collect::<Vec<_>>());
-    let tx = state.db.begin().await?;
-    jobs::fence(&tx, claim).await?;
-    if tx
-        .query_one(sql(
-            "SELECT id FROM providers WHERE id=? AND project_id=?",
-            vec![provider.into(), project.into()],
-        ))
-        .await?
-        .is_none()
-    {
-        return Err(ApiError::NotFound);
-    }
-    tx.execute(sql("UPDATE models SET enabled=0,lifecycle='archived' WHERE provider_id=? AND discovery_managed=1 AND upstream_name NOT IN (SELECT value FROM json_each(?))",vec![provider.into(),discovered_names.to_string().into()])).await?;
-    for model in &discovered {
-        let manual = tx.query_one(sql("SELECT id FROM models WHERE provider_id=? AND upstream_name=? AND discovery_managed=0 LIMIT 1",vec![provider.into(),model.id.clone().into()])).await?.is_some();
-        if manual {
-            tx.execute(sql("UPDATE models SET enabled=0,lifecycle='archived' WHERE provider_id=? AND upstream_name=? AND discovery_managed=1",vec![provider.into(),model.id.clone().into()])).await?;
-            continue;
-        }
-        let digest = blake3::hash(format!("{provider}\0{}", model.id).as_bytes())
-            .to_hex()
-            .to_string();
-        let model_id = format!("discovered-{}", &digest[..32]);
-        tx.execute(sql("INSERT INTO models(id,provider_id,public_name,upstream_name,capabilities,input_price_micros,output_price_micros,priority,enabled,created_at,catalog_metadata_json,lifecycle,discovery_managed) VALUES(?,?,?,?,?,0,0,100,1,?,?,'active',1) ON CONFLICT(id) DO UPDATE SET public_name=excluded.public_name,upstream_name=excluded.upstream_name,capabilities=excluded.capabilities,enabled=1,lifecycle='active',catalog_metadata_json=excluded.catalog_metadata_json WHERE models.provider_id=excluded.provider_id AND models.discovery_managed=1",vec![model_id.into(),provider.into(),model.id.clone().into(),model.id.clone().into(),json!(&model.capabilities).to_string().into(),db::now().into(),json!({"version":1,"discovery":{"adapter":&target.provider_kind}}).to_string().into()])).await?;
-    }
-    tx.execute(sql("UPDATE channel_settings SET model_sync_error=NULL,model_synced_at=?,model_sync_count=?,updated_at=? WHERE provider_id=? AND provider_id IN (SELECT id FROM providers WHERE project_id=?)",vec![db::now().into(),i64::try_from(discovered.len()).unwrap_or(i64::MAX).into(),db::now().into(),provider.into(),project.into()])).await?;
-    super::audit(&tx, None, project, "model.sync", provider).await?;
-    tx.commit().await?;
-    Ok(())
 }
 
 async fn record_model_sync_error(

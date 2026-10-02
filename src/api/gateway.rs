@@ -9,10 +9,31 @@ async fn resolve_candidate_credential(
     candidate: &orchestration::Candidate,
     project_id: &str,
 ) -> Result<Zeroizing<String>, ApiError> {
-    let target = &candidate.target;
+    resolve_route_credential(
+        state,
+        &candidate.target,
+        &candidate.provider_id,
+        &candidate.credential_id,
+        project_id,
+    )
+    .await
+    .map(|(secret, _)| secret)
+}
+
+/// Shared with discovery; the returned envelope identifies only a successful
+/// refresh CAS, allowing the caller to capture exactly that credential revision.
+pub(crate) async fn resolve_route_credential(
+    state: &AppState,
+    target: &crate::models::RouteTarget,
+    provider_id: &str,
+    credential_id: &str,
+    project_id: &str,
+) -> Result<(Zeroizing<String>, Option<String>), ApiError> {
+    let mut refreshed_envelope = None;
     let decrypted = state.secrets.decrypt(&target.secret_envelope)?;
     let Some(flow) = crate::oauth::Flow::for_credential_type(&target.credential_type) else {
         return crate::oauth::credential_secret(&target.credential_type, decrypted)
+            .map(|secret| (secret, None))
             .map_err(ApiError::Internal);
     };
     if !flow.supports_provider_kind(&target.provider_kind) {
@@ -20,8 +41,7 @@ async fn resolve_candidate_credential(
             "channel credential could not be resolved".into(),
         ));
     }
-    let spec =
-        super::operations_api::provider_oauth_spec(state, &candidate.provider_id, flow).await?;
+    let spec = super::operations_api::provider_oauth_spec(state, provider_id, flow).await?;
     let resolved = crate::oauth::resolve_credential(
         &state.oauth_client,
         spec,
@@ -35,32 +55,47 @@ async fn resolve_candidate_credential(
     if let Some(replacement) = replacement {
         let envelope = state.secrets.encrypt(&replacement)?;
         let tx = state.db.begin().await?;
+        let inventory_revision = crate::operations::model_inventory::credentials(&tx, project_id)
+            .await?
+            .into_iter()
+            .find(|credential| {
+                credential.id == credential_id
+                    && credential.provider == provider_id
+                    && credential.target.secret_envelope == target.secret_envelope
+            });
         let changed = tx
             .execute(crate::operations::sql(
                 "UPDATE channel_credentials SET secret_envelope=?,updated_at=? WHERE id=? AND provider_id=? AND secret_envelope=?",
                 vec![
-                    envelope.into(),
+                    envelope.clone().into(),
                     db::now().into(),
-                    candidate.credential_id.clone().into(),
-                    candidate.provider_id.clone().into(),
+                    credential_id.into(),
+                    provider_id.into(),
                     target.secret_envelope.clone().into(),
                 ],
             ))
             .await?
             .rows_affected();
         if changed == 1 {
+            refreshed_envelope = Some(envelope);
+            if let Some(previous) = inventory_revision {
+                crate::operations::model_inventory::carry_forward_oauth_refresh(
+                    &tx, project_id, &previous,
+                )
+                .await?;
+            }
             crate::operations::audit(
                 &tx,
                 None,
                 project_id,
                 "credentials.oauth.refresh",
-                &candidate.credential_id,
+                credential_id,
             )
             .await?;
         }
         tx.commit().await?;
     }
-    Ok(secret)
+    Ok((secret, refreshed_envelope))
 }
 
 #[derive(Clone)]

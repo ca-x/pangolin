@@ -1,4 +1,6 @@
-use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, FromQueryResult, Statement};
+use sea_orm::{
+    ConnectionTrait, DatabaseConnection, DbBackend, FromQueryResult, Statement, TransactionTrait,
+};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 
@@ -98,6 +100,7 @@ struct Row {
     credential_priority: i32,
     provider_priority: i32,
     model_enabled: bool,
+    discovery_managed: bool,
     provider_enabled: bool,
     settings_json: String,
     catalog_metadata_json: String,
@@ -135,11 +138,18 @@ pub async fn candidates(
     allow_direct_channel_model: bool,
 ) -> Result<Vec<Candidate>> {
     let instance = crate::operations::settings::load(db).await?;
+    // Keep revision-matched inventory and the credential/configuration rows
+    // in the same SQLite read snapshot. No provider I/O occurs in this scope.
+    let tx = db.begin().await?;
+    let db = &tx;
+    let inventory = crate::operations::model_inventory::load(db, &key.project_id)
+        .await
+        .map_err(|_| Error::Configuration)?;
     let rows = Row::find_by_statement(statement(r#"
         SELECT m.id AS model_id,p.id AS provider_id,c.id AS credential_id,m.public_name,m.upstream_name,m.capabilities,
         p.name AS provider_name,p.kind AS provider_kind,p.base_url,c.credential_type,c.secret_envelope,m.input_price_micros,m.output_price_micros,m.priority,
         p.priority AS provider_priority,
-        m.enabled AS model_enabled,p.enabled AS provider_enabled,p.settings_json,
+        m.enabled AS model_enabled,m.discovery_managed,p.enabled AS provider_enabled,p.settings_json,
         m.catalog_metadata_json,m.disable_developer_settings_inheritance,
         COALESCE(s.endpoint_mappings_json,'{"version":1}') AS endpoint_mappings_json,
         s.proxy_url,s.proxy_username,s.proxy_secret_envelope,COALESCE(s.proxy_reuse_connections,1) AS proxy_reuse_connections,s.proxy_preset_id,
@@ -153,6 +163,7 @@ pub async fn candidates(
         EXISTS(SELECT 1 FROM provider_quota_snapshots cq WHERE cq.id=(SELECT latest.id FROM provider_quota_snapshots latest WHERE latest.provider_id=p.id AND latest.credential_id=c.id ORDER BY latest.sequence DESC,latest.collected_at DESC,latest.id LIMIT 1)
           AND cq.remaining_micros<=0 AND (cq.period_end IS NULL OR cq.period_end>unixepoch())) AS credential_quota_exhausted
         FROM models m JOIN providers p ON p.id=m.provider_id
+        JOIN projects project ON project.id=p.project_id AND project.enabled=1
         JOIN channel_credentials c ON c.provider_id=p.id AND c.enabled=1
           AND NOT EXISTS(SELECT 1 FROM credential_health_state ch WHERE ch.credential_id=c.id AND ch.disabled_until>unixepoch())
         LEFT JOIN channel_settings s ON s.provider_id=p.id LEFT JOIN channel_health_state h ON h.provider_id=p.id
@@ -400,6 +411,29 @@ pub async fn candidates(
             }
         }
         let upstream_name = resolve_model(&row.upstream_name, &model_rules)?;
+        if !inventory.allows(
+            &row.credential_id,
+            &row.provider_id,
+            &upstream_name,
+            row.discovery_managed,
+        ) {
+            decisions.push(Decision {
+                stage: "eligibility",
+                candidate: Some(id),
+                reason: "credential_model_unavailable",
+            });
+            continue;
+        }
+        // Per-credential facts must take precedence over the channel's aggregate:
+        // a false from a different key must not remove this capable key.
+        let configured_card =
+            crate::catalog::types::StoredModelMetadata::parse(&row.catalog_metadata_json)
+                .and_then(|metadata| metadata.card);
+        let mut model_card = match inventory.card(&row.credential_id, &upstream_name) {
+            Some(card) if row.discovery_managed => card.clone(),
+            Some(Some(card)) => Some(card.clone().with_fallback(configured_card.as_ref())),
+            _ => configured_card,
+        };
         if model_rules.get("stream").and_then(Value::as_bool) == Some(false)
             && context["stream"] == true
         {
@@ -409,6 +443,14 @@ pub async fn candidates(
                 reason: "stream_disabled",
             });
             continue;
+        }
+        if !supports(&row.provider_kind, &capabilities, endpoint, true)
+            || model_rules.get("stream").and_then(Value::as_bool) == Some(false)
+        {
+            model_card
+                .get_or_insert_with(Default::default)
+                .capabilities
+                .streaming = Some(false);
         }
         let limits: Limits =
             serde_json::from_value(settings.get("limits").cloned().unwrap_or(json!({})))
@@ -430,6 +472,7 @@ pub async fn candidates(
             return Err(Error::Configuration);
         }
         result.push(Candidate {
+            model_card,
             target: RouteTarget {
                 public_name: row.public_name,
                 upstream_name,
@@ -487,6 +530,7 @@ pub async fn candidates(
         }
         unique
     });
+    tx.commit().await?;
     Ok(result)
 }
 

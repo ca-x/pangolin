@@ -1718,6 +1718,7 @@ async fn list(
         project_model_catalog_cards(&mut data);
     }
     if resource == "credentials" {
+        let inventory = operations::model_inventory::load(&state.db, &project).await?;
         let rows=state.db.query_all(sql("SELECT c.id,c.secret_envelope FROM channel_credentials c JOIN providers p ON p.id=c.provider_id WHERE p.project_id=?",vec![project.clone().into()])).await?;
         let states: HashMap<String, bool> = rows
             .into_iter()
@@ -1733,6 +1734,11 @@ async fn list(
             .collect::<Result<_, sea_orm::DbErr>>()?;
         for credential in &mut data {
             if let Some(object) = credential.as_object_mut() {
+                if let Some(id) = object.get("id").and_then(Value::as_str)
+                    && let Some(metadata) = inventory.credential_metadata(id).as_object()
+                {
+                    object.extend(metadata.clone());
+                }
                 let recoverable = object
                     .get("id")
                     .and_then(Value::as_str)
