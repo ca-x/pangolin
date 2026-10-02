@@ -798,6 +798,7 @@ async fn probe_response(
             if crate::orchestration::stream::failed(&event) {
                 return Err("invalid_response");
             }
+            let is_terminal = terminal.terminal(&event, endpoint);
             if let Ok(value) = serde_json::from_str::<Value>(&event.data) {
                 if !probe_stream_shape(endpoint, &value) {
                     return Err("invalid_response");
@@ -811,7 +812,10 @@ async fn probe_response(
                 );
                 output |= probe_stream_output(endpoint, &value);
                 let usage = super::pricing::Usage::parse(&value);
-                if usage.reported && usage.presence.output {
+                if usage.reported
+                    && usage.presence.output
+                    && crate::providers::usage::final_report(endpoint, &value, is_terminal)
+                {
                     measured.output_tokens = Some(usage.output);
                 }
             } else if event.data.trim() != "[DONE]" {
@@ -823,7 +827,7 @@ async fn probe_response(
                 measured.first_event_ms,
                 measured.first_text_ms,
             );
-            if terminal.terminal(&event, endpoint) {
+            if is_terminal {
                 return if output {
                     Ok(())
                 } else {
@@ -837,6 +841,15 @@ async fn probe_response(
         if raw.get("error").is_some() {
             return Err("invalid_response");
         }
+        // Measure native provider counters before a response transform can synthesize defaults.
+        let usage = super::pricing::Usage::parse_for(&raw, wire_endpoint == "/v1/messages");
+        let output_tokens = if selection.target.provider_kind == "bedrock" {
+            raw.pointer("/usage/outputTokens")
+                .and_then(Value::as_i64)
+                .filter(|count| *count >= 0)
+        } else {
+            (usage.reported && usage.presence.output).then_some(usage.output)
+        };
         let value = prepared
             .response
             .apply(raw)
@@ -847,10 +860,7 @@ async fn probe_response(
         if !probe_output(wire_endpoint, &value) {
             return Err("empty_response");
         }
-        let usage = super::pricing::Usage::parse(&value);
-        if usage.reported && usage.presence.output {
-            measured.output_tokens = Some(usage.output);
-        }
+        measured.output_tokens = output_tokens;
         Ok(())
     }
 }

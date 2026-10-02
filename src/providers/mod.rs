@@ -10,6 +10,7 @@ pub mod timing;
 pub mod tokens;
 mod transforms;
 mod upstream;
+pub mod usage;
 
 use crate::{api::ApiError, models::RouteTarget};
 use http::{HeaderMap, HeaderValue, Method, header};

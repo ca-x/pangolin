@@ -15427,3 +15427,215 @@ async fn reference_pricing_partial_cache_and_reasoning_merge_to_actual_terminal_
         assert_eq!(summary.output_tokens, Some(3));
     }
 }
+
+async fn reference_probe_output_case(
+    kind: &str,
+    capability: &str,
+    endpoint: &str,
+    body: String,
+    streamed: bool,
+    expected: Option<i64>,
+) {
+    let f = fixture(Router::new().fallback(post(move || {
+        let body = body.clone();
+        async move {
+            (
+                [(
+                    header::CONTENT_TYPE,
+                    if streamed {
+                        "text/event-stream"
+                    } else {
+                        "application/json"
+                    },
+                )],
+                body,
+            )
+        }
+    })))
+    .await;
+    if kind == "bedrock" {
+        let secret = f.state.secrets.encrypt(&json!({"region":"us-east-1","access_key_id":"mock-key","secret_access_key":"mock-secret"}).to_string()).unwrap();
+        sql(
+            &f,
+            "UPDATE channel_credentials SET secret_envelope=? WHERE provider_id=?",
+            vec![secret.into(), f.providers[0].clone().into()],
+        )
+        .await;
+    }
+    sql(
+        &f,
+        "UPDATE providers SET kind=? WHERE id=?",
+        vec![kind.into(), f.providers[0].clone().into()],
+    )
+    .await;
+    sql(
+        &f,
+        "UPDATE models SET capabilities=? WHERE provider_id=?",
+        vec![
+            json!([capability]).to_string().into(),
+            f.providers[0].clone().into(),
+        ],
+    )
+    .await;
+    let model: String = f
+        .state
+        .db
+        .query_one(ops::sql(
+            "SELECT id FROM models WHERE provider_id=? LIMIT 1",
+            vec![f.providers[0].clone().into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "id")
+        .unwrap();
+    ops::jobs::enqueue(&f.state.db,Some(db::DEFAULT_PROJECT_ID),"probe","reference-final-output",&json!({"provider_id":f.providers[0],"model_id":model,"endpoint":endpoint,"stream":streamed}),db::now()).await.unwrap();
+    let claim = ops::jobs::claim(&f.state.db, "worker", db::now(), 120)
+        .await
+        .unwrap()
+        .unwrap();
+    ops::runtime::execute(&f.state, &claim).await.unwrap();
+    let row = f
+        .state
+        .db
+        .query_one(ops::sql(
+            "SELECT output_tokens,first_text_ms,success FROM channel_probes WHERE provider_id=?",
+            vec![f.providers[0].clone().into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(row.try_get::<bool>("", "success").unwrap());
+    assert_eq!(
+        row.try_get::<Option<i64>>("", "output_tokens").unwrap(),
+        expected,
+        "{endpoint} final output"
+    );
+    assert_eq!(
+        row.try_get::<Option<i64>>("", "first_text_ms")
+            .unwrap()
+            .is_some(),
+        streamed
+    );
+}
+
+#[tokio::test]
+async fn reference_probe_final_output_chat_ignores_progress_and_preserves_final_zero() {
+    for final_count in [None, Some(0), Some(7)] {
+        let mut frames = format!(
+            "data: {}\n\ndata: {}\n\n",
+            json!({"choices":[{"delta":{"role":"assistant"}}],"usage":{"completion_tokens":0}}),
+            json!({"choices":[{"delta":{"content":"OK"}}],"usage":{"completion_tokens":2}})
+        );
+        if let Some(count) = final_count {
+            frames.push_str(&format!(
+                "data: {}\n\n",
+                json!({"choices":[],"usage":{"completion_tokens":count}})
+            ));
+        }
+        frames.push_str("data: [DONE]\n\n");
+        reference_probe_output_case(
+            "openai",
+            "chat",
+            "/v1/chat/completions",
+            frames,
+            true,
+            final_count,
+        )
+        .await;
+    }
+}
+#[tokio::test]
+async fn reference_probe_final_output_anthropic_requires_final_delta() {
+    for final_count in [None, Some(0), Some(7)] {
+        let mut frames = format!(
+            "data: {}\n\ndata: {}\n\n",
+            json!({"type":"message_start","message":{"usage":{"input_tokens":3,"output_tokens":0}}}),
+            json!({"type":"content_block_delta","delta":{"type":"text_delta","text":"OK"}})
+        );
+        if let Some(count) = final_count {
+            frames.push_str(&format!("data: {}\n\n",json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":count}})));
+        }
+        frames.push_str("data: {\"type\":\"message_stop\"}\n\n");
+        reference_probe_output_case(
+            "anthropic",
+            "messages",
+            "/v1/messages",
+            frames,
+            true,
+            final_count,
+        )
+        .await;
+    }
+}
+#[tokio::test]
+async fn reference_probe_final_output_responses_requires_completed_usage() {
+    for final_count in [None, Some(0), Some(7)] {
+        let mut terminal = json!({"type":"response.completed","response":{"status":"completed"}});
+        if let Some(count) = final_count {
+            terminal["response"]["usage"] = json!({"output_tokens":count});
+        }
+        let frames = format!(
+            "data: {}\n\ndata: {}\n\ndata: {}\n\n",
+            json!({"type":"response.created","response":{"usage":{"output_tokens":0}}}),
+            json!({"type":"response.output_text.delta","delta":"OK","response":{"usage":{"output_tokens":2}}}),
+            terminal
+        );
+        reference_probe_output_case(
+            "openai",
+            "responses",
+            "/v1/responses",
+            frames,
+            true,
+            final_count,
+        )
+        .await;
+    }
+}
+#[tokio::test]
+async fn reference_probe_final_output_gemini_uses_final_native_totals() {
+    for final_count in [None, Some(0), Some(7)] {
+        let mut terminal = json!({"candidates":[{"finishReason":"STOP"}]});
+        if let Some(count) = final_count {
+            terminal["usageMetadata"] =
+                json!({"promptTokenCount":3,"totalTokenCount":3+count,"candidatesTokenCount":0});
+        }
+        let frames = format!(
+            "data: {}\n\ndata: {}\n\n",
+            json!({"candidates":[{"content":{"parts":[{"text":"OK"}]}}],"usageMetadata":{"promptTokenCount":3,"totalTokenCount":5}}),
+            terminal
+        );
+        reference_probe_output_case(
+            "gemini",
+            "gemini",
+            "/v1beta/models:streamGenerateContent",
+            frames,
+            true,
+            final_count,
+        )
+        .await;
+    }
+}
+#[tokio::test]
+async fn reference_probe_final_output_nonstream_transform_keeps_source_measurement() {
+    for usage in [
+        json!({}),
+        json!({"promptTokenCount":3,"totalTokenCount":3}),
+        json!({"promptTokenCount":3,"totalTokenCount":10,"candidatesTokenCount":2}),
+    ] {
+        let expected = usage["totalTokenCount"].as_i64().map(|n| n - 3);
+        reference_probe_output_case("gemini","chat","/v1/chat/completions",json!({"candidates":[{"content":{"parts":[{"text":"OK"}]},"finishReason":"STOP"}],"usageMetadata":usage}).to_string(),false,expected).await;
+    }
+}
+
+#[tokio::test]
+async fn reference_probe_final_output_bedrock_reads_native_optional_counter() {
+    for count in [None, Some(0), Some(7)] {
+        let mut usage = json!({"inputTokens":3});
+        if let Some(count) = count {
+            usage["outputTokens"] = json!(count);
+            usage["totalTokens"] = json!(count + 3);
+        }
+        reference_probe_output_case("bedrock", "chat", "/v1/chat/completions", json!({"output":{"message":{"role":"assistant","content":[{"text":"OK"}]}},"stopReason":"end_turn","usage":usage}).to_string(), false, count).await;
+    }
+}
