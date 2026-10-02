@@ -74,6 +74,7 @@ pub struct Binding {
     pub rule_id: String,
     pub diagnostic: AffinityDiagnostic,
     sequence: u64,
+    completion_guard: Option<Arc<tokio::sync::Mutex<u64>>>,
     pub ttl_secs: u64,
     pub release_on_failure: bool,
 }
@@ -81,12 +82,12 @@ pub struct Cache {
     backend: Arc<dyn BaseCache<Value = CacheEntry>>,
     local: Option<Arc<InMemoryCache<CacheEntry>>>,
     sequence: std::sync::atomic::AtomicU64,
-    completed_sequences: moka::sync::Cache<String, u64>,
+    guard_limit: usize,
     pub hits: std::sync::atomic::AtomicU64,
     generation: std::sync::atomic::AtomicU64,
     project_generations: std::sync::Mutex<std::collections::HashMap<String, u64>>,
     switches: std::sync::Mutex<
-        std::collections::HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>,
+        std::collections::HashMap<String, std::sync::Weak<tokio::sync::Mutex<u64>>>,
     >,
 }
 impl Default for Cache {
@@ -109,7 +110,7 @@ impl Default for Cache {
             backend,
             local,
             sequence: Default::default(),
-            completed_sequences: moka::sync::Cache::builder().max_capacity(10000).build(),
+            guard_limit: 10000,
             hits: Default::default(),
             generation: Default::default(),
             project_generations: Default::default(),
@@ -130,6 +131,19 @@ impl Cache {
             local: Some(local),
             ..Self::default()
         }
+    }
+    #[cfg(test)]
+    pub fn with_test_completion_capacity(capacity: usize) -> Self {
+        Self {
+            guard_limit: capacity,
+            ..Self::with_test_clock(|| Duration::from_secs(1000))
+        }
+    }
+    #[cfg(test)]
+    pub fn run_test_capacity_tasks(&self) {
+        let mut guards = self.switches.lock().unwrap();
+        guards.retain(|_, guard| guard.strong_count() > 0);
+        assert!(guards.len() <= self.guard_limit);
     }
     pub fn diagnostic_counts(&self) -> (u64, u64) {
         (
@@ -167,18 +181,18 @@ impl Cache {
                 .unwrap_or(&0),
         )
     }
-    fn switch_lock(&self, key: &str) -> Option<Arc<tokio::sync::Mutex<()>>> {
+    fn switch_lock(&self, key: &str) -> Option<Arc<tokio::sync::Mutex<u64>>> {
         let mut locks = self.switches.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(lock) = locks.get(key).and_then(std::sync::Weak::upgrade) {
             return Some(lock);
         }
-        if locks.len() >= 10000 {
+        if locks.len() >= self.guard_limit {
             locks.retain(|_, v| v.strong_count() > 0);
-            if locks.len() >= 10000 {
+            if locks.len() >= self.guard_limit {
                 return None;
             }
         }
-        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        let lock = Arc::new(tokio::sync::Mutex::new(0));
         locks.insert(key.into(), Arc::downgrade(&lock));
         Some(lock)
     }
@@ -343,8 +357,9 @@ impl Cache {
                 diagnostic.expires_at = expires_at;
             }
             return Ok(Some(Binding {
-                fingerprint,
                 rule_id: diagnostic.rule_id.clone(),
+                completion_guard: self.switch_lock(&fingerprint),
+                fingerprint,
                 diagnostic,
                 sequence: self
                     .sequence
@@ -383,10 +398,14 @@ impl Cache {
         } else {
             vec![event(AffinityReason::CandidateFailed, None)]
         };
-        let Some(lock) = self.switch_lock(&binding.fingerprint) else {
+        // Every in-flight binding retains this scope's ordering state, including
+        // when the backend evicts/expires its ordinary binding. A bounded weak
+        // registry never evicts a live guard; absent safety state means no mutation.
+        let Some(lock) = binding.completion_guard.clone() else {
             return diagnostics;
         };
-        let Ok(_guard) = tokio::time::timeout(Duration::from_secs(2), lock.lock_owned()).await
+        let Ok(mut completed) =
+            tokio::time::timeout(Duration::from_secs(2), lock.lock_owned()).await
         else {
             return diagnostics;
         };
@@ -396,14 +415,8 @@ impl Cache {
             .await
             .ok()
             .flatten();
-        // The sequence is process-local and only orders this derived cache's
-        // writes, never authorization or durable facts. Late success/failure
-        // cannot replace/release a newer successful decision.
-        if self
-            .completed_sequences
-            .get(&binding.fingerprint)
-            .is_some_and(|sequence| sequence > binding.sequence)
-        {
+        // Sequence ordering is process-local, not a distributed-consistency claim.
+        if *completed > binding.sequence {
             return diagnostics;
         }
         if success
@@ -411,8 +424,7 @@ impl Cache {
                 .as_ref()
                 .is_some_and(|entry| entry.response == candidate)
         {
-            self.completed_sequences
-                .insert(binding.fingerprint.clone(), binding.sequence);
+            *completed = binding.sequence;
             return diagnostics;
         }
         if success {
@@ -432,8 +444,7 @@ impl Cache {
                 .await
                 .is_ok()
             {
-                self.completed_sequences
-                    .insert(binding.fingerprint.clone(), binding.sequence);
+                *completed = binding.sequence;
                 diagnostics.push(event(
                     AffinityReason::Established,
                     self.expires_at(&binding.fingerprint),
@@ -449,8 +460,7 @@ impl Cache {
                 .await
                 .is_ok()
         {
-            self.completed_sequences
-                .insert(binding.fingerprint.clone(), binding.sequence);
+            *completed = binding.sequence;
             diagnostics.push(event(AffinityReason::Released, None));
         }
         diagnostics
@@ -486,6 +496,7 @@ mod tests {
                 expires_at: None,
             },
             sequence: 1,
+            completion_guard: cache.switch_lock(blake3::hash(b"hashed-scope").to_hex().as_ref()),
             ttl_secs: 60,
             release_on_failure: true,
         };

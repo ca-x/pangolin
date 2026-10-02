@@ -13870,3 +13870,197 @@ async fn reference_conversion_diagnostics_uncontacted_hard_budget_keeps_spend_ze
     );
     assert_eq!(executions["data"][0]["status"], "local_failure");
 }
+
+#[tokio::test]
+async fn reference_affinity_diagnostics_strict_uncontacted_rejection_retains_binding() {
+    let models = Arc::new(Mutex::new(Vec::<String>::new()));
+    let seen = models.clone();
+    let f=fixture(Router::new().fallback(post(move|Json(body):Json<Value>|{
+        let seen=seen.clone(); async move {
+            seen.lock().await.push(body["model"].as_str().unwrap_or("native-gemini").to_owned());
+            if body["contents"].to_string().contains("force upstream rejection") {
+                return (StatusCode::BAD_REQUEST,Json(json!({"error":{"message":"mock rejected"}})));
+            }
+            (StatusCode::OK,Json(json!({"candidates":[{"content":{"role":"model","parts":[{"text":"OK"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1,"totalTokenCount":2}})))
+        }
+    }))).await;
+    let cookie = owner(&f).await;
+    sql(&f, "UPDATE providers SET kind='gemini'", vec![]).await;
+    sql(
+        &f,
+        "UPDATE models SET input_price_micros=1000000,output_price_micros=1000000",
+        vec![],
+    )
+    .await;
+    sql(&f, "UPDATE api_keys SET budget_micros=1000000", vec![]).await;
+    sql(&f,"UPDATE projects SET settings_json=?",vec![json!({"version":1,"routing":{"version":1,"sticky":"off"},"affinity_rules":[{"id":"strict-rejection","source":{"kind":"trace"},"mode":"strict","ttl_secs":60,"release_on_failure":true}]}).to_string().into()]).await;
+    assert_eq!(
+        request(&f, "/v1/chat/completions", chat()).await.status(),
+        StatusCode::OK
+    );
+    let first = reference_diagnostic_executions(&f, &cookie).await;
+    let provider = first["data"][0]["provider_id"].as_str().unwrap().to_owned();
+    let first_spend = count(&f, "SELECT SUM(spent_micros) AS n FROM api_keys").await;
+    assert!(first_spend > 0);
+    sql(
+        &f,
+        "UPDATE models SET priority=-10 WHERE provider_id<>?",
+        vec![provider.clone().into()],
+    )
+    .await;
+    let mut unsupported = chat();
+    unsupported["tools"] =
+        json!([{"type":"function","function":{"name":"private rejected tool","parameters":{}}}]);
+    assert_eq!(
+        request(&f, "/v1/chat/completions", unsupported)
+            .await
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(models.lock().await.len(), 1);
+    assert_eq!(
+        count(&f, "SELECT SUM(spent_micros) AS n FROM api_keys").await,
+        first_spend
+    );
+    assert_eq!(count(&f,"SELECT COALESCE(SUM(reserved_micros),0) AS n FROM execution_facts WHERE status='running'").await,0);
+    let rows = reference_diagnostic_executions(&f, &cookie).await;
+    let rejected = rows["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["status"] == "local_failure")
+        .unwrap();
+    assert_eq!(
+        rejected["conversion_diagnostics"][0]["code"],
+        "unsupported_tools"
+    );
+    assert_eq!(rejected["affinity_diagnostics"][0]["reason"], "hit");
+    assert_eq!(
+        rejected["affinity_diagnostics"].as_array().unwrap().len(),
+        1,
+        "uncontacted validation must not record candidate failure/release"
+    );
+    assert_eq!(
+        count(
+            &f,
+            "SELECT SUM(contacted) AS n FROM execution_facts WHERE status='local_failure'"
+        )
+        .await,
+        0
+    );
+    assert_eq!(count(&f,"SELECT SUM(u.total_cost_micros) AS n FROM usage_logs u JOIN execution_facts e ON e.id=u.execution_id WHERE e.status='local_failure'").await,0);
+    assert_eq!(
+        request(&f, "/v1/chat/completions", chat()).await.status(),
+        StatusCode::OK
+    );
+    // Gemini selects the actual model via the request URL; inspect the execution
+    // identity as well as the mock call count to prove the strict binding held.
+    assert_eq!(models.lock().await.len(), 2);
+    let rows = reference_diagnostic_executions(&f, &cookie).await;
+    assert!(
+        rows["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["provider_id"] == provider)
+    );
+    let mut failed = chat();
+    failed["messages"][0]["content"] = json!("force upstream rejection");
+    assert_eq!(
+        request(&f, "/v1/chat/completions", failed).await.status(),
+        StatusCode::BAD_REQUEST
+    );
+    let rows = reference_diagnostic_executions(&f, &cookie).await;
+    let contacted = rows["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["http_status"] == 400)
+        .unwrap();
+    assert!(
+        contacted["affinity_diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["reason"] == "released")
+    );
+    assert_eq!(
+        request(&f, "/v1/chat/completions", chat()).await.status(),
+        StatusCode::OK
+    );
+    let rows = reference_diagnostic_executions(&f, &cookie).await;
+    assert!(
+        rows["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["status"] == "succeeded" && row["provider_id"] != provider)
+    );
+}
+
+#[tokio::test]
+async fn reference_conversion_diagnostics_anthropic_string_stop_is_actual_and_native_unchanged() {
+    let seen = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let copied = seen.clone();
+    let f=fixture(Router::new().route("/v1/messages",post(move|Json(body):Json<Value>|{
+        let seen=copied.clone();async move {seen.lock().await.push(body);Json(json!({"id":"msg-stop","type":"message","model":"actual","content":[{"type":"text","text":"OK"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}))}
+    }))).await;
+    let cookie = owner(&f).await;
+    sql(&f, "UPDATE providers SET kind='anthropic'", vec![]).await;
+    let mut body = chat();
+    body["stop"] = json!("private stop text");
+    body["tools"] = json!([{"type":"function","function":{"name":"lookup","parameters":{"type":"object","properties":{}}}}]);
+    assert_eq!(
+        request(&f, "/v1/chat/completions", body).await.status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        seen.lock().await[0]["stop_sequences"],
+        json!(["private stop text"])
+    );
+    let rows = reference_diagnostic_executions(&f, &cookie).await;
+    assert_eq!(
+        rows["data"][0]["conversion_diagnostics"][0]["code"],
+        "stop_array_normalized"
+    );
+    assert_eq!(rows["data"][0]["conversion_diagnostics"][0]["path"], "stop");
+    let mut text = chat();
+    text["stop"] = json!("private text-only stop");
+    assert_eq!(
+        request(&f, "/v1/chat/completions", text).await.status(),
+        StatusCode::OK
+    );
+    assert!(
+        seen.lock().await[1]["stop_sequences"].is_string(),
+        "retain existing checked adapter bytes"
+    );
+    let mut native = chat();
+    native["stop_sequences"] = json!(["private native stop"]);
+    native["native_extension"] = json!({"opaque":"private native value"});
+    native["max_tokens"] = json!(8);
+    assert_eq!(
+        request(&f, "/v1/messages", native.clone()).await.status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        seen.lock().await[2]["stop_sequences"],
+        native["stop_sequences"]
+    );
+    assert_eq!(
+        seen.lock().await[2]["native_extension"],
+        native["native_extension"]
+    );
+    let rows = reference_diagnostic_executions(&f, &cookie).await;
+    assert_eq!(rows["data"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        rows["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|row| row["conversion_diagnostics"] == json!([]))
+            .count(),
+        2,
+        "native and text-only checked adapters must not invent normalization"
+    );
+    assert!(!rows.to_string().contains("private"));
+}

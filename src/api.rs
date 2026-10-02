@@ -1383,7 +1383,11 @@ async fn call_anthropic_chat(
         request = value.as_object().expect("LiteLLM emits an object").clone();
     }
     if let Some(accounting) = accounting.as_deref_mut() {
-        for diagnostic in diagnostics::normalizations(payload, false, false) {
+        for diagnostic in diagnostics::normalizations(
+            payload,
+            false,
+            request.get("stop_sequences").is_some_and(Value::is_array),
+        ) {
             accounting.conversion(diagnostic)?;
         }
     }

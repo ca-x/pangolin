@@ -2829,3 +2829,137 @@ async fn reference_affinity_diagnostics_controlled_expiry_late_completion_and_re
         .unwrap();
     assert_ne!(other.fingerprint, first.fingerprint);
 }
+
+#[tokio::test]
+async fn reference_affinity_diagnostics_capacity_churn_cannot_overwrite_newer_binding() {
+    reference_affinity_capacity_regression(true).await;
+}
+#[tokio::test]
+async fn reference_affinity_diagnostics_capacity_churn_cannot_release_newer_same_candidate() {
+    reference_affinity_capacity_regression(false).await;
+}
+async fn reference_affinity_capacity_regression(old_success: bool) {
+    use crate::providers::diagnostics::AffinityReason;
+    let f = database_fixture().await;
+    add_model(&f, "a", "public", "actual-a").await;
+    add_model(&f, "b", "public", "actual-b").await;
+    sql(&f,"UPDATE projects SET settings_json=?",vec![json!({"version":1,"affinity_rules":[{"id":"capacity","source":{"kind":"pointer","value":"/user"},"mode":"prefer","ttl_secs":86400}]}).to_string().into()]).await;
+    let body = json!({"model":"public","user":"protected scope"});
+    let candidates = plan(&f, body.clone()).await.unwrap().candidates;
+    let cache = affinity::Cache::with_test_completion_capacity(1);
+    let mut selected = candidates.clone();
+    let old = cache
+        .select(
+            &f.db,
+            &f.key,
+            &HeaderMap::new(),
+            &body,
+            "/v1/chat/completions",
+            &mut selected,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let newer = cache
+        .select(
+            &f.db,
+            &f.key,
+            &HeaderMap::new(),
+            &body,
+            "/v1/chat/completions",
+            &mut selected,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let retained = &candidates[usize::from(old_success)];
+    assert_eq!(
+        cache
+            .finish(&newer, &retained.id(), &retained.provider_id, true)
+            .await[0]
+            .reason,
+        AffinityReason::Established
+    );
+    // Smaller completion capacity than the still-live binding backend. Churn
+    // distinct scopes and complete them repeatedly so pending eviction is fully
+    // applied; the protected request remains in flight throughout.
+    for index in 0..64 {
+        let mut ordered = candidates.clone();
+        let churn = cache
+            .select(
+                &f.db,
+                &f.key,
+                &HeaderMap::new(),
+                &json!({"model":"public","user":format!("churn-{index}")}),
+                "/v1/chat/completions",
+                &mut ordered,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        for _ in 0..16 {
+            let effects = cache
+                .finish(
+                    &churn,
+                    &candidates[0].id(),
+                    &candidates[0].provider_id,
+                    true,
+                )
+                .await;
+            assert!(
+                effects.is_empty(),
+                "scope without a capacity-protected guard must not claim establishment"
+            );
+        }
+        cache.run_test_capacity_tasks();
+    }
+    let before = cache
+        .select(
+            &f.db,
+            &f.key,
+            &HeaderMap::new(),
+            &body,
+            "/v1/chat/completions",
+            &mut selected,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(before.diagnostic.reason, AffinityReason::Hit);
+    assert_eq!(
+        before.diagnostic.provider_id,
+        Some(retained.provider_id.clone())
+    );
+    let events = cache
+        .finish(
+            &old,
+            &candidates[0].id(),
+            &candidates[0].provider_id,
+            old_success,
+        )
+        .await;
+    assert!(
+        !events.iter().any(|event| matches!(
+            event.reason,
+            AffinityReason::Established | AffinityReason::Released
+        )),
+        "old completion mutated a live newer binding"
+    );
+    let after = cache
+        .select(
+            &f.db,
+            &f.key,
+            &HeaderMap::new(),
+            &body,
+            "/v1/chat/completions",
+            &mut selected,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.diagnostic.reason, AffinityReason::Hit);
+    assert_eq!(
+        after.diagnostic.provider_id,
+        Some(retained.provider_id.clone())
+    );
+}

@@ -149,11 +149,12 @@ pub fn cross_protocol(kind: &str, endpoint: &str) -> bool {
 }
 
 /// Called only after a successful, explicit cross-protocol request transform.
-/// Native pass-through never produces a normalization explanation.
+/// Native pass-through never produces a normalization explanation. Stop-array
+/// capability describes the completed transform, not a provider-family guess.
 pub fn normalizations(
     payload: &Value,
     native: bool,
-    gemini_target: bool,
+    normalizes_stop_to_array: bool,
 ) -> Vec<ConversionDiagnostic> {
     if native {
         return vec![];
@@ -171,7 +172,7 @@ pub fn normalizations(
             Some("messages[].role"),
         ));
     }
-    if gemini_target && payload["stop"].is_string() {
+    if normalizes_stop_to_array && payload["stop"].is_string() {
         diagnostics.push(ConversionDiagnostic::new(
             Phase::Request,
             StopArrayNormalized,

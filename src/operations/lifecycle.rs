@@ -607,7 +607,9 @@ impl Attempt {
         if self.settled {
             return Ok(());
         }
-        if let Some(binding) = &self.context.affinity {
+        if self.contacted
+            && let Some(binding) = &self.context.affinity
+        {
             let events = self
                 .context
                 .state
