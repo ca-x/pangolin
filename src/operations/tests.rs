@@ -693,3 +693,49 @@ fn reference_pricing_review_i2_derived_output_requires_every_summand() {
     assert_eq!((native.input, native.output), (3, 3));
     assert!(native.presence.input && native.presence.output);
 }
+
+#[test]
+fn reference_pricing_partial_children_wait_for_known_parents() {
+    for (partial, terminal) in [
+        (
+            json!({"usage":{"prompt_tokens_details":{"cached_tokens":5}}}),
+            json!({"usage":{"prompt_tokens":10,"completion_tokens":3,"prompt_tokens_details":{"cached_tokens":5}}}),
+        ),
+        (
+            json!({"usage":{"completion_tokens_details":{"reasoning_tokens":2}}}),
+            json!({"usage":{"prompt_tokens":10,"completion_tokens":3,"completion_tokens_details":{"reasoning_tokens":2}}}),
+        ),
+    ] {
+        let first = pricing::Usage::parse(&partial);
+        assert!(
+            first.reported && !first.invalid,
+            "an absent parent is unavailable, not measured zero"
+        );
+        let mut usage = pricing::Usage::default();
+        usage.merge(first);
+        usage.merge(pricing::Usage::parse(&terminal));
+        assert!(usage.reported && !usage.invalid);
+        assert_eq!((usage.input, usage.output), (10, 3));
+        assert!(usage.presence.input && usage.presence.output);
+    }
+}
+
+#[test]
+fn reference_pricing_known_contradictions_and_child_overflow_stay_invalid() {
+    for invalid in [
+        json!({"usage":{"prompt_tokens":0,"prompt_tokens_details":{"cached_tokens":5}}}),
+        json!({"usage":{"completion_tokens":0,"completion_tokens_details":{"reasoning_tokens":2}}}),
+        json!({"usage":{"cache_read_input_tokens":i64::MAX,"cache_creation_input_tokens":1}}),
+    ] {
+        let mut usage = pricing::Usage::default();
+        usage.merge(pricing::Usage::parse(&invalid));
+        assert!(usage.invalid);
+        usage.merge(pricing::Usage::parse(
+            &json!({"usage":{"prompt_tokens":10,"completion_tokens":3}}),
+        ));
+        assert!(
+            usage.invalid && !usage.reported,
+            "a valid later event cannot repair an actual contradiction"
+        );
+    }
+}

@@ -15330,3 +15330,100 @@ async fn reference_pricing_review_i1_audit_proof_survives_retention_clone_and_co
         99
     );
 }
+
+#[tokio::test]
+async fn reference_pricing_partial_cache_and_reasoning_merge_to_actual_terminal_cost() {
+    for (first, last, parent_known, child) in [
+        (
+            json!({"prompt_tokens_details":{"cached_tokens":5}}),
+            json!({"prompt_tokens":10,"completion_tokens":3,"prompt_tokens_details":{"cached_tokens":5}}),
+            true,
+            "cache_read_tokens",
+        ),
+        (
+            json!({"completion_tokens_details":{"reasoning_tokens":2}}),
+            json!({"prompt_tokens":10,"completion_tokens":3,"completion_tokens_details":{"reasoning_tokens":2}}),
+            true,
+            "reasoning_tokens",
+        ),
+        (
+            json!({"prompt_tokens_details":{"cached_tokens":5}}),
+            json!({"completion_tokens":3,"prompt_tokens_details":{"cached_tokens":5}}),
+            false,
+            "cache_read_tokens",
+        ),
+    ] {
+        let first = json!({"choices":[{"delta":{"content":"partial"}}],"usage":first});
+        let last = json!({"choices":[],"usage":last});
+        let events = format!("data: {first}\n\ndata: {last}\n\ndata: [DONE]\n\n");
+        let f = fixture(Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let events = events.clone();
+                async move { ([(header::CONTENT_TYPE, "text/event-stream")], events) }
+            }),
+        ))
+        .await;
+        sql(
+            &f,
+            "UPDATE providers SET enabled=0 WHERE id<>?; UPDATE api_keys SET budget_micros=10000",
+            vec![f.providers[0].clone().into()],
+        )
+        .await;
+        let model = f
+            .state
+            .db
+            .query_one(ops::sql(
+                "SELECT id FROM models WHERE provider_id=?",
+                vec![f.providers[0].clone().into()],
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get::<String>("", "id")
+            .unwrap();
+        let cookie = owner(&f).await;
+        assert_eq!(admin(&f,&cookie,http::Method::POST,&format!("/api/admin/v1/projects/{}/operations/prices",db::DEFAULT_PROJECT_ID),json!({"model_id":model,"components":[{"kind":"output","unit_size":1,"unit_price_micros":1}]}),true).await.status(),StatusCode::OK);
+        let response = request(&f, "/v1/chat/completions", streaming()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        to_bytes(response.into_body(), 16384).await.unwrap();
+        let row=f.state.db.query_one(ops::sql("SELECT pricing_status,settlement_kind,total_cost_micros,input_tokens,output_tokens,cache_read_tokens,reasoning_tokens,usage_measurement_json FROM usage_logs",vec![])).await.unwrap().unwrap();
+        assert_eq!(
+            row.try_get::<String>("", "pricing_status").unwrap(),
+            "priced"
+        );
+        assert_eq!(
+            row.try_get::<String>("", "settlement_kind").unwrap(),
+            "reported"
+        );
+        assert_eq!(row.try_get::<i64>("", "total_cost_micros").unwrap(), 3);
+        assert_eq!(
+            count(&f, "SELECT SUM(spent_micros) AS n FROM api_keys").await,
+            3
+        );
+        assert_eq!(row.try_get::<i64>("", "output_tokens").unwrap(), 3);
+        if parent_known {
+            assert_eq!(row.try_get::<i64>("", "input_tokens").unwrap(), 10);
+        }
+        let flags: Value =
+            serde_json::from_str(&row.try_get::<String>("", "usage_measurement_json").unwrap())
+                .unwrap();
+        assert_eq!(flags["input_tokens"], parent_known);
+        assert_eq!(flags["output_tokens"], true);
+        assert_eq!(flags[child], true);
+        ops::instance_backup::rebuild_projection(&f.state)
+            .await
+            .unwrap();
+        let summary = f
+            .state
+            .observations
+            .summary_for(db::DEFAULT_PROJECT_ID.into(), Default::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            summary.input_tokens,
+            if parent_known { Some(10) } else { None }
+        );
+        assert_eq!(summary.output_tokens, Some(3));
+    }
+}

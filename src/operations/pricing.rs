@@ -368,12 +368,14 @@ impl Usage {
             ]
             .iter()
             .any(|value| *value < 0)
-            || self
-                .cache_read
-                .checked_add(self.cache_write)
-                .is_none_or(|sum| sum > self.input)
-            || self.cache_write_1h > self.cache_write
-            || self.reasoning > self.output
+            // Overflow is invalid immediately, but absent parent counters are
+            // placeholders. A known child's lower bound can contradict only a
+            // parent quantity whose value was actually measured.
+            || self.cache_read.checked_add(self.cache_write).is_none()
+            || (self.presence.input
+                && self.cache_read.checked_add(self.cache_write).is_some_and(|sum|sum>self.input))
+            || (self.presence.cache_write && self.presence.cache_write_1h && self.cache_write_1h > self.cache_write)
+            || (self.presence.output && self.presence.reasoning && self.reasoning > self.output)
         {
             return Err(invalid());
         }
@@ -620,6 +622,12 @@ impl Price {
                 "unit" => u.units,
                 _ => return Err(invalid()),
             };
+            // An unavailable parent may make a selected split impossible to
+            // calculate; retain its unknown monetary status rather than persist
+            // a negative compatibility quantity.
+            if quantity < 0 {
+                return Err(invalid());
+            }
             let mut numerator = 0i128;
             if c.tiers.is_empty() {
                 numerator = i128::from(quantity) * i128::from(c.unit_price_micros)
