@@ -234,7 +234,7 @@ Before exposing probe output/rates, correct the existing progress-counter bounda
 
 Credentials show safe known/stale/unmeasured model-inventory status and last success/count, without plaintext fingerprints/secrets. Model details expose nullable shared capability/limits/effort/modality facts, distinguish unknown/unsupported and label that routes may depend on request conditions. Keep row selectors/bulk/filters usable, localized and >=14px; avoid wider page overflow at375px.
 
-**RED/GREEN tests:** choose credential/protocol/stream posts correct job payload; stale selection cleared on project change; unknown times and nonstream TPS dash; old header timing labeled separately; fresh/stale/unknown discovery labels; known false vs unknown metadata; query failures/retry/empty states; both translations. Focused: `pnpm --dir web test -- src/pages/referenceProbe.test.tsx src/pages/referenceInventory.test.tsx` (create these meaningful integration tests).
+**RED/GREEN tests:** choose credential/protocol/stream posts correct job payload; stale selection cleared on project change; unknown times and nonstream TPS dash; old header timing labeled separately; fresh/stale/unknown discovery labels; known false vs unknown metadata; query failures/retry/empty states; both translations. Focused: `pnpm --dir web exec vitest run src/pages/referenceProbe.test.tsx src/pages/referenceInventory.test.tsx` (create these meaningful integration tests).
 **Commit:** `feat(console): expose protocol probes and credential model inventory`.
 
 - [ ] **Step 1: Write the named behavioral regressions below and run the focused command before implementing.** Record expected RED output in the task report. Use existing composed mock fixtures; do not weaken tests to bless the implementation.
