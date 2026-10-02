@@ -19,6 +19,16 @@ Build order: additive schema -> probes -> discovery/metadata -> onboarding -> pr
 ## Shared data architecture
 SQLite/SeaORM is authoritative for new visibility/diagnostic/pricing facts. DuckDB is only a projection. All provider I/O occurs outside SQLite transactions. Persist discovery results only after lease fencing and rechecking provider/project, credential enable state and the captured encrypted credential revision. Preserve last-known-good visibility after a failed fetch; never reactivate a disabled credential. Imported secrets and plaintext samples never become logs or audit details.
 
+## Explicit DDIA database design
+The user explicitly requested `ddia-principles`. Apply the existing [full-parity data architecture](../docs/architecture/parity-data-design.md), particularly DDIA transactions, schema evolution, partial failures/fencing, and record systems versus derived data.
+
+- SQLite/SeaORM stores authoritative scoped inventory, configuration, execution, price/usage, audit and durable job facts; DuckDB is reconstructible analytics only.
+- Composite ownership constraints and short consistent reads prevent cross-project references and mixing old inventory with newly rotated credentials.
+- Perform external I/O first, then revalidate meaningful identity/configuration and lease fence inside atomic activation/audit; retries have durable operation identities.
+- Validity uses actual credential/discovery inputs, not generic wall-clock `updated_at`; label/priority/routing-only edits do not invalidate supplier observations. Instant measures durations; wall time labels dates and expiry.
+- Additive versioned fields/defaults preserve old data and immutable financial history. Unknown quantity/price facts remain distinct from measured zero.
+- Provider observations and analytical projections may be stale/partial, while authorization and budgets fail closed. The supported system remains single-node, without a distributed consistency or consensus claim.
+
 ## Commands
 Install/build web first: `pnpm --dir web install --frozen-lockfile`; `pnpm --dir web lint`; `pnpm --dir web test`; `pnpm --dir web build`.
 Rust: `cargo fmt --all -- --check`; `cargo clippy --locked --all-targets -- -D warnings`; `cargo test --locked`; `cargo build --release --locked`.

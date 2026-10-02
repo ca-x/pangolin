@@ -12,6 +12,8 @@
 
 ## Global Constraints
 
+- Explicit user requirement: apply `ddia-principles` and `docs/architecture/parity-data-design.md` to every database change; use semantic identity/discovery fingerprints, consistent scoped reads, atomic fenced activation and idempotent financial facts.
+
 - SQLite through SeaORM is authoritative; DuckDB failure degrades only observability.
 - No provider/network/object-store I/O inside a SQLite business transaction.
 - Control-plane mutations and their audit records commit transactionally.
