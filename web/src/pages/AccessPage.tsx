@@ -507,14 +507,20 @@ function KeysPanel() {
   type CreateKeyMutation = { projectId: string; body: unknown; generation: number }
   const create = useMutation({
     gcTime: 0,
-    mutationFn: ({ projectId, body }: CreateKeyMutation) => api<{ key: ScopedKey; token?: string; mode: string }>(keysPath(projectId), { method: 'POST', body: JSON.stringify(body) }),
-    onSuccess: (data, variables) => {
+    mutationFn: async (variables: CreateKeyMutation) => {
+      const data = await api<{ key: ScopedKey; token?: string; mode: string }>(keysPath(variables.projectId), { method: 'POST', body: JSON.stringify(variables.body) })
+      // Deliver once to the current dialog, then return only safe metadata. Raw
+      // credentials never become mutation cache or observer result data.
+      if (currentOperation(variables)) {
+        setOpen(false)
+        if (data.token) setToken({ value: data.token, title: t('keyCreated'), description: t('keyCreatedHint'), projectId: variables.projectId, keyId: data.key.id, keyName: data.key.name })
+        else toast.success(t('importComplete'))
+      }
+      return { key: data.key, mode: data.mode }
+    },
+    onSuccess: (_data, variables) => {
       void client.invalidateQueries({ queryKey: ['keys', variables.projectId] })
-      if (!currentOperation(variables)) return
-      setOpen(false)
-      if (data.token) setToken({ value: data.token, title: t('keyCreated'), description: t('keyCreatedHint'), projectId: variables.projectId, keyId: data.key.id, keyName: data.key.name })
-      else toast.success(t('importComplete'))
-      create.reset()
+      if (currentOperation(variables)) create.reset()
     },
     onError: (error: Error, variables) => { if (currentOperation(variables)) setCreateError(error.message) },
   })
@@ -522,13 +528,16 @@ function KeysPanel() {
   type KeyAction = { projectId: string; projectName: string; keyId: string; keyName: string }
   const rotate = useMutation({
     gcTime: 0,
-    mutationFn: ({ projectId, keyId }: KeyAction & { generation: number }) => api<{ key: ScopedKey; token: string }>(`${keysPath(projectId)}/${keyId}/rotate`, { method: 'POST' }),
-    onSuccess: async (data, variables) => {
+    mutationFn: async (variables: KeyAction & { generation: number }) => {
+      const data = await api<{ key: ScopedKey; token: string }>(`${keysPath(variables.projectId)}/${variables.keyId}/rotate`, { method: 'POST' })
       await client.invalidateQueries({ queryKey: ['keys', variables.projectId] })
-      if (!currentOperation(variables)) return
-      setToken({ value: data.token, title: t('keyRotated'), description: t('keyRotatedHint', { name: variables.keyName, project: variables.projectName }), projectId: variables.projectId, keyId: data.key.id, keyName: variables.keyName })
-      rotate.reset()
+      if (currentOperation(variables)) setToken({ value: data.token, title: t('keyRotated'), description: t('keyRotatedHint', { name: variables.keyName, project: variables.projectName }), projectId: variables.projectId, keyId: data.key.id, keyName: variables.keyName })
+      // A stale confirmation can attach after reset. Its result must remain
+      // credential-free even when its observer stays attached, without touching
+      // any newer operation's observer.
+      return { key: data.key }
     },
+    onSuccess: (_data, variables) => { if (currentOperation(variables)) rotate.reset() },
     onError: (error: Error, variables) => { if (currentOperation(variables)) toast.error(error.message) },
   })
   const archive = useMutation({

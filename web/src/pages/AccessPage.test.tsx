@@ -338,8 +338,10 @@ describe('one-time key response lifecycle fences', () => {
       return response({ data: [] })
     }))
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const observerResults: Array<() => { data: unknown; isPending: boolean }> = []
+    client.getMutationCache().subscribe((event) => { if (event.type === 'observerAdded') observerResults.push(() => event.observer.getCurrentResult()) })
     const view = render(<QueryClientProvider client={client}><MemoryRouter><ProjectProvider><AccessPage /><Switch /><ConfirmHost /></ProjectProvider></MemoryRouter></QueryClientProvider>)
-    return { pending, client, view }
+    return { pending, client, view, observerResults }
   }
   async function start(client: 'create' | 'rotate') {
     if (client === 'create') {
@@ -386,6 +388,40 @@ describe('one-time key response lifecycle fences', () => {
     pending[0].complete()
     await settled(client)
     expect(screen.queryByRole('dialog', { name: /API key (created|rotated)/ })).not.toBeInTheDocument()
+  })
+  it('disposes a rotate result started from a stale confirmation after the project reset', async () => {
+    const { pending, client, observerResults } = harness()
+    await userEvent.click(await screen.findByRole('button', { name: 'Rotate Fence key' }))
+    await userEvent.click(screen.getByRole('button', { name: 'Fence B' }))
+    await userEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Rotate' }))
+    await waitFor(() => expect(pending).toHaveLength(1))
+    expect(pending[0].path).toBe('/api/admin/v1/projects/fence-a/api-keys/fence-key/rotate')
+    pending[0].complete()
+    await settled(client)
+    expect(observerResults.length).toBeGreaterThan(0)
+    expect(JSON.stringify(observerResults.map((read) => read().data))).not.toContain('stale-sensitive-token')
+    expect(screen.queryByRole('dialog', { name: /API key rotated/ })).not.toBeInTheDocument()
+  })
+  it('scrubs an older rotate response without resetting a newer pending rotate observer', async () => {
+    const { pending, client, observerResults } = harness()
+    await userEvent.click(await screen.findByRole('button', { name: 'Rotate Fence key' }))
+    await userEvent.click(screen.getByRole('button', { name: 'Fence B' }))
+    await userEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Rotate' }))
+    await waitFor(() => expect(pending).toHaveLength(1))
+    await userEvent.click(screen.getByRole('button', { name: 'Rotate Fence key' }))
+    await userEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Rotate' }))
+    await waitFor(() => expect(pending).toHaveLength(2))
+    pending[0].complete()
+    await waitFor(() => expect(client.getMutationCache().getAll().filter((mutation) => mutation.state.status === 'pending')).toHaveLength(1))
+    expect(observerResults.some((read) => read().isPending)).toBe(true)
+    expect(JSON.stringify(observerResults.map((read) => read().data))).not.toContain('stale-sensitive-token')
+    expect(screen.queryByText(/stale-sensitive-token/)).not.toBeInTheDocument()
+    expect(pending[1].path).toBe('/api/admin/v1/projects/fence-b/api-keys/fence-key/rotate')
+    pending[1].complete('fresh-rotation-token')
+    expect(await screen.findByText(/wire_api/)).toHaveTextContent('fresh-rotation-token')
+    await userEvent.click(screen.getByRole('button', { name: 'Close' }))
+    await settled(client)
+    expect(JSON.stringify(observerResults.map((read) => read().data))).not.toContain('fresh-rotation-token')
   })
   it('keeps an earlier closed create from replacing a newer operation or its token', async () => {
     const { pending, client } = harness()
