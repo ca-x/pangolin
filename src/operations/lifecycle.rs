@@ -538,18 +538,20 @@ impl Attempt {
         }
     }
     pub fn response_headers(&mut self) {
-        self.response_headers_ms
-            .get_or_insert(self.started.elapsed().as_millis() as i64);
+        crate::providers::timing::record_headers_at(
+            self.started,
+            Instant::now(),
+            &mut self.response_headers_ms,
+        );
     }
     pub fn first_event(&mut self, data: &str) {
-        self.first_event_ms
-            .get_or_insert(self.started.elapsed().as_millis() as i64);
-        if self.ttft.is_none()
-            && serde_json::from_str::<Value>(data)
-                .is_ok_and(|value| crate::providers::timing::visible_text(&value))
-        {
-            self.ttft = Some(self.started.elapsed().as_millis() as i64);
-        }
+        crate::providers::timing::record_event_at(
+            self.started,
+            Instant::now(),
+            data,
+            &mut self.first_event_ms,
+            &mut self.ttft,
+        );
     }
     fn capture_response_id(&mut self, value: &Value) {
         if let Some(id) = value

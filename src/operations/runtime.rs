@@ -445,7 +445,7 @@ pub(crate) async fn validate_probe_selection<C: ConnectionTrait>(
         _ => return Err(ApiError::BadRequest("invalid probe stream choice".into())),
     };
     let row = connection.query_one(sql(
-        "SELECT p.name,p.kind,p.base_url,c.id AS credential_id,c.credential_type,c.secret_envelope,m.public_name,m.upstream_name,m.capabilities,s.endpoint_mappings_json,s.model_rules_json,s.proxy_url,s.proxy_username,s.proxy_secret_envelope,COALESCE(s.proxy_reuse_connections,1) AS proxy_reuse_connections,s.proxy_preset_id FROM providers p JOIN models m ON m.provider_id=p.id AND m.id=? AND m.enabled=1 AND m.lifecycle='active' JOIN channel_credentials c ON c.provider_id=p.id AND c.enabled=1 LEFT JOIN channel_settings s ON s.provider_id=p.id WHERE p.id=? AND p.project_id=? AND p.enabled=1 AND (? IS NULL OR c.id=?) ORDER BY c.priority,c.id LIMIT 1",
+        "SELECT p.name,p.kind,p.base_url,c.id AS credential_id,c.credential_type,c.secret_envelope,m.public_name,m.upstream_name,m.capabilities,s.endpoint_mappings_json,s.model_rules_json,s.proxy_url,s.proxy_username,s.proxy_secret_envelope,COALESCE(s.proxy_reuse_connections,1) AS proxy_reuse_connections,s.proxy_preset_id FROM providers p JOIN projects project ON project.id=p.project_id AND project.enabled=1 JOIN models m ON m.provider_id=p.id AND m.id=? AND m.enabled=1 AND m.lifecycle='active' JOIN channel_credentials c ON c.provider_id=p.id AND c.enabled=1 LEFT JOIN channel_settings s ON s.provider_id=p.id WHERE p.id=? AND p.project_id=? AND p.enabled=1 AND (? IS NULL OR c.id=?) ORDER BY c.priority,c.id LIMIT 1",
         vec![model.into(),provider.into(),project.into(),credential.into(),credential.into()],
     )).await?.ok_or_else(|| ApiError::BadRequest("probe model or credential is not enabled for this channel".into()))?;
     let kind: String = row.try_get("", "kind")?;
@@ -690,11 +690,19 @@ fn probe_stream_output(endpoint: &str, value: &Value) -> bool {
         }
 }
 
+fn probe_transport_error(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "timeout"
+    } else {
+        "network"
+    }
+}
+
 async fn probe_json(response: reqwest::Response) -> Result<Value, &'static str> {
     let mut chunks = response.bytes_stream();
     let mut bytes = Vec::new();
     while let Some(chunk) = chunks.next().await {
-        let chunk = chunk.map_err(|_| "network")?;
+        let chunk = chunk.map_err(|error| probe_transport_error(&error))?;
         if bytes.len().saturating_add(chunk.len()) > 1024 * 1024 {
             return Err("invalid_response");
         }
@@ -766,10 +774,12 @@ async fn probe_response(
         .json(&prepared.payload)
         .send()
         .await
-        .map_err(|_| "network")?;
-    measured
-        .response_headers_ms
-        .get_or_insert(started.elapsed().as_millis() as i64);
+        .map_err(|error| probe_transport_error(&error))?;
+    crate::providers::timing::record_headers_at(
+        started,
+        Instant::now(),
+        &mut measured.response_headers_ms,
+    );
     measured.status_code = Some(i32::from(response.status().as_u16()));
     if !response.status().is_success() {
         return Err(probe_error_status(response.status()));
@@ -788,11 +798,14 @@ async fn probe_response(
         }
         let bytes_seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter = bytes_seen.clone();
-        let transport_failed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let transport_flag = transport_failed.clone();
+        let transport_failure = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
+        let transport_flag = transport_failure.clone();
         let chunks = response.bytes_stream().map(move |chunk| {
-            let chunk = chunk.map_err(|_| {
-                transport_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            let chunk = chunk.map_err(|error| {
+                transport_flag.store(
+                    if error.is_timeout() { 2 } else { 1 },
+                    std::sync::atomic::Ordering::Relaxed,
+                );
                 std::io::Error::other("probe transport")
             })?;
             if counter
@@ -810,10 +823,10 @@ async fn probe_response(
         let mut output = false;
         while let Some(frame) = frames.next().await {
             let frame = frame.map_err(|_| {
-                if transport_failed.load(std::sync::atomic::Ordering::Relaxed) {
-                    "network"
-                } else {
-                    "invalid_response"
+                match transport_failure.load(std::sync::atomic::Ordering::Relaxed) {
+                    2 => "timeout",
+                    1 => "network",
+                    _ => "invalid_response",
                 }
             })?;
             events += 1;
@@ -821,9 +834,12 @@ async fn probe_response(
                 return Err("invalid_response");
             }
             let Some(data) = frame.data else { continue };
-            measured
-                .first_event_ms
-                .get_or_insert(started.elapsed().as_millis() as i64);
+            let observed = Instant::now();
+            crate::providers::timing::record_headers_at(
+                started,
+                observed,
+                &mut measured.first_event_ms,
+            );
             let event = eventsource_stream::Event {
                 event: frame.event.unwrap_or_else(|| "message".into()),
                 data,
@@ -836,11 +852,13 @@ async fn probe_response(
                 if !probe_stream_shape(endpoint, &value) {
                     return Err("invalid_response");
                 }
-                if measured.first_text_ms.is_none()
-                    && crate::providers::timing::visible_text(&value)
-                {
-                    measured.first_text_ms = Some(started.elapsed().as_millis() as i64);
-                }
+                crate::providers::timing::record_event_at(
+                    started,
+                    observed,
+                    &event.data,
+                    &mut measured.first_event_ms,
+                    &mut measured.first_text_ms,
+                );
                 output |= probe_stream_output(endpoint, &value);
                 let usage = super::pricing::Usage::parse(&value);
                 if usage.reported {

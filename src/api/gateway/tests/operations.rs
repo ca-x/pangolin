@@ -11449,3 +11449,262 @@ async fn reference_probe_native_stream_protocols_require_their_own_terminal() {
         assert_eq!(row.try_get::<i64>("", "ttft_ms").unwrap(), first_text);
     }
 }
+
+#[tokio::test]
+async fn reference_probe_disabled_project_after_enqueue_never_contacts_upstream() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counted = calls.clone();
+    let f = fixture(Router::new().route(
+        "/v1/chat/completions",
+        post(move || {
+            counted.fetch_add(1, Ordering::Relaxed);
+            async { Json(json!({"choices":[{"message":{"content":"OK"}}]})) }
+        }),
+    ))
+    .await;
+    let model: String = f
+        .state
+        .db
+        .query_one(ops::sql(
+            "SELECT id FROM models WHERE provider_id=? LIMIT 1",
+            vec![f.providers[0].clone().into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "id")
+        .unwrap();
+    ops::jobs::enqueue(
+        &f.state.db,
+        Some(db::DEFAULT_PROJECT_ID),
+        "probe",
+        "reference-disabled-project",
+        &json!({"provider_id":f.providers[0],"model_id":model}),
+        db::now(),
+    )
+    .await
+    .unwrap();
+    sql(
+        &f,
+        "UPDATE projects SET enabled=0 WHERE id=?",
+        vec![db::DEFAULT_PROJECT_ID.into()],
+    )
+    .await;
+    let claim = ops::jobs::claim(&f.state.db, "worker", db::now(), 120)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(ops::runtime::execute(&f.state, &claim).await.is_err());
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        count(&f, "SELECT COUNT(*) AS n FROM channel_probes").await,
+        0
+    );
+}
+
+#[tokio::test]
+async fn reference_probe_shorter_client_deadline_classifies_send_timeout() {
+    let mut f = fixture(Router::new().route(
+        "/v1/chat/completions",
+        post(|| async {
+            std::future::pending::<()>().await;
+            Json(json!({"choices":[{"message":{"content":"late"}}]}))
+        }),
+    ))
+    .await;
+    let mut config = (*f.state.config).clone();
+    config.upstream_timeout = Duration::from_millis(100);
+    f.state.config = Arc::new(config);
+    f.state.client = crate::providers::http_client(Duration::from_millis(100)).unwrap();
+    let model: String = f
+        .state
+        .db
+        .query_one(ops::sql(
+            "SELECT id FROM models WHERE provider_id=? LIMIT 1",
+            vec![f.providers[0].clone().into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "id")
+        .unwrap();
+    ops::jobs::enqueue(
+        &f.state.db,
+        Some(db::DEFAULT_PROJECT_ID),
+        "probe",
+        "reference-send-timeout",
+        &json!({"provider_id":f.providers[0],"model_id":model}),
+        db::now(),
+    )
+    .await
+    .unwrap();
+    let claim = ops::jobs::claim(&f.state.db, "worker", db::now(), 120)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            ops::runtime::execute(&f.state, &claim)
+        )
+        .await
+        .unwrap()
+        .is_err()
+    );
+    let row = f
+        .state
+        .db
+        .query_one(ops::sql(
+            "SELECT error_code,response_headers_ms FROM channel_probes WHERE provider_id=?",
+            vec![f.providers[0].clone().into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.try_get::<String>("", "error_code").unwrap(), "timeout");
+    assert_eq!(
+        row.try_get::<Option<i64>>("", "response_headers_ms")
+            .unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
+async fn reference_probe_shorter_client_deadline_classifies_nonstream_body_timeout() {
+    let mut f = fixture(Router::new().route(
+        "/v1/chat/completions",
+        post(|| async {
+            let body = async_stream::stream! {
+                yield Ok::<_,std::io::Error>(Bytes::from_static(b"{\"choices\":"));
+                std::future::pending::<()>().await;
+            };
+            (
+                [(header::CONTENT_TYPE, "application/json")],
+                Body::from_stream(body),
+            )
+        }),
+    ))
+    .await;
+    let mut config = (*f.state.config).clone();
+    config.upstream_timeout = Duration::from_millis(100);
+    f.state.config = Arc::new(config);
+    f.state.client = crate::providers::http_client(Duration::from_millis(100)).unwrap();
+    let model: String = f
+        .state
+        .db
+        .query_one(ops::sql(
+            "SELECT id FROM models WHERE provider_id=? LIMIT 1",
+            vec![f.providers[0].clone().into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "id")
+        .unwrap();
+    ops::jobs::enqueue(
+        &f.state.db,
+        Some(db::DEFAULT_PROJECT_ID),
+        "probe",
+        "reference-body-timeout",
+        &json!({"provider_id":f.providers[0],"model_id":model}),
+        db::now(),
+    )
+    .await
+    .unwrap();
+    let claim = ops::jobs::claim(&f.state.db, "worker", db::now(), 120)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            ops::runtime::execute(&f.state, &claim)
+        )
+        .await
+        .unwrap()
+        .is_err()
+    );
+    let row = f
+        .state
+        .db
+        .query_one(ops::sql(
+            "SELECT error_code,response_headers_ms FROM channel_probes WHERE provider_id=?",
+            vec![f.providers[0].clone().into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.try_get::<String>("", "error_code").unwrap(), "timeout");
+    assert!(
+        row.try_get::<Option<i64>>("", "response_headers_ms")
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn reference_probe_shorter_client_deadline_classifies_stream_body_timeout() {
+    let mut f = fixture(Router::new().route("/v1/chat/completions",post(|| async {
+        let body = async_stream::stream! {
+            yield Ok::<_,std::io::Error>(Bytes::from_static(b"data: {\"choices\":[{\"delta\":{\"content\":\"OK\"}}]}\n\n"));
+            std::future::pending::<()>().await;
+        };
+        ([(header::CONTENT_TYPE,"text/event-stream")],Body::from_stream(body))
+    }))).await;
+    let mut config = (*f.state.config).clone();
+    config.upstream_timeout = Duration::from_millis(100);
+    f.state.config = Arc::new(config);
+    f.state.client = crate::providers::http_client(Duration::from_millis(100)).unwrap();
+    let model: String = f
+        .state
+        .db
+        .query_one(ops::sql(
+            "SELECT id FROM models WHERE provider_id=? LIMIT 1",
+            vec![f.providers[0].clone().into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "id")
+        .unwrap();
+    ops::jobs::enqueue(
+        &f.state.db,
+        Some(db::DEFAULT_PROJECT_ID),
+        "probe",
+        "reference-stream-timeout",
+        &json!({"provider_id":f.providers[0],"model_id":model,"stream":true}),
+        db::now(),
+    )
+    .await
+    .unwrap();
+    let claim = ops::jobs::claim(&f.state.db, "worker", db::now(), 120)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            ops::runtime::execute(&f.state, &claim)
+        )
+        .await
+        .unwrap()
+        .is_err()
+    );
+    let row = f.state.db.query_one(ops::sql("SELECT error_code,response_headers_ms,first_event_ms,first_text_ms FROM channel_probes WHERE provider_id=?",vec![f.providers[0].clone().into()])).await.unwrap().unwrap();
+    assert_eq!(row.try_get::<String>("", "error_code").unwrap(), "timeout");
+    assert!(
+        row.try_get::<Option<i64>>("", "response_headers_ms")
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        row.try_get::<Option<i64>>("", "first_event_ms")
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        row.try_get::<Option<i64>>("", "first_text_ms")
+            .unwrap()
+            .is_some()
+    );
+}
