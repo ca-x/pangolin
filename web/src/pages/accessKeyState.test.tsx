@@ -58,7 +58,7 @@ function ProjectSwitch() {
 const renderPage = (fetchMock = apiMock()) => {
   vi.stubGlobal('fetch', fetchMock)
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-  return { fetchMock, ...render(<QueryClientProvider client={client}><MemoryRouter><ProjectProvider><AccessPage /><ProjectSwitch /></ProjectProvider></MemoryRouter></QueryClientProvider>) }
+  return { fetchMock, client, ...render(<QueryClientProvider client={client}><MemoryRouter><ProjectProvider><AccessPage /><ProjectSwitch /></ProjectProvider></MemoryRouter></QueryClientProvider>) }
 }
 const openCreate = async () => {
   await userEvent.click(await screen.findByRole('button', { name: 'Create API key' }))
@@ -193,7 +193,7 @@ describe('the key table reports the state admission enforces', () => {
       }
       return base(input, init)
     })
-    renderPage(fetchMock)
+    const { client } = renderPage(fetchMock)
     const dialog = await openCreate()
     await userEvent.type(within(dialog).getByRole('textbox', { name: 'Key name' }), 'in flight')
     await userEvent.click(within(dialog).getByRole('button', { name: 'Save' }))
@@ -202,7 +202,8 @@ describe('the key table reports the state admission enforces', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Project B' }))
     post.release()
 
-    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Create API key' })).not.toBeInTheDocument())
+    await waitFor(() => expect(client.getMutationCache().getAll().some((mutation) => mutation.state.status === 'pending')).toBe(false))
+    expect(screen.getByRole('dialog', { name: 'Create API key' })).toHaveTextContent('The selected project changed.')
     expect(screen.queryByRole('dialog', { name: 'API key created' })).not.toBeInTheDocument()
     expect(screen.queryByText('pg_project_a_once')).not.toBeInTheDocument()
     expect(sent(fetchMock)[0][0]).toBe('/api/admin/v1/projects/p1/api-keys')

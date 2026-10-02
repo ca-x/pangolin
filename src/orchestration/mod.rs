@@ -224,7 +224,7 @@ pub async fn visible_models(
     key: &ApiKeyCredential,
     headers: &HeaderMap,
 ) -> Result<Vec<Value>> {
-    visible_models_internal(db, key, headers, crate::providers::ENDPOINTS, false).await
+    visible_models_internal(db, key, headers, crate::providers::ENDPOINTS, false, None).await
 }
 
 pub async fn visible_models_for(
@@ -233,7 +233,7 @@ pub async fn visible_models_for(
     headers: &HeaderMap,
     endpoints: &[&str],
 ) -> Result<Vec<Value>> {
-    visible_models_internal(db, key, headers, endpoints, false).await
+    visible_models_internal(db, key, headers, endpoints, false, None).await
 }
 
 pub async fn visible_models_with_metadata_for(
@@ -242,7 +242,22 @@ pub async fn visible_models_with_metadata_for(
     headers: &HeaderMap,
     endpoints: &[&str],
 ) -> Result<Vec<Value>> {
-    visible_models_internal(db, key, headers, endpoints, true).await
+    visible_models_internal(db, key, headers, endpoints, true, None).await
+}
+
+/// Project the usual scoped names using the same protocol/body facts as a setup
+/// request. This avoids losing conditional streaming aliases before prepare.
+pub async fn visible_models_with_metadata_for_request(
+    db: &DatabaseConnection,
+    key: &ApiKeyCredential,
+    headers: &HeaderMap,
+    endpoint: &str,
+    payload: &Value,
+) -> Result<Vec<Value>> {
+    if !payload.is_object() {
+        return Err(Error::Invalid("request body must be an object"));
+    }
+    visible_models_internal(db, key, headers, &[endpoint], true, Some(payload)).await
 }
 
 async fn visible_models_internal(
@@ -251,6 +266,7 @@ async fn visible_models_internal(
     headers: &HeaderMap,
     endpoints: &[&str],
     include_metadata: bool,
+    request_context: Option<&Value>,
 ) -> Result<Vec<Value>> {
     use sea_orm::ConnectionTrait;
     let profile = load_profile(db, key).await?;
@@ -321,8 +337,12 @@ async fn visible_models_internal(
             {
                 continue;
             }
+            let mut request = request_context
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+            request["model"] = Value::String(mapped.clone());
             let context = policy::context(
-                &serde_json::json!({"model":mapped}),
+                &request,
                 headers,
                 endpoint,
                 Some((&key.project_id, &key.id)),

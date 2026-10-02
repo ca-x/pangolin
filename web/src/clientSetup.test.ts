@@ -52,3 +52,60 @@ describe('serialized client configuration', () => {
     expect(generateClientSetup({ client: 'python', baseUrl: 'https://example.com', model: 'public', effort: 'high' })).toContain('reasoning={"effort": "high"}')
   })
 })
+
+// Contract scanner for the literal subset emitted by these snippets. PowerShell
+// CharTraits.IsSingleQuote recognizes ASCII and all four U+2018..U+201B forms;
+// its literal scanner consumes doubled quote delimiters as data. This does not
+// execute snippets or pretend to validate arbitrary PowerShell grammar.
+function powerShellLiteralContract(source: string) {
+  const quotes = new Set(["'", '\u2018', '\u2019', '\u201a', '\u201b'])
+  const values: string[] = []
+  const statements: string[] = []
+  let text = '', depth = 0
+  const finish = () => { if (text.trim()) statements.push(text.trim()); text = '' }
+  for (let index = 0; index < source.length; index += 1) {
+    const start = source[index]
+    if (quotes.has(start) || start === '"') {
+      const single = quotes.has(start)
+      let value = '', closed = false
+      while (++index < source.length) {
+        const character = source[index]
+        if ((single && quotes.has(character)) || (!single && character === '"')) {
+          if (single && quotes.has(source[index + 1])) { value += character; index += 1; continue }
+          closed = true; break
+        }
+        value += character
+      }
+      if (!closed) throw new Error('Unterminated PowerShell string')
+      values.push(value); text += '<literal>'; continue
+    }
+    if (start === '#') { while (index < source.length && source[index] !== '\n') index += 1; index -= 1; continue }
+    if (['{', '(', '['].includes(start)) depth += 1
+    if (['}', ')', ']'].includes(start)) depth -= 1
+    if ((start === '\n' || start === ';') && depth === 0) finish()
+    else text += start
+  }
+  finish()
+  return { values, statements }
+}
+
+describe('PowerShell smart-quote command boundaries', () => {
+  it.each(['\u2018', '\u2019', '\u201a', '\u201b'].flatMap((quote) => ['claude', 'gemini', 'curl'].map((client) => [quote, client] as const)))('keeps %s data literal in the full %s snippet', (quote, client) => {
+    const model = `public${quote}; Write-Output PANGOLIN_MODEL_INJECTION; #\n$()`
+    const token = `token${quote}; Write-Output PANGOLIN_TOKEN_INJECTION; #\n$()`
+    const options = { client: client as 'claude' | 'gemini' | 'curl', baseUrl: 'https://example.com/team', shell: 'powershell' as const }
+    const prefix = (snippet: string) => client === 'claude' ? snippet.split('\n{')[0] : snippet
+    const baseline = powerShellLiteralContract(prefix(generateClientSetup({ ...options, model: 'public', token: 'token' })))
+    const snippet = generateClientSetup({ ...options, model, token })
+    const parsed = powerShellLiteralContract(prefix(snippet))
+    expect(parsed.statements).toEqual(baseline.statements)
+    expect(parsed.values).toContain(token)
+    if (client === 'curl') expect(JSON.parse(parsed.values.find((value) => value.startsWith('{"model":'))!).model).toBe(model)
+    else expect(parsed.values).toContain(model)
+    if (client === 'claude') {
+      const settings = JSON.parse(snippet.slice(snippet.indexOf('\n{') + 1))
+      expect(settings.env.ANTHROPIC_MODEL).toBe(model)
+      expect(settings.env.ANTHROPIC_AUTH_TOKEN).toBe(token)
+    }
+  })
+})

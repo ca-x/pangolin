@@ -312,3 +312,96 @@ describe('safe key client onboarding', () => {
     expect(screen.queryByText(/rotated-secret/)).not.toBeInTheDocument()
   })
 })
+
+describe('one-time key response lifecycle fences', () => {
+  const projects = [
+    { id: 'fence-a', name: 'Fence A', slug: 'a', enabled: true, is_default: true },
+    { id: 'fence-b', name: 'Fence B', slug: 'b', enabled: true, is_default: false },
+  ]
+  const key = { id: 'fence-key', name: 'Fence key', key_prefix: 'pg_fence', scopes: ['gateway:use'], enabled: true, key_type: 'service', expires_at: null, budget_micros: null, spent_micros: 0, last_used_at: null, profile_id: null, allowed_ips_json: '[]', denied_ips_json: '[]', lifecycle: 'active' }
+  beforeEach(async () => { await i18n.changeLanguage('en'); localStorage.clear() })
+  const Switch = () => {
+    const { setProjectId } = useProject()
+    return <>{projects.map((project) => <button key={project.id} onClick={() => setProjectId(project.id)}>{project.name}</button>)}</>
+  }
+  function harness() {
+    const pending: Array<{ path: string; complete: (token?: string) => void }> = []
+    vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input)
+      if (init?.method === 'POST' && (path.endsWith('/api-keys') || path.endsWith('/rotate'))) {
+        return new Promise<Response>((resolve) => pending.push({ path, complete: (token = 'stale-sensitive-token') => resolve(new Response(JSON.stringify({ key, token, mode: 'generated' }), { status: 200, headers: { 'Content-Type': 'application/json' } })) }))
+      }
+      if (path.endsWith('/projects')) return response(projects)
+      if (path.includes('/permissions')) return response(['api_key:manage'])
+      if (path.includes('/client-models?')) return response({ models: [{ id: 'public' }] })
+      if (path.endsWith('/api-keys')) return response([key])
+      return response({ data: [] })
+    }))
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const view = render(<QueryClientProvider client={client}><MemoryRouter><ProjectProvider><AccessPage /><Switch /><ConfirmHost /></ProjectProvider></MemoryRouter></QueryClientProvider>)
+    return { pending, client, view }
+  }
+  async function start(client: 'create' | 'rotate') {
+    if (client === 'create') {
+      await userEvent.click(await screen.findByRole('button', { name: 'Create API key' }))
+      await userEvent.type(screen.getByLabelText(/Key name/), 'Delayed key')
+      await userEvent.click(screen.getByRole('button', { name: 'Save' }))
+    } else {
+      await userEvent.click(await screen.findByRole('button', { name: 'Rotate Fence key' }))
+      await userEvent.click(within(await screen.findByRole('dialog')).getByRole('button', { name: 'Rotate' }))
+    }
+  }
+  async function settled(client: QueryClient) {
+    await waitFor(() => expect(client.getMutationCache().getAll().some((mutation) => mutation.state.status === 'pending')).toBe(false))
+    await waitFor(() => expect(JSON.stringify(client.getMutationCache().getAll().map((mutation) => mutation.state.data))).not.toContain('stale-sensitive-token'))
+    expect(screen.queryByText(/stale-sensitive-token/)).not.toBeInTheDocument()
+    expect(JSON.stringify(Object.entries(localStorage))).not.toContain('stale-sensitive-token')
+  }
+  it.each(['create', 'rotate'] as const)('rejects delayed %s token after A→B→A while preserving server attribution', async (operation) => {
+    const { pending, client } = harness()
+    await start(operation)
+    await waitFor(() => expect(pending).toHaveLength(1))
+    await userEvent.click(screen.getByRole('button', { name: 'Fence B' }))
+    await userEvent.click(await screen.findByRole('button', { name: 'Fence A' }))
+    pending[0].complete()
+    await settled(client)
+    expect(pending[0].path).toContain('/projects/fence-a/api-keys')
+    expect(screen.queryByRole('dialog', { name: /API key (created|rotated)/ })).not.toBeInTheDocument()
+  })
+  it.each(['Cancel', 'Close'])('rejects a delayed create token after an invalidating %s', async (name) => {
+    const { pending, client } = harness()
+    await start('create')
+    await waitFor(() => expect(pending).toHaveLength(1))
+    await userEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name }))
+    pending[0].complete()
+    await settled(client)
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+  })
+  it.each(['create', 'rotate'] as const)('disposes a pending %s response when the key panel closes', async (operation) => {
+    const { pending, client } = harness()
+    await start(operation)
+    await waitFor(() => expect(pending).toHaveLength(1))
+    await userEvent.click(screen.getByRole('tab', { name: 'Key profiles' }))
+    await userEvent.click(screen.getByRole('tab', { name: 'API keys' }))
+    pending[0].complete()
+    await settled(client)
+    expect(screen.queryByRole('dialog', { name: /API key (created|rotated)/ })).not.toBeInTheDocument()
+  })
+  it('keeps an earlier closed create from replacing a newer operation or its token', async () => {
+    const { pending, client } = harness()
+    await start('create')
+    await waitFor(() => expect(pending).toHaveLength(1))
+    await userEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Cancel' }))
+    await start('create')
+    await waitFor(() => expect(pending).toHaveLength(2))
+    pending[0].complete()
+    await waitFor(() => expect(client.getMutationCache().getAll().filter((mutation) => mutation.state.status === 'pending')).toHaveLength(1))
+    expect(screen.queryByText(/stale-sensitive-token/)).not.toBeInTheDocument()
+    expect(screen.getByRole('dialog', { name: 'Create API key' })).toBeInTheDocument()
+    pending[1].complete('fresh-sensitive-token')
+    expect(await screen.findByText(/wire_api/)).toHaveTextContent('fresh-sensitive-token')
+    await userEvent.click(screen.getByRole('button', { name: 'Close' }))
+    await settled(client)
+    expect(JSON.stringify(client.getMutationCache().getAll().map((mutation) => mutation.state.data))).not.toContain('fresh-sensitive-token')
+  })
+})

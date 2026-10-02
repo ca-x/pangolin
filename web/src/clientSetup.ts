@@ -22,7 +22,9 @@ export function defaultGatewayBase(): string {
   return new URL(import.meta.env.BASE_URL, window.location.origin).href
 }
 export const shellQuote = (value: string) => `'${value.replaceAll("'", "'\"'\"'")}'`
-export const powershellQuote = (value: string) => `'${value.replaceAll("'", "''")}'`
+// PowerShell recognizes all five characters as single-quote delimiters, even
+// within ASCII-delimited literals. Doubling each preserves the exact data value.
+export const powershellQuote = (value: string) => `'${value.replace(/['\u2018-\u201b]/g, '$&$&')}'`
 const literal = (value: string) => JSON.stringify(value).replaceAll(String.fromCharCode(127), "\\u007f")
 
 export function generateClientSetup({ client, baseUrl, model, token, effort, shell = 'posix' }: SetupOptions): string {

@@ -13038,3 +13038,47 @@ async fn reference_client_models_explicit_api_principal_never_inherits_session()
         0
     );
 }
+
+#[tokio::test]
+async fn reference_client_models_review_stream_condition_uses_actual_setup_context() {
+    let f = fixture(success()).await;
+    let cookie = owner(&f).await;
+    let model = f
+        .state
+        .db
+        .query_one(ops::sql(
+            "SELECT id FROM models WHERE provider_id=?",
+            vec![f.providers[0].clone().into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get::<String>("", "id")
+        .unwrap();
+    for (id, stream) in [("only-stream", true), ("only-nonstream", false)] {
+        sql(&f,"INSERT INTO model_associations(id,project_id,model_id,provider_id,match_type,pattern,conditions_json,priority,weight,enabled,created_at,updated_at) VALUES(?,?,?,?,'exact',?,?,1,1,1,0,0)",vec![id.into(),db::DEFAULT_PROJECT_ID.into(),model.clone().into(),f.providers[0].clone().into(),id.into(),json!({"version":1,"field":"/stream","op":"eq","value":stream}).to_string().into()]).await;
+    }
+    let streaming =
+        json_body(client_models_read(&f, &cookie, "/v1/responses&stream=true").await).await;
+    let nonstream =
+        json_body(client_models_read(&f, &cookie, "/v1/responses&stream=false").await).await;
+    for (body, present, absent) in [
+        (&streaming, "only-stream", "only-nonstream"),
+        (&nonstream, "only-nonstream", "only-stream"),
+    ] {
+        let names = body["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|model| model["id"].as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            names.contains(&present),
+            "{present} must survive actual request-context enumeration: {names:?}"
+        );
+        assert!(
+            !names.contains(&absent),
+            "{absent} must stay hidden for this stream mode"
+        );
+    }
+}

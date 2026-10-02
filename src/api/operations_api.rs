@@ -5297,11 +5297,22 @@ async fn client_models(
             .unwrap_or(matches!(endpoint, "/v1/responses" | "/v1/messages"));
     // A setup read has no operator cookie, bearer, sample or affinity header.
     let context_headers = HeaderMap::new();
-    let visible = crate::orchestration::visible_models_with_metadata_for(
+    let request_template = match endpoint {
+        "/v1/responses" => json!({"input":"Hello","stream":stream}),
+        "/v1/messages" => {
+            json!({"messages":[{"role":"user","content":"Hello"}],"max_tokens":1024,"stream":stream})
+        }
+        "/v1/chat/completions" => {
+            json!({"messages":[{"role":"user","content":"Hello"}],"stream":stream})
+        }
+        _ => json!({"contents":[{"role":"user","parts":[{"text":"Hello"}]}],"stream":stream}),
+    };
+    let visible = crate::orchestration::visible_models_with_metadata_for_request(
         &state.db,
         &key,
         &context_headers,
-        &[endpoint],
+        endpoint,
+        &request_template,
     )
     .await?;
     // Isolated transient runtime prevents setup from advancing routing counters,
@@ -5312,18 +5323,8 @@ async fn client_models(
         let Some(name) = model["id"].as_str() else {
             continue;
         };
-        let payload = match endpoint {
-            "/v1/responses" => json!({"model":name,"input":"Hello","stream":stream}),
-            "/v1/messages" => {
-                json!({"model":name,"messages":[{"role":"user","content":"Hello"}],"max_tokens":1024,"stream":stream})
-            }
-            "/v1/chat/completions" => {
-                json!({"model":name,"messages":[{"role":"user","content":"Hello"}],"stream":stream})
-            }
-            _ => {
-                json!({"model":name,"contents":[{"role":"user","parts":[{"text":"Hello"}]}],"stream":stream})
-            }
-        };
+        let mut payload = request_template.clone();
+        payload["model"] = Value::String(name.to_owned());
         let profile = crate::orchestration::load_profile(&state.db, &key).await?;
         let plan = match crate::orchestration::prepare(
             &state.db,
