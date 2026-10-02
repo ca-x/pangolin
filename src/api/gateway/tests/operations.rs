@@ -12214,13 +12214,58 @@ async fn reference_inventory_activation_rechecks_project_provider_key_config_and
             .await
             .unwrap();
         match race {
-            "project"=>sql(&f,"UPDATE projects SET enabled=0 WHERE id=?",vec![db::DEFAULT_PROJECT_ID.into()]).await,
-            "provider"=>sql(&f,"UPDATE providers SET enabled=0 WHERE id=?",vec![f.providers[0].clone().into()]).await,
-            "disable-key"=>sql(&f,"UPDATE channel_credentials SET enabled=0 WHERE id=?",vec![f.providers[0].clone().into()]).await,
-            "rotate-key"=>sql(&f,"UPDATE channel_credentials SET secret_envelope=? WHERE id=?",vec![f.state.secrets.encrypt("rotated").unwrap().into(),f.providers[0].clone().into()]).await,
-            "config"=>sql(&f,r#"UPDATE channel_settings SET model_rules_json='{"version":1,"prefix":"changed-"}' WHERE provider_id=?"#,vec![f.providers[0].clone().into()]).await,
-            "lease"=>sql(&f,"UPDATE operation_jobs SET fence=fence+1 WHERE kind='model_sync'",vec![]).await,
-            _=>unreachable!(),
+            "project" => {
+                sql(
+                    &f,
+                    "UPDATE projects SET enabled=0 WHERE id=?",
+                    vec![db::DEFAULT_PROJECT_ID.into()],
+                )
+                .await
+            }
+            "provider" => {
+                sql(
+                    &f,
+                    "UPDATE providers SET enabled=0 WHERE id=?",
+                    vec![f.providers[0].clone().into()],
+                )
+                .await
+            }
+            "disable-key" => {
+                sql(
+                    &f,
+                    "UPDATE channel_credentials SET enabled=0 WHERE id=?",
+                    vec![f.providers[0].clone().into()],
+                )
+                .await
+            }
+            "rotate-key" => {
+                sql(
+                    &f,
+                    "UPDATE channel_credentials SET secret_envelope=? WHERE id=?",
+                    vec![
+                        f.state.secrets.encrypt("rotated").unwrap().into(),
+                        f.providers[0].clone().into(),
+                    ],
+                )
+                .await
+            }
+            "config" => {
+                sql(
+                    &f,
+                    "UPDATE providers SET base_url='https://changed.invalid' WHERE id=?",
+                    vec![f.providers[0].clone().into()],
+                )
+                .await
+            }
+            "lease" => {
+                sql(
+                    &f,
+                    "UPDATE operation_jobs SET fence=fence+1 WHERE kind='model_sync'",
+                    vec![],
+                )
+                .await
+            }
+            _ => unreachable!(),
         }
         release.notify_one();
         assert!(task.await.unwrap().is_err(), "{race}");
@@ -12288,4 +12333,287 @@ async fn reference_inventory_refresh_preserves_operator_alias_prices_and_protoco
     sql(&f,"UPDATE models SET public_name='operator-alias',input_price_micros=123,output_price_micros=456,capabilities='[\"responses\"]' WHERE upstream_name='discovered'",vec![]).await;
     reference_inventory_sync(&f, "refresh-alias").await.unwrap();
     assert_eq!(count(&f,"SELECT COUNT(*) AS n FROM models WHERE upstream_name='discovered' AND public_name='operator-alias' AND input_price_micros=123 AND output_price_micros=456 AND capabilities='[\"responses\"]' AND enabled=1").await,1);
+}
+
+#[tokio::test]
+async fn reference_inventory_review_admin_cosmetic_edits_preserve_routes_and_lkg() {
+    for change in ["channel-name", "channel-priority", "credential-priority"] {
+        let failure = Arc::new(AtomicUsize::new(0));
+        let failed = failure.clone();
+        let f = fixture(success().route(
+            "/models",
+            get(move || {
+                let fail = failed.load(Ordering::SeqCst) > 0;
+                async move {
+                    if fail {
+                        StatusCode::BAD_GATEWAY.into_response()
+                    } else {
+                        Json(json!({"data":[{"id":"review-discovered"}]})).into_response()
+                    }
+                }
+            }),
+        ))
+        .await;
+        let cookie = owner(&f).await;
+        let provider = &f.providers[0];
+        sql(
+            &f,
+            "UPDATE providers SET updated_at=1 WHERE id=?",
+            vec![provider.clone().into()],
+        )
+        .await;
+        sql(
+            &f,
+            "UPDATE channel_credentials SET updated_at=1 WHERE id=?",
+            vec![provider.clone().into()],
+        )
+        .await;
+        reference_inventory_sync(&f, "review-initial")
+            .await
+            .unwrap();
+        let captured = ops::model_inventory::credentials(&f.state.db, db::DEFAULT_PROJECT_ID)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|c| c.id == *provider)
+            .unwrap();
+        let (resource, body) = if change == "credential-priority" {
+            (
+                "credentials",
+                json!({"id":provider,"provider_id":provider,"credential_type":"api_key","priority":3}),
+            )
+        } else {
+            (
+                "channels",
+                json!({"id":provider,"name":if change=="channel-name" {"renamed-channel"} else {"a"},"kind":"openai","base_url":captured.target.base_url,"priority":if change=="channel-priority" {3} else {100}}),
+            )
+        };
+        let response = admin(
+            &f,
+            &cookie,
+            http::Method::POST,
+            &format!(
+                "/api/admin/v1/projects/{}/operations/{resource}",
+                db::DEFAULT_PROJECT_ID
+            ),
+            body,
+            true,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK, "{change}");
+        let table = if resource == "channels" {
+            "providers"
+        } else {
+            "channel_credentials"
+        };
+        let row = f
+            .state
+            .db
+            .query_one(ops::sql(
+                format!("SELECT updated_at FROM {table} WHERE id=?"),
+                vec![provider.clone().into()],
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            row.try_get::<i64>("", "updated_at").unwrap() > 1,
+            "admin mutation must advance generic timestamp"
+        );
+        let inventory = ops::model_inventory::load(&f.state.db, db::DEFAULT_PROJECT_ID)
+            .await
+            .unwrap();
+        assert!(
+            inventory.allows(provider, provider, "review-discovered", true),
+            "{change}"
+        );
+        assert_eq!(
+            request(
+                &f,
+                "/v1/chat/completions",
+                json!({"model":"review-discovered","messages":[{"role":"user","content":"hello"}]})
+            )
+            .await
+            .status(),
+            StatusCode::OK,
+            "{change}"
+        );
+        failure.store(1, Ordering::SeqCst);
+        assert!(
+            reference_inventory_sync(&f, "review-failed-refresh")
+                .await
+                .is_err()
+        );
+        let inventory = ops::model_inventory::load(&f.state.db, db::DEFAULT_PROJECT_ID)
+            .await
+            .unwrap();
+        assert!(
+            inventory.allows(provider, provider, "review-discovered", true),
+            "{change}: LKG"
+        );
+        assert_eq!(
+            inventory.credential_metadata(provider)["discovery_status"],
+            "stale"
+        );
+    }
+}
+
+#[tokio::test]
+async fn reference_inventory_review_antigravity_discovery_never_sends_a_document_or_refreshes() {
+    for expired in [false, true] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let document_headers = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let documents = document_headers.clone();
+        let f = fixture(Router::new().fallback(move |headers: HeaderMap| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            if headers
+                .get("x-goog-api-key")
+                .is_some_and(|value| value.to_str().unwrap().contains("access_token"))
+            {
+                documents.fetch_add(1, Ordering::SeqCst);
+            }
+            async {
+                Json(json!({"data":[],"models":[],"access_token":"refreshed","expires_in":3600}))
+            }
+        }))
+        .await;
+        let provider = &f.providers[0];
+        let before = ops::model_inventory::credentials(&f.state.db, db::DEFAULT_PROJECT_ID)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|c| c.id == *provider)
+            .unwrap();
+        let document = json!({"version":1,"flow":"antigravity","access_token":"must-not-be-header-document","project_id":"test-project","client_id":"test-client","client_secret":"test-secret","refresh_token":"test-refresh","expires_at":if expired {1} else {db::now()+3600}});
+        sql(&f,"UPDATE providers SET kind='gemini',settings_json=? WHERE id=?",vec![json!({"version":1,"oauth_test":{"authorization_endpoint":"https://example.invalid/auth","token_endpoint":format!("{}/token",before.target.base_url)}}).to_string().into(),provider.clone().into()]).await;
+        sql(&f,"UPDATE channel_credentials SET credential_type='oauth_antigravity',secret_envelope=? WHERE id=?",vec![f.state.secrets.encrypt(&document.to_string()).unwrap().into(),provider.clone().into()]).await;
+        let result = reference_inventory_sync(&f, "review-unsupported").await;
+        assert_eq!(
+            document_headers.load(Ordering::SeqCst),
+            0,
+            "structured document must never become an auth header"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "unsupported discovery must refuse before OAuth or model-list I/O"
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            count(
+                &f,
+                "SELECT COUNT(*) AS n FROM credential_model_availability"
+            )
+            .await,
+            0
+        );
+    }
+}
+
+#[tokio::test]
+async fn reference_inventory_review_fingerprint_tracks_only_discovery_inputs() {
+    let f = fixture(Router::new()).await;
+    let provider = &f.providers[0];
+    sql(&f,"INSERT INTO proxy_presets(id,name,url,enabled,created_at,updated_at) VALUES('review-proxy','Before','http://127.0.0.1:1234',1,0,1)",vec![]).await;
+    sql(
+        &f,
+        "UPDATE channel_settings SET proxy_preset_id='review-proxy' WHERE provider_id=?",
+        vec![provider.clone().into()],
+    )
+    .await;
+    async fn capture(f: &Fixture) -> ops::model_inventory::Credential {
+        ops::model_inventory::credentials(&f.state.db, db::DEFAULT_PROJECT_ID)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|c| c.id == f.providers[0])
+            .unwrap()
+    }
+    let original = capture(&f).await;
+    sql(
+        &f,
+        "UPDATE providers SET settings_json=?,updated_at=updated_at+20 WHERE id=?",
+        vec![
+            json!({"version":1,"tags":["new-tag"],"limits":{"rpm":7}})
+                .to_string()
+                .into(),
+            provider.clone().into(),
+        ],
+    )
+    .await;
+    sql(&f,"UPDATE channel_settings SET model_rules_json=?,endpoint_mappings_json=? WHERE provider_id=?",vec![json!({"version":1,"mappings":{"public":"actual"}}).to_string().into(),json!({"version":1,"paths":{"/v1/chat/completions":"/chat"}}).to_string().into(),provider.clone().into()]).await;
+    sql(
+        &f,
+        "UPDATE channel_credentials SET settings_json=?,updated_at=updated_at+20 WHERE id=?",
+        vec![
+            json!({"version":1,"note":"local-label"}).to_string().into(),
+            provider.clone().into(),
+        ],
+    )
+    .await;
+    sql(
+        &f,
+        "UPDATE proxy_presets SET name='After',updated_at=updated_at+20 WHERE id='review-proxy'",
+        vec![],
+    )
+    .await;
+    let cosmetic = capture(&f).await;
+    assert_eq!(original.fingerprint, cosmetic.fingerprint);
+    assert_eq!(original.config_fingerprint, cosmetic.config_fingerprint);
+    sql(
+        &f,
+        "UPDATE proxy_presets SET url='http://127.0.0.1:1235' WHERE id='review-proxy'",
+        vec![],
+    )
+    .await;
+    let proxy = capture(&f).await;
+    assert_ne!(cosmetic.config_fingerprint, proxy.config_fingerprint);
+    sql(
+        &f,
+        "UPDATE providers SET base_url='https://different.invalid' WHERE id=?",
+        vec![provider.clone().into()],
+    )
+    .await;
+    let url = capture(&f).await;
+    assert_ne!(proxy.config_fingerprint, url.config_fingerprint);
+    sql(
+        &f,
+        "UPDATE channel_credentials SET secret_envelope=? WHERE id=?",
+        vec![
+            f.state.secrets.encrypt("rotated").unwrap().into(),
+            provider.clone().into(),
+        ],
+    )
+    .await;
+    let rotated = capture(&f).await;
+    assert_ne!(url.fingerprint, rotated.fingerprint);
+    sql(
+        &f,
+        "UPDATE channel_settings SET proxy_url='http://127.0.0.1:3333' WHERE provider_id=?",
+        vec![provider.clone().into()],
+    )
+    .await;
+    let direct = capture(&f).await;
+    sql(
+        &f,
+        "UPDATE proxy_presets SET url='http://127.0.0.1:7777',enabled=0 WHERE id='review-proxy'",
+        vec![],
+    )
+    .await;
+    assert_eq!(
+        direct.config_fingerprint,
+        capture(&f).await.config_fingerprint,
+        "an unused preset is not an effective discovery input"
+    );
+    sql(
+        &f,
+        "UPDATE channel_settings SET proxy_url='http://127.0.0.1:3334' WHERE provider_id=?",
+        vec![provider.clone().into()],
+    )
+    .await;
+    assert_ne!(
+        direct.config_fingerprint,
+        capture(&f).await.config_fingerprint
+    );
 }

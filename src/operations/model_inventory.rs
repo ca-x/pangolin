@@ -19,39 +19,37 @@ pub struct Credential {
     pub target: RouteTarget,
 }
 
-/// Hash encrypted revisions and effective provider/proxy configuration, never plaintext.
+/// Hash credential identity and the inputs actually used by discovery. Labels,
+/// priorities, routing policy and generic wall-clock update times are not revisions.
+/// Envelopes remain opaque; no plaintext secret enters a fingerprint.
 pub async fn credentials(
     db: &impl ConnectionTrait,
     project: &str,
 ) -> Result<Vec<Credential>, ApiError> {
-    let rows = db.query_all(sql(r#"SELECT c.id,c.provider_id,c.credential_type,c.secret_envelope,c.updated_at,c.settings_json,
+    let rows = db.query_all(sql(r#"SELECT c.id,c.provider_id,c.credential_type,c.secret_envelope,
         p.name,p.kind,p.base_url,s.proxy_url,s.proxy_username,s.proxy_secret_envelope,COALESCE(s.proxy_reuse_connections,1) AS proxy_reuse_connections,s.proxy_preset_id,
-        json_object('kind',p.kind,'base_url',p.base_url,'settings',p.settings_json,'revision',p.updated_at,
-          'endpoint_mappings',s.endpoint_mappings_json,'model_rules',s.model_rules_json,
-          'proxy_url',s.proxy_url,'proxy_username',s.proxy_username,'proxy_secret',s.proxy_secret_envelope,
-          'proxy_reuse',s.proxy_reuse_connections,'proxy_preset',s.proxy_preset_id,
-          'preset_url',proxy.url,'preset_secret',proxy.secret_envelope,'preset_enabled',proxy.enabled,'preset_revision',proxy.updated_at) AS config
+        json_object('kind',p.kind,'base_url',p.base_url,
+          'oauth',CASE WHEN ? THEN json_extract(p.settings_json,'$.oauth_test') ELSE NULL END,
+          'proxy',CASE WHEN s.proxy_url IS NOT NULL THEN
+            json_object('url',s.proxy_url,'username',s.proxy_username,'secret',s.proxy_secret_envelope,'reuse',COALESCE(s.proxy_reuse_connections,1))
+          WHEN s.proxy_preset_id IS NOT NULL THEN
+            json_object('id',s.proxy_preset_id,'url',proxy.url,'secret',proxy.secret_envelope,'enabled',proxy.enabled)
+          ELSE NULL END) AS config
         FROM channel_credentials c JOIN providers p ON p.id=c.provider_id AND p.enabled=1
         JOIN projects project ON project.id=p.project_id AND project.enabled=1
         LEFT JOIN channel_settings s ON s.provider_id=p.id LEFT JOIN proxy_presets proxy ON proxy.id=s.proxy_preset_id
-        WHERE p.project_id=? AND c.enabled=1 ORDER BY c.priority,c.id"#, vec![project.into()])).await?;
+        WHERE p.project_id=? AND c.enabled=1 ORDER BY c.priority,c.id"#, vec![cfg!(test).into(),project.into()])).await?;
     rows.into_iter()
         .map(|row| {
             let secret: String = row.try_get("", "secret_envelope")?;
             let kind: String = row.try_get("", "credential_type")?;
-            let revision: i64 = row.try_get("", "updated_at")?;
-            let settings: String = row.try_get("", "settings_json")?;
             let config: String = row.try_get("", "config")?;
             Ok(Credential {
                 id: row.try_get("", "id")?,
                 provider: row.try_get("", "provider_id")?,
-                fingerprint: blake3::hash(
-                    json!([secret, kind, revision, settings])
-                        .to_string()
-                        .as_bytes(),
-                )
-                .to_hex()
-                .to_string(),
+                fingerprint: blake3::hash(json!([secret, kind]).to_string().as_bytes())
+                    .to_hex()
+                    .to_string(),
                 config_fingerprint: blake3::hash(config.as_bytes()).to_hex().to_string(),
                 target: RouteTarget {
                     public_name: String::new(),
@@ -183,6 +181,14 @@ pub async fn sync(state: &AppState, claim: &jobs::Claim, payload: &Value) -> Res
     let results: Vec<_> = stream::iter(selected)
         .map(|mut credential| async move {
             let result = async {
+                if !crate::providers::discovery::credential_adapter_supported(
+                    &credential.target.provider_kind,
+                    &credential.target.credential_type,
+                ) {
+                    return Err(ApiError::BadRequest(
+                        "model discovery is not available for this credential adapter".into(),
+                    ));
+                }
                 // Revalidate as each bounded work item starts, so queued keys
                 // disabled while earlier fetches ran never reach the provider.
                 let before = credentials(&state.db, project).await?;

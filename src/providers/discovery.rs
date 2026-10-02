@@ -17,6 +17,12 @@ pub fn adapter_supported(kind: &str) -> bool {
     crate::providers::KINDS.contains(&kind) && !matches!(kind, "bedrock" | "vertex" | "gcp")
 }
 
+/// Antigravity's structured access-token/project document belongs to its own
+/// gateway adapter, not the Gemini API-key discovery contract.
+pub fn credential_adapter_supported(kind: &str, credential_type: &str) -> bool {
+    adapter_supported(kind) && credential_type != "oauth_antigravity"
+}
+
 pub async fn models(
     client: &reqwest::Client,
     kind: &str,
@@ -53,6 +59,11 @@ fn authenticated_request(
     url: String,
     secret: &str,
 ) -> Result<reqwest::RequestBuilder, ApiError> {
+    if kind != "azure" && secret.trim_start().starts_with(['{', '[']) {
+        return Err(ApiError::BadRequest(
+            "model discovery requires a scalar credential".into(),
+        ));
+    }
     let request = client.get(url);
     Ok(match kind {
         "anthropic" => request
@@ -225,6 +236,36 @@ mod tests {
                 r#"{"client_secret":"must-not-leak"}"#,
             )
             .is_err()
+        );
+    }
+    #[test]
+    fn reference_inventory_review_scalar_auth_rejects_structured_documents() {
+        let client = reqwest::Client::new();
+        for kind in ["gemini", "openai", "anthropic"] {
+            assert!(
+                authenticated_request(
+                    &client,
+                    kind,
+                    "https://example.invalid/models".into(),
+                    r#"{"access_token":"secret","project_id":"project"}"#
+                )
+                .is_err()
+            );
+        }
+        assert!(!credential_adapter_supported("gemini", "oauth_antigravity"));
+        assert!(credential_adapter_supported("gemini", "api_key"));
+        assert_eq!(
+            authenticated_request(
+                &client,
+                "gemini",
+                "https://example.invalid/models".into(),
+                "api-key"
+            )
+            .unwrap()
+            .build()
+            .unwrap()
+            .headers()["x-goog-api-key"],
+            "api-key"
         );
     }
 }

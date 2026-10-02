@@ -570,13 +570,7 @@ fn capability_mismatch(candidate: &Candidate, payload: &Value) -> Result<bool> {
     let Some(card) = &candidate.model_card else {
         return Ok(false);
     };
-    let context = policy::context(
-        payload,
-        &HeaderMap::new(),
-        &candidate.protocol_endpoint,
-        None,
-    );
-    let image = context["has_image"] == true;
+    let image = request_has_image(payload, &candidate.protocol_endpoint)?;
     let tools = ["tools", "functions"].iter().any(|field| {
         payload
             .get(field)
@@ -609,7 +603,7 @@ fn capability_mismatch(candidate: &Candidate, payload: &Value) -> Result<bool> {
                 .input
                 .as_ref()
                 .is_some_and(|values| !values.iter().any(|value| value == "image"))))
-        || ((context["stream"] == true
+        || ((payload.get("stream").and_then(Value::as_bool) == Some(true)
             || candidate
                 .protocol_endpoint
                 .ends_with(":streamGenerateContent"))
@@ -618,6 +612,106 @@ fn capability_mismatch(candidate: &Candidate, payload: &Value) -> Result<bool> {
         || output
             .zip(card.limits.output)
             .is_some_and(|(requested, limit)| requested > limit))
+}
+
+/// Inspect only protocol-defined input carriers. Tool schemas, function-call
+/// arguments, arbitrary JSON outputs and extensions are not media inputs.
+fn request_has_image(payload: &Value, endpoint: &str) -> Result<bool> {
+    const MAX_INPUT_NODES: usize = 65_536;
+    const MAX_CONTENT_DEPTH: usize = 32;
+    fn consume(remaining: &mut usize) -> Result<()> {
+        *remaining = remaining.checked_sub(1).ok_or(Error::Invalid(
+            "request content exceeds capability inspection limit",
+        ))?;
+        Ok(())
+    }
+    fn parts(value: &Value, protocol: &str, remaining: &mut usize, depth: usize) -> Result<bool> {
+        if depth > MAX_CONTENT_DEPTH {
+            return Err(Error::Invalid(
+                "request content exceeds capability inspection limit",
+            ));
+        }
+        let Some(values) = value.as_array() else {
+            return Ok(false);
+        };
+        for part in values {
+            consume(remaining)?;
+            let kind = part.get("type").and_then(Value::as_str);
+            let image = match protocol {
+                "chat" => kind == Some("image_url"),
+                "messages" => kind == Some("image"),
+                "responses" => kind == Some("input_image"),
+                "gemini" => ["inlineData", "fileData", "inline_data", "file_data"]
+                    .iter()
+                    .any(|field| {
+                        part.get(field).is_some_and(|data| {
+                            data.get("mimeType")
+                                .or_else(|| data.get("mime_type"))
+                                .and_then(Value::as_str)
+                                .is_some_and(|mime| {
+                                    mime.get(..6)
+                                        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("image/"))
+                                })
+                        })
+                    }),
+                _ => false,
+            };
+            if image {
+                return Ok(true);
+            }
+            if protocol == "messages"
+                && kind == Some("tool_result")
+                && parts(&part["content"], protocol, remaining, depth + 1)?
+            {
+                return Ok(true);
+            }
+            if protocol == "gemini" {
+                for field in ["functionResponse", "function_response"] {
+                    if parts(&part[field]["parts"], protocol, remaining, depth + 1)? {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+        Ok(false)
+    }
+    let protocol = crate::providers::capability(endpoint);
+    let mut remaining = MAX_INPUT_NODES;
+    let messages = match protocol {
+        "chat" | "messages" => payload.get("messages"),
+        "responses" => payload.get("input"),
+        "gemini" => payload.get("contents"),
+        _ => None,
+    };
+    if let Some(messages) = messages.and_then(Value::as_array) {
+        for message in messages {
+            consume(&mut remaining)?;
+            let content = match protocol {
+                "gemini" => &message["parts"],
+                "responses" => match message.get("type").and_then(Value::as_str) {
+                    Some("input_image") => return Ok(true),
+                    Some("function_call_output" | "custom_tool_call_output") => &message["output"],
+                    Some("message") | None => &message["content"],
+                    _ => continue,
+                },
+                _ => &message["content"],
+            };
+            if parts(content, protocol, &mut remaining, 0)? {
+                return Ok(true);
+            }
+        }
+    }
+    if protocol == "gemini" {
+        for field in ["systemInstruction", "system_instruction"] {
+            if parts(&payload[field]["parts"], protocol, &mut remaining, 0)? {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(
+        endpoint == "/v1/images/edits"
+            && payload.get("image").is_some_and(|value| !value.is_null()),
+    )
 }
 
 /// Shared by admission and protocol adapters; never infer a different output

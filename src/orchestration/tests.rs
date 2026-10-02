@@ -2085,3 +2085,119 @@ async fn reference_capability_manual_card_fills_unknown_discovery_facts() {
         0
     );
 }
+
+#[tokio::test]
+async fn reference_capability_review_native_gemini_images_are_inputs() {
+    let f = database_fixture().await;
+    let (provider, model) = add_model(&f, "gemini-native", "public", "actual").await;
+    sql(
+        &f,
+        "UPDATE providers SET kind='gemini' WHERE id=?",
+        vec![provider.into()],
+    )
+    .await;
+    sql(
+        &f,
+        "UPDATE models SET catalog_metadata_json=? WHERE id=?",
+        vec![
+            json!({"card":{"capabilities":{"vision":false,"tools":true}}})
+                .to_string()
+                .into(),
+            model.into(),
+        ],
+    )
+    .await;
+    for part in [
+        json!({"inlineData":{"mimeType":"image/png","data":"aGVsbG8="}}),
+        json!({"fileData":{"mimeType":"image/jpeg","fileUri":"gs://test/photo.jpg"}}),
+    ] {
+        let body = json!({"model":"public","contents":[{"role":"user","parts":[part]}]});
+        let result = prepare(
+            &f.db,
+            &Runtime::default(),
+            &f.key,
+            load_profile(&f.db, &f.key).await.unwrap(),
+            body,
+            &HeaderMap::new(),
+            "/v1beta/models:generateContent",
+        )
+        .await
+        .unwrap();
+        assert!(result.candidates.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn reference_capability_review_tool_schema_image_property_is_text() {
+    let f = database_fixture().await;
+    let (_, model) = add_model(&f, "text-tools", "public", "actual").await;
+    sql(
+        &f,
+        "UPDATE models SET catalog_metadata_json=? WHERE id=?",
+        vec![
+            json!({"card":{"capabilities":{"vision":false,"tools":true}}})
+                .to_string()
+                .into(),
+            model.into(),
+        ],
+    )
+    .await;
+    let body = json!({"model":"public","messages":[{"role":"user","content":"Classify this filename"}],"tools":[{"type":"function","function":{"name":"describe_filename","parameters":{"type":"object","properties":{"image":{"type":"string","description":"Filename as plain text"}}}}}],"metadata":{"image_url":"not-an-input"}});
+    assert_eq!(plan(&f, body).await.unwrap().candidates.len(), 1);
+}
+
+#[test]
+fn reference_capability_review_image_inspection_stays_within_input_structure_and_bounds() {
+    for (endpoint, body) in [
+        (
+            "/v1/messages",
+            json!({"messages":[{"role":"user","content":[{"type":"tool_result","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"aA=="}}]}]}]}),
+        ),
+        (
+            "/v1/responses",
+            json!({"input":[{"type":"message","role":"user","content":[{"type":"input_image","image_url":"https://image.invalid/a"}]}]}),
+        ),
+        (
+            "/v1/responses",
+            json!({"input":[{"type":"function_call_output","call_id":"call","output":[{"type":"input_image","image_url":"https://image.invalid/a"}]}]}),
+        ),
+        (
+            "/v1beta/models:generateContent",
+            json!({"contents":[{"parts":[{"file_data":{"mime_type":"Image/PNG","file_uri":"gs://test/a"}}]}]}),
+        ),
+    ] {
+        let original = body.clone();
+        assert!(
+            super::request_has_image(&body, endpoint).unwrap(),
+            "{endpoint}"
+        );
+        assert_eq!(body, original);
+    }
+    for (endpoint, body) in [
+        (
+            "/v1/messages",
+            json!({"messages":[{"content":[{"type":"text","text":"image"}]}],"tools":[{"input_schema":{"properties":{"image":{"type":"string"}}}}]}),
+        ),
+        (
+            "/v1/responses",
+            json!({"input":[{"type":"function_call","arguments":"{\"image\":\"filename\"}"}],"metadata":{"input_image":"not-content"}}),
+        ),
+        (
+            "/v1beta/models:generateContent",
+            json!({"contents":[{"parts":[{"inlineData":{"mimeType":"audio/wav","data":"aA=="}},{"functionResponse":{"response":{"image":"arbitrary-tool-json"}}}]}],"tools":[{"functionDeclarations":[{"parameters":{"properties":{"image":{"type":"string"}}}}]}]}),
+        ),
+    ] {
+        assert!(
+            !super::request_has_image(&body, endpoint).unwrap(),
+            "{endpoint}"
+        );
+    }
+    let excessive =
+        json!({"messages":[{"content":vec![json!({"type":"text","text":"x"});65_536]}]});
+    assert!(matches!(
+        super::request_has_image(&excessive, "/v1/chat/completions"),
+        Err(Error::Invalid(
+            "request content exceeds capability inspection limit"
+        ))
+    ));
+}
