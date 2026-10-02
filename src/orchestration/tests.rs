@@ -2480,3 +2480,190 @@ async fn reference_privacy_chat_tool_results_preserve_numeric_types_and_detect_n
     .unwrap();
     assert_eq!(preview["redacted_body"], live);
 }
+
+#[tokio::test]
+async fn reference_privacy_review_responses_replay_requires_string_carriers() {
+    let f = database_fixture().await;
+    sql(&f,"INSERT INTO prompt_protection_rules(id,project_id,name,content_pattern,action,replacement,created_at,updated_at) VALUES('replay-shape',?,'Replay shape','secret-[0-9]+','redact','[MASKED]',0,0)",vec![f.key.project_id.clone().into()]).await;
+    let rules = protection::load(&f.db, &f.key.project_id).await.unwrap();
+    for endpoint in ["/v1/responses", "/v1/responses/compact"] {
+        for kind in ["reasoning", "compaction", "compaction_summary"] {
+            for role in [None, Some("assistant")] {
+                let mut item = json!({"type":kind,"encrypted_content":"secret-123"});
+                if let Some(role) = role {
+                    item["role"] = json!(role);
+                }
+                let valid = json!({"input":[item.clone()]});
+                let context = policy::context(&valid, &HeaderMap::new(), endpoint, None);
+                let mut live = valid.clone();
+                protection::apply(&rules, &mut live, &context, &mut vec![]).unwrap();
+                assert_eq!(
+                    live, valid,
+                    "supported string replay changed: {endpoint}/{kind}"
+                );
+                let preview = serde_json::to_value(
+                    protection::request_preview(&f.db, &f.key.project_id, endpoint, valid.clone())
+                        .await
+                        .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(preview["decision"], "allow");
+                assert_eq!(preview["redacted_body"], valid);
+                for carrier in [
+                    json!({"signature":"secret-123"}),
+                    json!([{"signature":"secret-123"}]),
+                    json!(null),
+                    json!(123456),
+                    json!(true),
+                ] {
+                    item["encrypted_content"] = carrier;
+                    let invalid = json!({"input":[item.clone()]});
+                    let context = policy::context(&invalid, &HeaderMap::new(), endpoint, None);
+                    let mut live = invalid.clone();
+                    assert!(
+                        matches!(
+                            protection::apply(&rules, &mut live, &context, &mut vec![]),
+                            Err(Error::Invalid(
+                                "privacy replay encrypted_content must be a string"
+                            ))
+                        ),
+                        "unsupported replay shape forwarded: {endpoint}/{kind}: {live}"
+                    );
+                    assert_eq!(live, invalid, "replay rejection partially mutated request");
+                    assert!(matches!(
+                        protection::request_preview(&f.db, &f.key.project_id, endpoint, invalid)
+                            .await,
+                        Err(Error::Invalid(
+                            "privacy replay encrypted_content must be a string"
+                        ))
+                    ));
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn reference_privacy_review_typed_tool_result_arrays_preserve_json_scalars() {
+    let f = database_fixture().await;
+    sql(&f,"INSERT INTO prompt_protection_rules(id,project_id,name,content_pattern,action,replacement,role_pattern,created_at,updated_at) VALUES('typed-results',?,'Typed results','secret-[0-9]+|123456','redact','[MASKED]','^tool$',0,0)",vec![f.key.project_id.clone().into()]).await;
+    let rules = protection::load(&f.db, &f.key.project_id).await.unwrap();
+    for block_type in ["text", "input_text", "output_text"] {
+        let blocks = json!([
+            {"type":block_type,"id":"123456","annotations":[{"type":"citation","id":"123456","file_id":"123456"}],"text":"{\"secret-key\":\"secret-123\",\"123456\":123456,\"numeric_string\":\"123456\",\"flag\":true}"},
+            {"type":"text","text":"plain secret-789 transcript { incomplete"},
+            {"type":"image","source":{"type":"base64","media_type":"image/png","data":"secret-456"}}
+        ]);
+        for (endpoint, body, path) in [
+            (
+                "/v1/responses",
+                json!({"input":[{"type":"function_call_output","call_id":"123456","output":blocks}]}),
+                "/input/0/output",
+            ),
+            (
+                "/v1/responses",
+                json!({"input":[{"type":"custom_tool_call_output","call_id":"123456","output":blocks}]}),
+                "/input/0/output",
+            ),
+            (
+                "/v1/messages",
+                json!({"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"123456","content":blocks}]}]}),
+                "/messages/0/content/0/content",
+            ),
+            (
+                "/v1/chat/completions",
+                json!({"messages":[{"role":"tool","tool_call_id":"123456","content":blocks}]}),
+                "/messages/0/content",
+            ),
+        ] {
+            let context = policy::context(&body, &HeaderMap::new(), endpoint, None);
+            let mut live = body.clone();
+            protection::apply(&rules, &mut live, &context, &mut vec![]).unwrap();
+            let output = live.pointer(path).unwrap();
+            let structured: Value = serde_json::from_str(output[0]["text"].as_str().unwrap())
+                .expect("typed tool result must remain valid JSON");
+            assert_eq!(
+                structured,
+                json!({"secret-key":"[MASKED]","123456":123456,"numeric_string":"[MASKED]","flag":true}),
+                "wrong typed result: {endpoint}/{block_type}"
+            );
+            assert_eq!(output[0]["type"], block_type);
+            assert_eq!(output[0]["id"], "123456");
+            assert_eq!(output[0]["annotations"], blocks[0]["annotations"]);
+            assert_eq!(output[1]["text"], "plain [MASKED] transcript { incomplete");
+            assert_eq!(output[2], blocks[2], "media carrier changed on {endpoint}");
+            let preview = serde_json::to_value(
+                protection::request_preview(&f.db, &f.key.project_id, endpoint, body.clone())
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(preview["redacted_body"], live);
+            assert_eq!(preview["findings"].as_array().unwrap().len(), 3);
+            assert_eq!(
+                preview["findings"][0]["path"],
+                format!("{path}/0/text/$json/secret-key")
+            );
+            if endpoint == "/v1/messages" {
+                assert_eq!(live["messages"][0]["content"][0]["tool_use_id"], "123456");
+            } else if endpoint == "/v1/chat/completions" {
+                assert_eq!(live["messages"][0]["tool_call_id"], "123456");
+            } else {
+                assert_eq!(live["input"][0]["call_id"], "123456");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn reference_privacy_review_anthropic_search_replay_requires_string_carriers() {
+    let f = database_fixture().await;
+    sql(&f,"INSERT INTO prompt_protection_rules(id,project_id,name,content_pattern,action,replacement,created_at,updated_at) VALUES('search-replay',?,'Search replay','secret-[0-9]+','redact','[MASKED]',0,0)",vec![f.key.project_id.clone().into()]).await;
+    let rules = protection::load(&f.db, &f.key.project_id).await.unwrap();
+    let valid = json!({"messages":[{"role":"assistant","content":[{"type":"web_search_tool_result","tool_use_id":"secret-456","content":[{"type":"web_search_result","encrypted_content":"secret-123","title":"Reference","url":"https://example.test/result","page_age":"1 day","file_id":"secret-789","preview_image":{"type":"image","source":{"type":"base64","media_type":"image/png","data":"secret-789"}}}]}]}]});
+    let context = policy::context(&valid, &HeaderMap::new(), "/v1/messages", None);
+    let mut live = valid.clone();
+    protection::apply(&rules, &mut live, &context, &mut vec![]).unwrap();
+    assert_eq!(
+        live, valid,
+        "genuine web-search encrypted string/metadata changed"
+    );
+    let preview = serde_json::to_value(
+        protection::request_preview(&f.db, &f.key.project_id, "/v1/messages", valid.clone())
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(preview["redacted_body"], valid);
+    for carrier in [
+        json!({"signature":"secret-123"}),
+        json!([{"signature":"secret-123"}]),
+        json!(null),
+        json!(123456),
+        json!(false),
+    ] {
+        let mut invalid = valid.clone();
+        invalid["messages"][0]["content"][0]["content"][0]["encrypted_content"] = carrier;
+        let context = policy::context(&invalid, &HeaderMap::new(), "/v1/messages", None);
+        let mut live = invalid.clone();
+        assert!(
+            matches!(
+                protection::apply(&rules, &mut live, &context, &mut vec![]),
+                Err(Error::Invalid(
+                    "privacy replay encrypted_content must be a string"
+                ))
+            ),
+            "native web-search replay shape bypassed: {live}"
+        );
+        assert_eq!(
+            live, invalid,
+            "rejection partially mutated web-search history"
+        );
+        assert!(matches!(
+            protection::request_preview(&f.db, &f.key.project_id, "/v1/messages", invalid).await,
+            Err(Error::Invalid(
+                "privacy replay encrypted_content must be a string"
+            ))
+        ));
+    }
+}

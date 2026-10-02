@@ -186,6 +186,7 @@ impl<F: FnMut(&str, &str, &mut String) -> Result<()>> Walker<'_, F> {
                     "reasoning" | "compaction" | "compaction_summary"
                 )
             {
+                validate_encrypted_carrier(value)?;
                 for (key, value) in value.as_object_mut().expect("object").iter_mut() {
                     if key != "encrypted_content" && !protocol_key(key) {
                         self.content(value, "assistant", &child(path, key)?)?;
@@ -336,6 +337,10 @@ impl<F: FnMut(&str, &str, &mut String) -> Result<()>> Walker<'_, F> {
 
     fn content(&mut self, value: &mut Value, role: &str, path: &str) -> Result<()> {
         match value {
+            // Tool-result text wrappers and bare results share one parser. This
+            // preserves embedded container JSON scalars rather than matching its
+            // serialized numeric tokens as if they were ordinary text.
+            Value::String(_) if role == "tool" => self.tool(value, role, path),
             Value::String(text) => self.text(text, role, path),
             Value::Array(items) => {
                 for (index, value) in items.iter_mut().enumerate() {
@@ -379,6 +384,7 @@ impl<F: FnMut(&str, &str, &mut String) -> Result<()>> Walker<'_, F> {
                         for (index, item) in items.iter_mut().enumerate() {
                             let item_path = child(&child(path, "content")?, &index.to_string())?;
                             if item["type"] == "web_search_result" {
+                                validate_encrypted_carrier(item)?;
                                 for (key, leaf) in
                                     item.as_object_mut().expect("typed record").iter_mut()
                                 {
@@ -475,6 +481,7 @@ impl<F: FnMut(&str, &str, &mut String) -> Result<()>> Walker<'_, F> {
                     kind,
                     "text"
                         | "input_text"
+                        | "output_text"
                         | "image"
                         | "input_image"
                         | "image_url"
@@ -490,6 +497,20 @@ impl<F: FnMut(&str, &str, &mut String) -> Result<()>> Walker<'_, F> {
             self.tool(value, "tool", path)
         }
     }
+}
+
+// Opaque replay is a string carrier. Non-string values at the encrypted field
+// are unsupported ordinary content and must fail before provider forwarding.
+fn validate_encrypted_carrier(record: &Value) -> Result<()> {
+    if record
+        .get("encrypted_content")
+        .is_some_and(|carrier| !carrier.is_string())
+    {
+        return Err(Error::Invalid(
+            "privacy replay encrypted_content must be a string",
+        ));
+    }
+    Ok(())
 }
 
 fn protocol_key(key: &str) -> bool {
