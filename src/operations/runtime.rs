@@ -777,8 +777,14 @@ async fn probe_response(
         .map_err(|error| probe_transport_error(&error))?;
     crate::providers::timing::record_headers_at(
         started,
-        Instant::now(),
+        crate::providers::timing::capture_now(),
         &mut measured.response_headers_ms,
+    );
+    #[cfg(test)]
+    crate::providers::timing::observe_for_test(
+        measured.response_headers_ms,
+        measured.first_event_ms,
+        measured.first_text_ms,
     );
     measured.status_code = Some(i32::from(response.status().as_u16()));
     if !response.status().is_success() {
@@ -834,7 +840,7 @@ async fn probe_response(
                 return Err("invalid_response");
             }
             let Some(data) = frame.data else { continue };
-            let observed = Instant::now();
+            let observed = crate::providers::timing::capture_now();
             crate::providers::timing::record_headers_at(
                 started,
                 observed,
@@ -867,6 +873,12 @@ async fn probe_response(
             } else if event.data.trim() != "[DONE]" {
                 return Err("invalid_response");
             }
+            #[cfg(test)]
+            crate::providers::timing::observe_for_test(
+                measured.response_headers_ms,
+                measured.first_event_ms,
+                measured.first_text_ms,
+            );
             if terminal.terminal(&event, endpoint) {
                 return if output {
                     Ok(())

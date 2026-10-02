@@ -540,17 +540,29 @@ impl Attempt {
     pub fn response_headers(&mut self) {
         crate::providers::timing::record_headers_at(
             self.started,
-            Instant::now(),
+            crate::providers::timing::capture_now(),
             &mut self.response_headers_ms,
+        );
+        #[cfg(test)]
+        crate::providers::timing::observe_for_test(
+            self.response_headers_ms,
+            self.first_event_ms,
+            self.ttft,
         );
     }
     pub fn first_event(&mut self, data: &str) {
         crate::providers::timing::record_event_at(
             self.started,
-            Instant::now(),
+            crate::providers::timing::capture_now(),
             data,
             &mut self.first_event_ms,
             &mut self.ttft,
+        );
+        #[cfg(test)]
+        crate::providers::timing::observe_for_test(
+            self.response_headers_ms,
+            self.first_event_ms,
+            self.ttft,
         );
     }
     fn capture_response_id(&mut self, value: &Value) {

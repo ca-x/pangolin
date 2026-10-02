@@ -10868,20 +10868,81 @@ async fn reference_probe_uses_saved_path_and_rejects_unrelated_http_200() {
     );
 }
 
+type ReferencePhase = (Option<i64>, Option<i64>, Option<i64>);
+
+struct ReferenceStreamGate {
+    received: tokio::sync::oneshot::Receiver<()>,
+    headers: tokio::sync::oneshot::Sender<()>,
+    chunks: tokio::sync::mpsc::UnboundedSender<Bytes>,
+}
+
+fn reference_gated_chat_upstream() -> (Router, ReferenceStreamGate) {
+    let (received_tx, received) = tokio::sync::oneshot::channel();
+    let (headers, headers_rx) = tokio::sync::oneshot::channel();
+    let (chunks, chunks_rx) = tokio::sync::mpsc::unbounded_channel();
+    let received_tx = Arc::new(tokio::sync::Mutex::new(Some(received_tx)));
+    let headers_rx = Arc::new(tokio::sync::Mutex::new(Some(headers_rx)));
+    let chunks_rx = Arc::new(tokio::sync::Mutex::new(Some(chunks_rx)));
+    let router = Router::new().route(
+        "/v1/chat/completions",
+        post(move || {
+            let received_tx = received_tx.clone();
+            let headers_rx = headers_rx.clone();
+            let chunks_rx = chunks_rx.clone();
+            async move {
+                if let Some(sender) = received_tx.lock().await.take() {
+                    let _ = sender.send(());
+                }
+                if let Some(release) = headers_rx.lock().await.take() {
+                    let _ = release.await;
+                }
+                let mut source = chunks_rx.lock().await.take().expect("one upstream request");
+                let body = async_stream::stream! {
+                    while let Some(chunk) = source.recv().await {
+                        yield Ok::<Bytes,std::io::Error>(chunk);
+                    }
+                };
+                (
+                    [(header::CONTENT_TYPE, "text/event-stream")],
+                    Body::from_stream(body),
+                )
+            }
+        }),
+    );
+    (
+        router,
+        ReferenceStreamGate {
+            received,
+            headers,
+            chunks,
+        },
+    )
+}
+
+async fn next_reference_phase(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<ReferencePhase>,
+) -> ReferencePhase {
+    tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("phase observation timeout")
+        .expect("phase observer closed")
+}
+
+const REFERENCE_CREATED: &[u8] = b"data: {\"choices\":[],\"object\":\"chat.completion.chunk\"}\n\n";
+const REFERENCE_ROLE: &[u8] = b"data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n";
+const REFERENCE_HEARTBEAT: &[u8] = b": heartbeat\n\n";
+const REFERENCE_REASONING: &[u8] =
+    b"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"hidden\"}}]}\n\n";
+const REFERENCE_TEXT: &[u8] = b"data: {\"choices\":[{\"delta\":{\"content\":\"OK\"}}]}\n\n";
+const REFERENCE_LATER_TEXT: &[u8] =
+    b"data: {\"choices\":[{\"delta\":{\"content\":\"again\"}}]}\n\n";
+const REFERENCE_TERMINAL: &[u8] = b"data: [DONE]\n\n";
+
 #[tokio::test]
 async fn reference_probe_stream_records_headers_event_text_and_terminal() {
-    let events = concat!(
-        "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n",
-        ": heartbeat\n\n",
-        "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"hidden\"}}]}\n\n",
-        "data: {\"choices\":[{\"delta\":{\"content\":\"OK\"}}]}\n\n",
-        "data: [DONE]\n\n"
-    );
-    let f = fixture(Router::new().route(
-        "/v1/chat/completions",
-        post(move || async move { ([(header::CONTENT_TYPE, "text/event-stream")], events) }),
-    ))
-    .await;
+    use std::sync::atomic::AtomicU64;
+    let (router, gate) = reference_gated_chat_upstream();
+    let f = fixture(router).await;
     let model: String = f
         .state
         .db
@@ -10908,13 +10969,85 @@ async fn reference_probe_stream_records_headers_event_text_and_terminal() {
         .await
         .unwrap()
         .unwrap();
-    ops::runtime::execute(&f.state, &claim).await.unwrap();
+    let (phase_tx, mut phase_rx) = tokio::sync::mpsc::unbounded_channel::<ReferencePhase>();
+    let offset = Arc::new(AtomicU64::new(0));
+    let work = crate::providers::timing::with_test_observer(
+        offset.clone(),
+        phase_tx,
+        ops::runtime::execute(&f.state, &claim),
+    );
+    let drive = async {
+        gate.received.await.unwrap();
+        assert!(
+            phase_rx.try_recv().is_err(),
+            "headers arrived before release"
+        );
+        gate.headers.send(()).unwrap();
+        let headers = next_reference_phase(&mut phase_rx).await;
+        assert!(headers.0.is_some() && headers.1.is_none() && headers.2.is_none());
+        offset.store(100, Ordering::Relaxed);
+        gate.chunks
+            .send(Bytes::from_static(REFERENCE_CREATED))
+            .unwrap();
+        let created = next_reference_phase(&mut phase_rx).await;
+        assert_eq!(created.0, headers.0);
+        assert!(created.1.unwrap() > headers.0.unwrap() && created.2.is_none());
+        offset.store(150, Ordering::Relaxed);
+        gate.chunks
+            .send(Bytes::from_static(REFERENCE_HEARTBEAT))
+            .unwrap();
+        gate.chunks
+            .send(Bytes::from_static(REFERENCE_ROLE))
+            .unwrap();
+        let role = next_reference_phase(&mut phase_rx).await;
+        assert_eq!(role, created);
+        offset.store(200, Ordering::Relaxed);
+        gate.chunks
+            .send(Bytes::from_static(REFERENCE_REASONING))
+            .unwrap();
+        let reasoning = next_reference_phase(&mut phase_rx).await;
+        assert_eq!(reasoning, created, "reasoning must not set first text");
+        offset.store(300, Ordering::Relaxed);
+        gate.chunks
+            .send(Bytes::from_static(REFERENCE_TEXT))
+            .unwrap();
+        let visible = next_reference_phase(&mut phase_rx).await;
+        assert_eq!((visible.0, visible.1), (headers.0, created.1));
+        assert!(visible.2.unwrap() > created.1.unwrap());
+        offset.store(400, Ordering::Relaxed);
+        gate.chunks
+            .send(Bytes::from_static(REFERENCE_LATER_TEXT))
+            .unwrap();
+        assert_eq!(
+            next_reference_phase(&mut phase_rx).await,
+            visible,
+            "later text must keep the first capture"
+        );
+        offset.store(500, Ordering::Relaxed);
+        gate.chunks
+            .send(Bytes::from_static(REFERENCE_TERMINAL))
+            .unwrap();
+        visible
+    };
+    let (result, visible) = tokio::join!(work, drive);
+    result.unwrap();
     let row = f.state.db.query_one(ops::sql("SELECT response_headers_ms,first_event_ms,first_text_ms,ttft_ms,success FROM channel_probes WHERE provider_id=?",vec![f.providers[0].clone().into()])).await.unwrap().unwrap();
-    let headers = row.try_get::<i64>("", "response_headers_ms").unwrap();
-    let event = row.try_get::<i64>("", "first_event_ms").unwrap();
-    let text = row.try_get::<i64>("", "first_text_ms").unwrap();
-    assert!(headers <= event && event <= text);
-    assert_eq!(row.try_get::<i64>("", "ttft_ms").unwrap(), text);
+    assert_eq!(
+        row.try_get::<i64>("", "response_headers_ms").unwrap(),
+        visible.0.unwrap()
+    );
+    assert_eq!(
+        row.try_get::<i64>("", "first_event_ms").unwrap(),
+        visible.1.unwrap()
+    );
+    assert_eq!(
+        row.try_get::<i64>("", "first_text_ms").unwrap(),
+        visible.2.unwrap()
+    );
+    assert_eq!(
+        row.try_get::<i64>("", "ttft_ms").unwrap(),
+        visible.2.unwrap()
+    );
     assert!(row.try_get::<bool>("", "success").unwrap());
     let cookie = owner(&f).await;
     let listed = json_body(
@@ -11151,25 +11284,124 @@ async fn reference_probe_enforces_one_mib_response_limit() {
 
 #[tokio::test]
 async fn reference_timing_gateway_first_text_follows_role_and_reasoning() {
-    let events = concat!(
-        "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n",
-        "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"private\"}}]}\n\n",
-        "data: {\"choices\":[{\"delta\":{\"content\":\"OK\"}}]}\n\n",
-        "data: [DONE]\n\n"
-    );
-    let f = fixture(Router::new().route(
-        "/v1/chat/completions",
-        post(move || async move { ([(header::CONTENT_TYPE, "text/event-stream")], events) }),
-    ))
-    .await;
-    let response = request(&f, "/v1/chat/completions", streaming()).await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let _ = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    use std::sync::atomic::AtomicU64;
+    let (router, gate) = reference_gated_chat_upstream();
+    let f = fixture(router).await;
+    let (phase_tx, mut phase_rx) = tokio::sync::mpsc::unbounded_channel::<ReferencePhase>();
+    let (down_tx, mut down_rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
+    let offset = Arc::new(AtomicU64::new(0));
+    let work = crate::providers::timing::with_test_observer(offset.clone(), phase_tx, async {
+        let response = request(&f, "/v1/chat/completions", streaming()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body().into_data_stream();
+        while let Some(chunk) = body.next().await {
+            down_tx.send(chunk.unwrap()).unwrap();
+        }
+    });
+    let drive = async {
+        gate.received.await.unwrap();
+        assert!(
+            phase_rx.try_recv().is_err(),
+            "headers arrived before release"
+        );
+        gate.headers.send(()).unwrap();
+        let headers = next_reference_phase(&mut phase_rx).await;
+        assert!(headers.0.is_some() && headers.1.is_none() && headers.2.is_none());
+        offset.store(100, Ordering::Relaxed);
+        gate.chunks
+            .send(Bytes::from_static(REFERENCE_CREATED))
+            .unwrap();
+        let created = next_reference_phase(&mut phase_rx).await;
+        assert_eq!(created.0, headers.0);
+        assert!(created.1.unwrap() > headers.0.unwrap() && created.2.is_none());
+        let first_downstream = tokio::time::timeout(Duration::from_secs(5), down_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&first_downstream).contains("chat.completion.chunk"));
+        assert_eq!(
+            next_reference_phase(&mut phase_rx).await,
+            created,
+            "first event replay keeps capture"
+        );
+        offset.store(150, Ordering::Relaxed);
+        gate.chunks
+            .send(Bytes::from_static(REFERENCE_HEARTBEAT))
+            .unwrap();
+        gate.chunks
+            .send(Bytes::from_static(REFERENCE_ROLE))
+            .unwrap();
+        assert_eq!(next_reference_phase(&mut phase_rx).await, created);
+        let _ = tokio::time::timeout(Duration::from_secs(5), down_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        offset.store(200, Ordering::Relaxed);
+        gate.chunks
+            .send(Bytes::from_static(REFERENCE_REASONING))
+            .unwrap();
+        assert_eq!(
+            next_reference_phase(&mut phase_rx).await,
+            created,
+            "reasoning must not set first text"
+        );
+        let _ = tokio::time::timeout(Duration::from_secs(5), down_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        offset.store(300, Ordering::Relaxed);
+        gate.chunks
+            .send(Bytes::from_static(REFERENCE_TEXT))
+            .unwrap();
+        let visible = next_reference_phase(&mut phase_rx).await;
+        assert_eq!((visible.0, visible.1), (headers.0, created.1));
+        assert!(visible.2.unwrap() > created.1.unwrap());
+        let _ = tokio::time::timeout(Duration::from_secs(5), down_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        offset.store(400, Ordering::Relaxed);
+        gate.chunks
+            .send(Bytes::from_static(REFERENCE_LATER_TEXT))
+            .unwrap();
+        assert_eq!(
+            next_reference_phase(&mut phase_rx).await,
+            visible,
+            "later text must keep first capture"
+        );
+        let _ = tokio::time::timeout(Duration::from_secs(5), down_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        offset.store(500, Ordering::Relaxed);
+        gate.chunks
+            .send(Bytes::from_static(REFERENCE_TERMINAL))
+            .unwrap();
+        assert_eq!(
+            next_reference_phase(&mut phase_rx).await,
+            visible,
+            "terminal must keep captures"
+        );
+        let _ = tokio::time::timeout(Duration::from_secs(5), down_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        visible
+    };
+    let (_, visible) = tokio::join!(work, drive);
     let row = f.state.db.query_one(ops::sql("SELECT response_headers_ms,first_event_ms,first_text_ms,first_token_at FROM request_executions ORDER BY started_at DESC LIMIT 1",vec![])).await.unwrap().unwrap();
-    let headers = row.try_get::<i64>("", "response_headers_ms").unwrap();
-    let event = row.try_get::<i64>("", "first_event_ms").unwrap();
-    let text = row.try_get::<i64>("", "first_text_ms").unwrap();
-    assert!(headers <= event && event <= text);
+    assert_eq!(
+        row.try_get::<i64>("", "response_headers_ms").unwrap(),
+        visible.0.unwrap()
+    );
+    assert_eq!(
+        row.try_get::<i64>("", "first_event_ms").unwrap(),
+        visible.1.unwrap()
+    );
+    assert_eq!(
+        row.try_get::<i64>("", "first_text_ms").unwrap(),
+        visible.2.unwrap()
+    );
     assert!(
         row.try_get::<Option<i64>>("", "first_token_at")
             .unwrap()

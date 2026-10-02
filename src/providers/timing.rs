@@ -35,6 +35,53 @@ pub fn visible_text(value: &Value) -> bool {
     })
 }
 
+/// The production clock is monotonic. Tests can offset observations per task
+/// while a composed upstream stream is held at independently released phases.
+pub fn capture_now() -> Instant {
+    let now = Instant::now();
+    #[cfg(test)]
+    {
+        TEST_OBSERVER
+            .try_with(|observer| {
+                now + std::time::Duration::from_millis(
+                    observer.offset.load(std::sync::atomic::Ordering::Relaxed),
+                )
+            })
+            .unwrap_or(now)
+    }
+    #[cfg(not(test))]
+    {
+        now
+    }
+}
+
+#[cfg(test)]
+struct TestObserver {
+    offset: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    sender: tokio::sync::mpsc::UnboundedSender<(Option<i64>, Option<i64>, Option<i64>)>,
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static TEST_OBSERVER: TestObserver;
+}
+
+#[cfg(test)]
+pub async fn with_test_observer<T>(
+    offset: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    sender: tokio::sync::mpsc::UnboundedSender<(Option<i64>, Option<i64>, Option<i64>)>,
+    future: impl std::future::Future<Output = T>,
+) -> T {
+    TEST_OBSERVER
+        .scope(TestObserver { offset, sender }, future)
+        .await
+}
+
+#[cfg(test)]
+pub fn observe_for_test(headers: Option<i64>, event: Option<i64>, text: Option<i64>) {
+    let _ = TEST_OBSERVER.try_with(|observer| observer.sender.send((headers, event, text)));
+}
+
 /// Capture one phase against the caller's monotonic origin. The explicit
 /// observation instant also permits deterministic phase-order tests.
 pub fn record_headers_at(origin: Instant, observed: Instant, slot: &mut Option<i64>) {
@@ -74,12 +121,22 @@ mod tests {
         assert_eq!((headers, event, text), (Some(5), None, None));
         super::record_event_at(
             origin,
+            at(10),
+            r#"{"choices":[],"object":"chat.completion.chunk"}"#,
+            &mut event,
+            &mut text,
+        );
+        assert_eq!((headers, event, text), (Some(5), Some(10), None));
+        super::record_event_at(origin, at(12), ": heartbeat", &mut event, &mut text);
+        assert_eq!((headers, event, text), (Some(5), Some(10), None));
+        super::record_event_at(
+            origin,
             at(15),
             r#"{"choices":[{"delta":{"role":"assistant"}}]}"#,
             &mut event,
             &mut text,
         );
-        assert_eq!((headers, event, text), (Some(5), Some(15), None));
+        assert_eq!((headers, event, text), (Some(5), Some(10), None));
         super::record_event_at(
             origin,
             at(25),
@@ -87,7 +144,7 @@ mod tests {
             &mut event,
             &mut text,
         );
-        assert_eq!((headers, event, text), (Some(5), Some(15), None));
+        assert_eq!((headers, event, text), (Some(5), Some(10), None));
         super::record_event_at(
             origin,
             at(45),
@@ -95,7 +152,7 @@ mod tests {
             &mut event,
             &mut text,
         );
-        assert_eq!((headers, event, text), (Some(5), Some(15), Some(45)));
+        assert_eq!((headers, event, text), (Some(5), Some(10), Some(45)));
         super::record_headers_at(origin, at(60), &mut headers);
         super::record_event_at(
             origin,
@@ -104,7 +161,9 @@ mod tests {
             &mut event,
             &mut text,
         );
-        assert_eq!((headers, event, text), (Some(5), Some(15), Some(45)));
+        assert_eq!((headers, event, text), (Some(5), Some(10), Some(45)));
+        super::record_event_at(origin, at(80), "[DONE]", &mut event, &mut text);
+        assert_eq!((headers, event, text), (Some(5), Some(10), Some(45)));
     }
 
     #[test]
