@@ -409,7 +409,7 @@ impl Attempt {
     pub fn response(&mut self, value: &Value) {
         self.response_with_usage(
             value,
-            Usage::parse_for(value, self.context.endpoint == "/v1/messages"),
+            crate::providers::usage::protocol_usage(&self.context.endpoint, value, false),
         );
     }
     /// Capture the client response as before, while accounting for measured source
@@ -442,7 +442,10 @@ impl Attempt {
         if let Some(value) = value.as_ref() {
             self.capture_response_id(value);
         }
-        let parsed = value
+        let source_report = value.as_ref().map(|value| {
+            crate::providers::usage::protocol_report(&self.context.endpoint, value, true)
+        });
+        let parsed = source_report
             .as_ref()
             .map(|value| Usage::parse_for(value, self.context.endpoint == "/v1/messages"))
             .unwrap_or_default();
@@ -455,7 +458,7 @@ impl Attempt {
             crate::providers::usage::final_report(&self.context.endpoint, value, terminal)
         });
         self.terminal_usage |= parsed.reported && final_report;
-        if let Some(value) = value.as_ref() {
+        if let Some(value) = source_report.as_ref() {
             self.usage
                 .merge_event(value, self.context.endpoint == "/v1/messages");
         }

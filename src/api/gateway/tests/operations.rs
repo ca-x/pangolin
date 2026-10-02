@@ -15819,3 +15819,261 @@ async fn reference_gateway_source_usage_bedrock_keeps_optional_presence() {
         );
     }
 }
+
+fn reference_source_envelope_body(gemini: bool, output: Option<i64>) -> Value {
+    if gemini {
+        let mut raw = json!({"candidates":[{"content":{"parts":[{"text":"OK"}]},"finishReason":"STOP"}],"usage":{"prompt_tokens":0,"completion_tokens":9}});
+        if let Some(output) = output {
+            raw["usageMetadata"] = json!({"promptTokenCount":3,"totalTokenCount":3+output,"candidatesTokenCount":0,"thoughtsTokenCount":output,"input_tokens":0,"output_tokens":99});
+        }
+        raw
+    } else {
+        let mut raw = json!({"choices":[{"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],"usageMetadata":{"promptTokenCount":3,"totalTokenCount":10}});
+        if let Some(output) = output {
+            raw["usage"] = json!({"prompt_tokens":3,"completion_tokens":output,"promptTokenCount":0,"totalTokenCount":99,"thoughtsTokenCount":99});
+        }
+        raw
+    }
+}
+async fn reference_source_envelope_gateway_case(gemini: bool) {
+    for output in [Some(7), None, Some(0)] {
+        let raw = reference_source_envelope_body(gemini, output);
+        let f = fixture(Router::new().fallback(post(move || {
+            let raw = raw.clone();
+            async move { Json(raw) }
+        })))
+        .await;
+        sql(
+            &f,
+            "UPDATE providers SET kind=?",
+            vec![if gemini { "gemini" } else { "openai" }.into()],
+        )
+        .await;
+        sql(&f,"UPDATE models SET pricing_configured=1,input_price_micros=0,output_price_micros=1000000; UPDATE api_keys SET budget_micros=100000",vec![]).await;
+        let endpoint = if gemini {
+            "/v1/chat/completions"
+        } else {
+            "/v1/messages"
+        };
+        let response = request(&f,endpoint,json!({"model":"public","messages":[{"role":"user","content":"hello"}],"max_tokens":16})).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let caller = json_body(response).await;
+        if gemini {
+            assert_eq!(caller["choices"][0]["message"]["content"], "OK");
+            assert_eq!(caller["usage"]["completion_tokens"], 0);
+        } else {
+            assert_eq!(caller["content"][0]["text"], "OK");
+            assert_eq!(
+                caller["usage"]["output_tokens"],
+                output.map_or(Value::Null, Value::from)
+            );
+        }
+        let row = f.state.db.query_one(ops::sql("SELECT u.output_tokens,u.pricing_status,u.usage_measurement_json,u.total_cost_micros,u.settlement_kind,e.reserved_micros FROM usage_logs u JOIN execution_facts e ON e.id=u.execution_id",vec![])).await.unwrap().unwrap();
+        let flags: Value =
+            serde_json::from_str(&row.try_get::<String>("", "usage_measurement_json").unwrap())
+                .unwrap();
+        assert_eq!(flags["output_tokens"], output.is_some());
+        assert_eq!(
+            row.try_get::<i64>("", "output_tokens").unwrap(),
+            output.unwrap_or(0)
+        );
+        assert_eq!(
+            row.try_get::<String>("", "pricing_status").unwrap(),
+            if output.is_some() {
+                "priced"
+            } else {
+                "incomplete_usage"
+            }
+        );
+        let cost = row.try_get::<i64>("", "total_cost_micros").unwrap();
+        if let Some(output) = output {
+            assert_eq!(cost, output);
+            assert_eq!(
+                row.try_get::<String>("", "settlement_kind").unwrap(),
+                "reported"
+            );
+        } else {
+            assert!(cost > 0);
+            assert_eq!(cost, row.try_get::<i64>("", "reserved_micros").unwrap());
+            assert_eq!(
+                row.try_get::<String>("", "settlement_kind").unwrap(),
+                "conservative"
+            );
+        }
+        assert_eq!(
+            count(&f, "SELECT SUM(spent_micros) AS n FROM api_keys").await,
+            cost
+        );
+    }
+}
+#[tokio::test]
+async fn reference_source_envelope_gateway_gemini_native_counters_own_cost() {
+    reference_source_envelope_gateway_case(true).await;
+}
+#[tokio::test]
+async fn reference_source_envelope_gateway_openai_missing_native_usage_keeps_hold() {
+    reference_source_envelope_gateway_case(false).await;
+}
+#[tokio::test]
+async fn reference_source_envelope_probe_gemini_native_counters_own_measurement() {
+    for output in [Some(7), None, Some(0)] {
+        reference_probe_output_case(
+            "gemini",
+            "chat",
+            "/v1/chat/completions",
+            reference_source_envelope_body(true, output).to_string(),
+            false,
+            output,
+        )
+        .await;
+    }
+}
+#[tokio::test]
+async fn reference_source_envelope_probe_openai_ignores_foreign_only_usage() {
+    for output in [Some(7), None, Some(0)] {
+        reference_probe_output_case(
+            "openai",
+            "chat",
+            "/v1/messages",
+            reference_source_envelope_body(false, output).to_string(),
+            false,
+            output,
+        )
+        .await;
+    }
+}
+async fn reference_source_envelope_stream_case(endpoint: &str) {
+    for output in [Some(7), None, Some(0)] {
+        let (kind, capability, first, mut last, done) = match endpoint {
+            "/v1/chat/completions" => (
+                "openai",
+                "chat",
+                json!({"choices":[{"delta":{"content":"OK"}}]}),
+                json!({"choices":[],"usageMetadata":{"promptTokenCount":3,"totalTokenCount":10}}),
+                "data: [DONE]\n\n",
+            ),
+            "/v1/responses" => (
+                "openai",
+                "responses",
+                json!({"type":"response.output_text.delta","delta":"OK"}),
+                json!({"type":"response.completed","response":{"status":"completed"},"usage":{"input_tokens":0,"output_tokens":9}}),
+                "",
+            ),
+            "/v1/messages" => (
+                "anthropic",
+                "messages",
+                json!({"type":"content_block_delta","delta":{"type":"text_delta","text":"OK"}}),
+                json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"message":{"usage":{"output_tokens":9}}}),
+                "data: {\"type\":\"message_stop\"}\n\n",
+            ),
+            _ => (
+                "gemini",
+                "gemini",
+                json!({"candidates":[{"content":{"parts":[{"text":"OK"}]}}]}),
+                json!({"candidates":[{"finishReason":"STOP"}],"usage":{"prompt_tokens":0,"completion_tokens":9}}),
+                "",
+            ),
+        };
+        if let Some(output) = output {
+            match endpoint {
+                "/v1/chat/completions" => {
+                    last["usage"] = json!({"prompt_tokens":3,"completion_tokens":output,"promptTokenCount":0,"totalTokenCount":99})
+                }
+                "/v1/responses" => {
+                    last["response"]["usage"] = json!({"input_tokens":3,"output_tokens":output,"promptTokenCount":0,"totalTokenCount":99})
+                }
+                "/v1/messages" => {
+                    last["usage"] =
+                        json!({"output_tokens":output,"promptTokenCount":0,"totalTokenCount":99})
+                }
+                _ => {
+                    last["usageMetadata"] = json!({"promptTokenCount":3,"totalTokenCount":3+output,"candidatesTokenCount":0,"thoughtsTokenCount":output,"output_tokens":99})
+                }
+            }
+        }
+        reference_probe_output_case(
+            kind,
+            capability,
+            endpoint,
+            format!("data: {first}\n\ndata: {last}\n\n{done}"),
+            true,
+            output,
+        )
+        .await;
+    }
+}
+#[tokio::test]
+async fn reference_source_envelope_stream_probe_chat_ignores_foreign_counters() {
+    reference_source_envelope_stream_case("/v1/chat/completions").await;
+}
+#[tokio::test]
+async fn reference_source_envelope_stream_probe_responses_uses_response_usage() {
+    reference_source_envelope_stream_case("/v1/responses").await;
+}
+#[tokio::test]
+async fn reference_source_envelope_stream_probe_anthropic_uses_delta_usage() {
+    reference_source_envelope_stream_case("/v1/messages").await;
+}
+#[tokio::test]
+async fn reference_source_envelope_stream_probe_gemini_uses_native_metadata() {
+    reference_source_envelope_stream_case("/v1beta/models:streamGenerateContent").await;
+}
+
+async fn reference_source_envelope_native_gemini_case(streamed: bool) {
+    let raw = json!({"candidates":[{"content":{"parts":[{"text":"OK"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":3,"totalTokenCount":10,"candidatesTokenCount":2,"thoughtsTokenCount":5},"usage":{"prompt_tokens":0,"completion_tokens":0}});
+    let body = if streamed {
+        format!("data: {raw}\n\n")
+    } else {
+        raw.to_string()
+    };
+    let f = fixture(Router::new().fallback(post(move || {
+        let body = body.clone();
+        async move {
+            (
+                [(
+                    header::CONTENT_TYPE,
+                    if streamed {
+                        "text/event-stream"
+                    } else {
+                        "application/json"
+                    },
+                )],
+                body,
+            )
+        }
+    })))
+    .await;
+    sql(&f,"UPDATE providers SET kind='gemini'; UPDATE models SET pricing_configured=1,input_price_micros=0,output_price_micros=1000000; UPDATE api_keys SET budget_micros=100000",vec![]).await;
+    let endpoint = if streamed {
+        "/v1beta/models/public:streamGenerateContent"
+    } else {
+        "/v1beta/models/public:generateContent"
+    };
+    let response=request(&f,endpoint,json!({"contents":[{"role":"user","parts":[{"text":"hi"}]}],"generationConfig":{"maxOutputTokens":16}})).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 8192).await.unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    assert!(
+        body.contains("usageMetadata") && body.contains("\"completion_tokens\":0"),
+        "native envelope changed"
+    );
+    let row=f.state.db.query_one(ops::sql("SELECT output_tokens,total_cost_micros,pricing_status,usage_measurement_json FROM usage_logs",vec![])).await.unwrap().unwrap();
+    assert_eq!(row.try_get::<i64>("", "output_tokens").unwrap(), 7);
+    assert_eq!(row.try_get::<i64>("", "total_cost_micros").unwrap(), 7);
+    assert_eq!(
+        row.try_get::<String>("", "pricing_status").unwrap(),
+        "priced"
+    );
+    let flags: Value =
+        serde_json::from_str(&row.try_get::<String>("", "usage_measurement_json").unwrap())
+            .unwrap();
+    assert_eq!(flags["output_tokens"], true);
+}
+#[tokio::test]
+async fn reference_source_envelope_native_gemini_nonstream_ignores_foreign_usage() {
+    reference_source_envelope_native_gemini_case(false).await;
+}
+#[tokio::test]
+async fn reference_source_envelope_native_gemini_stream_ignores_foreign_usage() {
+    reference_source_envelope_native_gemini_case(true).await;
+}

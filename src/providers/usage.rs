@@ -63,6 +63,105 @@ pub fn final_report(endpoint: &str, value: &Value, terminal: bool) -> bool {
     }
 }
 
+// These are the counter fields already understood by the checked Usage parser.
+// Keep OpenAI-compatible snake_case aliases, but never admit another protocol's
+// camelCase counters or search a different response container for missing data.
+const OPENAI_COUNTERS: &[&str] = &[
+    "input_tokens",
+    "prompt_tokens",
+    "output_tokens",
+    "completion_tokens",
+    "cache_read_input_tokens",
+    "cache_creation_input_tokens",
+    "prompt_cache_hit_tokens",
+    "request_units",
+    "input_tokens_details/cached_tokens",
+    "prompt_tokens_details/cached_tokens",
+    "input_tokens_details/cache_write_tokens",
+    "prompt_tokens_details/cache_write_tokens",
+    "prompt_tokens_details/cache_creation_tokens",
+    "cache_creation/ephemeral_1h_input_tokens",
+    "output_tokens_details/reasoning_tokens",
+    "completion_tokens_details/reasoning_tokens",
+    "input_tokens_details/image_tokens",
+    "prompt_tokens_details/image_tokens",
+    "output_tokens_details/image_tokens",
+    "completion_tokens_details/image_tokens",
+];
+const GEMINI_COUNTERS: &[&str] = &[
+    "promptTokenCount",
+    "candidatesTokenCount",
+    "totalTokenCount",
+    "cachedContentTokenCount",
+    "thoughtsTokenCount",
+];
+const ANTHROPIC_COUNTERS: &[&str] = &[
+    "input_tokens",
+    "output_tokens",
+    "cache_read_input_tokens",
+    "cache_creation_input_tokens",
+    "cache_creation/ephemeral_1h_input_tokens",
+];
+
+fn projected_report(counters: Option<&Value>, fields: &[&str]) -> Value {
+    let mut projected = serde_json::Map::new();
+    if let Some(counters) = counters.filter(|value| value.is_object()) {
+        for field in fields {
+            if let Some(value) = counters.pointer(&format!("/{field}")) {
+                if let Some((object, name)) = field.split_once('/') {
+                    projected
+                        .entry(object.to_owned())
+                        .or_insert_with(|| serde_json::json!({}))[name] = value.clone();
+                } else {
+                    projected.insert((*field).into(), value.clone());
+                }
+            }
+        }
+    }
+    serde_json::json!({"usage":projected})
+}
+
+/// Metrics-only projection from a known wire protocol. Keep the original event
+/// for framing, terminal decisions, response identifiers and body capture.
+/// Anthropic's delta type survives so its existing checked split-usage merge
+/// still distinguishes cumulative output from corrected input/cache components.
+pub fn protocol_report(endpoint: &str, value: &Value, streamed: bool) -> Value {
+    match endpoint {
+        "/v1beta/models:generateContent" | "/v1beta/models:streamGenerateContent" => {
+            projected_report(value.get("usageMetadata"), GEMINI_COUNTERS)
+        }
+        "/v1/messages" => {
+            let counters = if streamed && value["type"] == "message_start" {
+                value.pointer("/message/usage")
+            } else {
+                value.get("usage")
+            };
+            let mut report = projected_report(counters, ANTHROPIC_COUNTERS);
+            if streamed
+                && let Some(kind @ ("message_start" | "message_delta")) = value["type"].as_str()
+            {
+                report["type"] = Value::String(kind.into());
+            }
+            report
+        }
+        "/v1/responses" if streamed => {
+            projected_report(value.pointer("/response/usage"), OPENAI_COUNTERS)
+        }
+        _ => projected_report(value.get("usage"), OPENAI_COUNTERS),
+    }
+}
+
+pub fn protocol_usage(
+    endpoint: &str,
+    value: &Value,
+    streamed: bool,
+) -> crate::operations::pricing::Usage {
+    crate::operations::pricing::Usage::parse_for(
+        &protocol_report(endpoint, value, streamed),
+        endpoint == "/v1/messages",
+    )
+}
+
 /// Read quantities from the actual upstream protocol, before a compatibility
 /// transform fills absent counters or changes their meaning. The existing Usage
 /// parser retains validation, presence and checked cache/reasoning arithmetic.
@@ -74,7 +173,7 @@ pub fn response_usage(
     use super::ResponseTransform;
     use crate::operations::pricing::Usage;
     match transform {
-        ResponseTransform::Identity => Usage::parse_for(value, endpoint == "/v1/messages"),
+        ResponseTransform::Identity => protocol_usage(endpoint, value, false),
         ResponseTransform::Antigravity(inner) => value
             .get("response")
             .map(|value| response_usage(inner, value, endpoint))
@@ -96,12 +195,14 @@ pub fn response_usage(
             }
             Usage::parse_for(&serde_json::json!({"usage":counters}), true)
         }
-        // Gemini source totals include thoughts/cache; OpenAI source completion
-        // counts already include reasoning. The parser distinguishes native keys.
-        ResponseTransform::GeminiChat(_)
-        | ResponseTransform::GeminiEmbedding
-        | ResponseTransform::ChatGemini
-        | ResponseTransform::ChatMessages(_) => Usage::parse_for(value, false),
+        ResponseTransform::GeminiChat(_) | ResponseTransform::GeminiEmbedding => Usage::parse_for(
+            &projected_report(value.get("usageMetadata"), GEMINI_COUNTERS),
+            false,
+        ),
+        ResponseTransform::ChatGemini | ResponseTransform::ChatMessages(_) => Usage::parse_for(
+            &projected_report(value.get("usage"), OPENAI_COUNTERS),
+            false,
+        ),
     }
 }
 
@@ -149,5 +250,97 @@ mod tests {
             "/v1/chat/completions",
         );
         assert!(!malformed.reported && malformed.invalid);
+    }
+    #[test]
+    fn reference_source_envelope_gemini_ignores_foreign_containers_and_counters() {
+        let transform = ResponseTransform::GeminiChat("model".into());
+        for output in [Some(7), None, Some(0)] {
+            let mut raw = json!({"usage":{"prompt_tokens":0,"completion_tokens":9}});
+            if let Some(output) = output {
+                raw["usageMetadata"] = json!({"promptTokenCount":3,"totalTokenCount":3+output,"candidatesTokenCount":0,"thoughtsTokenCount":output,"input_tokens":0,"output_tokens":99});
+            }
+            let measured = response_usage(&transform, &raw, "/v1/chat/completions");
+            assert_eq!(measured.presence.output, output.is_some());
+            assert_eq!(measured.output, output.unwrap_or(0));
+            assert_eq!(measured.reported, output.is_some());
+            if output.is_some() {
+                assert_eq!(measured.input, 3);
+            }
+        }
+        let foreign_fields = response_usage(
+            &transform,
+            &json!({"usageMetadata":{"prompt_tokens":3,"completion_tokens":7}}),
+            "/v1/chat/completions",
+        );
+        assert!(!foreign_fields.reported && !foreign_fields.presence.output);
+    }
+
+    #[test]
+    fn reference_source_envelope_openai_ignores_foreign_containers_and_counters() {
+        let transform = ResponseTransform::ChatMessages("model".into());
+        for output in [Some(7), None, Some(0)] {
+            let mut raw = json!({"usageMetadata":{"promptTokenCount":3,"totalTokenCount":10}});
+            if let Some(output) = output {
+                raw["usage"] = json!({"prompt_tokens":3,"completion_tokens":output,"promptTokenCount":0,"totalTokenCount":99,"thoughtsTokenCount":99});
+            }
+            let measured = response_usage(&transform, &raw, "/v1/messages");
+            assert_eq!(measured.presence.output, output.is_some());
+            assert_eq!(measured.output, output.unwrap_or(0));
+            assert_eq!(measured.reported, output.is_some());
+            if output.is_some() {
+                assert_eq!(measured.input, 3);
+                assert_eq!(measured.reasoning, 0);
+            }
+        }
+        let foreign_fields = response_usage(
+            &transform,
+            &json!({"usage":{"promptTokenCount":3,"totalTokenCount":10}}),
+            "/v1/messages",
+        );
+        assert!(!foreign_fields.reported && !foreign_fields.presence.output);
+    }
+
+    #[test]
+    fn reference_source_envelope_openai_compatibility_fields_remain_measured() {
+        let measured = response_usage(
+            &ResponseTransform::ChatGemini,
+            &json!({"usage":{
+                "input_tokens":10,"output_tokens":7,"request_units":1,
+                "input_tokens_details":{"cached_tokens":2,"cache_write_tokens":1,"image_tokens":3},
+                "output_tokens_details":{"reasoning_tokens":4,"image_tokens":1}
+            }}),
+            "/v1beta/models:generateContent",
+        );
+        assert!(measured.reported && measured.presence.input && measured.presence.output);
+        assert_eq!(
+            (
+                measured.input,
+                measured.output,
+                measured.cache_read,
+                measured.cache_write,
+                measured.reasoning,
+                measured.units
+            ),
+            (10, 7, 2, 1, 4, 1)
+        );
+        assert_eq!((measured.image_input, measured.image_output), (3, 1));
+        let compatibility = response_usage(
+            &ResponseTransform::ChatMessages("model".into()),
+            &json!({"usage":{"prompt_tokens":10,"completion_tokens":7,"prompt_cache_hit_tokens":2,"prompt_tokens_details":{"cache_creation_tokens":1},"completion_tokens_details":{"reasoning_tokens":4}}}),
+            "/v1/messages",
+        );
+        assert!(
+            compatibility.reported && compatibility.presence.input && compatibility.presence.output
+        );
+        assert_eq!(
+            (
+                compatibility.input,
+                compatibility.output,
+                compatibility.cache_read,
+                compatibility.cache_write,
+                compatibility.reasoning
+            ),
+            (10, 7, 2, 1, 4)
+        );
     }
 }

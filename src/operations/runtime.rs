@@ -811,7 +811,7 @@ async fn probe_response(
                     &mut measured.first_text_ms,
                 );
                 output |= probe_stream_output(endpoint, &value);
-                let usage = super::pricing::Usage::parse(&value);
+                let usage = crate::providers::usage::protocol_usage(endpoint, &value, true);
                 if usage.reported
                     && usage.presence.output
                     && crate::providers::usage::final_report(endpoint, &value, is_terminal)
@@ -842,7 +842,8 @@ async fn probe_response(
             return Err("invalid_response");
         }
         // Measure native provider counters before a response transform can synthesize defaults.
-        let usage = super::pricing::Usage::parse_for(&raw, wire_endpoint == "/v1/messages");
+        let usage =
+            crate::providers::usage::response_usage(&prepared.response, &raw, wire_endpoint);
         let output_tokens = if selection.target.provider_kind == "bedrock" {
             raw.pointer("/usage/outputTokens")
                 .and_then(Value::as_i64)
