@@ -185,6 +185,46 @@ pub(crate) async fn principal(
         .ok_or(ApiError::Unauthorized)
 }
 
+/// Explicit API credentials take precedence for this read-only administrative
+/// boundary. Invalid credentials never fall back to a session or another header;
+/// valid API-key principals retain their own project and scopes.
+pub(crate) async fn principal_read_only(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<Principal, ApiError> {
+    let explicit = if let Some(authorization) = headers.get(header::AUTHORIZATION) {
+        Some(
+            authorization
+                .to_str()
+                .ok()
+                .and_then(|value| value.strip_prefix("Bearer "))
+                .ok_or(ApiError::Unauthorized)?,
+        )
+    } else if let Some(api_key) = headers.get("x-api-key") {
+        Some(api_key.to_str().map_err(|_| ApiError::Unauthorized)?)
+    } else {
+        None
+    };
+    if let Some(token) = explicit {
+        let key =
+            db::authenticate_api_key_read_only(&state.db, token, api::trusted_client_ip(headers))
+                .await?
+                .ok_or(ApiError::Unauthorized)?;
+        let scopes = serde_json::from_str::<Vec<String>>(&key.scopes).unwrap_or_default();
+        return Ok(Principal::api_key(
+            key.id,
+            key.project_id,
+            key.user_id,
+            scopes,
+        ));
+    }
+    let token = session_token(headers).ok_or(ApiError::Unauthorized)?;
+    let user = db::find_user_by_session(&state.db, token)
+        .await?
+        .ok_or(ApiError::Unauthorized)?;
+    Ok(Principal::session(user.id))
+}
+
 async fn list_projects(
     State(state): State<AppState>,
     headers: HeaderMap,

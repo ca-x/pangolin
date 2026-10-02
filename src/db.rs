@@ -534,6 +534,25 @@ pub async fn authenticate_api_key(
     token: &str,
     client_ip: Option<IpAddr>,
 ) -> Result<Option<ApiKeyCredential>> {
+    let Some(credential) = authenticate_api_key_read_only(db, token, client_ip).await? else {
+        return Ok(None);
+    };
+    db.execute(stmt(
+        "UPDATE api_keys SET last_used_at=? WHERE id=?",
+        vec![now().into(), credential.id.clone().into()],
+    ))
+    .await?;
+    Ok(Some(credential))
+}
+
+/// Validate an explicit API-key credential with the normal lifecycle, owner,
+/// expiry, IP, hash and budget checks, without recording a gateway use.
+/// This grants no scopes beyond the authenticated key's stored principal.
+pub async fn authenticate_api_key_read_only(
+    db: &DatabaseConnection,
+    token: &str,
+    client_ip: Option<IpAddr>,
+) -> Result<Option<ApiKeyCredential>> {
     let lookup_digest = crypto::token_hash(token);
     let credential = ApiKeyCredential::find_by_statement(stmt(
         "SELECT k.id,k.project_id,k.user_id,k.key_hash,k.scopes,k.budget_micros,k.spent_micros,k.enabled,k.expires_at,k.allowed_ips_json,k.denied_ips_json FROM api_keys k LEFT JOIN users u ON u.id=k.user_id WHERE k.lookup_digest=? AND k.lifecycle='active' AND (k.key_type NOT IN ('user','personal') OR (u.enabled=1 AND EXISTS (SELECT 1 FROM project_memberships membership WHERE membership.project_id=k.project_id AND membership.user_id=k.user_id AND membership.status='active')))",
@@ -557,11 +576,6 @@ pub async fn authenticate_api_key(
     {
         return Ok(None);
     }
-    db.execute(stmt(
-        "UPDATE api_keys SET last_used_at=? WHERE id=?",
-        vec![now().into(), credential.id.clone().into()],
-    ))
-    .await?;
     Ok(Some(credential))
 }
 

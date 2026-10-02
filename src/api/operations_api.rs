@@ -5253,23 +5253,10 @@ async fn client_models(
     Path((project, key_id)): Path<(String, String)>,
     Query(query): Query<ClientModelsQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    // This browser setup read delegates the *target* key's routing policy from a
-    // session, just like Playground. Never fall back to bearer authentication:
-    // that normal path updates last_used_at and is not a read-only setup action.
-    let mut session_headers = headers.clone();
-    session_headers.remove(http::header::AUTHORIZATION);
-    session_headers.remove("x-api-key");
-    let principal = actor_for(
-        &state,
-        &session_headers,
-        Some(&project),
-        "api_key:manage",
-        false,
-    )
-    .await?;
-    if principal.kind != crate::access::PrincipalKind::Session {
-        return Err(ApiError::Forbidden);
-    }
+    let principal = crate::access_api::principal_read_only(&state, &headers).await?;
+    crate::access::authorize(&state.db, &principal, Some(&project), "api_key:manage")
+        .await
+        .map_err(|_| ApiError::Forbidden)?;
     let endpoint = query.endpoint.as_str();
     if !matches!(
         endpoint,

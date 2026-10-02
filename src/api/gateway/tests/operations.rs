@@ -12785,7 +12785,7 @@ async fn reference_client_models_principal_project_and_adapter_boundaries() {
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
     assert_eq!(
         count(
             &f,
@@ -12818,5 +12818,223 @@ async fn reference_client_models_principal_project_and_adapter_boundaries() {
     assert_eq!(
         json_body(client_models_read(&f, &cookie, "/v1/messages&stream=true").await).await["models"],
         json!([])
+    );
+}
+
+#[tokio::test]
+async fn reference_client_models_readonly_bearer_authentication_and_normal_gateway_use() {
+    let f = fixture(success()).await;
+    let cookie = owner(&f).await;
+    let target = db::authenticate_api_key(&f.state.db, &f.token, None)
+        .await
+        .unwrap()
+        .unwrap();
+    let (caller, caller_token) = db::create_api_key(
+        &f.state.db,
+        &ApiKeyInput {
+            name: "setup administrator".into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    sql(
+        &f,
+        "UPDATE api_keys SET scopes='[\"api_key:manage\"]' WHERE id=?",
+        vec![caller.id.clone().into()],
+    )
+    .await;
+    let path = format!(
+        "/api/admin/v1/projects/{}/api-keys/{}/client-models?endpoint=/v1/chat/completions",
+        db::DEFAULT_PROJECT_ID,
+        target.id
+    );
+    sql(&f, "UPDATE api_keys SET last_used_at=NULL", vec![]).await;
+    // Administrative API-key principal succeeds with only its own project scopes.
+    for header in ["authorization", "x-api-key"] {
+        let value = if header == "authorization" {
+            format!("Bearer {caller_token}")
+        } else {
+            caller_token.clone()
+        };
+        let response = router(f.state.clone())
+            .oneshot(
+                Request::get(&path)
+                    .header(header, value)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{header}");
+        assert_eq!(json_body(response).await["models"][0]["id"], "public");
+        assert_eq!(
+            count(
+                &f,
+                "SELECT COUNT(*) AS n FROM api_keys WHERE last_used_at IS NOT NULL"
+            )
+            .await,
+            0
+        );
+    }
+    // Invalid/expired/denied explicit credentials cannot inherit owner-cookie scopes.
+    for (token, status) in [
+        ("invalid-token".to_owned(), StatusCode::UNAUTHORIZED),
+        (f.token.clone(), StatusCode::FORBIDDEN),
+    ] {
+        for header in ["authorization", "x-api-key"] {
+            let value = if header == "authorization" {
+                format!("Bearer {token}")
+            } else {
+                token.clone()
+            };
+            let response = router(f.state.clone())
+                .oneshot(
+                    Request::get(&path)
+                        .header(header, value)
+                        .header("cookie", format!("pangolin_session={cookie}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                status,
+                "explicit {header} must retain API authority"
+            );
+            assert_eq!(
+                count(
+                    &f,
+                    "SELECT COUNT(*) AS n FROM api_keys WHERE last_used_at IS NOT NULL"
+                )
+                .await,
+                0
+            );
+        }
+    }
+    for update in [
+        "expires_at=1",
+        "enabled=0",
+        "lifecycle='archived'",
+        "budget_micros=0",
+        "allowed_ips_json='[\"192.0.2.1\"]'",
+    ] {
+        sql(&f,"UPDATE api_keys SET expires_at=NULL,enabled=1,lifecycle='active',budget_micros=NULL,allowed_ips_json='[]' WHERE id=?",vec![caller.id.clone().into()]).await;
+        sql(
+            &f,
+            &format!("UPDATE api_keys SET {update} WHERE id=?"),
+            vec![caller.id.clone().into()],
+        )
+        .await;
+        let response = router(f.state.clone())
+            .oneshot(
+                Request::get(&path)
+                    .header("authorization", format!("Bearer {caller_token}"))
+                    .header("cookie", format!("pangolin_session={cookie}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{update}");
+        assert_eq!(
+            count(
+                &f,
+                "SELECT COUNT(*) AS n FROM api_keys WHERE last_used_at IS NOT NULL"
+            )
+            .await,
+            0
+        );
+    }
+    sql(&f,"INSERT INTO projects(id,name,slug,is_default,enabled,created_at,updated_at) VALUES('setup-caller-foreign','Foreign','setup-caller-foreign',0,1,1,1)",vec![]).await;
+    sql(&f,"UPDATE api_keys SET project_id='setup-caller-foreign',expires_at=NULL,enabled=1,lifecycle='active',budget_micros=NULL,allowed_ips_json='[]' WHERE id=?",vec![caller.id.clone().into()]).await;
+    let foreign = router(f.state.clone())
+        .oneshot(
+            Request::get(&path)
+                .header("authorization", format!("Bearer {caller_token}"))
+                .header("cookie", format!("pangolin_session={cookie}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(foreign.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        count(
+            &f,
+            "SELECT COUNT(*) AS n FROM api_keys WHERE last_used_at IS NOT NULL"
+        )
+        .await,
+        0
+    );
+    // The preexisting real gateway authentication still records actual key use.
+    let gateway = request(&f, "/v1/chat/completions", chat()).await;
+    assert_eq!(gateway.status(), StatusCode::OK);
+    assert_eq!(
+        count(
+            &f,
+            "SELECT COUNT(*) AS n FROM api_keys WHERE last_used_at IS NOT NULL"
+        )
+        .await,
+        1
+    );
+    assert_eq!(count(&f,"SELECT COUNT(*) AS n FROM api_keys WHERE name='setup administrator' AND last_used_at IS NOT NULL").await,0);
+}
+
+#[tokio::test]
+async fn reference_client_models_explicit_api_principal_never_inherits_session() {
+    let f = fixture(success()).await;
+    let cookie = owner(&f).await;
+    let key = db::authenticate_api_key(&f.state.db, &f.token, None)
+        .await
+        .unwrap()
+        .unwrap();
+    let path = format!(
+        "/api/admin/v1/projects/{}/api-keys/{}/client-models?endpoint=/v1/responses",
+        db::DEFAULT_PROJECT_ID,
+        key.id
+    );
+    sql(&f, "UPDATE api_keys SET last_used_at=NULL", vec![]).await;
+    for (authorization, expected) in [
+        ("Bearer invalid", StatusCode::UNAUTHORIZED),
+        ("Basic invalid", StatusCode::UNAUTHORIZED),
+        ("", StatusCode::UNAUTHORIZED),
+    ] {
+        let response = router(f.state.clone())
+            .oneshot(
+                Request::get(&path)
+                    .header("authorization", authorization)
+                    .header("x-api-key", &f.token)
+                    .header("cookie", format!("pangolin_session={cookie}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            expected,
+            "explicit invalid Authorization cannot use another credential"
+        );
+    }
+    let denied = router(f.state.clone())
+        .oneshot(
+            Request::get(&path)
+                .header("authorization", format!("Bearer {}", f.token))
+                .header("cookie", format!("pangolin_session={cookie}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        count(
+            &f,
+            "SELECT COUNT(*) AS n FROM api_keys WHERE last_used_at IS NOT NULL"
+        )
+        .await,
+        0
     );
 }
