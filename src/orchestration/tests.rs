@@ -2201,3 +2201,282 @@ fn reference_capability_review_image_inspection_stays_within_input_structure_and
         ))
     ));
 }
+
+#[tokio::test]
+async fn reference_privacy_structured_tools_preserve_types_and_protocol_identifiers() {
+    let f = database_fixture().await;
+    sql(&f, "INSERT INTO prompt_protection_rules(id,project_id,name,content_pattern,action,replacement,created_at,updated_at) VALUES('reference-private',?,'Private','secret-[0-9]+','redact','[MASKED]',0,0)", vec![f.key.project_id.clone().into()]).await;
+    let rules = protection::load(&f.db, &f.key.project_id).await.unwrap();
+    for (endpoint, mut body, pointer) in [
+        (
+            "/v1/chat/completions",
+            json!({"messages":[{"role":"assistant","tool_calls":[{"id":"call-1","type":"function","function":{"name":"lookup","arguments":"{\"signature\":\"secret-123\",\"count\":2,\"ok\":true}"}}]}]}),
+            "/messages/0/tool_calls/0/function/arguments",
+        ),
+        (
+            "/v1/responses",
+            json!({"input":[{"type":"function_call","call_id":"call-1","name":"lookup","arguments":"{\"signature\":\"secret-123\",\"count\":2,\"ok\":true}"}]}),
+            "/input/0/arguments",
+        ),
+        (
+            "/v1/messages",
+            json!({"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"call-1","name":"lookup","input":{"signature":"secret-123","count":2,"ok":true}}]}]}),
+            "/messages/0/content/0/input",
+        ),
+        (
+            "/v1beta/models:generateContent",
+            json!({"contents":[{"role":"model","parts":[{"functionCall":{"name":"lookup","args":{"signature":"secret-123","count":2,"ok":true}}}]}]}),
+            "/contents/0/parts/0/functionCall/args",
+        ),
+    ] {
+        let context = policy::context(&body, &HeaderMap::new(), endpoint, None);
+        protection::apply(&rules, &mut body, &context, &mut vec![]).unwrap();
+        let value = body.pointer(pointer).unwrap();
+        let payload = value
+            .as_str()
+            .map(|s| serde_json::from_str::<Value>(s).unwrap())
+            .unwrap_or_else(|| value.clone());
+        assert_eq!(
+            payload,
+            json!({"signature":"[MASKED]","count":2,"ok":true}),
+            "{endpoint}: {body}"
+        );
+        assert!(body.to_string().contains("lookup"));
+    }
+}
+
+#[tokio::test]
+async fn reference_privacy_structural_overflow_is_rejected_online() {
+    let f = database_fixture().await;
+    sql(&f, "INSERT INTO prompt_protection_rules(id,project_id,name,content_pattern,action,created_at,updated_at) VALUES('bounds',?,'Bounds','secret','deny',0,0)", vec![f.key.project_id.clone().into()]).await;
+    let rules = protection::load(&f.db, &f.key.project_id).await.unwrap();
+    let mut nested = json!("ordinary");
+    for _ in 0..33 {
+        nested = json!([nested]);
+    }
+    for mut body in [
+        json!({"messages":[{"role":"user","content":nested}]}),
+        json!({"messages":[{"role":"user","content":vec!["ordinary"; 4097]}]}),
+    ] {
+        let context = json!({"endpoint":"/v1/chat/completions"});
+        assert!(matches!(
+            protection::apply(&rules, &mut body, &context, &mut vec![]),
+            Err(Error::Invalid(_))
+        ));
+    }
+}
+
+#[tokio::test]
+async fn reference_privacy_continuations_are_only_exempt_at_native_typed_locations() {
+    let f = database_fixture().await;
+    sql(&f,"INSERT INTO prompt_protection_rules(id,project_id,name,content_pattern,action,replacement,created_at,updated_at) VALUES('continuation',?,'Continuation','secret-[0-9]+','redact','[MASKED]',0,0)",vec![f.key.project_id.clone().into()]).await;
+    let rules = protection::load(&f.db, &f.key.project_id).await.unwrap();
+    for (endpoint, mut body) in [
+        (
+            "/v1/messages",
+            json!({"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"secret-123","signature":"secret-456"},{"type":"redacted_thinking","data":"secret-789"}]},{"role":"user","content":"ordinary"}]}),
+        ),
+        (
+            "/v1/responses",
+            json!({"input":[{"type":"reasoning","encrypted_content":"secret-123"},{"type":"compaction","encrypted_content":"secret-456"},{"type":"function_call_output","call_id":"id","output":[{"type":"encrypted_content","encrypted_content":"secret-789"}]}]}),
+        ),
+        (
+            "/v1/chat/completions",
+            json!({"messages":[{"role":"assistant","thinking_blocks":[{"type":"thinking","thinking":"secret-123","signature":"secret-456"}],"reasoning_details":[{"type":"reasoning.encrypted","data":"secret-789"}],"tool_calls":[{"id":"call-1","type":"function","function":{"name":"lookup","arguments":"{}","provider_specific_fields":{"thought_signature":"secret-123"}},"extra_content":{"google":{"thought_signature":"secret-456"}}}]}]}),
+        ),
+        (
+            "/v1beta/models:generateContent",
+            json!({"contents":[{"role":"model","parts":[{"text":"ordinary","thoughtSignature":"secret-123"},{"functionCall":{"name":"lookup","args":{}},"thought_signature":"secret-456"}]}]}),
+        ),
+    ] {
+        let before = body.clone();
+        let context = policy::context(&body, &HeaderMap::new(), endpoint, None);
+        protection::apply(&rules, &mut body, &context, &mut vec![]).unwrap();
+        assert_eq!(body, before, "native replay changed on {endpoint}");
+    }
+    for (endpoint, mut body) in [
+        (
+            "/v1/messages",
+            json!({"messages":[{"role":"user","content":[{"type":"thinking","thinking":"secret-123","signature":"secret-456"}]},{"role":"assistant","content":[{"type":"tool_use","id":"id","name":"lookup","input":{"type":"thinking","signature":"secret-789"}}]}]}),
+        ),
+        (
+            "/v1/responses",
+            json!({"input":[{"role":"user","type":"reasoning","encrypted_content":"secret-123"},{"type":"function_call","call_id":"id","name":"lookup","arguments":"{\"encrypted_content\":\"secret-456\"}"},{"role":"user","type":"function_call_output","output":[{"type":"encrypted_content","encrypted_content":"secret-789"}]}]}),
+        ),
+        (
+            "/v1/chat/completions",
+            json!({"messages":[{"role":"user","reasoning_details":[{"type":"reasoning.encrypted","data":"secret-123"}],"content":"{\"signature\":\"secret-456\"}"},{"role":"assistant","tool_calls":[{"type":"function","function":{"name":"lookup","arguments":"{\"thought_signature\":\"secret-789\"}"}}]}]}),
+        ),
+        (
+            "/v1beta/models:generateContent",
+            json!({"contents":[{"role":"user","parts":[{"thoughtSignature":"secret-123"}]},{"role":"model","parts":[{"functionCall":{"name":"lookup","args":{"thoughtSignature":"secret-456"}}}]}]}),
+        ),
+    ] {
+        let context = policy::context(&body, &HeaderMap::new(), endpoint, None);
+        protection::apply(&rules, &mut body, &context, &mut vec![]).unwrap();
+        assert!(
+            !body.to_string().contains("secret-"),
+            "spoof bypass on {endpoint}: {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn reference_privacy_allowlists_policy_reasons_and_utf8_offsets_match_online() {
+    let f = database_fixture().await;
+    sql(&f,"INSERT INTO prompt_protection_rules(id,project_id,name,content_pattern,action,replacement,allowlist_json,role_pattern,scopes_json,test_mode,enabled,state,created_at,updated_at) VALUES
+    ('active',?,'Active','secret-[0-9]+','redact','[MASKED]','[\"secret-123\"]','^assistant$','{\"version\":1}',0,1,'active',0,0),
+    ('disabled',?,'Disabled','secret','deny',NULL,'[]',NULL,'{\"version\":1}',0,0,'active',1,1),
+    ('inactive',?,'Inactive','secret','deny',NULL,'[]',NULL,'{\"version\":1}',0,1,'archived',2,2),
+    ('scope',?,'Scope','secret','deny',NULL,'[]',NULL,'{\"version\":1,\"field\":\"/endpoint\",\"op\":\"eq\",\"value\":\"/v1/messages\"}',0,1,'active',3,3),
+    ('test',?,'Test','secret','deny',NULL,'[]',NULL,'{\"version\":1}',1,1,'active',4,4)",vec![f.key.project_id.clone().into();5]).await;
+    let body = json!({"messages":[{"role":"assistant","tool_calls":[{"id":"call-1","type":"function","function":{"name":"lookup","arguments":"{\"secret-999\":\"界 secret-123 secret-456\",\"number_string\":\"123456\",\"number\":123456}"}}]},{"role":"user","content":"secret-456"}]});
+    let preview = serde_json::to_value(
+        protection::request_preview(
+            &f.db,
+            &f.key.project_id,
+            "/v1/chat/completions",
+            body.clone(),
+        )
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(preview["findings"].as_array().unwrap().len(), 1);
+    assert_eq!(preview["findings"][0]["start"], 15); // UTF-8: 界=3 bytes, then space and 10-byte first span and space.
+    assert_eq!(preview["findings"][0]["end"], 25);
+    assert_eq!(
+        preview["findings"][0]["path"],
+        "/messages/0/tool_calls/0/function/arguments/$json/secret-999"
+    );
+    for reason in [
+        "allowlisted",
+        "role_mismatch",
+        "disabled",
+        "inactive",
+        "scope_mismatch",
+        "test_mode",
+    ] {
+        assert!(
+            preview["suppressed_findings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["reason"] == reason),
+            "missing {reason}: {preview}"
+        );
+    }
+    let rules = protection::load(&f.db, &f.key.project_id).await.unwrap();
+    let mut live = body.clone();
+    let context = policy::context(&body, &HeaderMap::new(), "/v1/chat/completions", None);
+    protection::apply(&rules, &mut live, &context, &mut vec![]).unwrap();
+    assert_eq!(live, preview["redacted_body"]);
+    let argument: Value = serde_json::from_str(
+        live["messages"][0]["tool_calls"][0]["function"]["arguments"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(argument["secret-999"], "界 secret-123 [MASKED]");
+    assert_eq!(argument["number"], 123456);
+    assert_eq!(argument["number_string"], "123456");
+    assert_eq!(live["messages"][1]["content"], "secret-456");
+}
+
+#[tokio::test]
+async fn reference_privacy_rejects_excess_findings_and_ambiguous_tool_json() {
+    let f = database_fixture().await;
+    sql(&f,"INSERT INTO prompt_protection_rules(id,project_id,name,content_pattern,action,replacement,created_at,updated_at) VALUES('limits',?,'Limits','secret','redact','[MASKED]',0,0)",vec![f.key.project_id.clone().into()]).await;
+    for body in [
+        json!({"messages":[{"role":"user","content":"secret ".repeat(513)}]}),
+        json!({"messages":[{"role":"assistant","tool_calls":[{"type":"function","function":{"name":"lookup","arguments":"{\"field\":\"ordinary\",\"field\":\"secret\"}"}}]}]}),
+        json!({"messages":[{"role":"assistant","tool_calls":[{"type":"function","function":{"name":"lookup","arguments":format!("{}0{}","[".repeat(128),"]".repeat(128))}}]}]}),
+    ] {
+        assert!(matches!(
+            protection::request_preview(&f.db, &f.key.project_id, "/v1/chat/completions", body)
+                .await,
+            Err(Error::Invalid(_))
+        ));
+    }
+    sql(
+        &f,
+        "UPDATE prompt_protection_rules SET content_pattern='^'",
+        vec![],
+    )
+    .await;
+    let preview = serde_json::to_value(
+        protection::request_preview(
+            &f.db,
+            &f.key.project_id,
+            "/v1/chat/completions",
+            json!({"messages":[{"role":"user","content":"text"}]}),
+        )
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        preview["redacted_body"]["messages"][0]["content"],
+        "[MASKED]text"
+    );
+}
+
+#[tokio::test]
+async fn reference_privacy_bounds_cumulative_paths_before_tool_key_amplification() {
+    let f = database_fixture().await;
+    sql(&f,"INSERT INTO prompt_protection_rules(id,project_id,name,content_pattern,action,replacement,created_at,updated_at) VALUES('path',?,'Path','secret','redact','[MASKED]',0,0)",vec![f.key.project_id.clone().into()]).await;
+    let rules = protection::load(&f.db, &f.key.project_id).await.unwrap();
+    let mut leaves = serde_json::Map::new();
+    for index in 0..512 {
+        leaves.insert(index.to_string(), json!("secret"));
+    }
+    for payload in [
+        json!({"界".repeat(1400):leaves}),
+        json!({"~".repeat(2100):[1,2,3]}),
+    ] {
+        for arguments in [payload.clone(), json!(payload.to_string())] {
+            let body = json!({"messages":[{"role":"assistant","tool_calls":[{"type":"function","function":{"name":"lookup","arguments":arguments}}]}]});
+            let mut live = body.clone();
+            let context = policy::context(&body, &HeaderMap::new(), "/v1/chat/completions", None);
+            let failure = protection::apply(&rules, &mut live, &context, &mut vec![]);
+            assert!(matches!(
+                failure,
+                Err(Error::Invalid("privacy inspection path exceeds 4096 bytes"))
+            ));
+            assert_eq!(
+                live, body,
+                "rejected path must not partially mutate request"
+            );
+            assert!(matches!(
+                protection::request_preview(&f.db, &f.key.project_id, "/v1/chat/completions", body)
+                    .await,
+                Err(Error::Invalid("privacy inspection path exceeds 4096 bytes"))
+            ));
+        }
+    }
+}
+
+#[tokio::test]
+async fn reference_privacy_chat_tool_results_preserve_numeric_types_and_detect_numeric_strings() {
+    let f = database_fixture().await;
+    sql(&f,"INSERT INTO prompt_protection_rules(id,project_id,name,content_pattern,action,replacement,role_pattern,created_at,updated_at) VALUES('tool-types',?,'Tool types','123456','redact','[MASKED]','^tool$',0,0)",vec![f.key.project_id.clone().into()]).await;
+    let body = json!({"messages":[{"role":"tool","tool_call_id":"call-123456","content":"{\"123456\":123456,\"flag\":true,\"signature\":\"123456\"}"}]});
+    let rules = protection::load(&f.db, &f.key.project_id).await.unwrap();
+    let context = policy::context(&body, &HeaderMap::new(), "/v1/chat/completions", None);
+    let mut live = body.clone();
+    protection::apply(&rules, &mut live, &context, &mut vec![]).unwrap();
+    let result: Value =
+        serde_json::from_str(live["messages"][0]["content"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        result,
+        json!({"123456":123456,"flag":true,"signature":"[MASKED]"})
+    );
+    assert_eq!(live["messages"][0]["tool_call_id"], "call-123456");
+    let preview = serde_json::to_value(
+        protection::request_preview(&f.db, &f.key.project_id, "/v1/chat/completions", body)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(preview["redacted_body"], live);
+}

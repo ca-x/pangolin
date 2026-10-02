@@ -255,6 +255,14 @@ pub(super) fn router(state: AppState) -> Router<AppState> {
             post(protection_preview).layer(axum::extract::DefaultBodyLimit::max(32 * 1024)),
         )
         .route(
+            "/api/admin/v1/projects/{project}/protection-request-preview",
+            post(protection_request_preview).layer(axum::extract::DefaultBodyLimit::max(68 * 1024)),
+        )
+        .route(
+            "/api/admin/v1/projects/{project}/operations/protection-templates",
+            get(protection_templates),
+        )
+        .route(
             "/api/admin/v1/projects/{project}/backup/export",
             post(export),
         )
@@ -1501,7 +1509,7 @@ fn query(resource: &str) -> Result<(&'static str, &'static str, &'static str), A
         "protection" => (
             "prompt_protection_rules",
             "project_id=?",
-            "json_object('id',id,'name',name,'description',description,'role_pattern',role_pattern,'content_pattern',content_pattern,'action',action,'replacement',replacement,'scopes',json(scopes_json),'test_mode',test_mode,'enabled',enabled,'state',state,'created_at',created_at,'updated_at',updated_at)",
+            "json_object('id',id,'name',name,'description',description,'role_pattern',role_pattern,'content_pattern',content_pattern,'action',action,'replacement',replacement,'scopes',json(scopes_json),'test_mode',test_mode,'enabled',enabled,'state',state,'allowlist',json(allowlist_json),'created_at',created_at,'updated_at',updated_at)",
         ),
         "health" => (
             "channel_health_state",
@@ -3092,6 +3100,42 @@ async fn protection_preview(
     Ok(Json(json!({ "rules": rules })))
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProtectionRequestPreviewInput {
+    endpoint: String,
+    body: Value,
+}
+async fn protection_request_preview(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project): Path<String>,
+    Json(input): Json<ProtectionRequestPreviewInput>,
+) -> Result<Json<Value>, ApiError> {
+    actor(&state, &headers, Some(&project), false).await?;
+    if !crate::providers::ENDPOINTS.contains(&input.endpoint.as_str()) {
+        return Err(ApiError::BadRequest("unsupported preview endpoint".into()));
+    }
+    let result = crate::orchestration::preview_protection_request(
+        &state.db,
+        &project,
+        &input.endpoint,
+        input.body,
+    )
+    .await?;
+    Ok(Json(
+        serde_json::to_value(result).map_err(|e| ApiError::Internal(e.into()))?,
+    ))
+}
+async fn protection_templates(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    actor(&state, &headers, Some(&project), false).await?;
+    Ok(Json(crate::orchestration::protection_templates()))
+}
+
 const PROFILE_TEMPLATE_DOCUMENT_BYTES: usize = 64 * 1024;
 const PROFILE_TEMPLATE_ITEMS: usize = 128;
 
@@ -4460,10 +4504,25 @@ async fn mutate(
                 .map_err(|_| ApiError::BadRequest("invalid protection rule scopes".into()))?;
             let current = transaction
                 .query_one(sql(
-                    "SELECT description,state FROM prompt_protection_rules WHERE id=? AND project_id=?",
+                    "SELECT description,state,allowlist_json FROM prompt_protection_rules WHERE id=? AND project_id=?",
                     vec![resource_id.clone().into(), project.clone().into()],
                 ))
                 .await?;
+            let allowlist = match value.get("allowlist") {
+                Some(value) => crate::orchestration::validate_allowlist(value)?,
+                None => current
+                    .as_ref()
+                    .map(|row| row.try_get::<String>("", "allowlist_json"))
+                    .transpose()?
+                    .map(|raw| {
+                        serde_json::from_str::<Value>(&raw)
+                            .map_err(|e| ApiError::Internal(e.into()))
+                    })
+                    .transpose()?
+                    .map(|value| crate::orchestration::validate_allowlist(&value))
+                    .transpose()?
+                    .unwrap_or_default(),
+            };
             let description = match value.get("description") {
                 None => current
                     .as_ref()
@@ -4495,7 +4554,7 @@ async fn mutate(
                     ));
                 }
             };
-            let changed = transaction.execute(sql("INSERT INTO prompt_protection_rules(id,project_id,name,description,role_pattern,content_pattern,action,replacement,scopes_json,test_mode,enabled,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,description=excluded.description,role_pattern=excluded.role_pattern,content_pattern=excluded.content_pattern,action=excluded.action,replacement=excluded.replacement,scopes_json=excluded.scopes_json,test_mode=excluded.test_mode,enabled=excluded.enabled,state=excluded.state,updated_at=excluded.updated_at WHERE prompt_protection_rules.project_id=excluded.project_id",vec![resource_id.clone().into(),project.clone().into(),text(&value,"name")?.into(),description.into(),value["role_pattern"].as_str().into(),text(&value,"content_pattern")?.into(),action.into(),value["replacement"].as_str().into(),scopes.to_string().into(),value["test_mode"].as_bool().unwrap_or(false).into(),value["enabled"].as_bool().unwrap_or(true).into(),state_value.into(),db::now().into(),db::now().into()])).await?.rows_affected();
+            let changed = transaction.execute(sql("INSERT INTO prompt_protection_rules(id,project_id,name,description,role_pattern,content_pattern,action,replacement,scopes_json,test_mode,enabled,state,allowlist_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,description=excluded.description,role_pattern=excluded.role_pattern,content_pattern=excluded.content_pattern,action=excluded.action,replacement=excluded.replacement,scopes_json=excluded.scopes_json,test_mode=excluded.test_mode,enabled=excluded.enabled,state=excluded.state,allowlist_json=excluded.allowlist_json,updated_at=excluded.updated_at WHERE prompt_protection_rules.project_id=excluded.project_id",vec![resource_id.clone().into(),project.clone().into(),text(&value,"name")?.into(),description.into(),value["role_pattern"].as_str().into(),text(&value,"content_pattern")?.into(),action.into(),value["replacement"].as_str().into(),scopes.to_string().into(),value["test_mode"].as_bool().unwrap_or(false).into(),value["enabled"].as_bool().unwrap_or(true).into(),state_value.into(),json!(allowlist).to_string().into(),db::now().into(),db::now().into()])).await?.rows_affected();
             if changed != 1 {
                 return Err(ApiError::Forbidden);
             }

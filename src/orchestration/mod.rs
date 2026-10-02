@@ -2,6 +2,7 @@
 //! observability consumes redacted `Decision`s and terminal attempt outcomes.
 pub mod affinity;
 pub mod compaction;
+mod inspection;
 pub mod policy;
 mod protection;
 mod repository;
@@ -17,7 +18,10 @@ use std::sync::Arc;
 
 use crate::models::{ApiKeyCredential, RouteTarget};
 use policy::{CircuitPolicy, Limits, Retry, Routing, StickyMode};
-pub use protection::preview as preview_protection;
+pub use protection::{
+    preview as preview_protection, request_preview as preview_protection_request,
+    templates as protection_templates, validate_allowlist,
+};
 pub use runtime::Runtime;
 
 #[derive(Debug, thiserror::Error)]

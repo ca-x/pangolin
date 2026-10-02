@@ -13082,3 +13082,348 @@ async fn reference_client_models_review_stream_condition_uses_actual_setup_conte
         );
     }
 }
+
+#[tokio::test]
+async fn reference_privacy_preview_is_transient_and_matches_online_tool_enforcement() {
+    let seen = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let capture = seen.clone();
+    let f = fixture(Router::new().route(
+        "/v1/chat/completions",
+        post(move |Json(body): Json<Value>| {
+            let capture = capture.clone();
+            async move {
+                capture.lock().await.push(body);
+                Json(json!({"choices":[{"message":{"content":"ok"}}]}))
+            }
+        }),
+    ))
+    .await;
+    let (cookie, _) = owner_principal(&f).await;
+    let project = db::DEFAULT_PROJECT_ID;
+    sql(&f, "INSERT INTO prompt_protection_rules(id,project_id,name,content_pattern,action,replacement,allowlist_json,created_at,updated_at) VALUES('reference-email',?,'Email','[a-z]+@example\\.test','redact','[MASKED]','[\"allowed@example.test\"]',0,0)", vec![project.into()]).await;
+    let before = count(&f, "SELECT COUNT(*) AS n FROM audit_events").await;
+    let body = json!({"model":"public","messages":[{"role":"assistant","tool_calls":[{"id":"call-1","type":"function","function":{"name":"lookup","arguments":"{\"signature\":\"transient@example.test\",\"other\":\"allowed@example.test\",\"count\":2}"}}]}]});
+    let path = format!("/api/admin/v1/projects/{project}/protection-request-preview");
+    let response = admin(
+        &f,
+        &cookie,
+        http::Method::POST,
+        &path,
+        json!({"endpoint":"/v1/chat/completions","body":body}),
+        true,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let preview = json_body(response).await;
+    assert_eq!(preview["decision"], "redact");
+    assert_eq!(preview["truncated"], false);
+    assert_eq!(preview["findings"].as_array().unwrap().len(), 1);
+    assert_eq!(preview["suppressed_findings"][0]["reason"], "allowlisted");
+    assert!(
+        !preview["findings"]
+            .to_string()
+            .contains("transient@example.test")
+    );
+    assert!(seen.lock().await.is_empty());
+    assert_eq!(
+        count(&f, "SELECT COUNT(*) AS n FROM audit_events").await,
+        before
+    );
+    assert_eq!(count(&f, "SELECT COUNT(*) AS n FROM requests").await, 0);
+    assert_eq!(
+        count(&f, "SELECT COUNT(*) AS n FROM response_sessions").await,
+        0
+    );
+    assert_eq!(
+        count(
+            &f,
+            "SELECT COUNT(*) AS n FROM audit_events WHERE details LIKE '%transient@example.test%'"
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        request(&f, "/v1/chat/completions", body).await.status(),
+        StatusCode::OK
+    );
+    let upstream = seen.lock().await;
+    assert_eq!(
+        upstream[0]["messages"],
+        preview["redacted_body"]["messages"]
+    );
+    assert_eq!(upstream[0]["messages"][0]["tool_calls"][0]["id"], "call-1");
+}
+
+#[tokio::test]
+async fn reference_privacy_preview_templates_and_allowlists_are_scoped_and_audited() {
+    let f = fixture(Router::new()).await;
+    let (cookie, _) = owner_principal(&f).await;
+    let project = db::DEFAULT_PROJECT_ID;
+    let path = format!("/api/admin/v1/projects/{project}/operations/protection-templates");
+    let templates = admin(&f, &cookie, http::Method::GET, &path, Value::Null, false).await;
+    assert_eq!(templates.status(), StatusCode::OK);
+    let templates = json_body(templates).await;
+    assert_eq!(templates["templates"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        count(&f, "SELECT COUNT(*) AS n FROM prompt_protection_rules").await,
+        0
+    );
+    let path = format!("/api/admin/v1/projects/{project}/operations/protection");
+    let mut rule = templates["templates"][0].clone();
+    rule["allowlist"] = json!(["allowed@example.test"]);
+    let saved = admin(&f, &cookie, http::Method::POST, &path, rule.clone(), true).await;
+    assert_eq!(saved.status(), StatusCode::OK);
+    let id = json_body(saved).await["id"].clone();
+    let listed =
+        json_body(admin(&f, &cookie, http::Method::GET, &path, Value::Null, false).await).await;
+    assert_eq!(listed["data"][0]["allowlist"], rule["allowlist"]);
+    assert_eq!(
+        count(
+            &f,
+            "SELECT COUNT(*) AS n FROM audit_events WHERE action='protection.save'"
+        )
+        .await,
+        1
+    );
+    for allowlist in [
+        json!([0]),
+        json!(vec!["a"; 65]),
+        json!(["界".repeat(86)]),
+        json!(null),
+    ] {
+        rule["id"] = id.clone();
+        rule["allowlist"] = allowlist;
+        assert_eq!(
+            admin(&f, &cookie, http::Method::POST, &path, rule.clone(), true)
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+}
+
+#[tokio::test]
+async fn reference_privacy_preview_all_native_tool_carriers_equal_mock_upstream_bodies() {
+    for (kind, endpoint, public_endpoint, body) in [
+        (
+            "openai",
+            "/v1/chat/completions",
+            "/v1/chat/completions",
+            json!({"model":"public","messages":[{"role":"assistant","tool_calls":[{"id":"secret-call-id","type":"function","function":{"name":"secret-tool-name","arguments":"{\"secret-key\":\"secret-value\",\"count\":2,\"flag\":false}"}}]}]}),
+        ),
+        (
+            "openai",
+            "/v1/responses",
+            "/v1/responses",
+            json!({"model":"public","input":[{"type":"function_call","call_id":"secret-call-id","name":"secret-tool-name","arguments":"{\"secret-key\":\"secret-value\",\"count\":2,\"flag\":false}"},{"type":"custom_tool_call","call_id":"secret-custom-id","name":"secret-tool-name","input":"secret-custom-value"},{"type":"function_call_output","call_id":"secret-call-id","output":{"arbitrary":{"signature":"secret-output-value","count":2}}}]}),
+        ),
+        (
+            "anthropic",
+            "/v1/messages",
+            "/v1/messages",
+            json!({"model":"public","max_tokens":24,"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"secret-call-id","name":"secret-tool-name","input":{"secret-key":"secret-value","count":2,"flag":false}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"secret-call-id","content":{"arbitrary":{"encrypted_content":"secret-output-value","count":2}}}]}]}),
+        ),
+        (
+            "gemini",
+            "/v1beta/models:generateContent",
+            "/v1beta/models/public:generateContent",
+            json!({"model":"public","contents":[{"role":"model","parts":[{"functionCall":{"name":"secret-tool-name","args":{"secret-key":"secret-value","count":2,"flag":false}}}]},{"role":"user","parts":[{"functionResponse":{"name":"secret-tool-name","response":{"arbitrary":{"signature":"secret-output-value","count":2}}}}]}]}),
+        ),
+    ] {
+        let seen = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let capture = seen.clone();
+        let f=fixture(Router::new().fallback(move |Json(body):Json<Value>| { let capture=capture.clone(); async move {
+            capture.lock().await.push(body);
+            Json(match endpoint {
+                "/v1/responses"=>json!({"id":"resp_reference","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}]}),
+                "/v1/messages"=>json!({"id":"msg_reference","type":"message","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn"}),
+                "/v1beta/models:generateContent"=>json!({"candidates":[{"content":{"parts":[{"text":"ok"}]},"finishReason":"STOP"}]}),
+                _=>json!({"choices":[{"message":{"content":"ok"}}]}),
+            })
+        }})).await;
+        sql(&f, "UPDATE providers SET kind=?", vec![kind.into()]).await;
+        sql(
+            &f,
+            "UPDATE models SET capabilities=?",
+            vec![
+                json!(["chat", "responses", "messages", "gemini"])
+                    .to_string()
+                    .into(),
+            ],
+        )
+        .await;
+        let (cookie, _) = owner_principal(&f).await;
+        sql(&f,"INSERT INTO prompt_protection_rules(id,project_id,name,content_pattern,action,replacement,created_at,updated_at) VALUES('native',?,'Native','secret-[a-z-]+','redact','[MASKED]',0,0)",vec![db::DEFAULT_PROJECT_ID.into()]).await;
+        let response = admin(
+            &f,
+            &cookie,
+            http::Method::POST,
+            &format!(
+                "/api/admin/v1/projects/{}/protection-request-preview",
+                db::DEFAULT_PROJECT_ID
+            ),
+            json!({"endpoint":endpoint,"body":body}),
+            true,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK, "preview {endpoint}");
+        let preview = json_body(response).await;
+        let mut native_body = body.clone();
+        if kind == "gemini" {
+            native_body.as_object_mut().unwrap().remove("model");
+        }
+        let response = request(&f, public_endpoint, native_body).await;
+        let status = response.status();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "gateway {endpoint}: {}",
+            json_body(response).await
+        );
+        let upstream = seen.lock().await;
+        let mut expected = preview["redacted_body"].clone();
+        if kind == "gemini" {
+            expected.as_object_mut().unwrap().remove("model");
+        } else {
+            expected["model"] = upstream[0]["model"].clone();
+        }
+        assert_eq!(
+            upstream[0], expected,
+            "online/preview differs on {endpoint}"
+        );
+        let output = upstream[0].to_string();
+        assert!(!output.contains("secret-value"));
+        assert!(!output.contains("secret-output-value"));
+        assert!(output.contains("secret-tool-name"));
+        assert!(output.contains("secret-key"));
+    }
+}
+
+#[tokio::test]
+async fn reference_privacy_preview_denial_limits_auth_and_samples_never_persist() {
+    let seen = Arc::new(AtomicUsize::new(0));
+    let capture = seen.clone();
+    let f = fixture(Router::new().route(
+        "/v1/chat/completions",
+        post(move || {
+            let capture = capture.clone();
+            async move {
+                capture.fetch_add(1, Ordering::Relaxed);
+                Json(json!({"choices":[{"message":{"content":"ok"}}]}))
+            }
+        }),
+    ))
+    .await;
+    let (cookie, owner_id) = owner_principal(&f).await;
+    let owner = access::Principal::session(owner_id);
+    let (_, manager) = access::create_scoped_api_key(
+        &f.state.db,
+        &owner,
+        &access::ScopedApiKeyInput {
+            name: "privacy-manager".into(),
+            project_id: db::DEFAULT_PROJECT_ID.into(),
+            key_type: "service".into(),
+            scopes: vec!["project:manage".into()],
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    sql(&f,"INSERT INTO projects(id,name,slug,is_default,enabled,created_at,updated_at) VALUES('privacy-foreign','Foreign','privacy-foreign',0,1,0,0)",vec![]).await;
+    sql(&f,"INSERT INTO prompt_protection_rules(id,project_id,name,content_pattern,action,created_at,updated_at) VALUES('deny',?,'Deny','transient-sample-sentinel','deny',0,0)",vec![db::DEFAULT_PROJECT_ID.into()]).await;
+    let path = format!(
+        "/api/admin/v1/projects/{}/protection-request-preview",
+        db::DEFAULT_PROJECT_ID
+    );
+    let sample = json!({"endpoint":"/v1/chat/completions","body":{"model":"public","messages":[{"role":"user","content":"transient-sample-sentinel"}]}});
+    let before = count(&f, "SELECT COUNT(*) AS n FROM audit_events").await;
+    let preview = admin(&f, &cookie, http::Method::POST, &path, sample.clone(), true).await;
+    assert_eq!(preview.status(), StatusCode::OK);
+    let preview = json_body(preview).await;
+    assert_eq!(preview["decision"], "deny");
+    assert_eq!(preview["findings"][0]["action"], "deny");
+    assert!(
+        !preview["findings"]
+            .to_string()
+            .contains("transient-sample-sentinel")
+    );
+    assert_eq!(seen.load(Ordering::Relaxed), 0);
+    let mut deep = json!("transient-sample-sentinel");
+    for _ in 0..33 {
+        deep = json!([deep]);
+    }
+    for body in [
+        json!({"messages":[{"role":"user","content":deep}]}),
+        json!({"messages":[{"role":"user","content":vec!["ordinary";4097]}]}),
+        json!({"messages":[{"role":"user","content":"transient-sample-sentinel ".repeat(513)}]}),
+        json!({"messages":[{"role":"user","content":"x".repeat(64*1024)}]}),
+    ] {
+        let response = admin(
+            &f,
+            &cookie,
+            http::Method::POST,
+            &path,
+            json!({"endpoint":"/v1/chat/completions","body":body}),
+            true,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+    for target in [
+        "protection-request-preview",
+        "operations/protection-templates",
+    ] {
+        let response = router(f.state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(if target.starts_with("operations") {
+                        http::Method::GET
+                    } else {
+                        http::Method::POST
+                    })
+                    .uri(format!("/api/admin/v1/projects/privacy-foreign/{target}"))
+                    .header("authorization", format!("Bearer {manager}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(sample.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+    let unauthenticated = router(f.state.clone())
+        .oneshot(
+            Request::post(&path)
+                .header("content-type", "application/json")
+                .body(Body::from(sample.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        count(&f, "SELECT COUNT(*) AS n FROM audit_events").await,
+        before
+    );
+    for table in [
+        "requests",
+        "request_executions",
+        "response_sessions",
+        "usage_logs",
+        "operation_jobs",
+    ] {
+        assert_eq!(
+            count(&f, &format!("SELECT COUNT(*) AS n FROM {table}")).await,
+            0,
+            "preview persisted in {table}"
+        );
+    }
+    assert_eq!(count(&f,"SELECT COUNT(*) AS n FROM audit_events WHERE details LIKE '%transient-sample-sentinel%'").await,0);
+    assert_eq!(
+        request(&f, "/v1/chat/completions", sample["body"].clone())
+            .await
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(seen.load(Ordering::Relaxed), 0);
+}
