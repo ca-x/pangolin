@@ -4,7 +4,7 @@
 
 **Goal:** Deliver the seven reviewed improvements as tested, usable Pangolin gateway/control-plane/console behavior.
 
-**Architecture:** Extend existing services with one additive SQLite migration and bounded typed metadata. Keep DuckDB derived, provider network I/O outside transactions, and project/key policy before routing. Existing native forwarding, stream commitment, budgets and immutable price references remain authoritative.
+**Architecture:** Extend existing services with additive SQLite migrations29–31 and bounded typed metadata. Keep DuckDB derived, provider network I/O outside transactions, and project/key policy before routing. Existing native forwarding, stream commitment, budgets and immutable price references remain authoritative.
 
 **Tech Stack:** Rust 1.98/edition 2024, Axum 0.8, SeaORM/SQLite, bundled DuckDB, existing LiteLLM Rust pin; React 19, Mantine/Radix, TanStack Query/Table, pnpm 11. No new dependencies required.
 
@@ -57,11 +57,11 @@ assert_eq!(row.try_get::<i64>("", "count")?, 3);
 Focused command: `cargo test --locked reference_schema`.
 **Commit:** `feat(db): add reference adoption metadata and migration contracts`.
 
-- [ ] **Step 1: Write the named behavioral regressions below and run the focused command before implementing.** Record expected RED output in the task report. Use existing composed mock fixtures; do not weaken tests to bless the implementation.
-- [ ] **Step 2: Implement the contract in the listed files, preserving existing defaults and public compatibility where specified.** Apply only this task's required changes.
-- [ ] **Step 3: Run focused GREEN verification, then the relevant full suite once.** Backend tasks: `cargo fmt --all -- --check`, `cargo test --locked`. Frontend tasks: `pnpm --dir web lint`, `pnpm --dir web test`, `pnpm --dir web build`. New source may be formatted with `cargo fmt --all` before checks. Capture exact commands, exit codes and relevant counts.
-- [ ] **Step 4: Read your own diff for scope, typed boundaries, leaked content and regressions; fix findings and repeat only covering checks.** Commit the implementation/tests atomically with the conventional subject specified below. Never include controller-owned specs/plans/docs in a source implementation commit.
-- [ ] **Step 5: Write the task report, including RED/GREEN evidence, changed files, self-review and concerns.** Return DONE/DONE_WITH_CONCERNS/BLOCKED/NEEDS_CONTEXT plus commit and one-line test summary. No worker-spawned agents or reviewers.
+- [x] **Step 1: Write the named behavioral regressions below and run the focused command before implementing.** Record expected RED output in the task report. Use existing composed mock fixtures; do not weaken tests to bless the implementation.
+- [x] **Step 2: Implement the contract in the listed files, preserving existing defaults and public compatibility where specified.** Apply only this task's required changes.
+- [x] **Step 3: Run focused GREEN verification, then the relevant full suite once.** Backend tasks: `cargo fmt --all -- --check`, `cargo test --locked`. Frontend tasks: `pnpm --dir web lint`, `pnpm --dir web test`, `pnpm --dir web build`. New source may be formatted with `cargo fmt --all` before checks. Capture exact commands, exit codes and relevant counts.
+- [x] **Step 4: Read your own diff for scope, typed boundaries, leaked content and regressions; fix findings and repeat only covering checks.** Commit the implementation/tests atomically with the conventional subject specified below. Never include controller-owned specs/plans/docs in a source implementation commit.
+- [x] **Step 5: Write the task report, including RED/GREEN evidence, changed files, self-review and concerns.** Return DONE/DONE_WITH_CONCERNS/BLOCKED/NEEDS_CONTEXT plus commit and one-line test summary. No worker-spawned agents or reviewers.
 
 ## Task 2: Protocol/model/credential probes and honest timing
 
@@ -83,11 +83,11 @@ assert!(visible_text(&json!({"type":"response.output_text.delta","delta":"OK"}))
 Focused: `cargo test --locked reference_probe`; `cargo test --locked reference_timing`.
 **Commit:** `feat(observability): measure protocol probes and first text accurately`.
 
-- [ ] **Step 1: Write the named behavioral regressions below and run the focused command before implementing.** Record expected RED output in the task report. Use existing composed mock fixtures; do not weaken tests to bless the implementation.
-- [ ] **Step 2: Implement the contract in the listed files, preserving existing defaults and public compatibility where specified.** Apply only this task's required changes.
-- [ ] **Step 3: Run focused GREEN verification, then the relevant full suite once.** Backend tasks: `cargo fmt --all -- --check`, `cargo test --locked`. Frontend tasks: `pnpm --dir web lint`, `pnpm --dir web test`, `pnpm --dir web build`. New source may be formatted with `cargo fmt --all` before checks. Capture exact commands, exit codes and relevant counts.
-- [ ] **Step 4: Read your own diff for scope, typed boundaries, leaked content and regressions; fix findings and repeat only covering checks.** Commit the implementation/tests atomically with the conventional subject specified below. Never include controller-owned specs/plans/docs in a source implementation commit.
-- [ ] **Step 5: Write the task report, including RED/GREEN evidence, changed files, self-review and concerns.** Return DONE/DONE_WITH_CONCERNS/BLOCKED/NEEDS_CONTEXT plus commit and one-line test summary. No worker-spawned agents or reviewers.
+- [x] **Step 1: Write the named behavioral regressions below and run the focused command before implementing.** Record expected RED output in the task report. Use existing composed mock fixtures; do not weaken tests to bless the implementation.
+- [x] **Step 2: Implement the contract in the listed files, preserving existing defaults and public compatibility where specified.** Apply only this task's required changes.
+- [x] **Step 3: Run focused GREEN verification, then the relevant full suite once.** Backend tasks: `cargo fmt --all -- --check`, `cargo test --locked`. Frontend tasks: `pnpm --dir web lint`, `pnpm --dir web test`, `pnpm --dir web build`. New source may be formatted with `cargo fmt --all` before checks. Capture exact commands, exit codes and relevant counts.
+- [x] **Step 4: Read your own diff for scope, typed boundaries, leaked content and regressions; fix findings and repeat only covering checks.** Commit the implementation/tests atomically with the conventional subject specified below. Never include controller-owned specs/plans/docs in a source implementation commit.
+- [x] **Step 5: Write the task report, including RED/GREEN evidence, changed files, self-review and concerns.** Return DONE/DONE_WITH_CONCERNS/BLOCKED/NEEDS_CONTEXT plus commit and one-line test summary. No worker-spawned agents or reviewers.
 
 ## Task 3: Credential visibility snapshots and conservative route metadata
 
@@ -111,11 +111,11 @@ assert_eq!(aggregate_limits(&[Some(100), None]), None);
 Adapt helper name to the focused projection module, keeping behavior. Focused commands: `cargo test --locked reference_inventory`; `cargo test --locked reference_metadata`; `cargo test --locked reference_capability`.
 **Commit:** `feat(routing): discover credential models and aggregate route capabilities`.
 
-- [ ] **Step 1: Write the named behavioral regressions below and run the focused command before implementing.** Record expected RED output in the task report. Use existing composed mock fixtures; do not weaken tests to bless the implementation.
-- [ ] **Step 2: Implement the contract in the listed files, preserving existing defaults and public compatibility where specified.** Apply only this task's required changes.
-- [ ] **Step 3: Run focused GREEN verification, then the relevant full suite once.** Backend tasks: `cargo fmt --all -- --check`, `cargo test --locked`. Frontend tasks: `pnpm --dir web lint`, `pnpm --dir web test`, `pnpm --dir web build`. New source may be formatted with `cargo fmt --all` before checks. Capture exact commands, exit codes and relevant counts.
-- [ ] **Step 4: Read your own diff for scope, typed boundaries, leaked content and regressions; fix findings and repeat only covering checks.** Commit the implementation/tests atomically with the conventional subject specified below. Never include controller-owned specs/plans/docs in a source implementation commit.
-- [ ] **Step 5: Write the task report, including RED/GREEN evidence, changed files, self-review and concerns.** Return DONE/DONE_WITH_CONCERNS/BLOCKED/NEEDS_CONTEXT plus commit and one-line test summary. No worker-spawned agents or reviewers.
+- [x] **Step 1: Write the named behavioral regressions below and run the focused command before implementing.** Record expected RED output in the task report. Use existing composed mock fixtures; do not weaken tests to bless the implementation.
+- [x] **Step 2: Implement the contract in the listed files, preserving existing defaults and public compatibility where specified.** Apply only this task's required changes.
+- [x] **Step 3: Run focused GREEN verification, then the relevant full suite once.** Backend tasks: `cargo fmt --all -- --check`, `cargo test --locked`. Frontend tasks: `pnpm --dir web lint`, `pnpm --dir web test`, `pnpm --dir web build`. New source may be formatted with `cargo fmt --all` before checks. Capture exact commands, exit codes and relevant counts.
+- [x] **Step 4: Read your own diff for scope, typed boundaries, leaked content and regressions; fix findings and repeat only covering checks.** Commit the implementation/tests atomically with the conventional subject specified below. Never include controller-owned specs/plans/docs in a source implementation commit.
+- [x] **Step 5: Write the task report, including RED/GREEN evidence, changed files, self-review and concerns.** Return DONE/DONE_WITH_CONCERNS/BLOCKED/NEEDS_CONTEXT plus commit and one-line test summary. No worker-spawned agents or reviewers.
 
 ## Task 4: Client setup read API and quick-connect dialog
 
@@ -137,11 +137,11 @@ expect(generateClientSetup({ client: 'claude', baseUrl: 'https://gateway.example
 Match exported function names to this contract or report exact produced signatures. Focused: `cargo test --locked reference_client_models`; `pnpm --dir web test -- src/clientSetup.test.ts src/pages/ClientSetupDialog.test.tsx`.
 **Commit:** `feat(console): add safe client setup for project API keys`.
 
-- [ ] **Step 1: Write the named behavioral regressions below and run the focused command before implementing.** Record expected RED output in the task report. Use existing composed mock fixtures; do not weaken tests to bless the implementation.
-- [ ] **Step 2: Implement the contract in the listed files, preserving existing defaults and public compatibility where specified.** Apply only this task's required changes.
-- [ ] **Step 3: Run focused GREEN verification, then the relevant full suite once.** Backend tasks: `cargo fmt --all -- --check`, `cargo test --locked`. Frontend tasks: `pnpm --dir web lint`, `pnpm --dir web test`, `pnpm --dir web build`. New source may be formatted with `cargo fmt --all` before checks. Capture exact commands, exit codes and relevant counts.
-- [ ] **Step 4: Read your own diff for scope, typed boundaries, leaked content and regressions; fix findings and repeat only covering checks.** Commit the implementation/tests atomically with the conventional subject specified below. Never include controller-owned specs/plans/docs in a source implementation commit.
-- [ ] **Step 5: Write the task report, including RED/GREEN evidence, changed files, self-review and concerns.** Return DONE/DONE_WITH_CONCERNS/BLOCKED/NEEDS_CONTEXT plus commit and one-line test summary. No worker-spawned agents or reviewers.
+- [x] **Step 1: Write the named behavioral regressions below and run the focused command before implementing.** Record expected RED output in the task report. Use existing composed mock fixtures; do not weaken tests to bless the implementation.
+- [x] **Step 2: Implement the contract in the listed files, preserving existing defaults and public compatibility where specified.** Apply only this task's required changes.
+- [x] **Step 3: Run focused GREEN verification, then the relevant full suite once.** Backend tasks: `cargo fmt --all -- --check`, `cargo test --locked`. Frontend tasks: `pnpm --dir web lint`, `pnpm --dir web test`, `pnpm --dir web build`. New source may be formatted with `cargo fmt --all` before checks. Capture exact commands, exit codes and relevant counts.
+- [x] **Step 4: Read your own diff for scope, typed boundaries, leaked content and regressions; fix findings and repeat only covering checks.** Commit the implementation/tests atomically with the conventional subject specified below. Never include controller-owned specs/plans/docs in a source implementation commit.
+- [x] **Step 5: Write the task report, including RED/GREEN evidence, changed files, self-review and concerns.** Return DONE/DONE_WITH_CONCERNS/BLOCKED/NEEDS_CONTEXT plus commit and one-line test summary. No worker-spawned agents or reviewers.
 
 ## Task 5: Structured privacy traversal, allowlists and request dry run
 
@@ -162,11 +162,11 @@ let payload = json!({"messages":[{"role":"assistant","tool_calls":[{"id":"call-1
 Focused: `cargo test --locked reference_privacy`; `cargo test --locked reference_privacy_preview`.
 **Commit:** `feat(privacy): inspect structured tool content and explain request dry runs`.
 
-- [ ] **Step 1: Write the named behavioral regressions below and run the focused command before implementing.** Record expected RED output in the task report. Use existing composed mock fixtures; do not weaken tests to bless the implementation.
-- [ ] **Step 2: Implement the contract in the listed files, preserving existing defaults and public compatibility where specified.** Apply only this task's required changes.
-- [ ] **Step 3: Run focused GREEN verification, then the relevant full suite once.** Backend tasks: `cargo fmt --all -- --check`, `cargo test --locked`. Frontend tasks: `pnpm --dir web lint`, `pnpm --dir web test`, `pnpm --dir web build`. New source may be formatted with `cargo fmt --all` before checks. Capture exact commands, exit codes and relevant counts.
-- [ ] **Step 4: Read your own diff for scope, typed boundaries, leaked content and regressions; fix findings and repeat only covering checks.** Commit the implementation/tests atomically with the conventional subject specified below. Never include controller-owned specs/plans/docs in a source implementation commit.
-- [ ] **Step 5: Write the task report, including RED/GREEN evidence, changed files, self-review and concerns.** Return DONE/DONE_WITH_CONCERNS/BLOCKED/NEEDS_CONTEXT plus commit and one-line test summary. No worker-spawned agents or reviewers.
+- [x] **Step 1: Write the named behavioral regressions below and run the focused command before implementing.** Record expected RED output in the task report. Use existing composed mock fixtures; do not weaken tests to bless the implementation.
+- [x] **Step 2: Implement the contract in the listed files, preserving existing defaults and public compatibility where specified.** Apply only this task's required changes.
+- [x] **Step 3: Run focused GREEN verification, then the relevant full suite once.** Backend tasks: `cargo fmt --all -- --check`, `cargo test --locked`. Frontend tasks: `pnpm --dir web lint`, `pnpm --dir web test`, `pnpm --dir web build`. New source may be formatted with `cargo fmt --all` before checks. Capture exact commands, exit codes and relevant counts.
+- [x] **Step 4: Read your own diff for scope, typed boundaries, leaked content and regressions; fix findings and repeat only covering checks.** Commit the implementation/tests atomically with the conventional subject specified below. Never include controller-owned specs/plans/docs in a source implementation commit.
+- [x] **Step 5: Write the task report, including RED/GREEN evidence, changed files, self-review and concerns.** Return DONE/DONE_WITH_CONCERNS/BLOCKED/NEEDS_CONTEXT plus commit and one-line test summary. No worker-spawned agents or reviewers.
 
 ## Task 6: Persist safe per-attempt conversion and affinity diagnostics
 
@@ -186,11 +186,11 @@ assert_eq!(execution["conversion_diagnostics"][0]["code"], "unsupported_request_
 Use specific fixed codes for supported known rejection cases; keep a generic safe code for unknown shapes. Focused: `cargo test --locked reference_conversion_diagnostics`; `cargo test --locked reference_affinity_diagnostics`.
 **Commit:** `feat(trace): explain protocol conversion and affinity per attempt`.
 
-- [ ] **Step 1: Write the named behavioral regressions below and run the focused command before implementing.** Record expected RED output in the task report. Use existing composed mock fixtures; do not weaken tests to bless the implementation.
-- [ ] **Step 2: Implement the contract in the listed files, preserving existing defaults and public compatibility where specified.** Apply only this task's required changes.
-- [ ] **Step 3: Run focused GREEN verification, then the relevant full suite once.** Backend tasks: `cargo fmt --all -- --check`, `cargo test --locked`. Frontend tasks: `pnpm --dir web lint`, `pnpm --dir web test`, `pnpm --dir web build`. New source may be formatted with `cargo fmt --all` before checks. Capture exact commands, exit codes and relevant counts.
-- [ ] **Step 4: Read your own diff for scope, typed boundaries, leaked content and regressions; fix findings and repeat only covering checks.** Commit the implementation/tests atomically with the conventional subject specified below. Never include controller-owned specs/plans/docs in a source implementation commit.
-- [ ] **Step 5: Write the task report, including RED/GREEN evidence, changed files, self-review and concerns.** Return DONE/DONE_WITH_CONCERNS/BLOCKED/NEEDS_CONTEXT plus commit and one-line test summary. No worker-spawned agents or reviewers.
+- [x] **Step 1: Write the named behavioral regressions below and run the focused command before implementing.** Record expected RED output in the task report. Use existing composed mock fixtures; do not weaken tests to bless the implementation.
+- [x] **Step 2: Implement the contract in the listed files, preserving existing defaults and public compatibility where specified.** Apply only this task's required changes.
+- [x] **Step 3: Run focused GREEN verification, then the relevant full suite once.** Backend tasks: `cargo fmt --all -- --check`, `cargo test --locked`. Frontend tasks: `pnpm --dir web lint`, `pnpm --dir web test`, `pnpm --dir web build`. New source may be formatted with `cargo fmt --all` before checks. Capture exact commands, exit codes and relevant counts.
+- [x] **Step 4: Read your own diff for scope, typed boundaries, leaked content and regressions; fix findings and repeat only covering checks.** Commit the implementation/tests atomically with the conventional subject specified below. Never include controller-owned specs/plans/docs in a source implementation commit.
+- [x] **Step 5: Write the task report, including RED/GREEN evidence, changed files, self-review and concerns.** Return DONE/DONE_WITH_CONCERNS/BLOCKED/NEEDS_CONTEXT plus commit and one-line test summary. No worker-spawned agents or reviewers.
 
 ## Task 7: Pricing completeness and missing-price budget enforcement
 
@@ -216,11 +216,11 @@ assert_eq!(upstream_calls.load(std::sync::atomic::Ordering::SeqCst), 0); // for 
 Focused: `cargo test --locked reference_pricing`; `cargo test --locked reference_missing_price_budget`.
 **Commit:** `feat(accounting): distinguish missing prices from confirmed free usage`.
 
-- [ ] **Step 1: Write the named behavioral regressions below and run the focused command before implementing.** Record expected RED output in the task report. Use existing composed mock fixtures; do not weaken tests to bless the implementation.
-- [ ] **Step 2: Implement the contract in the listed files, preserving existing defaults and public compatibility where specified.** Apply only this task's required changes.
-- [ ] **Step 3: Run focused GREEN verification, then the relevant full suite once.** Backend tasks: `cargo fmt --all -- --check`, `cargo test --locked`. Frontend tasks: `pnpm --dir web lint`, `pnpm --dir web test`, `pnpm --dir web build`. New source may be formatted with `cargo fmt --all` before checks. Capture exact commands, exit codes and relevant counts.
-- [ ] **Step 4: Read your own diff for scope, typed boundaries, leaked content and regressions; fix findings and repeat only covering checks.** Commit the implementation/tests atomically with the conventional subject specified below. Never include controller-owned specs/plans/docs in a source implementation commit.
-- [ ] **Step 5: Write the task report, including RED/GREEN evidence, changed files, self-review and concerns.** Return DONE/DONE_WITH_CONCERNS/BLOCKED/NEEDS_CONTEXT plus commit and one-line test summary. No worker-spawned agents or reviewers.
+- [x] **Step 1: Write the named behavioral regressions below and run the focused command before implementing.** Record expected RED output in the task report. Use existing composed mock fixtures; do not weaken tests to bless the implementation.
+- [x] **Step 2: Implement the contract in the listed files, preserving existing defaults and public compatibility where specified.** Apply only this task's required changes.
+- [x] **Step 3: Run focused GREEN verification, then the relevant full suite once.** Backend tasks: `cargo fmt --all -- --check`, `cargo test --locked`. Frontend tasks: `pnpm --dir web lint`, `pnpm --dir web test`, `pnpm --dir web build`. New source may be formatted with `cargo fmt --all` before checks. Capture exact commands, exit codes and relevant counts.
+- [x] **Step 4: Read your own diff for scope, typed boundaries, leaked content and regressions; fix findings and repeat only covering checks.** Commit the implementation/tests atomically with the conventional subject specified below. Never include controller-owned specs/plans/docs in a source implementation commit.
+- [x] **Step 5: Write the task report, including RED/GREEN evidence, changed files, self-review and concerns.** Return DONE/DONE_WITH_CONCERNS/BLOCKED/NEEDS_CONTEXT plus commit and one-line test summary. No worker-spawned agents or reviewers.
 
 ## Task 8: Operational probe and model-inventory console
 
@@ -239,11 +239,11 @@ Credentials show safe known/stale/unmeasured model-inventory status and last suc
 **RED/GREEN tests:** choose credential/protocol/stream posts correct job payload; stale selection cleared on project change; unknown times and nonstream TPS dash; old header timing labeled separately; fresh/stale/unknown discovery labels; known false vs unknown metadata; query failures/retry/empty states; both translations. Focused: `pnpm --dir web exec vitest run src/pages/referenceProbe.test.tsx src/pages/referenceInventory.test.tsx` (create these meaningful integration tests).
 **Commit:** `feat(console): expose protocol probes and credential model inventory`.
 
-- [ ] **Step 1: Write the named behavioral regressions below and run the focused command before implementing.** Record expected RED output in the task report. Use existing composed mock fixtures; do not weaken tests to bless the implementation.
-- [ ] **Step 2: Implement the contract in the listed files, preserving existing defaults and public compatibility where specified.** Apply only this task's required changes.
-- [ ] **Step 3: Run focused GREEN verification, then the relevant full suite once.** Backend tasks: `cargo fmt --all -- --check`, `cargo test --locked`. Frontend tasks: `pnpm --dir web lint`, `pnpm --dir web test`, `pnpm --dir web build`. New source may be formatted with `cargo fmt --all` before checks. Capture exact commands, exit codes and relevant counts.
-- [ ] **Step 4: Read your own diff for scope, typed boundaries, leaked content and regressions; fix findings and repeat only covering checks.** Commit the implementation/tests atomically with the conventional subject specified below. Never include controller-owned specs/plans/docs in a source implementation commit.
-- [ ] **Step 5: Write the task report, including RED/GREEN evidence, changed files, self-review and concerns.** Return DONE/DONE_WITH_CONCERNS/BLOCKED/NEEDS_CONTEXT plus commit and one-line test summary. No worker-spawned agents or reviewers.
+- [x] **Step 1: Write the named behavioral regressions below and run the focused command before implementing.** Record expected RED output in the task report. Use existing composed mock fixtures; do not weaken tests to bless the implementation.
+- [x] **Step 2: Implement the contract in the listed files, preserving existing defaults and public compatibility where specified.** Apply only this task's required changes.
+- [x] **Step 3: Run focused GREEN verification, then the relevant full suite once.** Backend tasks: `cargo fmt --all -- --check`, `cargo test --locked`. Frontend tasks: `pnpm --dir web lint`, `pnpm --dir web test`, `pnpm --dir web build`. New source may be formatted with `cargo fmt --all` before checks. Capture exact commands, exit codes and relevant counts.
+- [x] **Step 4: Read your own diff for scope, typed boundaries, leaked content and regressions; fix findings and repeat only covering checks.** Commit the implementation/tests atomically with the conventional subject specified below. Never include controller-owned specs/plans/docs in a source implementation commit.
+- [x] **Step 5: Write the task report, including RED/GREEN evidence, changed files, self-review and concerns.** Return DONE/DONE_WITH_CONCERNS/BLOCKED/NEEDS_CONTEXT plus commit and one-line test summary. No worker-spawned agents or reviewers.
 
 ## Task 9: Privacy, diagnostics and pricing console surfaces
 
@@ -260,11 +260,11 @@ Model editing can confirm intentional free pricing (pricing_configured) with exp
 **RED/GREEN tests:** structured sample posts correct endpoint/body; invalid JSON/oversize blocks; suppression/path/decision localized; close clears sample; templates opt-in save audit API path; allowlist inline errors; diagnostics shown without payload; cross-attempt entries do not merge; missing price vs explicit free vs legacy/conservative; nonzero model edits and unrelated edits preserve pricing_configured; query error/retry/empty and zh/en. Focused tests named `referencePrivacy.test.tsx`, `referenceDiagnostics.test.tsx`, `referencePricing.test.tsx`.
 **Commit:** `feat(console): explain privacy decisions diagnostics and pricing completeness`.
 
-- [ ] **Step 1: Write the named behavioral regressions below and run the focused command before implementing.** Record expected RED output in the task report. Use existing composed mock fixtures; do not weaken tests to bless the implementation.
-- [ ] **Step 2: Implement the contract in the listed files, preserving existing defaults and public compatibility where specified.** Apply only this task's required changes.
-- [ ] **Step 3: Run focused GREEN verification, then the relevant full suite once.** Backend tasks: `cargo fmt --all -- --check`, `cargo test --locked`. Frontend tasks: `pnpm --dir web lint`, `pnpm --dir web test`, `pnpm --dir web build`. New source may be formatted with `cargo fmt --all` before checks. Capture exact commands, exit codes and relevant counts.
-- [ ] **Step 4: Read your own diff for scope, typed boundaries, leaked content and regressions; fix findings and repeat only covering checks.** Commit the implementation/tests atomically with the conventional subject specified below. Never include controller-owned specs/plans/docs in a source implementation commit.
-- [ ] **Step 5: Write the task report, including RED/GREEN evidence, changed files, self-review and concerns.** Return DONE/DONE_WITH_CONCERNS/BLOCKED/NEEDS_CONTEXT plus commit and one-line test summary. No worker-spawned agents or reviewers.
+- [x] **Step 1: Write the named behavioral regressions below and run the focused command before implementing.** Record expected RED output in the task report. Use existing composed mock fixtures; do not weaken tests to bless the implementation.
+- [x] **Step 2: Implement the contract in the listed files, preserving existing defaults and public compatibility where specified.** Apply only this task's required changes.
+- [x] **Step 3: Run focused GREEN verification, then the relevant full suite once.** Backend tasks: `cargo fmt --all -- --check`, `cargo test --locked`. Frontend tasks: `pnpm --dir web lint`, `pnpm --dir web test`, `pnpm --dir web build`. New source may be formatted with `cargo fmt --all` before checks. Capture exact commands, exit codes and relevant counts.
+- [x] **Step 4: Read your own diff for scope, typed boundaries, leaked content and regressions; fix findings and repeat only covering checks.** Commit the implementation/tests atomically with the conventional subject specified below. Never include controller-owned specs/plans/docs in a source implementation commit.
+- [x] **Step 5: Write the task report, including RED/GREEN evidence, changed files, self-review and concerns.** Return DONE/DONE_WITH_CONCERNS/BLOCKED/NEEDS_CONTEXT plus commit and one-line test summary. No worker-spawned agents or reviewers.
 
 ## Task 10: Documentation, fresh gates and release-binary browser QA
 

@@ -52,7 +52,7 @@ API-key RPM counts logical requests; channel RPM counts every upstream attempt. 
 
 Circuit failures are isolated by channel and resolved upstream model, recorded in a moving failure window. Recovery admits one probe; success closes the circuit, failure reopens it, cancellation releases the probe without classifying client cancellation as a provider failure. Local admission rejection does not create a circuit failure.
 
-Profile budgets aggregate existing SQLite API-key spend and serialize requests sharing the budget. Budget-limited streaming remains explicitly unavailable until provider-neutral streaming settlement is implemented. Persisted `channel_health_state` and `provider_quota_snapshots` are consumed here; scheduled probes, quota collection and durable execution/cost accounting belong to the operations task.
+Profile budgets aggregate existing SQLite API-key spend and serialize requests sharing the budget. Supported conversational streams use conservative reservations and exact settlement only with valid final source usage; cancellation, interruption or unavailable required usage retains the conservative charge. Persisted `channel_health_state` and `provider_quota_snapshots` are consumed here; scheduled probes, quota collection and durable execution/cost accounting belong to the operations task.
 
 ## Conditions, model rules and overrides
 
@@ -97,3 +97,9 @@ Completed Responses outputs and normalized inputs are encrypted with Pangolin's 
 The cache is derived acceleration. Every restore checks the authoritative row's scope and expiry and validates encrypted ownership, version and envelope revision. Another key, expired response or missing response ID fails explicitly instead of forwarding an unscoped upstream identifier. Restoring history removes transport status fields, preserves tool/message ordering and keeps current instructions. Persistence completes before a streamed terminal event is delivered.
 
 Limits: 30-minute expiry, 1 MiB plaintext per record, 128 records per key, 10,000 records and 256 MiB encrypted state globally; hot cache is weighted to 32 MiB. Writes prune expired/old records transactionally. Oversized records are not persisted. Reopening SQLite and reloading the same master key restores continuity. Responses compact/WebSocket transports consume this boundary in the protocol task.
+
+## Credential visibility and model facts
+
+Candidate configuration and matching credential inventory are read together in a short scoped SQLite transaction. Discovery-managed models require a matching successful snapshot, including stale last-known-good observations. Manual models use current matching snapshots: a model confirmed by one current key is excluded from another known key that omits it; a manual name unknown to every eligible current snapshot retains existing authorization/compatibility checks. Disabled/rotated credentials cannot reuse foreign or stale identity observations.
+
+`GET /v1/models?include_metadata=true&endpoint=...` conservatively aggregates eligible candidate facts. A known false restricts, true requires all candidates known true, otherwise unknown; known limits take the minimum and known sets intersect. These cards do not grant request eligibility. Actual tools/media/stream/output-limit features and policy conditions are checked again before forwarding. Source-bound quantity evidence and attempt-local conversion/affinity explanations are documented in [operations.md](operations.md).

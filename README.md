@@ -22,6 +22,8 @@ Pangolin (Chinese name 鲮鲤) is a single-binary AI API aggregation gateway. It
 - Thread → Trace → Request → Execution → Usage/Cost observability end to end, plus an explainable routing preview
 - SeaORM + SQLite as the authoritative record system, DuckDB as an independent analytical projection; encrypted per-project and whole-instance backup and restore
 - Site-level and API-key-level request logging policy that keeps sensitive bodies out by default, with optional exact session replay and compaction
+- Protocol/credential/model probes with honest header/event/text timing; per-credential model inventory and conservative model facts
+- Key connection snippets, structured protection previews/allowlists/templates, attempt diagnostics and independent price/quantity completeness
 - Web setup wizard or unattended environment-variable initialization
 - Bilingual Chinese/English console, system/light/dark modes, and 16 interface styles × 20 colour palettes
 - Embedded React console in a single binary and a non-root Docker image
@@ -144,7 +146,7 @@ pnpm --dir web dev
 - Upstream API keys are encrypted with XChaCha20-Poly1305; passwords and virtual API keys are hashed with Argon2id.
 - Request and response body capture is off by default. Assess privacy, compliance and disk usage before setting `PANGOLIN_CAPTURE_PAYLOADS=true`.
 - The current supported release targets single-node deployment. The SQLite and DuckDB files must not be shared for writing between multiple Pangolin processes.
-- A budgeted virtual key re-checks and settles its balance serially per key; streaming requests are not allowed for budget keys because streamed consumption cannot be settled reliably. A single non-streaming request can still overshoot a very small remaining balance — budgets are a cost guardrail, not a prepaid ledger.
+- Hard-budget keys/profiles require configured pricing and reserve a conservative bound before provider I/O. Supported conversational streams settle valid final source usage; cancellation, interruption or unavailable required usage retains a separately labeled conservative charge. Historical amounts and immutable price versions are not re-priced.
 - Request events are retained for 30 days by default and can be adjusted with `PANGOLIN_OBSERVATION_RETENTION_DAYS`; when DuckDB is unavailable the gateway keeps proxying and reports `degraded` in health checks and metrics.
 - Gateway IP allow/deny policy is scoped to each API key. Pangolin intentionally has no instance-wide IP blocklist or request-log “ban IP” action; enforce a site-wide network boundary at the reverse proxy or host firewall. See [ADR 0004](docs/adr/0004-api-key-scoped-ip-policy.md).
 
@@ -165,6 +167,8 @@ These open source projects were studied deliberately during design and implement
 - [QuantumNous/new-api](https://github.com/QuantumNous/new-api) (AGPL-3.0; evaluated at commit `972aed1972820389ea0b603ca58f03f846fbf790`): studied channel/model presets, group multipliers, token management, affinity rules and operational interactions only; no AGPL source code or assets were copied.
 - [farion1231/cc-switch](https://github.com/farion1231/cc-switch/tree/main/src-tauri/src/proxy) (MIT; evaluated at commit `06082e189d65e6d6dbadc35dacdac1ce6c79d89a`): reference for Rust proxy pipeline, failover, usage, media and session handling design.
 - [yetone/magpie](https://github.com/yetone/magpie) (MIT; evaluated at commit `ea20c2db594187540b11c3a4c1821eab8dd571f2`): reference for explaining model routing and conversion as a visible path, and for brief, purposeful route feedback. Pangolin's implementation uses its own components and motion rules.
+
+- [Calcium-Ion/AstrLink](https://github.com/Calcium-Ion/AstrLink) (root Apache-2.0; evaluated at `5f6da6bbf84aa860118fd2ce39acf2f0ebde8f47`): behaviour reference for client setup, structured privacy decisions, protocol probes and pricing explanations. Core/RelayKit AGPL modules, project code and image assets were excluded.
 
 Pangolin is an independent implementation and is not affiliated with, or endorsed by, any of these projects or their maintainers. Third-party trademarks, copyrights and licences remain with their respective owners.
 

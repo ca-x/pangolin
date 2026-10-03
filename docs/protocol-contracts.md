@@ -65,7 +65,7 @@ Gemini control objects use the canonical camelCase names (`generationConfig`, `s
 
 Multipart requests are limited to 64 MiB and 128 fields; duplicate text field names fail explicitly, while repeated file fields retain each file. Buffered upstream responses retain the existing 16 MiB bound. Streaming has a 1 MiB frame bound and never retries after downstream commitment.
 
-Budget-limited keys/profiles still reject streaming until usage settlement is available. Media endpoints also reject budget-limited keys/profiles and TPM policies because token-only price estimates cannot reliably account for image/audio/video units. Nontext TPM requests fail explicitly. Text keeps conservative byte-plus-output reservations; an operator-provided `PANGOLIN_TOKENIZER_CL100K` rank file enables LiteLLM token counting for recognized GPT-4/GPT-3.5 text-chat shapes. Other models and shapes retain the conservative reservation. Token counts use a bounded memory cache containing hashes/counts, not prompt text. Redis caching is not enabled.
+Supported conversational streams use conservative hard-budget reservations and final source-usage settlement. Hard-budget media requires configured flat/unit prices and trustworthy bounded image/video/speech quantities; uploaded media with unknown duration requires flat pricing. TPM policies still reject unsupported nontext quantities. Nontext TPM requests fail explicitly. Text keeps conservative byte-plus-output reservations; an operator-provided `PANGOLIN_TOKENIZER_CL100K` rank file enables LiteLLM token counting for recognized GPT-4/GPT-3.5 text-chat shapes. Other models and shapes retain the conservative reservation. Token counts use a bounded memory cache containing hashes/counts, not prompt text. Redis caching is not enabled.
 
 ## Upstream reuse and test evidence
 
@@ -76,3 +76,9 @@ The independent fixture table lives at `src/api/gateway/tests/fixtures/axonhub_p
 These providers are **contract-tested**, not live-tested. Realtime remains AxonHub's upstream Todo.
 
 The versioned offline catalog, online subscriptions, signatures, local overrides and setup metadata are documented in [catalog.md](catalog.md). Catalog breadth does not imply that every listed vendor has a live adapter.
+
+## Source measurements and structured protection
+
+Source protocol fields determine usage before generic response conversion, and native/SSE accounting uses the same source-bound counter projection. Foreign protocol containers and compatibility zeros are retained where native forwarding requires them, but cannot become measured counters. Gemini total/thought semantics, OpenAI compatible detail aliases and Anthropic split-cache/input reports use checked presence/arithmetic. Original response/event values still control forwarding, terminals, IDs and durable sessions. Quantity availability is independently exposed in `usage_measurement`; known cost never proves an unreported counter was zero.
+
+Structured protection applies to supported conversational/tool text across Chat, Responses, Messages and Gemini. JSON keys, typed values, IDs, media and recognized native opaque continuation remain intact; ordinary user/tool signature-named strings are inspectable. Invalid replay carriers and duplicate tool JSON keys reject explicitly. This is structure recognition, not signature verification or OCR. The full-request preview applies the same traversal with endpoint/body context only; its bounds, transient sample handling and attempt diagnostics are described in [operations.md](operations.md).

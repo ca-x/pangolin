@@ -22,6 +22,8 @@ Pangolin（中文正式名称“鲮鲤”）是一款单二进制 AI API 聚合�
 - Thread → Trace → Request → Execution → Usage/Cost 全链路观测与可解释路由预览
 - SeaORM + SQLite 权威主库，DuckDB 独立派生分析库；项目与整实例加密备份/恢复
 - 站点与 API Key 级请求日志策略，默认不保存敏感正文；可选精确会话回放与压缩
+- 按协议、凭据和模型探测，区分响应头、首事件和首文本时序；按凭据保存模型库存，保守展示模型能力
+- Key 连接配置片段、结构化隐私预览/精确允许列表/模板、逐次执行诊断，以及独立的价格与用量完整性
 - Web 初始化向导或环境变量无人值守初始化
 - 中英文、system/light/dark，以及 16 种界面风格 × 20 套配色
 - 内嵌 React 控制台，单二进制与非 root Docker 镜像
@@ -128,7 +130,7 @@ pnpm --dir web dev
 - 上游 API Key 使用 XChaCha20-Poly1305 加密；密码和虚拟 API Key 使用 Argon2id 哈希。
 - 请求/响应正文采集默认关闭。设置 `PANGOLIN_CAPTURE_PAYLOADS=true` 前请评估隐私、合规和磁盘占用。
 - 当前支持版本面向单节点部署。SQLite/DuckDB 文件不能由多个 Pangolin 进程共享写入。
-- 带预算的虚拟 Key 会按 Key 串行执行余额复查与结算；为了避免无法可靠结算的流式消耗，预算 Key 不允许流式请求。单个非流式请求仍可能超过极小的剩余余额，预算用于成本护栏而非预付费硬账本。
+- 硬预算 Key/Profile 要求已配置价格，并在上游调用前预留保守上限。支持的会话流式请求按有效的原生最终用量结算；取消、中断或缺少必需用量时保留并标明保守结算。历史金额和不可变价格版本不会重新计价。
 - 请求事件默认保留 30 天，可用 `PANGOLIN_OBSERVATION_RETENTION_DAYS` 调整；DuckDB 不可用时网关继续提供代理服务，并在健康检查与指标中报告 degraded。
 - 网关 IP 允许/拒绝策略按 API 密钥生效。Pangolin 有意不提供实例级 IP 黑名单或请求日志中的“封禁 IP”操作；站点级网络边界应在反向代理或主机防火墙实施。参见 [ADR 0004](docs/adr/0004-api-key-scoped-ip-policy.md)。
 
@@ -148,6 +150,8 @@ pnpm --dir web dev
 - [ca-x/raindrop](https://github.com/ca-x/raindrop)（MIT；评估 commit `73948bd650d2aa6b117b4ad63af6aff8b24e2938`）：参考嵌入式 React、原生多平台二进制、不可变备份目标快照、fencing、保留策略和 GitHub Actions 发布链路。
 - [QuantumNous/new-api](https://github.com/QuantumNous/new-api)（AGPL-3.0；评估 commit `972aed1972820389ea0b603ca58f03f846fbf790`）：仅研究渠道/模型预设、分组倍率、令牌管理、亲和规则与运维交互；没有复制其 AGPL 源代码或资源。
 - [farion1231/cc-switch](https://github.com/farion1231/cc-switch/tree/main/src-tauri/src/proxy)（MIT；评估 commit `06082e189d65e6d6dbadc35dacdac1ce6c79d89a`）：参考 Rust 代理流水线、故障切换、用量、媒体和会话处理设计。
+- [yetone/magpie](https://github.com/yetone/magpie)（MIT；评估 commit `ea20c2db594187540b11c3a4c1821eab8dd571f2`）：参考协议探测、路由说明和有目的的状态反馈，使用鲮鲤自己的组件与动效规则。
+- [Calcium-Ion/AstrLink](https://github.com/Calcium-Ion/AstrLink)（根目录 Apache-2.0；评估 commit `5f6da6bbf84aa860118fd2ce39acf2f0ebde8f47`）：参考客户端配置、结构化隐私决策、协议探测和计价说明。排除 Core/RelayKit AGPL 模块，没有导入项目代码或图片资源。
 
 Pangolin 是独立实现，与上述项目及其维护者不存在隶属或官方关联；第三方商标、版权和许可证归各自权利人所有。
 

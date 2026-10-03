@@ -42,6 +42,7 @@ This inventory is the parity source of truth. It is cross-checked against AxonHu
 | API-key status/scopes | Enable/disable/expiry/scopes, allowed IPs and project ownership |
 | API-key token mode | Secure generated token or one-time import of an existing high-entropy token; indexed lookup + Argon2id, no plaintext recovery |
 | API-key profiles/templates | Model mappings, allowed models, quota/routing policies and reusable templates |
+| Client connection setup | Read-only scoped eligible models; Codex/Claude/Gemini/curl/Python/Node POSIX/PowerShell snippets, explicit principal precedence, environment placeholders and disposable one-time token state |
 | OIDC providers | Discovery/config, authorize/callback/exchange, PKCE/state, JIT and manual link/unlink |
 | Codex OAuth | start/exchange and auth JSON decode |
 | xAI OAuth/SSO | start/exchange/SSO decode |
@@ -69,19 +70,19 @@ sign-in page; no provider trademark asset is copied into Pangolin.
 | Credential recovery | Invalid/encryption recovery path without leaking plaintext |
 | Proxy settings | Direct HTTP/SOCKS policy plus reusable encrypted presets for channels, webhooks and catalog fetches |
 | Endpoint mappings | Per-format path/base URL/transport and provider-family routing |
-| Model discovery/sync | Fetch/query channel models, manual models, scheduled auto-sync |
+| Model discovery/sync | Per-enabled-credential scoped visibility, known/stale/unknown snapshots, matching last-known-good fallback, manual/current-snapshot compatibility and scheduled auto-sync |
 | Model transformations | Prefix, lowercase, explicit mappings, auto-trim, hide original/mapped |
 | Model protocol policy | Per-model API formats and stream policy |
-| Model cards | Reasoning/tools/temperature/vision/modalities/cost/limits/knowledge/release metadata |
+| Model cards | Nullable capability/limit/modality/effort facts, false versus unknown, conservative eligible-route projection and conditional-route caveat; cost/knowledge/release metadata |
 | Model catalog defaults | Versioned developer/model metadata snapshot, fallback + refresh/cache, aliases/provider mappings and operator override |
 | Extensible model capabilities | Typed common capabilities plus preserved unknown extension values, adapter availability and no-code-update discovery for existing protocols |
 | Model CRUD/bulk | Create/update/archive/enable/disable/delete, routability-aware listing |
 | Associations | channel+model, channel regex, global regex/model, channel tags+model/regex, exclusions |
 | Conditions | Nested AND/OR field/operator/value filters |
 | Developer settings | Per-developer associations, inheritance control and reasoning-effort mapping |
-| Pricing | Channel price entries, immutable versions, schedule/timezone/overrides |
+| Pricing | Base-price confirmation and durable operator provenance, immutable versions/schedules/overrides; legacy/priced/free/missing/incomplete status, hard-budget missing-price rejection |
 | Pricing modes | Flat, per-unit and tiered pricing; cache-write variants |
-| Channel probing | Scheduled probes, success/TTFT/TPS history and test prompts |
+| Channel probing | Credential/model/protocol/stream selection, scheduled jobs, separate headers/event/visible-text times, final native output and honest nullable TPS; old header timing preserved under its correct label |
 | Provider quota collection | Provider-specific normalization, periods, URLs, snapshots and backoff |
 | Auto-disable | Status/error pattern counters, duration/cron recovery and API-key/channel actions |
 
@@ -106,7 +107,7 @@ sign-in page; no provider trademark asset is copied into Pangolin.
 | Pass-through modes | Body and User-Agent pass-through controls |
 | Transform options | Developer/system role normalization, array forcing and reasoning effort |
 | Prompt injection/actions | Prompt records with activation conditions and enable/bulk lifecycle |
-| Prompt protection | Regex matcher, deny/redact replacement, scopes and preview/test mode |
+| Prompt protection | Typed conversational/tool JSON inspection, exact span allowlists, opt-in templates, bounded endpoint/body dry run and transient local preview state; native continuation preservation and explicit malformed-shape rejection |
 | Allowed tools | Tool allow/filter behavior without corrupting message order |
 | Auto reasoning effort | Developer/model-aware effort inference |
 | Responses sessions | Session continuity and compact behavior |
@@ -121,15 +122,15 @@ sign-in page; no provider trademark asset is copied into Pangolin.
 | Trace | End-to-end logical call with API-key/project/user attribution |
 | Request | Inbound normalized request, content policy and source/IP metadata |
 | Site/key logging levels | Site master/default/override policy plus per-key inherit/off/metadata/redacted/full body; secrets always excluded; accounting/audit facts remain |
-| Request execution | One row per channel/credential attempt, timing, error/retry and chosen model |
-| Usage log | Input/output/cache/reasoning tokens, request units and cost references |
-| Detailed cost | Price item, quantity, tiers, cache TTL variants and subtotal |
+| Request execution | One row per channel/credential attempt, timing/error/retry/model plus bounded localized conversion and affinity explanations without body capture |
+| Usage log | Independent trusted input/output/cache/reasoning/unit/image availability flags, source-native counters, pricing status and immutable cost references; unknown differs from measured0 |
+| Detailed cost | Immutable price item/subtotal and tiers; derived quantity needs complete split evidence, TTL subset unavailable when unproved; measured cost separate from booked settlements |
 | Live preview | Authorized in-flight request snapshot |
 | Content download | Authorized stored request/response body retrieval |
 | Dashboard | Requests/errors/latency, top channels/models/keys/projects/users |
 | Analytics | Date and dimension filters; daily and overview stats |
 | Performance analytics | Throughput, TTFT, latency and confidence per channel/model |
-| Cost analytics | Channel/model/key/user/project breakdown |
+| Cost analytics | Channel/model/key/user/project measured subtotals, missing/incomplete attempt counts and separate booked totals; historical-compatible Summary qualification |
 | Retention and GC | Per-resource cleanup policy, body cleanup and database vacuum |
 | Metrics/logging | Prometheus-compatible gateway/admission/limiter/queue metrics and redacted logs |
 

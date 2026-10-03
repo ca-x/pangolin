@@ -68,7 +68,7 @@ Catalog refresh, probes, quota collection, webhook delivery, backup and GC use d
 
 ## Budget and rate semantics
 
-Money is integer micro-USD. Immutable price versions avoid historical reinterpretation. Hard budget paths reserve an upper bound before I/O and settle actual cost atomically; when an upper bound cannot be calculated (unsupported media/stream), the request is rejected for hard-budget keys rather than silently undercounted. Rate/cache state may be process-local in single-node mode, but durable spend and quotas remain authoritative.
+Money is integer micro-USD. Immutable price versions avoid historical reinterpretation. Hard budget paths reserve an upper bound before I/O and settle actual cost atomically; when an upper bound cannot be calculated (unsupported quantity/price or cross-protocol stream shapes), the request is rejected for hard-budget keys rather than silently undercounted. Rate/cache state may be process-local in single-node mode, but durable spend and quotas remain authoritative.
 
 ## Backup and recovery
 
@@ -84,3 +84,11 @@ The supported release is single-node. SQLite serialized writes and bundled DuckD
 - object storage for payload/media bodies.
 
 No future store weakens authorization, budget or ownership consistency merely to improve availability.
+
+## Reference-adoption facts and schema evolution
+
+Additive migrations29–31 keep credential inventory, timing, diagnostics, price intent and quantity availability in SQLite. Inventory ownership uses composite project/provider/credential constraints; activation revalidates meaningful discovery fingerprints and the worker fence after external I/O. Matching last-known-good observations may remain stale while access/budget policy stays strict. Automatic OAuth refresh carries identity only through a successful envelope CAS; manual rotation invalidates it.
+
+Financial definition, monetary completeness and each quantity's availability are independent facts. Closed version1 usage flags default to unspecified `{}` for old rows, without rewriting numeric/financial history. Source-native counter projection prevents foreign namespaces and converter placeholders from becoming authoritative. Price provenance uses the new durable operator-confirmation marker backed by scoped audit proof rather than inherited default origins; only this new metadata is annotated during upgrade. Short consistent snapshots and the existing atomic/idempotent terminal transaction own rates, price references, spend, status and measurements together.
+
+DuckDB schema8 is reconstructible and cannot authorize routing or budgets. Its historical-compatible Summary totals remain distinct from strict SQLite measured-cost coverage. Affinity ordering uses live scope guards with conservative refusal under bounded capacity; it does not create a distributed limit or consensus claim. Transient privacy samples are outside every record/projection/job/audit system.
