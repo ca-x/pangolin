@@ -27,8 +27,8 @@ function ItemFact({ row, quantity = false }: { row: Document; quantity?: boolean
   if (price.isError) return <QueryError retry={() => void price.refetch()} />
   if (price.isLoading) return <Text size="sm">{t('loading')}</Text>
   const components = Array.isArray(price.data?.components) ? (price.data.components as Document[]) : []
-  const kind = components.find((c) => c.id === row.component_id)?.kind
-  return <>{componentQuantity(usage.data, kind, row.quantity)}</>
+  const component = components.find((c) => c.id === row.component_id)
+  return <>{componentQuantity(usage.data, component, row.quantity, components)}</>
 }
 export function CostItemsPanel() {
   const { t } = useTranslation()

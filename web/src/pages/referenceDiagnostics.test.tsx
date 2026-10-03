@@ -107,12 +107,67 @@ it('shows loading while the exact request record is pending instead of inventing
   const { RequestDetailPage } = await import('./OperationsPage')
   const { waitFor } = await import('@testing-library/react')
   let finish: ((value: Response) => void) | undefined
-  const detail = { id: 'r1', request_id: 'public-r1', trace_id: null, input_tokens: 0, output_tokens: 0, cost_micros: 0, latency_ms: 1, started_at: 1, status_code: 200, usage_measurement: { version: 1, input_tokens: true, output_tokens: true }, pricing_status: 'priced' }
-  const fetchMock = mockApi(path => path.includes('/observability/requests/r1') ? json(detail) : path.endsWith('/operations/requests/r1') ? new Promise<Response>(resolve => { finish = resolve }) : undefined)
-  mount(<Routes><Route path="/operations/requests/:id" element={<RequestDetailPage />} /></Routes>, '/operations/requests/r1', fetchMock)
+  const detail = {
+    id: 'r1',
+    request_id: 'public-r1',
+    trace_id: null,
+    input_tokens: 0,
+    output_tokens: 0,
+    cost_micros: 0,
+    latency_ms: 1,
+    started_at: 1,
+    status_code: 200,
+    usage_measurement: { version: 1, input_tokens: true, output_tokens: true },
+    pricing_status: 'priced',
+  }
+  const fetchMock = mockApi((path) =>
+    path.includes('/observability/requests/r1')
+      ? json(detail)
+      : path.endsWith('/operations/requests/r1')
+        ? new Promise<Response>((resolve) => {
+            finish = resolve
+          })
+        : undefined,
+  )
+  mount(
+    <Routes>
+      <Route path="/operations/requests/:id" element={<RequestDetailPage />} />
+    </Routes>,
+    '/operations/requests/r1',
+    fetchMock,
+  )
   await waitFor(() => expect(finish).toBeDefined())
   expect(screen.getByRole('status')).toHaveAccessibleName(i18n.t('loading'))
   expect(screen.queryByRole('region', { name: i18n.t('attemptDiagnostics') })).not.toBeInTheDocument()
   finish!(await json({ executions: [], usage: [], cost_items: [] }))
   expect(await screen.findByRole('region', { name: i18n.t('attemptDiagnostics') })).toBeInTheDocument()
+})
+it('keeps valid diagnostics readable when a safe integer expiry is outside the Date range', async () => {
+  const { ExecutionDiagnostics } = await import('./ExecutionDiagnostics')
+  const base = { scope_digest: 'a'.repeat(64), reason: 'hit', provider_id: 'c1' }
+  mount(
+    <ExecutionDiagnostics
+      attempt={{
+        attempt: 1,
+        conversion_diagnostics: [
+          { phase: 'request', code: 'roles_normalized', reason: 'roles_normalized', path: 'messages[].role' },
+        ],
+        affinity_diagnostics: [
+          { ...base, rule_id: 'out-of-range', expires_at: 100000000000000 },
+          { ...base, rule_id: 'valid-date', expires_at: 1800000000 },
+          { ...base, rule_id: 'no-date', expires_at: null },
+        ],
+      }}
+    />,
+    '/operations',
+    mockApi(),
+  )
+  expect(await screen.findByText('out-of-range')).toBeInTheDocument()
+  expect(screen.getByText('valid-date')).toBeInTheDocument()
+  expect(screen.getByText('no-date')).toBeInTheDocument()
+  expect(screen.getByText(i18n.t('conversion_roles_normalized'))).toBeInTheDocument()
+  const invalid = screen.getByText('out-of-range').closest('.mantine-Stack-root')!
+  expect(invalid).toHaveTextContent(`${i18n.t('affinityExpiry')}: —`)
+  const valid = screen.getByText('valid-date').closest('.mantine-Stack-root')!
+  expect(valid).not.toHaveTextContent(`${i18n.t('affinityExpiry')}: —`)
 })

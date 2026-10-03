@@ -8,7 +8,7 @@ import { api } from '../api'
 import { InlineQueryError } from '../components'
 import { UNMEASURED, formatCount, formatMicros } from '../observability'
 import { projectOperationPath, useProject } from '../project'
-import { quantityValue, amountValue, PricingCoverageNotice, rowCoverage, type PricingFacts } from '../measurement'
+import { quantityValue, amountValue, PricingCoverageNotice, SettlementFacts, rowCoverage, type PricingFacts } from '../measurement'
 import { PageHeader } from './shared'
 
 /**
@@ -614,7 +614,7 @@ export default function PlaygroundPage() {
                 ) : record.isLoading ? (
                   <Text size="xs" c="dimmed">{t('playgroundUsageLoading')}</Text>
                 ) : (
-                  <Stack gap={4}><Group gap="lg" wrap="wrap">{facts.map(([name, value]) => <Text size="sm" c="dimmed" key={name}>{`${name}: ${value}`}</Text>)}</Group><PricingCoverageNotice coverage={rowCoverage(usage??[])}/></Stack>
+                  <Stack gap={4}><Group gap="lg" wrap="wrap">{facts.map(([name, value]) => <Text size="sm" c="dimmed" key={name}>{`${name}: ${value}`}</Text>)}</Group><PricingCoverageNotice coverage={rowCoverage(usage??[])}/><SettlementFacts rows={usage??[]}/></Stack>
                 )}
               </Group>
             )}

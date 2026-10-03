@@ -1,4 +1,4 @@
-import { Stack, Text } from '@mantine/core'
+import { Code, Stack, Text } from '@mantine/core'
 import { useTranslation } from 'react-i18next'
 import { formatCount, formatMicros, UNMEASURED } from './observability'
 
@@ -111,7 +111,7 @@ export function CostFact({
   showSettlement?: boolean
 }) {
   const { t } = useTranslation()
-  const actual = value === undefined ? row.cost_micros ?? row.total_cost_micros : value
+  const actual = value === undefined ? (row.cost_micros ?? row.total_cost_micros) : value
   const known = amountValue(row, actual)
   return (
     <Stack gap={2} style={{ minWidth: 0 }}>
@@ -159,19 +159,32 @@ export function aggregateAmount(row: PricingCoverage, value: unknown) {
     ? null
     : nonnegative(value)
 }
-export function PricingCoverageNotice({ coverage }: { coverage: PricingCoverage }) {
+export function PricingCoverageNotice({
+  coverage,
+  historicalSummary = false,
+}: {
+  coverage: PricingCoverage
+  historicalSummary?: boolean
+}) {
   const { t } = useTranslation()
   const missing = nonnegative(coverage.missing_pricing_count)
   const incomplete = nonnegative(coverage.incomplete_usage_count)
   return (
     <Stack gap={2}>
       <Text size="sm" c="dimmed">
-        {missing == null || incomplete == null
-          ? t('pricingCountsUnknown')
-          : missing + incomplete > 0
-            ? t('partialPricing', { missing, incomplete })
-            : t('measuredSubtotal')}
+        {historicalSummary
+          ? t('summaryHistoricalHelp')
+          : missing == null || incomplete == null
+            ? t('pricingCountsUnknown')
+            : missing + incomplete > 0
+              ? t('partialPricing', { missing, incomplete })
+              : t('measuredSubtotal')}
       </Text>
+      {historicalSummary && missing != null && incomplete != null && missing + incomplete > 0 && (
+        <Text size="sm" c="dimmed">
+          {t('partialPricing', { missing, incomplete })}
+        </Text>
+      )}
       {(coverage.historical_amount_count ?? 0) > 0 && (
         <Text size="sm" c="dimmed">
           {t('pricingHistoricalIncluded', { count: coverage.historical_amount_count })}
@@ -184,9 +197,36 @@ export function PricingCoverageNotice({ coverage }: { coverage: PricingCoverage 
       )}
       {coverage.measured_cost_count != null && (
         <Text size="sm" c="dimmed">
-          {t('pricingMeasuredAttempts', { count: coverage.measured_cost_count })}
+          {t(historicalSummary ? 'summaryIncludedRecords' : 'pricingMeasuredAttempts', {
+            count: coverage.measured_cost_count,
+          })}
         </Text>
       )}
+    </Stack>
+  )
+}
+export function SettlementFacts({ rows }: { rows: PricingFacts[] }) {
+  const { t } = useTranslation()
+  const ledger = (row: PricingFacts) => nonnegative(row.total_cost_micros ?? row.cost_micros)
+  return (
+    <Stack component="section" gap="sm" aria-label={t('settlementByExecution')}>
+      <Text size="sm" fw={560}>
+        {t('settlementByExecution')}
+      </Text>
+      <Text size="sm">
+        {t('settledAmount')}: {formatMicros(sumKnown(rows.map(ledger)))}
+      </Text>
+      {rows.map((row, index) => (
+        <Stack component="section" key={typeof row.execution_id === 'string' ? row.execution_id : index} gap={2}>
+          <Text size="sm">
+            {t('executionId')}: <Code>{typeof row.execution_id === 'string' ? row.execution_id : UNMEASURED}</Code>
+          </Text>
+          <Text size="sm">{t(settlementKey(row.settlement_kind))}</Text>
+          <Text size="sm" c="dimmed">
+            {t('settledAmount')}: {formatMicros(ledger(row))}
+          </Text>
+        </Stack>
+      ))}
     </Stack>
   )
 }
@@ -209,8 +249,33 @@ export const costQuantityKey: Partial<Record<string, MeasurementKey>> = {
   unit: 'request_units',
   flat: 'request_units',
 }
-export function componentQuantity(row: PricingFacts | undefined, kind: unknown, value: unknown): string {
-  if (!row) return UNMEASURED
-  const key = costQuantityKey[String(kind)]
-  return key ? quantityText(row, key, value) : UNMEASURED
+export type QuantityComponent = { [key: string]: unknown; kind?: unknown; cache_ttl?: unknown }
+/** The stored component quantity may subtract child counters, even at zero rates. */
+export function componentQuantity(
+  row: PricingFacts | undefined,
+  component: QuantityComponent | undefined,
+  value: unknown,
+  siblings: QuantityComponent[] | undefined,
+): string {
+  if (!row || !component || !siblings?.length || siblings.length > 64) return UNMEASURED
+  const kind = typeof component.kind === 'string' ? component.kind : ''
+  const key = costQuantityKey[kind]
+  if (!key) return UNMEASURED
+  const flags = measurement(row.usage_measurement)
+  if (flags?.[key] !== true) return UNMEASURED
+  // Lost component identities cannot prove the absence of a subtraction.
+  if ((kind === 'input' || kind === 'output') && siblings.some((c) => !costQuantityKey[String(c.kind)]))
+    return UNMEASURED
+  const has = (child: string) => siblings.some((c) => c.kind === child)
+  if (
+    kind === 'input' &&
+    ((has('cache_read') && flags.cache_read_tokens !== true) ||
+      (has('cache_write') && flags.cache_write_tokens !== true))
+  )
+    return UNMEASURED
+  if (kind === 'output' && has('reasoning') && flags.reasoning_tokens !== true) return UNMEASURED
+  // V1 exposes only total cache writes, not the 1h subset or its 5m remainder.
+  // Missing TTL identity is also insufficient to prove this is the total.
+  if (kind === 'cache_write' && component.cache_ttl !== null) return UNMEASURED
+  return formatCount(nonnegative(value))
 }

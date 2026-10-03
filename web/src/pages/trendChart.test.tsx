@@ -35,7 +35,8 @@ const renderPage = () => {
 }
 
 const paths = (selector: string) => [...document.querySelectorAll(selector)].map((node) => node.getAttribute('d') ?? '')
-const cells = (index: number) => [...document.querySelectorAll('.chart-table tbody tr')[index].querySelectorAll('td')].map((cell) => cell.textContent)
+// Numeric assertions read the monetary value separately from its historical-coverage qualifier.
+const cells = (index: number) => [...document.querySelectorAll('.chart-table tbody tr')[index].querySelectorAll('td')].map((cell, column) => column === 6 ? cell.firstChild?.textContent : cell.textContent)
 
 describe('the trend chart tells the truth about its buckets', () => {
   beforeEach(() => { void i18n.changeLanguage('en') })
@@ -110,6 +111,7 @@ describe('the trend chart tells the truth about its buckets', () => {
     // The disclosure table prints the same distinction: `—` where nothing was
     // measured, `0` where a zero was measured.
     expect(cells(0).slice(3)).toEqual(['10', '5', '15', '$0.000003'])
+    expect(document.querySelector('.chart-table tbody tr td:last-child')).toHaveTextContent(i18n.t('summaryHistoricalHelp'))
     expect(cells(1).slice(3)).toEqual(['—', '—', '—', '—'])
     expect(cells(2).slice(3)).toEqual(['0', '0', '0', '$0.000000'])
   })

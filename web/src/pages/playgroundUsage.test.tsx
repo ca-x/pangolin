@@ -230,3 +230,15 @@ describe('the playground shows the usage and cost the record holds', () => {
     expect(recordCalls(fetchMock)).toHaveLength(2)
   })
 })
+
+it('Playground distinguishes mixed authoritative settlements and their booked sum from measured cost',async()=>{
+ await i18n.changeLanguage('en')
+ const usage=[{execution_id:'conservative-exec',pricing_status:'incomplete_usage',settlement_kind:'conservative',total_cost_micros:100},{execution_id:'interrupted-exec',pricing_status:'incomplete_usage',settlement_kind:'interrupted',total_cost_micros:50},{execution_id:'unreported-exec',pricing_status:'incomplete_usage',settlement_kind:'unreported',total_cost_micros:0},{execution_id:'reported-exec',pricing_status:'priced',settlement_kind:'reported',total_cost_micros:3,usage_measurement:{version:1,input_tokens:true,output_tokens:true},input_tokens:10,output_tokens:3}]
+ await send(mockApi(()=>Promise.resolve(sse([delta('answer'),completed])),()=>json({...record,usage})))
+ expect(await screen.findByText('Cost: $0.000003')).toBeInTheDocument();const {within}=await import('@testing-library/react');const settlements=within(await screen.findByRole('region',{name:'Settlement by execution'}));expect(settlements.getByText('Settled ledger amount: $0.000153')).toBeInTheDocument()
+ for(const row of usage){const entry=settlements.getByText(row.execution_id).closest('section')!;expect(entry).toHaveTextContent(i18n.t(`settlement_${row.settlement_kind}`));expect(entry).toHaveTextContent(`$${(row.total_cost_micros/1e6).toFixed(6)}`)}
+})
+it.each(['conservative','interrupted','unreported'])('Playground keeps %s booked settlement visible while measured cost is unknown',async kind=>{
+ await i18n.changeLanguage('en');await send(mockApi(()=>Promise.resolve(sse([delta('answer'),completed])),()=>json({...record,usage:[{execution_id:'e1',pricing_status:'incomplete_usage',settlement_kind:kind,total_cost_micros:kind==='unreported'?0:100}]})))
+ expect(await screen.findByText('Cost: —')).toBeInTheDocument();expect(screen.getByText(i18n.t(`settlement_${kind}`))).toBeInTheDocument();expect(screen.getAllByText(`Settled ledger amount: ${kind==='unreported'?'$0.000000':'$0.000100'}`)).not.toHaveLength(0)
+})

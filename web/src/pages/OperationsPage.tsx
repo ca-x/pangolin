@@ -600,7 +600,7 @@ function TraceAttempts({ executions, usage, costItems }: { executions: TraceBund
             <Table.Tbody>{costItems.map((item, index) => <Table.Tr key={`${item.execution_id}-${index}`}>
               <Table.Td className="mono-cell">{attemptLabel(item.execution_id)}</Table.Td>
               <Table.Td>{costKind(item.kind)}</Table.Td>
-              <Table.Td className="mono-cell">{componentQuantity(usage.find(row=>row.execution_id===item.execution_id),item.kind,item.quantity)}</Table.Td>
+              <Table.Td className="mono-cell">{componentQuantity(usage.find(row=>row.execution_id===item.execution_id),item,item.quantity,costItems.filter(sibling=>sibling.execution_id===item.execution_id))}</Table.Td>
               <Table.Td className="mono-cell">{formatMicros(item.unit_price_micros)}</Table.Td>
               <Table.Td className="mono-cell">{<CostFact row={usage.find(row=>row.execution_id===item.execution_id)??{pricing_status:'unavailable'}} value={item.subtotal_micros}/>} </Table.Td>
             </Table.Tr>)}</Table.Tbody>
@@ -680,7 +680,7 @@ function TraceFacts({ data, record, traceLink }: { data: RequestDetail; record?:
           <Table.Tbody>{components.map((item, position) => (
             <Table.Tr key={item.execution_id ? `${item.execution_id}-${position}` : position}>
               <Table.Td>{costKind(item.kind ?? null)}</Table.Td>
-              <Table.Td>{componentQuantity(record?.usage?.find(row=>row.execution_id===item.execution_id),item.kind,item.quantity)}</Table.Td>
+              <Table.Td>{componentQuantity(record?.usage?.find(row=>row.execution_id===item.execution_id),item,item.quantity,components.filter(sibling=>sibling.execution_id===item.execution_id))}</Table.Td>
               <Table.Td>{<CostFact row={record?.usage?.find(row=>row.execution_id===item.execution_id)??{pricing_status:'unavailable'}} value={item.subtotal_micros}/>}</Table.Td>
             </Table.Tr>
           ))}</Table.Tbody>

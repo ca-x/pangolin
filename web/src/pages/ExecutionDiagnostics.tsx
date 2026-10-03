@@ -37,6 +37,10 @@ const id = (value: unknown) => typeof value === 'string' && /^[A-Za-z0-9_-]{1,12
 function object(value: unknown): value is Record<string, unknown> {
   return value != null && typeof value === 'object' && !Array.isArray(value)
 }
+function expiryText(value: number): string {
+  if (!Number.isFinite(new Date(value * 1000).getTime())) return '—'
+  return formatDate(value)
+}
 export type DiagnosticAttempt = {
   id?: string
   attempt?: number | null
@@ -112,7 +116,7 @@ export function ExecutionDiagnostics({ attempt }: { attempt: DiagnosticAttempt }
             )}
             {d.expires_at != null && (
               <Text size="sm">
-                {t('affinityExpiry')}: {formatDate(d.expires_at)}
+                {t('affinityExpiry')}: {expiryText(d.expires_at)}
               </Text>
             )}
           </Stack>
