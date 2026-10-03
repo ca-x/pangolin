@@ -115,21 +115,21 @@ export function CostFact({
   const known = amountValue(row, actual)
   return (
     <Stack gap={2} style={{ minWidth: 0 }}>
-      <Text component="span" size="sm" style={{ fontVariantNumeric: 'tabular-nums' }}>
+      <Text component="span" size="md" style={{ fontVariantNumeric: 'tabular-nums' }}>
         {formatMicros(known)}
       </Text>
       {(!compact || known == null || row.pricing_status === 'legacy' || row.pricing_status == null) && (
-        <Text component="span" size="sm" c="dimmed">
+        <Text component="span" size="md" c="dimmed">
           {t(pricingKey(row.pricing_status))}
         </Text>
       )}
       {showSettlement && row.settlement_kind != null && (!compact || row.settlement_kind !== 'reported') && (
-        <Text component="span" size="sm" c="dimmed">
+        <Text component="span" size="md" c="dimmed">
           {t(settlementKey(row.settlement_kind))}
         </Text>
       )}
       {['conservative', 'interrupted'].includes(row.settlement_kind ?? '') && (
-        <Text component="span" size="sm" c="dimmed">
+        <Text component="span" size="md" c="dimmed">
           {t('settledAmount')}: {formatMicros(actual)}
         </Text>
       )}
@@ -171,7 +171,7 @@ export function PricingCoverageNotice({
   const incomplete = nonnegative(coverage.incomplete_usage_count)
   return (
     <Stack gap={2}>
-      <Text size="sm" c="dimmed">
+      <Text size="md" c="dimmed">
         {historicalSummary
           ? t('summaryHistoricalHelp')
           : missing == null || incomplete == null
@@ -181,22 +181,22 @@ export function PricingCoverageNotice({
               : t('measuredSubtotal')}
       </Text>
       {historicalSummary && missing != null && incomplete != null && missing + incomplete > 0 && (
-        <Text size="sm" c="dimmed">
+        <Text size="md" c="dimmed">
           {t('partialPricing', { missing, incomplete })}
         </Text>
       )}
       {(coverage.historical_amount_count ?? 0) > 0 && (
-        <Text size="sm" c="dimmed">
+        <Text size="md" c="dimmed">
           {t('pricingHistoricalIncluded', { count: coverage.historical_amount_count })}
         </Text>
       )}
       {coverage.settled_cost_micros != null && (
-        <Text size="sm" c="dimmed">
+        <Text size="md" c="dimmed">
           {t('settledAmount')}: {formatMicros(coverage.settled_cost_micros)}
         </Text>
       )}
       {coverage.measured_cost_count != null && (
-        <Text size="sm" c="dimmed">
+        <Text size="md" c="dimmed">
           {t(historicalSummary ? 'summaryIncludedRecords' : 'pricingMeasuredAttempts', {
             count: coverage.measured_cost_count,
           })}
@@ -210,19 +210,19 @@ export function SettlementFacts({ rows }: { rows: PricingFacts[] }) {
   const ledger = (row: PricingFacts) => nonnegative(row.total_cost_micros ?? row.cost_micros)
   return (
     <Stack component="section" gap="sm" aria-label={t('settlementByExecution')}>
-      <Text size="sm" fw={560}>
+      <Text size="md" fw={560}>
         {t('settlementByExecution')}
       </Text>
-      <Text size="sm">
+      <Text size="md">
         {t('settledAmount')}: {formatMicros(sumKnown(rows.map(ledger)))}
       </Text>
       {rows.map((row, index) => (
         <Stack component="section" key={typeof row.execution_id === 'string' ? row.execution_id : index} gap={2}>
-          <Text size="sm">
+          <Text size="md">
             {t('executionId')}: <Code>{typeof row.execution_id === 'string' ? row.execution_id : UNMEASURED}</Code>
           </Text>
-          <Text size="sm">{t(settlementKey(row.settlement_kind))}</Text>
-          <Text size="sm" c="dimmed">
+          <Text size="md">{t(settlementKey(row.settlement_kind))}</Text>
+          <Text size="md" c="dimmed">
             {t('settledAmount')}: {formatMicros(ledger(row))}
           </Text>
         </Stack>

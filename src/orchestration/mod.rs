@@ -627,13 +627,23 @@ fn capability_mismatch(candidate: &Candidate, payload: &Value) -> Result<bool> {
     } else {
         None
     };
-    Ok((image
-        && (card.capabilities.vision == Some(false)
-            || card
-                .modalities
-                .input
-                .as_ref()
-                .is_some_and(|values| !values.iter().any(|value| value == "image"))))
+    let context_exceeded = card.limits.context.is_some_and(|limit| {
+        !image
+            && crate::providers::tokens::input_tokens(
+                &candidate.target.provider_kind,
+                &candidate.target.upstream_name,
+                payload,
+            )
+            .is_some_and(|input| u64::from(input) + output.unwrap_or(0) > limit)
+    });
+    Ok(context_exceeded
+        || (image
+            && (card.capabilities.vision == Some(false)
+                || card
+                    .modalities
+                    .input
+                    .as_ref()
+                    .is_some_and(|values| !values.iter().any(|value| value == "image"))))
         || ((payload.get("stream").and_then(Value::as_bool) == Some(true)
             || candidate
                 .protocol_endpoint

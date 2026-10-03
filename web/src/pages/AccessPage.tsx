@@ -417,7 +417,7 @@ function KeyUsageDialog({ projectId, apiKey, onClose }: { projectId: string; api
           {top.map((row) => <Paper key={row.dimension ?? 'unknown'} withBorder p="sm">
             <Group justify="space-between" align="flex-start" wrap="wrap">
               <Code>{row.dimension || UNMEASURED}</Code>
-              <Text size="sm" className="mono-cell">{`${(row.usage_measured===false&&row.measured_cost_count==null)||row.input_tokens==null||row.output_tokens==null?UNMEASURED:formatCount(row.input_tokens + row.output_tokens)} ${t('tokens')} · ${formatMicros(aggregateAmount(row,row.cost_micros))}`}</Text>
+              <Text size="md" className="mono-cell">{`${(row.usage_measured===false&&row.measured_cost_count==null)||row.input_tokens==null||row.output_tokens==null?UNMEASURED:formatCount(row.input_tokens + row.output_tokens)} ${t('tokens')} · ${formatMicros(aggregateAmount(row,row.cost_micros))}`}</Text>
             </Group>
           </Paper>)}
         </Stack>}
@@ -456,9 +456,11 @@ function KeysPanel() {
   const [usageKey, setUsageKey] = useState<{ projectId: string; key: ScopedKey } | null>(null)
   const [token, setToken] = useState<{ value: string; title: string; description: string; projectId: string; keyId: string; keyName: string } | null>(null)
   const [setupKey, setSetupKey] = useState<{ projectId: string; key: ScopedKey } | null>(null)
+  const sensitiveOpener = useRef<HTMLElement | null>(null)
   const sensitiveLifecycle = useRef({ projectId: project.id, generation: 0, active: true })
   // Identity can return to A; its generation must never return to the old A.
   if (sensitiveLifecycle.current.projectId !== project.id) {
+    sensitiveOpener.current = null
     sensitiveLifecycle.current.projectId = project.id
     sensitiveLifecycle.current.generation += 1
   }
@@ -472,7 +474,10 @@ function KeysPanel() {
     create.reset()
     rotate.reset()
   }
+  const focusScope = () => { const lifecycle = sensitiveLifecycle.current; return lifecycle.active && lifecycle.projectId === project.id ? `${project.id}:${lifecycle.generation}` : null }
   const beginSensitiveOperation = () => {
+    const active = document.activeElement
+    if (active instanceof HTMLElement && active !== document.body && !active.closest('[role="dialog"]')) sensitiveOpener.current = active
     invalidateSensitive()
     setSetupKey(null)
     return sensitiveLifecycle.current.generation
@@ -764,8 +769,8 @@ function KeysPanel() {
           </Stack>
         </form>
       </Modal>
-      {token && token.projectId === project.id && <ClientSetupDialog key={`token:${token.projectId}:${token.keyId}`} projectId={token.projectId} keyId={token.keyId} keyName={token.keyName} token={token.value} title={token.title} description={token.description} onClose={invalidateSensitive} />}
-      {setupKey && setupKey.projectId === project.id && <ClientSetupDialog key={`setup:${setupKey.projectId}:${setupKey.key.id}`} projectId={setupKey.projectId} keyId={setupKey.key.id} keyName={setupKey.key.name} onClose={() => { invalidateSensitive(); setSetupKey(null) }} />}
+      {token && token.projectId === project.id && <ClientSetupDialog key={`token:${token.projectId}:${token.keyId}`} opener={sensitiveOpener.current} focusScope={focusScope} projectId={token.projectId} keyId={token.keyId} keyName={token.keyName} token={token.value} title={token.title} description={token.description} onClose={invalidateSensitive} />}
+      {setupKey && setupKey.projectId === project.id && <ClientSetupDialog key={`setup:${setupKey.projectId}:${setupKey.key.id}`} opener={sensitiveOpener.current} focusScope={focusScope} projectId={setupKey.projectId} keyId={setupKey.key.id} keyName={setupKey.key.name} onClose={() => { invalidateSensitive(); setSetupKey(null) }} />}
       {usageKey && <KeyUsageDialog key={`${usageKey.projectId}:${usageKey.key.id}`} projectId={usageKey.projectId} apiKey={usageKey.key} onClose={() => setUsageKey(null)} />}
     </>
   )

@@ -14,7 +14,7 @@ export function Field({ label, hint, children }: { label: string; hint?: string;
   )
 }
 
-export function Modal({ open, onOpenChange, title, description, trigger, children }: { open?: boolean; onOpenChange?: (open: boolean) => void; title: string; description?: string; trigger?: ReactNode; children: ReactNode }) {
+export function Modal({ open, onOpenChange, title, description, trigger, children, returnFocus = true }: { returnFocus?: boolean; open?: boolean; onOpenChange?: (open: boolean) => void; title: string; description?: string; trigger?: ReactNode; children: ReactNode }) {
   const { t } = useTranslation()
   const [internalOpen, setInternalOpen] = useState(false)
   const controlled = open !== undefined
@@ -30,7 +30,7 @@ export function Modal({ open, onOpenChange, title, description, trigger, childre
   return (
     <>
       {trigger && !controlled && cloneElement(trigger as React.ReactElement<{ onClick?: React.MouseEventHandler }>, { onClick: (e: React.MouseEvent) => { handleOpen(); (trigger as React.ReactElement<{ onClick?: React.MouseEventHandler }>).props.onClick?.(e) } })}
-      <MantineModal opened={opened} onClose={handleClose} title={title} closeButtonProps={{ 'aria-label': t('close') }} returnFocus size="md">
+      <MantineModal opened={opened} onClose={handleClose} title={title} closeButtonProps={{ 'aria-label': t('close') }} returnFocus={returnFocus} size="md">
         {description ? <Text size="sm" c="dimmed" mb="md">{description}</Text> : <Text className="sr-only">{title}</Text>}
         {children}
       </MantineModal>

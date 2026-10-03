@@ -88,34 +88,34 @@ export function ExecutionDiagnostics({ attempt }: { attempt: DiagnosticAttempt }
           {t('attempt')} #{attempt.attempt ?? '—'}
         </Text>
         {!conversion.length && !affinity.length && (
-          <Text size="sm" c="dimmed">
+          <Text size="md" c="dimmed">
             {t('noDiagnostics')}
           </Text>
         )}
         {conversion.map((d, index) => (
           <Group key={`c${index}`} gap="xs" wrap="wrap">
-            <Text size="sm" c="dimmed">
+            <Text size="md" c="dimmed">
               {t(`conversionPhase_${d.phase}`)}
             </Text>
-            <Text size="sm">{t(`conversion_${d.code}`)}</Text>
+            <Text size="md">{t(`conversion_${d.code}`)}</Text>
             {d.path && <Code style={{ whiteSpace: 'normal', overflowWrap: 'anywhere', fontSize: 14 }}>{d.path}</Code>}
           </Group>
         ))}
         {affinity.map((d, index) => (
           <Stack key={`a${index}`} gap={2}>
-            <Text size="sm">
+            <Text size="md">
               {t('affinityDiagnostics')}: {t(`affinity_${d.reason}`)}
             </Text>
-            <Text size="sm">
+            <Text size="md">
               {t('affinityRule')}: <Code>{d.rule_id}</Code>
             </Text>
             {d.provider_id && (
-              <Text size="sm">
+              <Text size="md">
                 {t('affinityChannel')}: <Code style={{ overflowWrap: 'anywhere' }}>{d.provider_id}</Code>
               </Text>
             )}
             {d.expires_at != null && (
-              <Text size="sm">
+              <Text size="md">
                 {t('affinityExpiry')}: {expiryText(d.expires_at)}
               </Text>
             )}
@@ -133,7 +133,7 @@ export function AttemptDiagnosticList({ executions }: { executions: DiagnosticAt
       {executions.length ? (
         executions.map((attempt, index) => <ExecutionDiagnostics key={attempt.id ?? index} attempt={attempt} />)
       ) : (
-        <Text size="sm" c="dimmed">
+        <Text size="md" c="dimmed">
           {t('executionEmpty')}
         </Text>
       )}

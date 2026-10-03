@@ -323,7 +323,7 @@ function Breakdowns({ projectId, bounds, windowLabel }: { projectId: string; bou
               <Table.Td className="mono-cell">{formatCount(row.input_tokens)}</Table.Td>
               <Table.Td className="mono-cell">{formatCount(row.output_tokens)}</Table.Td>
               <Table.Td className="mono-cell">{formatCount(row.cache_hit_tokens)}</Table.Td>
-              <Table.Td className="mono-cell">{<><Text size="sm">{formatMicros(aggregateAmount(row,row.cost_micros))}</Text><PricingCoverageNotice coverage={row}/></>}</Table.Td>
+              <Table.Td className="mono-cell">{<><Text size="md">{formatMicros(aggregateAmount(row,row.cost_micros))}</Text><PricingCoverageNotice coverage={row}/></>}</Table.Td>
               <Table.Td className="mono-cell">{row.latency_ms == null ? UNMEASURED : `${Math.round(row.latency_ms)} ms`}</Table.Td>
             </Table.Tr>
           })}</Table.Tbody>

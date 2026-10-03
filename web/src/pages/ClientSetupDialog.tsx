@@ -4,16 +4,20 @@ import { Copy } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
+import { restoreConnectedOpener } from '../dialogFocus'
 import { api } from '../api'
 import { InlineQueryError, Modal, SelectField } from '../components'
 import { CLIENT_LABELS, SETUP_CLIENTS, clientProtocol, defaultGatewayBase, gatewayUrls, generateClientSetup, type SetupClient } from '../clientSetup'
 
 type ClientModel = { id: string; metadata?: { reasoning_levels?: string[] | null } }
-export type ClientSetupDialogProps = { projectId: string; keyId: string; keyName: string; token?: string; title?: string; description?: string; onClose: () => void }
+export type ClientSetupDialogProps = { projectId: string; keyId: string; keyName: string; token?: string; title?: string; description?: string; onClose: () => void; opener?: HTMLElement | null; focusScope?: () => string | null }
 
 export function ClientSetupDialog(props: ClientSetupDialogProps) {
   const { t } = useTranslation()
   const queryClient = useQueryClient()
+  const opener = useRef(props.opener ?? (document.activeElement instanceof HTMLElement ? document.activeElement : null))
+  const currentContext = useRef(`${props.projectId}:${props.keyId}`)
+  currentContext.current = `${props.projectId}:${props.keyId}`
   const initialContext = useRef(`${props.projectId}:${props.keyId}`)
   const [closed, setClosed] = useState(false)
   const [token, setToken] = useState(props.token)
@@ -38,6 +42,8 @@ export function ClientSetupDialog(props: ClientSetupDialogProps) {
     setClosed(true); setToken(undefined); setModel(''); setEffort(''); setBaseUrl('')
     queryClient.removeQueries({ queryKey: ['client-models', props.projectId, props.keyId] })
     props.onClose()
+    const closedScope = props.focusScope?.()
+    restoreConnectedOpener(opener.current, () => currentContext.current === initialContext.current && (!props.focusScope || closedScope != null && props.focusScope() === closedScope))
   }
   useEffect(() => {
     if (contextChanged) { setToken(undefined); setModel(''); setEffort(''); setClosed(true); props.onClose() }
@@ -57,7 +63,7 @@ export function ClientSetupDialog(props: ClientSetupDialogProps) {
   }
   // Unmount sensitive DOM immediately; do not retain it for an overlay exit.
   if (!active) return null
-  return <Modal open onOpenChange={(open) => { if (!open) close() }} title={props.title ?? t('clientSetupTitle', { name: props.keyName })} description={props.description ?? t('clientSetupHint')}>
+  return <Modal open returnFocus={false} onOpenChange={(open) => { if (!open) close() }} title={props.title ?? t('clientSetupTitle', { name: props.keyName })} description={props.description ?? t('clientSetupHint')}>
     <Stack gap="md" style={{ minWidth: 0 }}>
       {token !== undefined && <><Text size="sm">{t('clientOneTimeHint')}</Text><Code block style={{ overflowWrap: 'anywhere', whiteSpace: 'pre-wrap' }}>{token}</Code><Button variant="default" onClick={() => void copy(token)}>{t('copy')}</Button></>}
       <Tabs value={client} onChange={(value) => { if (value) { setClient(value as SetupClient); setModel(''); setEffort('') } }}>

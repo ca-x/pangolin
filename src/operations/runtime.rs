@@ -599,7 +599,7 @@ fn probe_stream_shape(endpoint: &str, value: &Value) -> bool {
 }
 
 fn probe_stream_output(endpoint: &str, value: &Value) -> bool {
-    crate::providers::timing::visible_text(value)
+    crate::providers::timing::visible_text(endpoint, value)
         || match endpoint {
             "/v1/chat/completions" => value["choices"].as_array().is_some_and(|choices| {
                 choices.iter().any(|choice| {
@@ -806,6 +806,7 @@ async fn probe_response(
                 crate::providers::timing::record_event_at(
                     started,
                     observed,
+                    endpoint,
                     &event.data,
                     &mut measured.first_event_ms,
                     &mut measured.first_text_ms,

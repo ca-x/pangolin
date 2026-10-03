@@ -23,7 +23,7 @@ it.each(['en', 'zh-CN'])('shows known, stale and unknown inventory without finge
 })
 it.each(['en', 'zh-CN'])('distinguishes false, unknown and empty shared metadata in %s', async (language) => {
   await i18n.changeLanguage(language)
-  const model = { ...models[0], catalog_metadata: { capabilities: { tools: false, streaming: true, vision: null }, limits: { context: 8192, output: null }, modalities: { input: ['text'], output: [] }, reasoning_levels: null } }
+  const model = { ...models[0], catalog_metadata: { catalog_version: 'test', card: { capabilities: { tools: false, streaming: true, vision: null }, limits: { context: 8192, output: null }, modalities: { input: ['text'], output: [] }, reasoning_levels: null } } }
   mount(<ModelsPage />, '/models', mockApi((path) => path.includes('/operations/models') ? json({ data: [model], total: 1 }) : undefined))
   const region = within(await screen.findByRole('region', { name: i18n.t('models') }))
   await userEvent.click(region.getByRole('button', { name: `${i18n.t('modelFacts')} Fast` }))

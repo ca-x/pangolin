@@ -307,7 +307,7 @@ function CredentialsPanel() {
   const retryOptions = () => void query.refetch()
   return (
     <>
-      <ResourcePage resource="credentials" tableMinWidth={1260} mobileColumnLimit={10} title={t('credentials')} description={t('credentialsDescription')} empty={t('credentialEmpty')} selectable="credentials" createLabel={t('addApiKey')} secondaryAction={<Button variant="default" onClick={() => setOauthOpen(true)}>{t('addOauth')}</Button>} notice={<HealthNotice kind="credential" />} columns={[{ key: 'provider_name', label: t('channel') }, { key: 'suffix', label: t('suffix'), mono: true }, { key: 'credential_type', label: t('credentialType'), render: (value) => credentialType(value) }, { key: 'state', label: t('credentialState'), render: (value) => <Badge variant="light" color={value === 'unrecoverable' ? 'red' : 'green'}>{t(value === 'unrecoverable' ? 'credentialUnrecoverable' : 'credentialReady')}</Badge> }, { key: 'discovery_status', label: t('modelInventory'), render: (value) => <Text size="sm">{t(value === 'known' ? 'inventoryKnown' : value === 'stale' ? 'inventoryStale' : 'inventoryUnknown')}</Text> }, { key: 'discovery_model_count', label: t('inventoryCount'), render: displayValue }, { key: 'discovery_last_success_at', label: t('inventoryLastSuccess'), render: formatDate }, { key: 'priority', label: t('priority') }, { key: 'health', label: t('credentialHealth'), render: (_value, row) => <HealthCell kind="credential" id={String(row.id)} /> }, { key: 'enabled', label: t('status'), render: (value) => <EnabledPill enabled={value} /> }]} rowActions={(row) => row.state === 'unrecoverable' ? <CredentialRecoveryAction row={row} /> : null} normalize={(values, editing) => ({ ...values, credential_type: editing?.credential_type ?? 'api_key', ...(editing ? { id: editing.id } : {}) })} fields={[{ key: 'provider_id', label: t('channel'), kind: 'select', required: true, options, error: optionsError, onRetry: retryOptions }, { key: 'secret', label: t('secret'), kind: 'secret', hint: t('secretUpdateHint'), omitWhenBlank: true }, { key: 'priority', label: t('priority'), kind: 'number', defaultValue: 100 }, { key: 'enabled', label: t('status'), kind: 'checkbox' }, { key: 'settings', label: t('advancedSettings'), kind: 'json', defaultValue: { version: 1 } }]} />
+      <ResourcePage resource="credentials" tableMinWidth={1260} mobileColumnLimit={10} title={t('credentials')} description={t('credentialsDescription')} empty={t('credentialEmpty')} selectable="credentials" createLabel={t('addApiKey')} secondaryAction={<Button variant="default" onClick={() => setOauthOpen(true)}>{t('addOauth')}</Button>} notice={<HealthNotice kind="credential" />} columns={[{ key: 'provider_name', label: t('channel') }, { key: 'suffix', label: t('suffix'), mono: true }, { key: 'credential_type', label: t('credentialType'), render: (value) => credentialType(value) }, { key: 'state', label: t('credentialState'), render: (value) => <Badge variant="light" color={value === 'unrecoverable' ? 'red' : 'green'}>{t(value === 'unrecoverable' ? 'credentialUnrecoverable' : 'credentialReady')}</Badge> }, { key: 'discovery_status', label: t('modelInventory'), render: (value) => <Text size="md">{t(value === 'known' ? 'inventoryKnown' : value === 'stale' ? 'inventoryStale' : 'inventoryUnknown')}</Text> }, { key: 'discovery_model_count', label: t('inventoryCount'), render: displayValue }, { key: 'discovery_last_success_at', label: t('inventoryLastSuccess'), render: formatDate }, { key: 'priority', label: t('priority') }, { key: 'health', label: t('credentialHealth'), render: (_value, row) => <HealthCell kind="credential" id={String(row.id)} /> }, { key: 'enabled', label: t('status'), render: (value) => <EnabledPill enabled={value} /> }]} rowActions={(row) => row.state === 'unrecoverable' ? <CredentialRecoveryAction row={row} /> : null} normalize={(values, editing) => ({ ...values, credential_type: editing?.credential_type ?? 'api_key', ...(editing ? { id: editing.id } : {}) })} fields={[{ key: 'provider_id', label: t('channel'), kind: 'select', required: true, options, error: optionsError, onRetry: retryOptions }, { key: 'secret', label: t('secret'), kind: 'secret', hint: t('secretUpdateHint'), omitWhenBlank: true }, { key: 'priority', label: t('priority'), kind: 'number', defaultValue: 100 }, { key: 'enabled', label: t('status'), kind: 'checkbox' }, { key: 'settings', label: t('advancedSettings'), kind: 'json', defaultValue: { version: 1 } }]} />
       <Modal opened={oauthOpen} onClose={() => setOauthOpen(false)} title={t('providerOauth')} size="lg" closeOnClickOutside={false} closeButtonProps={{ 'aria-label': t('close') }}>
         {oauthOpen && <OAuthCredentialPanel options={options} optionsError={optionsError} retryOptions={retryOptions} onComplete={() => setOauthOpen(false)} />}
       </Modal>
@@ -532,7 +532,7 @@ function ProbeSparkline({ rows, name, failed, retry }: { rows: ProbeRow[]; name:
 
 function ProbeHistory({ rows }: { rows: ProbeRow[] }) {
   const { t } = useTranslation()
-  if (!rows.length) return <Text size="sm" c="dimmed">{t('probeEmpty')}</Text>
+  if (!rows.length) return <Text size="md" c="dimmed">{t('probeEmpty')}</Text>
   const successes = rows.filter(successfulProbe).length
   const latency = measuredAverage(rows, 'latency_ms')
   const ttft = measuredAverage(rows, 'first_text_ms')
@@ -548,9 +548,9 @@ function ProbeHistory({ rows }: { rows: ProbeRow[] }) {
     <Title order={3}>{t('probeHistory')}</Title>
     <SimpleGrid cols={{ base: 2, sm: 4 }} spacing="xs">{facts.map(([label, value]) => <Paper withBorder p="xs" key={label}><Text size="xs" c="dimmed">{label}</Text><Text fw={650} ff="monospace">{value}</Text></Paper>)}</SimpleGrid>
     <Stack gap="sm">{[...rows].sort((left, right) => Number(right.probed_at || 0) - Number(left.probed_at || 0)).slice(0, 20).map((row) => <Stack key={row.id || `${row.probed_at}-${row.model}`} gap={4}>
-      <Group justify="space-between" wrap="wrap"><Text size="sm" fw={560} style={{ overflowWrap: 'anywhere' }}>{row.model || UNMEASURED}</Text><Badge variant="light" color={successfulProbe(row) ? 'green' : 'red'}>{t(successfulProbe(row) ? 'statusSucceeded' : 'statusFailed')}</Badge></Group>
-      <Text size="sm" c="dimmed" style={{ overflowWrap: 'anywhere' }}>{row.endpoint || UNMEASURED} · {formatDate(row.probed_at)}</Text>
-      <SimpleGrid cols={{ base: 1, sm: 3 }} spacing="xs">{(['response_headers_ms', 'first_event_ms', 'first_text_ms'] as const).map((field, index) => <Text size="sm" key={field}>{t(['probeResponseHeaders', 'probeFirstEvent', 'probeFirstText'][index])}: {measuredTime(row[field])}</Text>)}</SimpleGrid>
+      <Group justify="space-between" wrap="wrap"><Text size="md" fw={560} style={{ overflowWrap: 'anywhere' }}>{row.model || UNMEASURED}</Text><Badge variant="light" color={successfulProbe(row) ? 'green' : 'red'}>{t(successfulProbe(row) ? 'statusSucceeded' : 'statusFailed')}</Badge></Group>
+      <Text size="md" c="dimmed" style={{ overflowWrap: 'anywhere' }}>{row.endpoint || UNMEASURED} · {formatDate(row.probed_at)}</Text>
+      <SimpleGrid cols={{ base: 1, sm: 3 }} spacing="xs">{(['response_headers_ms', 'first_event_ms', 'first_text_ms'] as const).map((field, index) => <Text size="md" key={field}>{t(['probeResponseHeaders', 'probeFirstEvent', 'probeFirstText'][index])}: {measuredTime(row[field])}</Text>)}</SimpleGrid>
     </Stack>)}</Stack>
   </Stack>
 }
@@ -578,13 +578,13 @@ function ProbeRowAction({ id, name }: { id: string; name: string }) {
         {open && <ProbeForm providerId={id} onQueued={() => { setBaseline(newest); setQueued(true); void query.refetch() }} />}
         {query.isError ? <InlineQueryError message={t('probeResultsUnavailable')} onRetry={() => void query.refetch()} />
           : !queued ? null
-            : !result ? <Text size="sm" c="dimmed">{t('probeWaiting')}</Text>
+            : !result ? <Text size="md" c="dimmed">{t('probeWaiting')}</Text>
               : <Stack gap={4}>
                 <Badge variant="light" color={outcome ? 'green' : 'red'}>{t(outcome ? 'statusSucceeded' : 'statusFailed')}</Badge>
-                <Text size="sm">{`${t('model')}: ${result.model || UNMEASURED}`}</Text>
-                <Text size="sm">{`${t('latency')}: ${result.latency_ms == null || result.latency_ms <= 0 ? UNMEASURED : `${result.latency_ms} ms`}`}</Text>
-                <Text size="sm">{`${t('statusCode')}: ${result.status_code == null || result.status_code <= 0 ? UNMEASURED : result.status_code}`}</Text>
-                {result.error && <Text size="sm" className="error-text">{`${t('probeError')}: ${result.error}`}</Text>}
+                <Text size="md">{`${t('model')}: ${result.model || UNMEASURED}`}</Text>
+                <Text size="md">{`${t('latency')}: ${result.latency_ms == null || result.latency_ms <= 0 ? UNMEASURED : `${result.latency_ms} ms`}`}</Text>
+                <Text size="md">{`${t('statusCode')}: ${result.status_code == null || result.status_code <= 0 ? UNMEASURED : result.status_code}`}</Text>
+                {result.error && <Text size="md" className="error-text">{`${t('probeError')}: ${result.error}`}</Text>}
               </Stack>}
         <ProbeHistory rows={rows} />
       </Stack>

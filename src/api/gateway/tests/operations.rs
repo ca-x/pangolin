@@ -16077,3 +16077,5 @@ async fn reference_source_envelope_native_gemini_nonstream_ignores_foreign_usage
 async fn reference_source_envelope_native_gemini_stream_ignores_foreign_usage() {
     reference_source_envelope_native_gemini_case(true).await;
 }
+
+mod final_delivery;

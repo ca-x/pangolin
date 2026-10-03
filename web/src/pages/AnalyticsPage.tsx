@@ -95,7 +95,7 @@ export default function AnalyticsPage() {
                 <Table.Td className="mono-cell">{row.ttft_ms == null ? UNMEASURED : `${Math.round(row.ttft_ms)} ms`}</Table.Td>
                 <Table.Td className="mono-cell">{row.tokens_per_second == null ? UNMEASURED : `${new Intl.NumberFormat(undefined, { maximumFractionDigits: 1 }).format(row.tokens_per_second)} ${t('tokensPerSecond')}`}</Table.Td>
                 {showConfidence && <Table.Td><ConfidenceFact row={row} /></Table.Td>}
-                <Table.Td className="mono-cell">{<><Text size="sm">{formatMicros(aggregateAmount(row,row.cost_micros))}</Text><PricingCoverageNotice coverage={row}/></>}</Table.Td>
+                <Table.Td className="mono-cell">{<><Text size="md">{formatMicros(aggregateAmount(row,row.cost_micros))}</Text><PricingCoverageNotice coverage={row}/></>}</Table.Td>
               </Table.Tr>
             })}</Table.Tbody>
           </Table>

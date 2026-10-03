@@ -1699,8 +1699,25 @@ async fn list(
     let mut predicate = format!("{scope}{lifecycle}");
     let mut scoped_values: Vec<sea_orm::Value> = vec![project.clone().into()];
     if let Some(provider_id) = filter.provider_id.as_deref() {
-        if resource != "probes" || provider_id.is_empty() || provider_id.len() > 128 {
+        if !matches!(
+            resource.as_str(),
+            "probes" | "credentials" | "channel-settings"
+        ) || provider_id.is_empty()
+            || provider_id.len() > 128
+        {
             return Err(ApiError::BadRequest("invalid provider filter".into()));
+        }
+        if resource != "probes"
+            && state
+                .db
+                .query_one(sql(
+                    "SELECT 1 AS owned FROM providers WHERE id=? AND project_id=?",
+                    vec![provider_id.to_owned().into(), project.clone().into()],
+                ))
+                .await?
+                .is_none()
+        {
+            return Err(ApiError::NotFound);
         }
         predicate.push_str(" AND provider_id=?");
         scoped_values.push(provider_id.to_owned().into());

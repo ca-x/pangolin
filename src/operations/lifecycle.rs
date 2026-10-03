@@ -418,7 +418,20 @@ impl Attempt {
         self.capture_response_id(value);
         self.usage.merge(usage);
         self.terminal_usage = self.usage.reported;
-        self.final_usage = self.terminal_usage && self.price.complete_usage(&self.usage);
+        let recognized = match crate::providers::capability(&self.context.endpoint) {
+            "chat" => value["choices"]
+                .as_array()
+                .is_some_and(|choices| choices.iter().all(|choice| choice["message"].is_object())),
+            "completions" => value["choices"]
+                .as_array()
+                .is_some_and(|choices| choices.iter().all(|choice| choice["text"].is_string())),
+            "messages" => value["content"].is_array(),
+            "responses" => value["status"] == "completed" && value["output"].is_array(),
+            "gemini" => value["candidates"].is_array(),
+            _ => value.is_object(),
+        };
+        self.final_usage =
+            (self.terminal_usage || recognized) && self.price.complete_usage(&self.usage);
         self.body = self.context.level.body(value);
     }
     pub fn media(&mut self, endpoint: &str, payload: &Value) {
@@ -437,7 +450,7 @@ impl Attempt {
         self.terminal_usage |= self.usage.reported;
         self.final_usage |= self.usage.reported;
     }
-    pub fn stream_event(&mut self, event_name: &str, data: &str, terminal: bool) {
+    pub fn stream_event(&mut self, event_name: &str, data: &str, terminal: bool, successful: bool) {
         let value = serde_json::from_str::<Value>(data).ok();
         if let Some(value) = value.as_ref() {
             self.capture_response_id(value);
@@ -462,7 +475,13 @@ impl Attempt {
             self.usage
                 .merge_event(value, self.context.endpoint == "/v1/messages");
         }
-        self.final_usage = self.terminal_usage && self.price.complete_usage(&self.usage);
+        // Stream closure alone cannot promote progress counters into a final report.
+        // Only tariffs whose charge is independent of every native counter may
+        // complete financially from a successful terminal without such a report.
+        let independent_completion =
+            terminal && successful && self.price.complete_usage(&Usage::default());
+        self.final_usage = (self.terminal_usage || independent_completion)
+            && self.price.complete_usage(&self.usage);
         self.capture_stream_envelope(event_name, data, value.as_ref(), terminal);
     }
     fn capture_stream_envelope(
@@ -559,6 +578,7 @@ impl Attempt {
         crate::providers::timing::record_event_at(
             self.started,
             crate::providers::timing::capture_now(),
+            &self.context.endpoint,
             data,
             &mut self.first_event_ms,
             &mut self.ttft,
@@ -714,8 +734,10 @@ impl Attempt {
         let error_kind = self.error_kind(status);
         let http_status = self.http_status.map(i32::from);
         let usage_id = id();
-        let mut kind = if self.final_usage {
+        let mut kind = if self.final_usage && self.terminal_usage {
             "reported"
+        } else if self.final_usage {
+            "unreported"
         } else if self.contacted && self.reserved > 0 {
             "conservative"
         } else {

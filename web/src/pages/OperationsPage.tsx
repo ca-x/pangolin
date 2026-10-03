@@ -88,7 +88,7 @@ export default function OperationsPage() {
       <Tabs.Panel value="executions"><ResourcePage resource="executions" title={t('executions')} description={t('executionsDescription')} empty={t('executionEmpty')} immutable rowActions={row => <ExecutionDiagnosticsButton attempt={row} />} columns={[{key:'status',label:t('status')},{key:'request_id',label:t('requestId'),mono:true},{key:'provider_id',label:t('provider'),mono:true},{key:'attempt',label:t('attempt')},{key:'latency_ms',label:t('latency')},{key:'retry_reason',label:t('retryReason')}]} /></Tabs.Panel>
       <Tabs.Panel value="threads"><ResourcePage resource="threads" title={t('threads')} description={t('threadsDescription')} empty={t('threadEmpty')} immutable columns={[{key:'id',label:t('threadId'),mono:true},{key:'external_id',label:t('externalId'),mono:true},{key:'api_key_id',label:t('key'),mono:true},{key:'created_at',label:t('time'),render:formatDate}]} /></Tabs.Panel>
       <Tabs.Panel value="traces"><TraceList /></Tabs.Panel>
-      <Tabs.Panel value="usage"><ResourcePage resource="usage" title={t('usage')} description={t('usageDescription')} empty={t('usageEmpty')} immutable columns={[{key:'execution_id',label:t('executionId'),mono:true},{key:'input_tokens',label:t('inputTokens'),render:(value,row)=>quantityText(row,'input_tokens',value)},{key:'output_tokens',label:t('outputTokens'),render:(value,row)=>quantityText(row,'output_tokens',value)},{key:'cache_read_tokens',label:t('cacheTokens'),render:(value,row)=>quantityText(row,'cache_read_tokens',value)},{key:'cost_micros',label:t('cost'),render:(value,row)=><CostFact row={row} value={value} showSettlement={false}/>},{key:'settlement_kind',label:t('settlement'),render:value=><Settlement kind={value}/>}]} /></Tabs.Panel>
+      <Tabs.Panel value="usage"><ResourcePage resource="usage" mobileColumnLimit={6} mobileValueSize="md" title={t('usage')} description={t('usageDescription')} empty={t('usageEmpty')} immutable columns={[{key:'execution_id',label:t('executionId'),mono:true},{key:'input_tokens',label:t('inputTokens'),render:(value,row)=>quantityText(row,'input_tokens',value)},{key:'output_tokens',label:t('outputTokens'),render:(value,row)=>quantityText(row,'output_tokens',value)},{key:'cache_read_tokens',label:t('cacheTokens'),render:(value,row)=>quantityText(row,'cache_read_tokens',value)},{key:'cost_micros',label:t('cost'),render:(value,row)=><CostFact row={row} value={value} showSettlement={false}/>},{key:'settlement_kind',label:t('settlement'),render:value=><Settlement kind={value}/>}]} /></Tabs.Panel>
       <Tabs.Panel value="costItems"><CostItemsPanel /></Tabs.Panel>
       <Tabs.Panel value="audit"><ResourcePage resource="audit" title={t('audit')} description={t('auditDescription')} empty={t('auditEmpty')} immutable columns={[{key:'action',label:t('action')},{key:'resource_type',label:t('type')},{key:'resource_id',label:t('resourceId'),mono:true},{key:'actor_user_id',label:t('actor'),mono:true},{key:'created_at',label:t('time'),render:formatDate}]} /></Tabs.Panel>
     </Tabs>
@@ -364,7 +364,7 @@ function ModelPair({ row }: { row: RequestItem }) {
  */
 function TokenFacts({ row }: { row: RequestItem }) {
   const { t } = useTranslation()
-  return <Stack gap={0}><Text size="sm" className="mono-cell">{`${quantityText(row,'input_tokens',row.input_tokens)} / ${quantityText(row,'output_tokens',row.output_tokens)}`}</Text><Text size="sm" c="dimmed">{`${t('tokenCacheRead')} ${quantityText(row,'cache_read_tokens',row.cached_tokens)} · ${t('tokenCacheWrite')} ${quantityText(row,'cache_write_tokens',row.cache_write_tokens)} · ${t('tokenReasoning')} ${quantityText(row,'reasoning_tokens',row.reasoning_tokens)}`}</Text></Stack>
+  return <Stack gap={0}><Text size="md" className="mono-cell">{`${quantityText(row,'input_tokens',row.input_tokens)} / ${quantityText(row,'output_tokens',row.output_tokens)}`}</Text><Text size="md" c="dimmed">{`${t('tokenCacheRead')} ${quantityText(row,'cache_read_tokens',row.cached_tokens)} · ${t('tokenCacheWrite')} ${quantityText(row,'cache_write_tokens',row.cache_write_tokens)} · ${t('tokenReasoning')} ${quantityText(row,'reasoning_tokens',row.reasoning_tokens)}`}</Text></Stack>
 }
 
 /** Navigation context handed over by the request list, so the detail can step through the page it came from. */
@@ -672,7 +672,7 @@ function TraceFacts({ data, record, traceLink }: { data: RequestDetail; record?:
         </SimpleGrid>
         <Group justify="space-between" align="baseline" wrap="wrap">
           <Text size="sm" c="dimmed">{`${t('tokens')}: ${formatCount(total)}`}</Text>
-          <Text size="sm" fw={560}>{`${t('cost')}: ${formatMicros(amountValue(data))}`}</Text>
+          <Text size="md" fw={560}>{`${t('cost')}: ${formatMicros(amountValue(data))}`}</Text>
         </Group>
         <CostFact row={data}/><AttemptDiagnosticList executions={attempts}/>
         {components.length > 0 ? <Table>

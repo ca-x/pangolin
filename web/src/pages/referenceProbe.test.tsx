@@ -95,7 +95,7 @@ it('shows loading until credential options resolve and honors a channel streamin
 })
 
 it('keeps a known unsupported model stream disabled while allowing a nonstream probe', async () => {
-  mount(<ChannelsPage />, '/channels?tab=probes', mockApi((path) => path.includes('/operations/models') ? json({ data: [{ ...models[0], catalog_metadata: { capabilities: { streaming: false } } }], total: 1 }) : undefined))
+  mount(<ChannelsPage />, '/channels?tab=probes', mockApi((path) => path.includes('/operations/models') ? json({ data: [{ ...models[0], catalog_metadata: { catalog_version: 'test', card: { capabilities: { streaming: false } } } }], total: 1 }) : undefined))
   await waitFor(() => expect(screen.getByRole('button', { name: 'Run probe' })).toBeEnabled())
   expect(screen.getByRole('switch', { name: 'Stream' })).toBeDisabled()
 })

@@ -2,6 +2,7 @@ import { Alert, Badge, Button, Code, Group, Modal, Paper, Select, Stack, Tabs, T
 import { AlertTriangle, Eye } from 'lucide-react'
 import { useEffect, useLayoutEffect, useRef, useState, type FormEvent } from 'react'
 import { useTranslation } from 'react-i18next'
+import { restoreConnectedOpener } from '../dialogFocus'
 import { api } from '../api'
 import { useProject } from '../project'
 
@@ -98,6 +99,9 @@ function preview(value: unknown): value is Preview {
 export function ProtectionRequestPreview() {
   const { t } = useTranslation()
   const { project } = useProject()
+  const opener = useRef<HTMLButtonElement>(null)
+  const currentProject = useRef(project.id)
+  currentProject.current = project.id
   const [openedProject, setOpenedProject] = useState<string | null>(null)
   useEffect(() => {
     setOpenedProject(null)
@@ -105,12 +109,12 @@ export function ProtectionRequestPreview() {
   return (
     <>
       <Group justify="flex-end" mb="md">
-        <Button variant="default" leftSection={<Eye size={17} />} onClick={() => setOpenedProject(project.id)}>
+        <Button ref={opener} variant="default" leftSection={<Eye size={17} />} onClick={() => setOpenedProject(project.id)}>
           {t('previewRules')}
         </Button>
       </Group>
       {openedProject === project.id && (
-        <PreviewSession key={project.id} projectId={project.id} onClose={() => setOpenedProject(null)} />
+        <PreviewSession key={project.id} projectId={project.id} onClose={() => { setOpenedProject(null); restoreConnectedOpener(opener.current, () => currentProject.current === project.id) }} />
       )}
     </>
   )
@@ -206,6 +210,7 @@ function PreviewSession({ projectId, onClose }: { projectId: string; onClose: ()
   return (
     <Modal
       opened
+      returnFocus={false}
       onClose={close}
       title={t('protectionPreviewTitle')}
       size="lg"
@@ -295,7 +300,7 @@ function PreviewSession({ projectId, onClose }: { projectId: string; onClose: ()
             <Stack gap="md">
               <Group>
                 <Text fw={600}>{t('privacyDecision')}</Text>
-                <Badge color={result.decision === 'deny' ? 'red' : result.decision === 'redact' ? 'yellow' : 'teal'}>
+                <Badge variant="default" styles={{root:{color:'var(--mantine-color-text)',backgroundColor:'var(--mantine-color-default)',fontSize:14}}} color={result.decision === 'deny' ? 'red' : result.decision === 'redact' ? 'yellow' : 'teal'}>
                   {t(`privacy_${result.decision}`)}
                 </Badge>
               </Group>
@@ -307,6 +312,8 @@ function PreviewSession({ projectId, onClose }: { projectId: string; onClose: ()
               <Text fw={560}>{t('privacyResult')}</Text>
               <Text
                 component="pre"
+                role="region"
+                tabIndex={0}
                 aria-label={t('privacyResult')}
                 className="protection-preview-result"
                 style={{
@@ -341,6 +348,9 @@ function PreviewSession({ projectId, onClose }: { projectId: string; onClose: ()
                         {rule.action === 'deny' && <Text size="sm">{t('previewDenyHint')}</Text>}
                         <Text
                           component="pre"
+                          role="region"
+                          tabIndex={0}
+                          aria-label={`${t('previewResult')} · ${rule.name} (${rule.id})`}
                           className="protection-preview-result"
                           style={{ maxHeight: 280, overflow: 'auto', whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}
                         >

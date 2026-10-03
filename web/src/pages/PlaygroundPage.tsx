@@ -614,7 +614,7 @@ export default function PlaygroundPage() {
                 ) : record.isLoading ? (
                   <Text size="xs" c="dimmed">{t('playgroundUsageLoading')}</Text>
                 ) : (
-                  <Stack gap={4}><Group gap="lg" wrap="wrap">{facts.map(([name, value]) => <Text size="sm" c="dimmed" key={name}>{`${name}: ${value}`}</Text>)}</Group><PricingCoverageNotice coverage={rowCoverage(usage??[])}/><SettlementFacts rows={usage??[]}/></Stack>
+                  <Stack gap={4}><Group gap="lg" wrap="wrap">{facts.map(([name, value]) => <Text size="md" c="dimmed" key={name}>{`${name}: ${value}`}</Text>)}</Group><PricingCoverageNotice coverage={rowCoverage(usage??[])}/><SettlementFacts rows={usage??[]}/></Stack>
                 )}
               </Group>
             )}

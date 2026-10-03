@@ -3,6 +3,7 @@ import { useMutation, useQuery } from '@tanstack/react-query'
 import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
+import { catalogCard } from '../catalogCard'
 import { api, type Document, type Paged } from '../api'
 import { InlineQueryError, SelectField } from '../components'
 import { projectOperationPath, useProject } from '../project'
@@ -38,11 +39,11 @@ function ScopedProbeForm({ providerId, onQueued }: { providerId?: string; onQueu
   const available = (channels.data?.data || []).filter(enabled)
   const current = providerId || (available.some((row) => row.id === selected) ? selected : String(available[0]?.id || ''))
   const channel = available.find((row) => row.id === current)
-  if (channels.isPending) return <Text size="sm" role="status">{t('loading')}</Text>
+  if (channels.isPending) return <Text size="md" role="status">{t('loading')}</Text>
   if (channels.isError) return <InlineQueryError message={t('optionsUnavailable')} onRetry={() => void channels.refetch()} />
   return <Stack gap="md" aria-label={t('probeConfiguration')}>
     {!providerId && <SelectField label={t('channel')} value={current} onValueChange={setSelected} options={available.map((row) => ({ value: String(row.id), label: String(row.name) }))} />}
-    {channel ? <ProbeSelection key={current} channel={channel} onQueued={onQueued} /> : <Text size="sm">{t('probeNoChannels')}</Text>}
+    {channel ? <ProbeSelection key={current} channel={channel} onQueued={onQueued} /> : <Text size="md">{t('probeNoChannels')}</Text>}
   </Stack>
 }
 function ProbeSelection({ channel, onQueued }: { channel: Document; onQueued?: () => void }) {
@@ -57,16 +58,16 @@ function ProbeSelection({ channel, onQueued }: { channel: Document; onQueued?: (
   const keys = (credentials.data?.data || []).filter((row) => row.provider_id === channel.id && enabled(row) && row.state !== 'unrecoverable')
   const policy = policies.data?.data.find((row) => row.provider_id === channel.id)
   const rules = policy?.model_rules as Record<string, unknown> | undefined
-  const metadata = selected?.catalog_metadata as { capabilities?: { streaming?: boolean | null } } | undefined
+  const metadata = catalogCard(selected?.catalog_metadata)
   const failed = models.isError || credentials.isError || policies.isError
   const loading = models.isPending || credentials.isPending || policies.isPending
   return <Stack gap="md">
-    {loading && <Text size="sm" role="status">{t('loading')}</Text>}
+    {loading && <Text size="md" role="status">{t('loading')}</Text>}
     {models.isError && <InlineQueryError message={t('probeModelsUnavailable')} onRetry={() => void models.refetch()} />}
     {credentials.isError && <InlineQueryError message={t('probeCredentialsUnavailable')} onRetry={() => void credentials.refetch()} />}
     {policies.isError && <InlineQueryError message={t('optionsUnavailable')} onRetry={() => void policies.refetch()} />}
-    {!models.isPending && !models.isError && !eligible.length && <Text size="sm">{t('probeNoModels')}</Text>}
-    {!credentials.isPending && !credentials.isError && !keys.length && <Text size="sm">{t('probeNoCredentials')}</Text>}
+    {!models.isPending && !models.isError && !eligible.length && <Text size="md">{t('probeNoModels')}</Text>}
+    {!credentials.isPending && !credentials.isError && !keys.length && <Text size="md">{t('probeNoCredentials')}</Text>}
     <SelectField label={t('model')} value={String(selected?.id || '')} onValueChange={setModel} options={eligible.map((row) => ({ value: String(row.id), label: String(row.public_name || row.id) }))} />
     <ProbeOptions key={String(selected?.id || '')} channel={channel} model={selected} credentials={keys} blocked={failed || loading} allowStream={rules?.stream !== false && metadata?.capabilities?.streaming !== false} onQueued={onQueued} />
   </Stack>
@@ -96,7 +97,7 @@ function ProbeOptions({ channel, model, credentials, blocked, allowStream, onQue
         <SelectField label={t('probeCredential')} value={String(key?.id || '')} onValueChange={setCredential} options={credentials.map((row) => ({ value: row.id, label: `•••• ${row.suffix || row.id}` }))} />
         <SelectField label={t('probeProtocol')} value={selected?.value || ''} onValueChange={(value) => { setProtocol(value); setStream(false) }} options={available} />
       </SimpleGrid>
-      {!blocked && model && !available.length && <Text size="sm">{t('probeNoProtocols')}</Text>}
+      {!blocked && model && !available.length && <Text size="md">{t('probeNoProtocols')}</Text>}
       <Switch label={t('stream')} checked={streaming} disabled={!canStream || !canNonstream} onChange={(event) => setStream(event.currentTarget.checked)} />
       {run.isError && <InlineQueryError message={run.error.message} onRetry={() => { if (ready) run.mutate() }} />}
       <Button type="submit" disabled={!ready} loading={run.isPending} style={{ alignSelf: 'flex-start' }}>{t('runProbe')}</Button>

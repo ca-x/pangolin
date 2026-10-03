@@ -561,7 +561,9 @@ async fn execute_inner(
                     attempt.finish(AttemptOutcome::UpstreamFailure).await?;
                     continue;
                 }
-                attempt.response(&value);
+                // The special bridge already captured native Anthropic evidence.
+                // Its Chat envelope contains compatibility defaults, not measurements.
+                attempt.response_with_usage(&value, crate::operations::pricing::Usage::default());
                 attempt.finish(AttemptOutcome::Success).await?;
                 if let Some(permit) = &mut key_permit {
                     permit.finish(true);
@@ -742,8 +744,8 @@ async fn execute_inner(
                     loop {
                         let terminal=terminal_state.terminal(&event,endpoint);
                         attempt.first_event(&event.data);
-                        attempt.stream_event(&event.event,&event.data,terminal);
                         let failed=sse::failed(&event);
+                        attempt.stream_event(&event.event,&event.data,terminal,!failed);
                         if let Some(response)=sse::completed_response(&event)
                             && runtime.sessions.persist(&database,&secrets,&session_credential,&session_request,&response).await.is_err() {
                             let _=attempt.finish(AttemptOutcome::LocalFailure).await;key.finish(false);

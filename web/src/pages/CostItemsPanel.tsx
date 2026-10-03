@@ -35,6 +35,8 @@ export function CostItemsPanel() {
   return (
     <ResourcePage
       resource="cost-items"
+      mobileColumnLimit={4}
+      mobileValueSize="md"
       title={t('costItems')}
       description={t('costDescription')}
       empty={t('costEmpty')}

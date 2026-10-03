@@ -522,18 +522,14 @@ impl Price {
     /// Presence requirements follow the selected components, including splits.
     /// Unpriced counters can remain unknown without inventing measured zero.
     pub fn complete_usage(&self, u: &Usage) -> bool {
+        if u.validate_quantities().is_err() {
+            return false;
+        }
         if self.components.is_empty() {
             return true;
         }
-        if !u.reported {
-            return false;
-        }
-        let free = matches!(
-            self.pricing_status,
-            PricingStatus::ExplicitFree | PricingStatus::MissingPrice
-        );
         let charged = |c: &Component| {
-            free || c.unit_price_micros > 0 || c.tiers.iter().any(|t| t.unit_price_micros > 0)
+            c.unit_price_micros > 0 || c.tiers.iter().any(|t| t.unit_price_micros > 0)
         };
         let input = self
             .components

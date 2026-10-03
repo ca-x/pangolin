@@ -1419,7 +1419,11 @@ async fn call_anthropic_chat(
     {
         accounting
             .usage
-            .merge(crate::operations::pricing::Usage::parse_for(&body, true));
+            .merge(crate::providers::usage::protocol_usage(
+                "/v1/messages",
+                &body,
+                false,
+            ));
     }
     if !status.is_success() {
         return Err(AnthropicHttpError {
@@ -1486,6 +1490,10 @@ async fn call_anthropic_chat(
     let canonical_usage = crate::operations::pricing::Usage::parse_for(&body, true);
     let input_tokens = canonical_usage.input;
     let output_tokens = canonical_usage.output;
+    // Each validated counter fits i64; their nonnegative protocol total may need u64.
+    // This compatibility field must not panic before conservative monetary settlement.
+    let total_tokens = u64::try_from(input_tokens).unwrap_or_default()
+        + u64::try_from(output_tokens).unwrap_or_default();
     Ok(json!({
         "id": body.get("id").cloned().unwrap_or_else(|| Value::String(format!("chatcmpl_{}", Uuid::new_v4().simple()))),
         "object": "chat.completion",
@@ -1503,7 +1511,7 @@ async fn call_anthropic_chat(
         "usage": {
             "prompt_tokens": input_tokens,
             "completion_tokens": output_tokens,
-            "total_tokens": input_tokens + output_tokens,
+            "total_tokens": total_tokens,
             "prompt_tokens_details":{"cached_tokens":body.pointer("/usage/cache_read_input_tokens").and_then(Value::as_i64).unwrap_or(0),"cache_creation_tokens":body.pointer("/usage/cache_creation_input_tokens").and_then(Value::as_i64).unwrap_or(0)}
         }
     }))
