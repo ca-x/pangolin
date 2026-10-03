@@ -279,8 +279,11 @@ Final whole-branch GPT-6 review receives the full diff/specs, task reports/ledge
 **Verification:** all commands exit0, complete release QA cases pass, no open important/critical review findings, `git diff --check` clean; final report lists exact features and material remaining limitations.
 **Commit:** `docs: document reference adoption contracts and verified behavior`.
 
-- [ ] **Step 1: Write the named behavioral regressions below and run the focused command before implementing.** Record expected RED output in the task report. Use existing composed mock fixtures; do not weaken tests to bless the implementation.
-- [ ] **Step 2: Implement the contract in the listed files, preserving existing defaults and public compatibility where specified.** Apply only this task's required changes.
-- [ ] **Step 3: Run focused GREEN verification, then the relevant full suite once.** Backend tasks: `cargo fmt --all -- --check`, `cargo test --locked`. Frontend tasks: `pnpm --dir web lint`, `pnpm --dir web test`, `pnpm --dir web build`. New source may be formatted with `cargo fmt --all` before checks. Capture exact commands, exit codes and relevant counts.
-- [ ] **Step 4: Read your own diff for scope, typed boundaries, leaked content and regressions; fix findings and repeat only covering checks.** Commit the implementation/tests atomically with the conventional subject specified below. Never include controller-owned specs/plans/docs in a source implementation commit.
-- [ ] **Step 5: Write the task report, including RED/GREEN evidence, changed files, self-review and concerns.** Return DONE/DONE_WITH_CONCERNS/BLOCKED/NEEDS_CONTEXT plus commit and one-line test summary. No worker-spawned agents or reviewers.
+- [x] **Step 1: Write the named behavioral regressions below and run the focused command before implementing.** Record expected RED output in the task report. Use existing composed mock fixtures; do not weaken tests to bless the implementation.
+- [x] **Step 2: Implement the contract in the listed files, preserving existing defaults and public compatibility where specified.** Apply only this task's required changes.
+- [x] **Step 3: Run focused GREEN verification, then the relevant full suite once.** Backend tasks: `cargo fmt --all -- --check`, `cargo test --locked`. Frontend tasks: `pnpm --dir web lint`, `pnpm --dir web test`, `pnpm --dir web build`. New source may be formatted with `cargo fmt --all` before checks. Capture exact commands, exit codes and relevant counts.
+- [x] **Step 4: Read your own diff for scope, typed boundaries, leaked content and regressions; fix findings and repeat only covering checks.** Commit the implementation/tests atomically with the conventional subject specified below. Never include controller-owned specs/plans/docs in a source implementation commit.
+- [x] **Step 5: Write the task report, including RED/GREEN evidence, changed files, self-review and concerns.** Return DONE/DONE_WITH_CONCERNS/BLOCKED/NEEDS_CONTEXT plus commit and one-line test summary. No worker-spawned agents or reviewers.
+
+
+Delivery evidence: [verified reference adoption](../docs/reference-adoption-verification.md). Fresh source gates: `93b69f349ba06ff380cfc008f3840785395944a7`; documentation-only delivery embedding is verified separately with matching backend/frontend provenance.
