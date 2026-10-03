@@ -8,6 +8,7 @@ import { api, type AnalyticsRow } from '../api'
 import { ANALYTICS_DIMENSIONS, type AnalyticsDimension, useAnalyticsDimensionNames } from '../analyticsDimensions'
 import { EmptyState, SkeletonRows } from '../components'
 import { formatCount, formatMicros, UNMEASURED } from '../observability'
+import { aggregateAmount, PricingCoverageNotice } from '../measurement'
 import { useProject } from '../project'
 import { PageHeader, QueryError } from './shared'
 
@@ -77,7 +78,7 @@ export default function AnalyticsPage() {
       {names.query.isError && <Stack mb="lg"><QueryError retry={() => void names.query.refetch()} /></Stack>}
       <SimpleGrid cols={{ base: 1, md: 2 }} mb="lg">
         <MetricBars title={t('throughput')} rows={rows} label={names.resolve} value={(row) => row.tokens_per_second} format={(value) => `${new Intl.NumberFormat(undefined, { maximumFractionDigits: 1 }).format(value)} ${t('tokensPerSecond')}`} showConfidence={showConfidence} />
-        <MetricBars title={t('cost')} rows={rows} label={names.resolve} value={(row) => row.usage_measured === false ? null : row.cost_micros} format={formatMicros} />
+        <MetricBars title={t('measuredSubtotal')} rows={rows} label={names.resolve} value={(row) => aggregateAmount(row,row.cost_micros)} format={formatMicros} />
       </SimpleGrid>
       <Card p="lg">
         <Group justify="space-between" mb="sm"><Stack gap={2}><Title order={2}>{t('performanceBreakdown')}</Title><Text size="sm" c="dimmed">{t('analyticsMeasuredHint')}</Text></Stack></Group>
@@ -94,7 +95,7 @@ export default function AnalyticsPage() {
                 <Table.Td className="mono-cell">{row.ttft_ms == null ? UNMEASURED : `${Math.round(row.ttft_ms)} ms`}</Table.Td>
                 <Table.Td className="mono-cell">{row.tokens_per_second == null ? UNMEASURED : `${new Intl.NumberFormat(undefined, { maximumFractionDigits: 1 }).format(row.tokens_per_second)} ${t('tokensPerSecond')}`}</Table.Td>
                 {showConfidence && <Table.Td><ConfidenceFact row={row} /></Table.Td>}
-                <Table.Td className="mono-cell">{row.usage_measured === false ? UNMEASURED : formatMicros(row.cost_micros)}</Table.Td>
+                <Table.Td className="mono-cell">{<><Text size="sm">{formatMicros(aggregateAmount(row,row.cost_micros))}</Text><PricingCoverageNotice coverage={row}/></>}</Table.Td>
               </Table.Tr>
             })}</Table.Tbody>
           </Table>

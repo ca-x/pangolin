@@ -184,7 +184,7 @@ describe('the prompt list says what a prompt does', () => {
     const dialog = screen.getByRole('dialog', { name: '预览防护规则' })
     await userEvent.type(within(dialog).getByRole('textbox', { name: '示例文本' }), 'secret')
     await userEvent.click(within(dialog).getByRole('button', { name: '运行预览' }))
-    expect(await within(dialog).findByText('preview unavailable')).toBeInTheDocument()
+    expect(await within(dialog).findByText(i18n.t('privacyFailure'))).toBeInTheDocument()
     await userEvent.click(within(dialog).getByRole('button', { name: '重试' }))
     await waitFor(() => expect(previews).toBe(2))
     expect(await within(dialog).findByText('没有可预览的防护规则。')).toBeInTheDocument()

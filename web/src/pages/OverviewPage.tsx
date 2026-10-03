@@ -9,6 +9,7 @@ import { EmptyState, SkeletonRows, Status } from '../components'
 import i18n from '../i18n'
 import { ObservabilityNotice, UNMEASURED, formatCount, formatMicros, useObservability } from '../observability'
 import { PageHeader, QueryError, displayValue, formatDate } from './shared'
+import { aggregateAmount, PricingCoverageNotice } from '../measurement'
 import { useProject } from '../project'
 import { Button, Card, Group, Select, SimpleGrid, Stack, Table, TableScrollContainer, Text, ThemeIcon, Title } from '@mantine/core'
 
@@ -93,7 +94,7 @@ export default function OverviewPage() {
   // Token and cost totals are unmeasured when the window settled no usage at all:
   // `—` there, never an invented zero, and a measured zero stays a real zero.
   const tokens = value && value.input_tokens != null && value.output_tokens != null ? value.input_tokens + value.output_tokens : null
-  const cost = value ? value.cost_micros : null
+  const cost = value ? aggregateAmount(value,value.cost_micros) : null
   // The backend counts failed requests itself; reconstructing the count from the
   // rounded rate disagreed with the row-level statuses.
   const failed = value ? value.errors : null
@@ -104,9 +105,10 @@ export default function OverviewPage() {
       <Stat id="requests" icon={<Activity />} label={t('totalRequests')} value={measured && value ? formatNumber(value.requests) : UNMEASURED} sub={measured && tokens != null && tokens > 0 ? `${formatNumber(tokens)} ${t('tokens')}` : undefined} />
       <Stat id="errors" icon={<ShieldCheck />} label={t('errorRate')} value={measured && hasTraffic && value!.error_rate != null ? <>{(value!.error_rate * 100).toFixed(1)}<Text component="span" fz=".62em" fw={500} c="dimmed">%</Text></> : UNMEASURED} sub={measured && failed ? t('failedRequests', { count: failed }) : undefined} tone={measured && value?.error_rate != null && value.error_rate > .05 ? 'danger' : undefined} />
       <Stat id="latency" icon={<Clock3 />} label={t('p95Latency')} value={measured && hasTraffic && value!.p95_latency_ms != null ? <>{Math.round(value!.p95_latency_ms)}<Text component="span" fz=".62em" fw={500} c="dimmed"> ms</Text></> : UNMEASURED} />
-      <Stat id="cost" icon={<CircleDollarSign />} label={t('cost')} value={measured && value ? formatMicros(cost) : UNMEASURED} sub={measured && hasTraffic && cost != null ? `${formatMicros(cost / value!.requests)} ${t('perRequest')}` : undefined} />
+      <Stat id="cost" icon={<CircleDollarSign />} label={t('cost')} value={measured && value ? formatMicros(cost) : UNMEASURED} sub={measured && ((value?.missing_pricing_count??0)+(value?.incomplete_usage_count??0)>0) ? t('measuredSubtotal') : measured && hasTraffic && cost != null ? `${formatMicros(cost / value!.requests)} ${t('perRequest')}` : undefined} />
     </SimpleGrid>
-    {!measured ? null : summary.isLoading || requests.isLoading ? <SkeletonRows count={5}/> : value?.requests === 0 ? <EmptyState icon={<Server />} title={t('overviewEmptyTitle', { window: labels[window] })} copy={t('overviewEmptyCopy')} action={<Button component={Link} to="/channels">{t('configureChannel')}</Button>} /> : <div className="overview-grid"><Card p="lg"><Group justify="space-between" align="flex-start" mb="sm"><Stack gap={2}><Title order={2}>{t('requestTrend')}</Title><Text size="sm" c="dimmed">{`${formatNumber(value?.requests || 0)} ${t('requests')} · ${t('tokens')}: ${formatCount(tokens)}`}</Text></Stack><ChartLegend /></Group><TrendChart series={value?.series || []}/><details className="chart-table"><summary>{t('dataTable')}</summary><table><thead><tr><th>{t('startedAt')}</th><th>{t('requests')}</th><th>{t('errorsLabel')}</th><th>{t('inputTokens')}</th><th>{t('outputTokens')}</th><th>{t('totalTokens')}</th><th>{t('cost')}</th></tr></thead><tbody>{value?.series.map((point) => <tr key={point.bucket}><td>{formatDate(point.bucket)}</td><td className="mono-cell">{formatCount(point.requests)}</td><td className="mono-cell">{formatCount(point.errors)}</td><td className="mono-cell">{formatCount(point.input_tokens)}</td><td className="mono-cell">{formatCount(point.output_tokens)}</td><td className="mono-cell">{formatCount(totalTokens(point))}</td><td className="mono-cell">{formatMicros(point.cost_micros)}</td></tr>)}</tbody></table></details></Card><Card p="lg"><Group justify="space-between" align="flex-start" mb="sm"><Title order={2}>{t('recentRequests')}</Title><Button variant="subtle" size="compact-sm" component={Link} to="/operations">{t('viewAll')}</Button></Group><CompactRequests rows={requests.data?.data || []}/></Card></div>}
+    {measured&&value&&<PricingCoverageNotice coverage={value}/>}
+    {!measured ? null : summary.isLoading || requests.isLoading ? <SkeletonRows count={5}/> : value?.requests === 0 ? <EmptyState icon={<Server />} title={t('overviewEmptyTitle', { window: labels[window] })} copy={t('overviewEmptyCopy')} action={<Button component={Link} to="/channels">{t('configureChannel')}</Button>} /> : <div className="overview-grid"><Card p="lg"><Group justify="space-between" align="flex-start" mb="sm"><Stack gap={2}><Title order={2}>{t('requestTrend')}</Title><Text size="sm" c="dimmed">{`${formatNumber(value?.requests || 0)} ${t('requests')} · ${t('tokens')}: ${formatCount(tokens)}`}</Text></Stack><ChartLegend /></Group><TrendChart series={value?.series || []}/><details className="chart-table"><summary>{t('dataTable')}</summary><table><thead><tr><th>{t('startedAt')}</th><th>{t('requests')}</th><th>{t('errorsLabel')}</th><th>{t('inputTokens')}</th><th>{t('outputTokens')}</th><th>{t('totalTokens')}</th><th>{t('cost')}</th></tr></thead><tbody>{value?.series.map((point) => <tr key={point.bucket}><td>{formatDate(point.bucket)}</td><td className="mono-cell">{formatCount(point.requests)}</td><td className="mono-cell">{formatCount(point.errors)}</td><td className="mono-cell">{formatCount(point.input_tokens)}</td><td className="mono-cell">{formatCount(point.output_tokens)}</td><td className="mono-cell">{formatCount(totalTokens(point))}</td><td className="mono-cell">{formatMicros(aggregateAmount(point,point.cost_micros))}</td></tr>)}</tbody></table></details></Card><Card p="lg"><Group justify="space-between" align="flex-start" mb="sm"><Title order={2}>{t('recentRequests')}</Title><Button variant="subtle" size="compact-sm" component={Link} to="/operations">{t('viewAll')}</Button></Group><CompactRequests rows={requests.data?.data || []}/></Card></div>}
     {measured && hasTraffic && <Breakdowns projectId={project.id} bounds={bounds} windowLabel={labels[window]} />}
   </>
 }
@@ -237,11 +239,11 @@ function TrendChart({ series }: { series: SeriesPoint[] }) {
           {/* deslop-ignore-next-line 24 — chart marks, not icons */}
           {focus && <circle className="chart-dot-active" cx={focus.x} cy={focus.y} r="4.5" vectorEffect="non-scaling-stroke"/>}
         </svg>
-        {focus && <div className="chart-tooltip" style={{ left: `${(focus.x / CHART_WIDTH) * 100}%`, top: `${(focus.y / CHART_HEIGHT) * 100}%` }}><span>{formatBucket(focus.bucket, bucketWidth)}</span><div><strong>{formatNumber(focus.requests)}</strong><span>{t('requests')}</span></div><div><strong>{formatNumber(focus.errors)}</strong><span>{t('errorsLabel')}</span></div><div><strong>{formatCount(focus.input_tokens)}</strong><span>{t('inputTokens')}</span></div><div><strong>{formatCount(focus.output_tokens)}</strong><span>{t('outputTokens')}</span></div><div><strong>{formatCount(totalTokens(focus))}</strong><span>{t('totalTokens')}</span></div><div><strong>{formatMicros(focus.cost_micros)}</strong><span>{t('cost')}</span></div></div>}
+        {focus && <div className="chart-tooltip" style={{ left: `${(focus.x / CHART_WIDTH) * 100}%`, top: `${(focus.y / CHART_HEIGHT) * 100}%` }}><span>{formatBucket(focus.bucket, bucketWidth)}</span><div><strong>{formatNumber(focus.requests)}</strong><span>{t('requests')}</span></div><div><strong>{formatNumber(focus.errors)}</strong><span>{t('errorsLabel')}</span></div><div><strong>{formatCount(focus.input_tokens)}</strong><span>{t('inputTokens')}</span></div><div><strong>{formatCount(focus.output_tokens)}</strong><span>{t('outputTokens')}</span></div><div><strong>{formatCount(totalTokens(focus))}</strong><span>{t('totalTokens')}</span></div><div><strong>{formatMicros(aggregateAmount(focus,focus.cost_micros))}</strong><span>{t('cost')}</span></div></div>}
       </div>
     </div>
     <SparkRow label={t('totalTokens')} values={series.map(totalTokens)} format={formatNumber} flat={flat} x={x} focus={focus}/>
-    <SparkRow label={t('cost')} values={series.map((point) => point.cost_micros)} format={formatMicros} flat={flat} x={x} focus={focus}/>
+    <SparkRow label={t('cost')} values={series.map((point) => aggregateAmount(point,point.cost_micros))} format={formatMicros} flat={flat} x={x} focus={focus}/>
     <div className="chart-x-labels" aria-hidden="true">{tickTimes.map((time) => <span key={time} className="chart-axis-label" style={{ left: `${((time - firstBucket) / span) * 100}%` }}>{formatBucket(time, bucketWidth)}</span>)}</div>
   </div>
 }
@@ -321,7 +323,7 @@ function Breakdowns({ projectId, bounds, windowLabel }: { projectId: string; bou
               <Table.Td className="mono-cell">{formatCount(row.input_tokens)}</Table.Td>
               <Table.Td className="mono-cell">{formatCount(row.output_tokens)}</Table.Td>
               <Table.Td className="mono-cell">{formatCount(row.cache_hit_tokens)}</Table.Td>
-              <Table.Td className="mono-cell">{formatMicros(row.cost_micros)}</Table.Td>
+              <Table.Td className="mono-cell">{<><Text size="sm">{formatMicros(aggregateAmount(row,row.cost_micros))}</Text><PricingCoverageNotice coverage={row}/></>}</Table.Td>
               <Table.Td className="mono-cell">{row.latency_ms == null ? UNMEASURED : `${Math.round(row.latency_ms)} ms`}</Table.Td>
             </Table.Tr>
           })}</Table.Tbody>

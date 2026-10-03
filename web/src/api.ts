@@ -1,3 +1,4 @@
+import type { PricingCoverage, UsageMeasurement } from './measurement'
 export type Branding = { instance_name: string; branding_name: string; favicon_url: string; onboarding_complete: boolean; currency?: string; timezone?: string }
 export let displayCurrency = 'USD'
 const browserTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'
@@ -22,14 +23,14 @@ export type ApiKey = { id: string; name: string; key_prefix: string; scopes: str
  * unmeasured bucket is a gap in the series and prints `—`, while a measured zero
  * is a plotted zero. `latency_ms` is the bucket's average.
  */
-export type SummaryPoint = { bucket: number; requests: number; errors: number; latency_ms: number; input_tokens: number | null; output_tokens: number | null; cost_micros: number | null }
+export type SummaryPoint = PricingCoverage & { bucket: number; requests: number; errors: number; latency_ms: number; input_tokens: number | null; output_tokens: number | null; cost_micros: number | null }
 /**
  * The overview's totals for one window. `input_tokens`, `output_tokens` and
  * `cost_micros` are `null` when the window measured no usage: a window of
  * unmeasured failures has no total, and `0` would be a measurement nobody made.
  * `requests`, `errors`, `error_rate` and `p95_latency_ms` are unchanged.
  */
-export type Summary = { requests: number; errors: number; error_rate: number | null; p95_latency_ms: number | null; input_tokens: number | null; output_tokens: number | null; cost_micros: number | null; series: SummaryPoint[] }
+export type Summary = PricingCoverage & { requests: number; errors: number; error_rate: number | null; p95_latency_ms: number | null; input_tokens: number | null; output_tokens: number | null; cost_micros: number | null; series: SummaryPoint[] }
 /**
  * One row of the request log. `internal_id` is Pangolin's own request UUID: it is
  * unique, so it is the row key and the identity the detail is opened by. `request_id`
@@ -49,7 +50,7 @@ export type Summary = { requests: number; errors: number; error_rate: number | n
  * request's own admission decision: `true`, `false`, or `null` when nothing
  * recorded it, which is not the same fact as `false`.
  */
-export type RequestItem = { internal_id: string; request_id: string; started_at: number; endpoint: string; provider: string | null; requested_model: string | null; resolved_model: string | null; status_code: number | null; error_kind: string | null; latency_ms: number; ttft_ms: number | null; input_tokens: number; output_tokens: number; cached_tokens: number | null; cache_write_tokens: number | null; reasoning_tokens: number | null; stream: boolean | null; cost_micros: number; api_key_id: string | null }
+export type RequestItem = { pricing_status?:string; usage_measurement?:UsageMeasurement; settlement_kind?:string; internal_id: string; request_id: string; started_at: number; endpoint: string; provider: string | null; requested_model: string | null; resolved_model: string | null; status_code: number | null; error_kind: string | null; latency_ms: number; ttft_ms: number | null; input_tokens: number; output_tokens: number; cached_tokens: number | null; cache_write_tokens: number | null; reasoning_tokens: number | null; stream: boolean | null; cost_micros: number; api_key_id: string | null }
 /**
  * One row of `/analytics`: the aggregate of a single value of the selected
  * dimension. `dimension` is an opaque id for every entity facet, and `latency_ms`
@@ -57,7 +58,7 @@ export type RequestItem = { internal_id: string; request_id: string; started_at:
  * and model rows also carry the measured throughput sample count and its
  * reference-compatible confidence classification.
  */
-export type AnalyticsRow = { dimension: string | null; requests: number; attempts: number; errors: number; sample_count?: number; confidence_level?: 'low' | 'medium' | 'high'; usage_measured?: boolean; input_tokens: number; output_tokens: number; cache_hit_tokens: number; cache_savings_micros: number; cost_micros: number; latency_ms: number | null; ttft_ms: number | null; tokens_per_second?: number | null }
+export type AnalyticsRow = PricingCoverage & { dimension: string | null; requests: number; attempts: number; errors: number; sample_count?: number; confidence_level?: 'low' | 'medium' | 'high'; usage_measured?: boolean; input_tokens: number | null; output_tokens: number | null; cache_hit_tokens: number | null; cache_savings_micros: number | null; cost_micros: number | null; latency_ms: number | null; ttft_ms: number | null; tokens_per_second?: number | null }
 export type LiveRequest = { model: string; channel_id: string; api_key_id: string; started_at: number }
 /**
  * The projection's detail document for one request: the same facts as a list row plus

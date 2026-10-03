@@ -8,6 +8,7 @@ import { api } from '../api'
 import { InlineQueryError } from '../components'
 import { UNMEASURED, formatCount, formatMicros } from '../observability'
 import { projectOperationPath, useProject } from '../project'
+import { quantityValue, amountValue, PricingCoverageNotice, rowCoverage, type PricingFacts } from '../measurement'
 import { PageHeader } from './shared'
 
 /**
@@ -163,7 +164,7 @@ function settle(terminal: Terminal): Outcome {
 type RequestRecord = {
   id: string
   /** The record also carries `executions` and `cost_items`; this compact view reads only the usage. */
-  usage?: Array<{ input_tokens?: number | null; output_tokens?: number | null; total_cost_micros?: number | null }>
+  usage?: Array<PricingFacts & { input_tokens?: number | null; output_tokens?: number | null; total_cost_micros?: number | null }>
 }
 
 type PlaygroundKey = { id: string; name: string; enabled: boolean; expires_at: number | null; budget_micros: number | null; spent_micros: number | null }
@@ -179,7 +180,7 @@ function sumUsage(rows: RequestRecord['usage'], key: 'input_tokens' | 'output_to
   let total = 0
   let measured = false
   for (const row of rows ?? []) {
-    const value = row?.[key]
+    const value = key==='total_cost_micros'?amountValue(row,row?.[key]):quantityValue(row,key,row?.[key])
     if (typeof value === 'number' && Number.isFinite(value) && value >= 0) { total += value; measured = true }
   }
   return measured ? total : null
@@ -613,7 +614,7 @@ export default function PlaygroundPage() {
                 ) : record.isLoading ? (
                   <Text size="xs" c="dimmed">{t('playgroundUsageLoading')}</Text>
                 ) : (
-                  facts.map(([name, value]) => <Text size="xs" c="dimmed" key={name}>{`${name}: ${value}`}</Text>)
+                  <Stack gap={4}><Group gap="lg" wrap="wrap">{facts.map(([name, value]) => <Text size="sm" c="dimmed" key={name}>{`${name}: ${value}`}</Text>)}</Group><PricingCoverageNotice coverage={rowCoverage(usage??[])}/></Stack>
                 )}
               </Group>
             )}

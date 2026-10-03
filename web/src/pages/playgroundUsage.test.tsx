@@ -35,8 +35,8 @@ const record = {
     { id: 'e2', request_id: 'internal-1', provider_id: 'backup', attempt: 2, model: 'demo', status: 'succeeded', retry_reason: null, latency_ms: 7 },
   ],
   usage: [
-    { execution_id: 'e1', model_id: 'm1', input_tokens: 4, output_tokens: 3, cache_read_tokens: 0, cache_write_tokens: 0, reasoning_tokens: 0, total_cost_micros: 6, created_at: 1 },
-    { execution_id: 'e2', model_id: 'm1', input_tokens: 7, output_tokens: 4, cache_read_tokens: 0, cache_write_tokens: 0, reasoning_tokens: 0, total_cost_micros: 8, created_at: 2 },
+    { pricing_status: 'priced', usage_measurement: { version: 1, input_tokens: true, output_tokens: true }, execution_id: 'e1', model_id: 'm1', input_tokens: 4, output_tokens: 3, cache_read_tokens: 0, cache_write_tokens: 0, reasoning_tokens: 0, total_cost_micros: 6, created_at: 1 },
+    { pricing_status: 'priced', usage_measurement: { version: 1, input_tokens: true, output_tokens: true }, execution_id: 'e2', model_id: 'm1', input_tokens: 7, output_tokens: 4, cache_read_tokens: 0, cache_write_tokens: 0, reasoning_tokens: 0, total_cost_micros: 8, created_at: 2 },
   ],
   cost_items: [{ execution_id: 'e2', kind: 'input', quantity: 7, unit_price_micros: 1, subtotal_micros: 7 }],
 }
@@ -154,7 +154,7 @@ describe('the playground shows the usage and cost the record holds', () => {
   })
 
   it('prints a measured zero as a zero, and an unmeasured fact as —', async () => {
-    const fetchMock = mockApi(() => Promise.resolve(sse([delta('nothing was measured'), completed])), () => json({ ...record, usage: [{ execution_id: 'e1', input_tokens: 0, output_tokens: 0, total_cost_micros: 0 }] }))
+    const fetchMock = mockApi(() => Promise.resolve(sse([delta('nothing was measured'), completed])), () => json({ ...record, usage: [{ execution_id: 'e1', pricing_status: 'priced', usage_measurement: { version: 1, input_tokens: true, output_tokens: true }, input_tokens: 0, output_tokens: 0, total_cost_micros: 0 }] }))
     await send(fetchMock)
 
     expect(await screen.findByText('Input tokens: 0')).toBeInTheDocument()

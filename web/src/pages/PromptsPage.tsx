@@ -1,11 +1,9 @@
-import { Alert, Badge, Button, Group, Modal, Paper, Stack, Tabs, Text, Textarea } from '@mantine/core'
-import { useMutation } from '@tanstack/react-query'
-import { AlertTriangle, CheckCircle2, Circle, Eye } from 'lucide-react'
-import { useState, type FormEvent } from 'react'
+import { Badge, Group, Stack, Tabs, Text } from '@mantine/core'
+import { CheckCircle2, Circle } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
-import { api } from '../api'
 import { EnabledPill } from '../components'
-import { useProject } from '../project'
+import { AllowlistField, ProtectionTemplates } from './ProtectionTemplates'
+import { ProtectionRequestPreview } from './ProtectionRequestPreview'
 import { BulkToggle, ResourcePage } from './shared'
 import { useActiveTabInView, useRoutedTab } from './useRoutedTab'
 
@@ -68,96 +66,6 @@ function ProtectionState({ value }: { value: unknown }) {
   return <Badge variant="light" color={archived ? 'gray' : 'teal'} leftSection={archived ? <Circle size={9} /> : <CheckCircle2 size={11} />}>{archived ? t('archived') : t('active')}</Badge>
 }
 
-type PreviewRule = {
-  id: string
-  name: string
-  description: string
-  action: 'deny' | 'redact'
-  enabled: boolean
-  state: 'active' | 'archived'
-  matched: boolean
-  result: string
-}
-
-function ProtectionPreview() {
-  const { t } = useTranslation()
-  const { project } = useProject()
-  const [open, setOpen] = useState(false)
-  const [sample, setSample] = useState('')
-  const sampleBytes = new Blob([sample]).size
-  const sampleTooLarge = sampleBytes > 16 * 1024
-  const preview = useMutation({
-    mutationFn: (text: string) => api<{ rules: PreviewRule[] }>(`/api/admin/v1/projects/${project.id}/protection-preview`, { method: 'POST', body: JSON.stringify({ text }) }),
-  })
-  const run = (event?: FormEvent<HTMLFormElement>) => {
-    event?.preventDefault()
-    if (sample.length > 0 && !sampleTooLarge) preview.mutate(sample)
-  }
-  const close = () => {
-    setOpen(false)
-    preview.reset()
-  }
-  return <>
-    <Group justify="flex-end" mb="md">
-      <Button variant="default" leftSection={<Eye size={17} />} onClick={() => setOpen(true)}>{t('previewRules')}</Button>
-    </Group>
-    <Modal opened={open} onClose={close} title={t('protectionPreviewTitle')} size="lg" classNames={{ content: 'protection-preview-dialog' }} closeButtonProps={{ 'aria-label': t('close') }}>
-      <form onSubmit={run}>
-        <Stack gap="md">
-          <Textarea
-            label={t('sampleText')}
-            description={t('sampleTextHint')}
-            value={sample}
-            onChange={(event) => { setSample(event.currentTarget.value); preview.reset() }}
-            required
-            maxLength={16 * 1024}
-            rows={5}
-            error={sampleTooLarge ? t('sampleTextTooLarge') : undefined}
-          />
-          <Group justify="flex-end">
-            <Button type="submit" loading={preview.isPending} disabled={sample.length === 0 || sampleTooLarge}>{t('runPreview')}</Button>
-          </Group>
-          <div aria-live="polite">
-            {preview.isPending && <Text role="status" size="sm" c="dimmed">{t('previewLoading')}</Text>}
-            {preview.isError && <Alert color="red" variant="light" title={t('previewError')} icon={<AlertTriangle size={18} />}>
-              <Stack gap="xs">
-                <Text size="sm">{preview.error instanceof Error ? preview.error.message : t('networkError')}</Text>
-                <Button variant="outline" color="red" size="compact-sm" onClick={() => preview.mutate(sample)} style={{ alignSelf: 'flex-start' }}>{t('retry')}</Button>
-              </Stack>
-            </Alert>}
-            {preview.isSuccess && preview.data.rules.length === 0 && <Paper withBorder p="md"><Text size="sm" c="dimmed">{t('protectionPreviewEmpty')}</Text></Paper>}
-            {preview.isSuccess && preview.data.rules.length > 0 && <Stack gap="sm" role="list" aria-label={t('protectionPreviewResults')}>
-              {preview.data.rules.map((rule) => <Paper key={rule.id} withBorder p="md" role="listitem">
-                <Stack gap="xs">
-                  <Group justify="space-between" align="flex-start" wrap="wrap">
-                    <Stack gap={2} style={{ minWidth: 0 }}>
-                      <Text fw={600}>{rule.name}</Text>
-                      {rule.description && <Text size="sm" c="dimmed">{rule.description}</Text>}
-                    </Stack>
-                    <Group gap="xs">
-                      <ProtectionState value={rule.state} />
-                      <EnabledPill enabled={rule.enabled} />
-                    </Group>
-                  </Group>
-                  <Group gap="xs">
-                    <Badge variant="light" color={rule.matched ? 'teal' : 'gray'} leftSection={rule.matched ? <CheckCircle2 size={11} /> : <Circle size={9} />}>{rule.matched ? t('matched') : t('noMatch')}</Badge>
-                    <Text size="sm" c="dimmed">{rule.action === 'deny' ? t('deny') : t('redact')}</Text>
-                  </Group>
-                  {rule.matched && <>
-                    <Text size="sm" fw={500}>{t('previewResult')}</Text>
-                    {rule.action === 'deny' && <Text size="sm" c="dimmed">{t('previewDenyHint')}</Text>}
-                    <Text component="pre" className="protection-preview-result">{rule.result}</Text>
-                  </>}
-                </Stack>
-              </Paper>)}
-            </Stack>}
-          </div>
-        </Stack>
-      </form>
-    </Modal>
-  </>
-}
-
 export default function PromptsPage() {
   const { t } = useTranslation()
   const [tab, setTab] = useRoutedTab(['prompts', 'protection', 'overrides'] as const, 'prompts')
@@ -176,7 +84,7 @@ export default function PromptsPage() {
         <BulkToggle resource="prompts" />
       </Tabs.Panel>
       <Tabs.Panel value="protection">
-        <ResourcePage resource="protection" title={t('protection')} description={t('protectionDescription')} empty={t('protectionEmpty')} selectable="protection" createLabel={t('addRule')} notice={<ProtectionPreview />} columns={[{ key: 'name', label: t('name') }, { key: 'description', label: t('description') }, { key: 'content_pattern', label: t('pattern'), mono: true }, { key: 'action', label: t('action') }, { key: 'state', label: t('ruleState'), render: (value) => <ProtectionState value={value} /> }, { key: 'test_mode', label: t('testMode') }, { key: 'enabled', label: t('status'), render: (value) => <EnabledPill enabled={value} /> }]} mobileStatus={(row) => <Group gap="xs"><ProtectionState value={row.state} /><EnabledPill enabled={row.enabled} /></Group>} fields={[{ key: 'name', label: t('name'), required: true }, { key: 'description', label: t('description'), kind: 'textarea' }, { key: 'role_pattern', label: t('rolePattern') }, { key: 'content_pattern', label: t('contentPattern'), required: true }, { key: 'action', label: t('action'), kind: 'select', options: [{ value: 'deny', label: t('deny') }, { value: 'redact', label: t('redact') }] }, { key: 'replacement', label: t('replacement') }, { key: 'scopes', label: t('scopes'), kind: 'json', defaultValue: { version: 1 } }, { key: 'test_mode', label: t('testMode'), kind: 'checkbox', defaultValue: false }, { key: 'enabled', label: t('enabled'), kind: 'checkbox' }, { key: 'state', label: t('ruleState'), kind: 'select', required: true, defaultValue: 'active', options: [{ value: 'active', label: t('active') }, { value: 'archived', label: t('archived') }] }]} />
+        <ResourcePage resource="protection" title={t('protection')} description={t('protectionDescription')} empty={t('protectionEmpty')} selectable="protection" createLabel={t('addRule')} secondaryAction={<ProtectionTemplates />} notice={<ProtectionRequestPreview />} columns={[{ key: 'name', label: t('name') }, { key: 'description', label: t('description') }, { key: 'content_pattern', label: t('pattern'), mono: true }, { key: 'action', label: t('action') }, { key: 'state', label: t('ruleState'), render: (value) => <ProtectionState value={value} /> }, { key: 'test_mode', label: t('testMode') }, { key: 'enabled', label: t('status'), render: (value) => <EnabledPill enabled={value} /> }]} mobileStatus={(row) => <Group gap="xs"><ProtectionState value={row.state} /><EnabledPill enabled={row.enabled} /></Group>} fields={[{ key: 'name', label: t('name'), required: true }, { key: 'description', label: t('description'), kind: 'textarea' }, { key: 'role_pattern', label: t('rolePattern') }, { key: 'content_pattern', label: t('contentPattern'), required: true }, { key: 'action', label: t('action'), kind: 'select', options: [{ value: 'deny', label: t('deny') }, { value: 'redact', label: t('redact') }] }, { key: 'replacement', label: t('replacement') }, { key: 'scopes', label: t('scopes'), kind: 'json', defaultValue: { version: 1 } }, { key: 'allowlist', label: t('allowlistLabel'), kind: 'json', defaultValue: [], render: props => <AllowlistField {...props} /> }, { key: 'test_mode', label: t('testMode'), kind: 'checkbox', defaultValue: false }, { key: 'enabled', label: t('enabled'), kind: 'checkbox' }, { key: 'state', label: t('ruleState'), kind: 'select', required: true, defaultValue: 'active', options: [{ value: 'active', label: t('active') }, { value: 'archived', label: t('archived') }] }]} />
         <BulkToggle resource="protection" />
       </Tabs.Panel>
       <Tabs.Panel value="overrides">

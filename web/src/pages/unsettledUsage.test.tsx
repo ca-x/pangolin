@@ -18,7 +18,7 @@ const json = (value: unknown) => Promise.resolve(new Response(JSON.stringify(val
 const project = { id: 'p1', name: 'Project', slug: 'project', owner_user_id: 'u1', is_default: true, enabled: true }
 const bootstrap = { initialized: true, authenticated: true, user: { id: 'u1', email: 'owner@example.test', role: 'admin', language: 'en', theme: 'system:bronze', created_at: 1 }, capture_payloads: false, observability_available: true, branding: { instance_name: 'Pangolin', branding_name: 'Pangolin', favicon_url: '/logo.webp', onboarding_complete: true } }
 const policy = { enabled: true, default_level: 'metadata', key_override_enabled: false, key_disable_allowed: false }
-const row = (overrides: Record<string, unknown> = {}) => ({ internal_id: `internal-${overrides.request_id ?? 'r1'}`, request_id: 'r1', started_at: 1, endpoint: '/v1/chat/completions', provider: 'openai', requested_model: 'demo', resolved_model: 'demo', status_code: 200, error_kind: null, latency_ms: 12, input_tokens: 3, output_tokens: 4, cost_micros: 0, ...overrides })
+const row = (overrides: Record<string, unknown> = {}) => ({ internal_id: `internal-${overrides.request_id ?? 'r1'}`, request_id: 'r1', started_at: 1, endpoint: '/v1/chat/completions', provider: 'openai', requested_model: 'demo', resolved_model: 'demo', status_code: 200, error_kind: null, latency_ms: 12, input_tokens: 3, output_tokens: 4, cost_micros: 0, usage_measurement: { version: 1, input_tokens: overrides.error_kind !== 'usage_unavailable' && !(overrides.input_tokens === 0 && overrides.output_tokens === 0 && overrides.error_kind), output_tokens: overrides.error_kind !== 'usage_unavailable' && !(overrides.input_tokens === 0 && overrides.output_tokens === 0 && overrides.error_kind), cache_read_tokens: true, cache_write_tokens: true, reasoning_tokens: true }, ...overrides })
 const detail = (overrides: Record<string, unknown> = {}) => ({ ...row({ id: 'internal-r2', request_id: 'r2', status_code: 502, error_kind: 'failed', input_tokens: 0, output_tokens: 0, cost_micros: 0 }), finished_at: 2, trace_id: 'trace-external', api_key_id: 'k1', ttft_ms: null, cached_tokens: 0, payload_captured: false, request_json: null, response_json: null, ...overrides })
 
 const mockApi = (options: { rows?: unknown[]; detail?: unknown } = {}) => vi.fn((input: RequestInfo | URL) => {
@@ -51,14 +51,14 @@ describe('an unsettled request reports unknown usage, not zero', () => {
   })
 
   it('keeps the numbers a partial settlement really measured', async () => {
-    vi.stubGlobal('fetch', mockApi({ detail: detail({ input_tokens: 7, output_tokens: 9, cost_micros: 1234 }) }))
+    vi.stubGlobal('fetch', mockApi({ detail: detail({ input_tokens: 7, output_tokens: 9, cost_micros: 1234, usage_measurement: { version: 1, input_tokens: true, output_tokens: true } }) }))
     renderPage(<OperationsPage />, '/operations/requests/r2')
     expect(await screen.findByText('Cost: $0.001234')).toBeInTheDocument()
     expect(screen.getByText('Tokens: 16')).toBeInTheDocument()
   })
 
   it('keeps a measured zero on a request that succeeded', async () => {
-    vi.stubGlobal('fetch', mockApi({ detail: detail({ status_code: 200, error_kind: null, input_tokens: 0, output_tokens: 0, cost_micros: 0 }) }))
+    vi.stubGlobal('fetch', mockApi({ detail: detail({ status_code: 200, error_kind: null, input_tokens: 0, output_tokens: 0, cost_micros: 0, usage_measurement: { version: 1, input_tokens: true, output_tokens: true } }) }))
     renderPage(<OperationsPage />, '/operations/requests/r2')
     expect(await screen.findByText('Cost: $0.000000')).toBeInTheDocument()
     expect(screen.getByText('Tokens: 0')).toBeInTheDocument()

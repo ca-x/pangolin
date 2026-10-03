@@ -35,7 +35,7 @@ const project = { id: 'p1', name: 'Project A', slug: 'project-a', owner_user_id:
 const bootstrap = { initialized: true, authenticated: true, user: { id: 'u1', email: 'owner@example.test', role: 'admin', language: 'en', theme: 'system:bronze', created_at: 1 }, capture_payloads: false, branding: { instance_name: 'Pangolin', branding_name: 'Pangolin', favicon_url: '/logo.webp', onboarding_complete: true } }
 const policy = { enabled: true, default_level: 'metadata', key_override_enabled: false, key_disable_allowed: false }
 const summary = (overrides: Record<string, unknown> = {}) => ({ requests: 3, errors: 1, error_rate: 0.33, p95_latency_ms: 20, input_tokens: 10, output_tokens: 5, cost_micros: 1234, series: [{ bucket: 1_700_000_000, requests: 3, errors: 1, latency_ms: 12 }], ...overrides })
-const row = (overrides: Record<string, unknown> = {}) => ({ internal_id: `internal-${overrides.request_id ?? 'r1'}`, request_id: 'r1', started_at: 1_700_000_000, endpoint: '/v1/chat/completions', provider: 'openai', requested_model: 'demo', resolved_model: 'demo', status_code: 200, error_kind: null, latency_ms: 12, input_tokens: 1, output_tokens: 1, cost_micros: 0, ...overrides })
+const row = (overrides: Record<string, unknown> = {}) => ({ internal_id: `internal-${overrides.request_id ?? 'r1'}`, request_id: 'r1', started_at: 1_700_000_000, endpoint: '/v1/chat/completions', provider: 'openai', requested_model: 'demo', resolved_model: 'demo', status_code: 200, error_kind: null, latency_ms: 12, input_tokens: 1, output_tokens: 1, cost_micros: 0, usage_measurement: { version: 1, input_tokens: overrides.error_kind !== 'usage_unavailable' && !(overrides.input_tokens === 0 && overrides.output_tokens === 0 && overrides.error_kind), output_tokens: overrides.error_kind !== 'usage_unavailable' && !(overrides.input_tokens === 0 && overrides.output_tokens === 0 && overrides.error_kind), cache_read_tokens: true, cache_write_tokens: true, reasoning_tokens: true }, ...overrides })
 const dimensionRow = (overrides: Record<string, unknown> = {}) => ({ dimension: 'prov-1', requests: 5, attempts: 6, errors: 1, input_tokens: 10, output_tokens: 4, cache_hit_tokens: 2, cache_savings_micros: 0, cost_micros: 1234, latency_ms: 12.5, ttft_ms: null, ...overrides })
 const bundle = (overrides: Record<string, unknown> = {}) => ({
   trace: { id: 't1', status: 'failed', started_at: 1_700_000_000, finished_at: 1_700_000_009, thread_id: null },
@@ -46,8 +46,8 @@ const bundle = (overrides: Record<string, unknown> = {}) => ({
     { id: 'e3', request_id: 'r1', provider_id: 'google', provider_name: 'Channel C', attempt: 3, model: 'gemini', status: 'succeeded', retry_reason: null, latency_ms: 40, started_at: 1_700_000_002, finished_at: 1_700_000_003 },
   ],
   usage: [
-    { execution_id: 'e1', model_id: 'm1', input_tokens: 10, output_tokens: 4, cache_read_tokens: 2, cache_write_tokens: 1, reasoning_tokens: 3, total_cost_micros: 1234, created_at: 1_700_000_001 },
-    { execution_id: 'e2', model_id: 'm2', input_tokens: 5, output_tokens: 1, cache_read_tokens: 0, cache_write_tokens: 0, reasoning_tokens: 0, total_cost_micros: 100, created_at: 1_700_000_002 },
+    { pricing_status: 'priced', usage_measurement: { version: 1, input_tokens: true, output_tokens: true, cache_read_tokens: true, cache_write_tokens: true, reasoning_tokens: true }, execution_id: 'e1', model_id: 'm1', input_tokens: 10, output_tokens: 4, cache_read_tokens: 2, cache_write_tokens: 1, reasoning_tokens: 3, total_cost_micros: 1234, created_at: 1_700_000_001 },
+    { pricing_status: 'priced', usage_measurement: { version: 1, input_tokens: true, output_tokens: true, cache_read_tokens: true, cache_write_tokens: true, reasoning_tokens: true }, execution_id: 'e2', model_id: 'm2', input_tokens: 5, output_tokens: 1, cache_read_tokens: 0, cache_write_tokens: 0, reasoning_tokens: 0, total_cost_micros: 100, created_at: 1_700_000_002 },
   ],
   cost_items: [
     { execution_id: 'e1', kind: 'input', quantity: 10, unit_price_micros: 100, subtotal_micros: 1000 },
@@ -332,7 +332,7 @@ describe('the trace detail shows every attempt with its tokens and cost', () => 
     expect(within(input).getByText('$0.001000')).toBeInTheDocument()
     expect(within(components.getByRole('row', { name: /Output/ })).getByText('$0.000232')).toBeInTheDocument()
     // A charge whose price component was deleted keeps its amount and loses its kind.
-    expect(within(components.getByRole('row', { name: /#2/ })).getByText('—')).toBeInTheDocument()
+    expect(within(components.getByRole('row', { name: /#2/ })).getAllByRole('cell')[1]).toHaveTextContent('—')
   })
 
   it('states that usage is unmeasured when the trace carries no usage rows at all', async () => {

@@ -8,6 +8,7 @@ import { api, type AnalyticsRow, type Document } from '../api'
 import { confirmAction, EmptyState, EnabledPill, InlineQueryError, Modal, SecretInput, SelectField, SkeletonRows } from '../components'
 import { ClientSetupDialog } from './ClientSetupDialog'
 import { AllowedModelsEditor, ProfileMappingsEditor, RoutingPolicyEditor } from './documentEditors'
+import { aggregateAmount, sumKnown, PricingCoverageNotice } from '../measurement'
 import { UNMEASURED, formatCount, formatMicros } from '../observability'
 import { projectOperationPath, useProject } from '../project'
 import { PageHeader, QueryError, ResourcePage, displayValue, formatDate } from './shared'
@@ -379,18 +380,13 @@ function KeyUsageDialog({ projectId, apiKey, onClose }: { projectId: string; api
     queryFn: () => api<{ data: AnalyticsRow[] }>(`/api/admin/v1/projects/${encodeURIComponent(projectId)}/analytics?dimension=model&api_key=${encodeURIComponent(apiKey.id)}&from=${bounds.from}&until=${bounds.until}`),
   })
   const rows = query.data?.data ?? []
-  // Older servers omit the marker and remain compatible; a current false value
-  // means requests existed but no authoritative usage row did.
-  const measuredRows = rows.filter((row) => row.usage_measured !== false)
-  const measured = measuredRows.length > 0
-  const total = (field: 'input_tokens' | 'output_tokens' | 'cache_hit_tokens' | 'cost_micros') => measured
-    ? measuredRows.reduce((sum, row) => sum + (typeof row[field] === 'number' ? row[field] : 0), 0)
-    : null
-  const input = total('input_tokens')
-  const output = total('output_tokens')
-  const cache = total('cache_hit_tokens')
-  const cost = total('cost_micros')
-  const top = [...rows].sort((left, right) => (right.input_tokens + right.output_tokens) - (left.input_tokens + left.output_tokens)).slice(0, 3)
+  const measured = rows.some(row=>row.usage_measured!==false&&(row.input_tokens!=null||row.output_tokens!=null))
+  const input=sumKnown(rows.map(row=>row.usage_measured===false&&row.measured_cost_count==null?null:typeof row.input_tokens==='number'?row.input_tokens:null))
+  const output=sumKnown(rows.map(row=>row.usage_measured===false&&row.measured_cost_count==null?null:typeof row.output_tokens==='number'?row.output_tokens:null))
+  const cache=sumKnown(rows.map(row=>row.usage_measured===false&&row.measured_cost_count==null?null:typeof row.cache_hit_tokens==='number'?row.cache_hit_tokens:null))
+  const cost=sumKnown(rows.map(row=>aggregateAmount(row,row.cost_micros)))
+  const coverage={settled_cost_micros:sumKnown(rows.map(row=>row.settled_cost_micros??null)),missing_pricing_count:sumKnown(rows.map(row=>row.missing_pricing_count??null))??undefined,incomplete_usage_count:sumKnown(rows.map(row=>row.incomplete_usage_count??null))??undefined,measured_cost_count:sumKnown(rows.map(row=>row.measured_cost_count??null))??undefined}
+  const top = [...rows].sort((left, right) => ((right.input_tokens ?? 0) + (right.output_tokens ?? 0)) - ((left.input_tokens ?? 0) + (left.output_tokens ?? 0))).slice(0, 3)
   const count = (value: number | null) => value == null ? UNMEASURED : formatCount(value)
   return <Modal open onOpenChange={(open) => !open && onClose()} title={t('keyUsageTitle', { name: apiKey.name })}>
     <Stack gap="md">
@@ -402,6 +398,7 @@ function KeyUsageDialog({ projectId, apiKey, onClose }: { projectId: string; api
         </Tabs.List>
       </Tabs>
       {query.isError ? <QueryError retry={() => void query.refetch()} /> : query.isLoading ? <SkeletonRows count={4} /> : <>
+        <PricingCoverageNotice coverage={coverage}/>
         {!measured && <Text size="sm" c="dimmed">{t('keyUsageUnmeasured')}</Text>}
         <TableScrollContainer minWidth={440} scrollAreaProps={{ viewportProps: { role: 'region', 'aria-label': t('keyUsageOverall'), tabIndex: 0 } }}>
           <Table>
@@ -420,7 +417,7 @@ function KeyUsageDialog({ projectId, apiKey, onClose }: { projectId: string; api
           {top.map((row) => <Paper key={row.dimension ?? 'unknown'} withBorder p="sm">
             <Group justify="space-between" align="flex-start" wrap="wrap">
               <Code>{row.dimension || UNMEASURED}</Code>
-              <Text size="sm" className="mono-cell">{row.usage_measured === false ? `${UNMEASURED} · ${UNMEASURED}` : `${formatCount(row.input_tokens + row.output_tokens)} ${t('tokens')} · ${formatMicros(row.cost_micros)}`}</Text>
+              <Text size="sm" className="mono-cell">{`${(row.usage_measured===false&&row.measured_cost_count==null)||row.input_tokens==null||row.output_tokens==null?UNMEASURED:formatCount(row.input_tokens + row.output_tokens)} ${t('tokens')} · ${formatMicros(aggregateAmount(row,row.cost_micros))}`}</Text>
             </Group>
           </Paper>)}
         </Stack>}

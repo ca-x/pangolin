@@ -7,9 +7,12 @@ import { toast } from 'sonner'
 import { api, type Document, type LiveRequest, type Paged, type RequestDetail, type RequestItem } from '../api'
 import { ActionIcon, Alert, Anchor, Badge, Button, Card, Code, Group, MultiSelect, Pagination, Select, SimpleGrid, Stack, Table, TableScrollContainer, Tabs, Text, TextInput, Title, Tooltip } from '@mantine/core'
 import { EmptyState, SkeletonRows, Status, confirmAction } from '../components'
-import { ObservabilityNotice, UNMEASURED, formatCount, formatMicros, usageMeasured, useErrorKindLabel, useObservability } from '../observability'
+import { ObservabilityNotice, UNMEASURED, formatCount, formatMicros, useErrorKindLabel, useObservability } from '../observability'
 import { projectOperationPath, useProject } from '../project'
 import { PageHeader, QueryError, ResourcePage, displayValue, formatDate } from './shared'
+import { CostItemsPanel } from './CostItemsPanel'
+import { AttemptDiagnosticList, ExecutionDiagnosticsButton, type DiagnosticAttempt } from './ExecutionDiagnostics'
+import { CostFact, Settlement, quantityText, quantityValue, sumQuantity, sumAmounts, rowCoverage, PricingCoverageNotice, componentQuantity, amountValue, type PricingFacts } from '../measurement'
 import { PayloadViewer } from './PayloadViewer'
 import { useActiveTabInView, useRoutedTab } from './useRoutedTab'
 
@@ -82,11 +85,11 @@ export default function OperationsPage() {
     <Tabs keepMounted={false} value={tab} onChange={setTab} mb="lg">
       <Tabs.List ref={tabsRef} mb="lg">{TAB_VALUES.map(value => <Tabs.Tab key={value} value={value}>{t(value)}</Tabs.Tab>)}</Tabs.List>
       <Tabs.Panel value="requests"><LiveRequestsPanel /><RequestList observability={observability} /></Tabs.Panel>
-      <Tabs.Panel value="executions"><ResourcePage resource="executions" title={t('executions')} description={t('executionsDescription')} empty={t('executionEmpty')} immutable columns={[{key:'status',label:t('status')},{key:'request_id',label:t('requestId'),mono:true},{key:'provider_id',label:t('provider'),mono:true},{key:'attempt',label:t('attempt')},{key:'latency_ms',label:t('latency')},{key:'retry_reason',label:t('retryReason')}]} /></Tabs.Panel>
+      <Tabs.Panel value="executions"><ResourcePage resource="executions" title={t('executions')} description={t('executionsDescription')} empty={t('executionEmpty')} immutable rowActions={row => <ExecutionDiagnosticsButton attempt={row} />} columns={[{key:'status',label:t('status')},{key:'request_id',label:t('requestId'),mono:true},{key:'provider_id',label:t('provider'),mono:true},{key:'attempt',label:t('attempt')},{key:'latency_ms',label:t('latency')},{key:'retry_reason',label:t('retryReason')}]} /></Tabs.Panel>
       <Tabs.Panel value="threads"><ResourcePage resource="threads" title={t('threads')} description={t('threadsDescription')} empty={t('threadEmpty')} immutable columns={[{key:'id',label:t('threadId'),mono:true},{key:'external_id',label:t('externalId'),mono:true},{key:'api_key_id',label:t('key'),mono:true},{key:'created_at',label:t('time'),render:formatDate}]} /></Tabs.Panel>
       <Tabs.Panel value="traces"><TraceList /></Tabs.Panel>
-      <Tabs.Panel value="usage"><ResourcePage resource="usage" title={t('usage')} description={t('usageDescription')} empty={t('usageEmpty')} immutable columns={[{key:'execution_id',label:t('executionId'),mono:true},{key:'input_tokens',label:t('inputTokens')},{key:'output_tokens',label:t('outputTokens')},{key:'cache_read_tokens',label:t('cacheTokens')},{key:'cost_micros',label:t('cost'),render:(value)=>formatMicros(value)},{key:'settlement_kind',label:t('settlement')}]} /></Tabs.Panel>
-      <Tabs.Panel value="costItems"><ResourcePage resource="cost-items" title={t('costItems')} description={t('costDescription')} empty={t('costEmpty')} immutable columns={[{key:'usage_id',label:t('usageId'),mono:true},{key:'component_id',label:t('component'),mono:true},{key:'quantity',label:t('quantity')},{key:'subtotal_micros',label:t('cost'),render:(value)=>formatMicros(value)}]} /></Tabs.Panel>
+      <Tabs.Panel value="usage"><ResourcePage resource="usage" title={t('usage')} description={t('usageDescription')} empty={t('usageEmpty')} immutable columns={[{key:'execution_id',label:t('executionId'),mono:true},{key:'input_tokens',label:t('inputTokens'),render:(value,row)=>quantityText(row,'input_tokens',value)},{key:'output_tokens',label:t('outputTokens'),render:(value,row)=>quantityText(row,'output_tokens',value)},{key:'cache_read_tokens',label:t('cacheTokens'),render:(value,row)=>quantityText(row,'cache_read_tokens',value)},{key:'cost_micros',label:t('cost'),render:(value,row)=><CostFact row={row} value={value} showSettlement={false}/>},{key:'settlement_kind',label:t('settlement'),render:value=><Settlement kind={value}/>}]} /></Tabs.Panel>
+      <Tabs.Panel value="costItems"><CostItemsPanel /></Tabs.Panel>
       <Tabs.Panel value="audit"><ResourcePage resource="audit" title={t('audit')} description={t('auditDescription')} empty={t('auditEmpty')} immutable columns={[{key:'action',label:t('action')},{key:'resource_type',label:t('type')},{key:'resource_id',label:t('resourceId'),mono:true},{key:'actor_user_id',label:t('actor'),mono:true},{key:'created_at',label:t('time'),render:formatDate}]} /></Tabs.Panel>
     </Tabs>
   </>
@@ -323,7 +326,7 @@ function RequestList({ observability }: { observability: ReturnType<typeof useOb
             {/* The row is keyed and linked by Pangolin's own UUID: the external id is
                 chosen by the caller, so two rows can share one and only one of them
                 would ever be openable. The external id stays visible for correlation. */}
-            <Table.Tbody>{rows.map((row, index) => <Table.Tr key={row.internal_id}><Table.Td><Link to={`/operations/requests/${row.internal_id}`} state={{ from: '/operations' + (searchParams.size ? '?' + searchParams.toString() : ''), ids: rows.map(item => item.internal_id), index }}><Status code={row.status_code} /></Link></Table.Td><Table.Td>{row.error_kind ? kindLabel(row.error_kind) : UNMEASURED}</Table.Td><Table.Td className="mono-cell">{displayValue(row.request_id)}</Table.Td><Table.Td><ModelPair row={row} /></Table.Td><Table.Td>{displayValue(row.provider)}</Table.Td><Table.Td><Code>{row.endpoint}</Code></Table.Td><Table.Td><TokenFacts row={row} /></Table.Td><Table.Td className="mono-cell">{row.ttft_ms == null ? UNMEASURED : `${row.ttft_ms} ms`}</Table.Td><Table.Td>{row.stream == null ? UNMEASURED : t(row.stream ? 'yes' : 'no')}</Table.Td><Table.Td className="mono-cell">{row.latency_ms >= 0 ? `${row.latency_ms} ms` : UNMEASURED}</Table.Td><Table.Td className="mono-cell">{usageMeasured(row) ? formatMicros(row.cost_micros) : UNMEASURED}</Table.Td><Table.Td>{formatDate(row.started_at)}</Table.Td></Table.Tr>)}</Table.Tbody>
+            <Table.Tbody>{rows.map((row, index) => <Table.Tr key={row.internal_id}><Table.Td><Link to={`/operations/requests/${row.internal_id}`} state={{ from: '/operations' + (searchParams.size ? '?' + searchParams.toString() : ''), ids: rows.map(item => item.internal_id), index }}><Status code={row.status_code} /></Link></Table.Td><Table.Td>{row.error_kind ? kindLabel(row.error_kind) : UNMEASURED}</Table.Td><Table.Td className="mono-cell">{displayValue(row.request_id)}</Table.Td><Table.Td><ModelPair row={row} /></Table.Td><Table.Td>{displayValue(row.provider)}</Table.Td><Table.Td><Code>{row.endpoint}</Code></Table.Td><Table.Td><TokenFacts row={row} /></Table.Td><Table.Td className="mono-cell">{row.ttft_ms == null ? UNMEASURED : `${row.ttft_ms} ms`}</Table.Td><Table.Td>{row.stream == null ? UNMEASURED : t(row.stream ? 'yes' : 'no')}</Table.Td><Table.Td className="mono-cell">{row.latency_ms >= 0 ? `${row.latency_ms} ms` : UNMEASURED}</Table.Td><Table.Td className="mono-cell">{<CostFact row={row} compact/>}</Table.Td><Table.Td>{formatDate(row.started_at)}</Table.Td></Table.Tr>)}</Table.Tbody>
           </Table>
         </TableScrollContainer>
         {total > limit && <Group justify="flex-end" gap="sm" mt="md">
@@ -361,24 +364,15 @@ function ModelPair({ row }: { row: RequestItem }) {
  */
 function TokenFacts({ row }: { row: RequestItem }) {
   const { t } = useTranslation()
-  if (!usageMeasured(row)) return <>{UNMEASURED}</>
-  const facts: Array<[string, number | null | undefined]> = [
-    [t('tokenCacheRead'), row.cached_tokens],
-    [t('tokenCacheWrite'), row.cache_write_tokens],
-    [t('tokenReasoning'), row.reasoning_tokens],
-  ]
-  return <Stack gap={0}>
-    <Text size="sm" className="mono-cell">{`${formatCount(row.input_tokens)} / ${formatCount(row.output_tokens)}`}</Text>
-    <Text size="sm" c="dimmed" className="mono-cell">{facts.map(([label, value]) => `${label} ${formatCount(value)}`).join(' · ')}</Text>
-  </Stack>
+  return <Stack gap={0}><Text size="sm" className="mono-cell">{`${quantityText(row,'input_tokens',row.input_tokens)} / ${quantityText(row,'output_tokens',row.output_tokens)}`}</Text><Text size="sm" c="dimmed">{`${t('tokenCacheRead')} ${quantityText(row,'cache_read_tokens',row.cached_tokens)} · ${t('tokenCacheWrite')} ${quantityText(row,'cache_write_tokens',row.cache_write_tokens)} · ${t('tokenReasoning')} ${quantityText(row,'reasoning_tokens',row.reasoning_tokens)}`}</Text></Stack>
 }
 
 /** Navigation context handed over by the request list, so the detail can step through the page it came from. */
 type RequestNavigation = { from?: string; tab?: string; ids?: string[]; index?: number }
 /** The record-system view of one request: its attempts, usage and cost parts. */
 type RequestRecord = {
-  executions?: Array<{ id?: string; attempt?: number | null; provider_id?: string | null; provider_name?: string | null; model?: string | null; status?: string | null; latency_ms?: number | null; retry_reason?: string | null; http_status?: number | null; error_kind?: string | null }>
-  usage?: Array<{ execution_id?: string; input_tokens?: number; output_tokens?: number; total_cost_micros?: number }>
+  executions?: Array<DiagnosticAttempt & { id?: string; attempt?: number | null; provider_id?: string | null; provider_name?: string | null; model?: string | null; status?: string | null; latency_ms?: number | null; retry_reason?: string | null; http_status?: number | null; error_kind?: string | null }>
+  usage?: Array<PricingFacts & { cache_read_tokens?:number; cache_write_tokens?:number; reasoning_tokens?:number; execution_id?: string; input_tokens?: number; output_tokens?: number; total_cost_micros?: number }>
   cost_items?: Array<{ execution_id?: string; kind?: string | null; quantity?: number | null; unit_price_micros?: number | null; subtotal_micros?: number | null }>
 }
 
@@ -430,13 +424,14 @@ export function RequestDetailPage() {
         <Tooltip label={t('nextRequest')}><ActionIcon variant="default" aria-label={t('nextRequest')} disabled={index < 0 || index >= ids.length - 1} onClick={() => step(index + 1)}><ChevronRight size={16} /></ActionIcon></Tooltip>
       </Group>}
     </Group>
-    {query.isError ? <QueryError retry={() => void query.refetch()} /> : query.isLoading ? <SkeletonRows /> : data && <TraceFacts data={data} record={record.data} traceLink={internalTraceId ? `/operations/traces/${internalTraceId}` : undefined} />}
+    {record.isError && <QueryError retry={() => void record.refetch()} />}
+    {query.isError ? <QueryError retry={() => void query.refetch()} /> : query.isLoading || record.isLoading ? <SkeletonRows /> : data && <TraceFacts data={data} record={record.data} traceLink={internalTraceId ? `/operations/traces/${internalTraceId}` : undefined} />}
   </>
 }
 
-type TraceUsage = { execution_id: string; model_id: string | null; input_tokens: number; output_tokens: number; cache_read_tokens: number; cache_write_tokens: number; reasoning_tokens: number; total_cost_micros: number; created_at: number }
+type TraceUsage = PricingFacts & { execution_id: string; model_id: string | null; input_tokens: number; output_tokens: number; cache_read_tokens: number; cache_write_tokens: number; reasoning_tokens: number; total_cost_micros: number; created_at: number }
 type TraceCostItem = { execution_id: string; kind: string | null; quantity: number; unit_price_micros: number; subtotal_micros: number }
-type TraceBundle = { trace: { id: string; status: string; started_at: number; finished_at: number | null; thread_id: string | null }; requests: Array<{ id: string; public_id: string; status: string; endpoint: string; model: string; started_at: number; finished_at: number | null }>; executions: Array<{ id: string; request_id: string; status: string; provider_id: string | null; provider_name?: string | null; model: string | null; attempt: number; latency_ms: number | null; retry_reason: string | null; started_at: number; finished_at: number | null }>; usage?: TraceUsage[]; cost_items?: TraceCostItem[] }
+type TraceBundle = { trace: { id: string; status: string; started_at: number; finished_at: number | null; thread_id: string | null }; requests: Array<{ id: string; public_id: string; status: string; endpoint: string; model: string; started_at: number; finished_at: number | null }>; executions: Array<DiagnosticAttempt & { id: string; request_id: string; status: string; provider_id: string | null; provider_name?: string | null; model: string | null; attempt: number; latency_ms: number | null; retry_reason: string | null; started_at: number; finished_at: number | null }>; usage?: TraceUsage[]; cost_items?: TraceCostItem[] }
 
 /** The price components a charge can be made of, localized; an unknown kind is shown verbatim. */
 const COST_KIND_KEYS: Record<string, string> = { input: 'costKindInput', output: 'costKindOutput', cache_read: 'costKindCacheRead', cache_write: 'costKindCacheWrite', reasoning: 'costKindReasoning', flat: 'costKindFlat', unit: 'costKindUnit' }
@@ -534,18 +529,12 @@ function TraceTimeline({ trace, requests, executions, from }: { trace: TraceBund
  */
 function TraceAttempts({ executions, usage, costItems }: { executions: TraceBundle['executions']; usage: TraceUsage[]; costItems: TraceCostItem[] }) {
   const { t } = useTranslation()
-  const totals = usage.reduce((sum, row) => ({
-    input: sum.input + row.input_tokens,
-    output: sum.output + row.output_tokens,
-    cacheRead: sum.cacheRead + row.cache_read_tokens,
-    cacheWrite: sum.cacheWrite + row.cache_write_tokens,
-    reasoning: sum.reasoning + row.reasoning_tokens,
-    cost: sum.cost + row.total_cost_micros,
-  }), { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0, cost: 0 })
-  // No usage row at all means the trace was never settled, which is not the same
-  // fact as a trace that used nothing.
-  const settled = usage.length > 0
-  const count = (value: number) => settled ? formatCount(value) : UNMEASURED
+  const totals = {
+    input:sumQuantity(usage,'input_tokens',row=>row.input_tokens), output:sumQuantity(usage,'output_tokens',row=>row.output_tokens),
+    cacheRead:sumQuantity(usage,'cache_read_tokens',row=>row.cache_read_tokens), cacheWrite:sumQuantity(usage,'cache_write_tokens',row=>row.cache_write_tokens),
+    reasoning:sumQuantity(usage,'reasoning_tokens',row=>row.reasoning_tokens), cost:sumAmounts(usage,row=>row.total_cost_micros),
+  }
+  const count = (value:number|null) => formatCount(value)
   const attemptLabel = (executionId: string) => {
     const attempt = executions.find((item) => item.id === executionId)?.attempt
     return attempt == null ? UNMEASURED : `#${attempt}`
@@ -558,13 +547,14 @@ function TraceAttempts({ executions, usage, costItems }: { executions: TraceBund
           <Title order={2}>{t('traceUsage')}</Title>
           <Text size="sm" c="dimmed">{t('traceUsageHint')}</Text>
         </Group>
+        <Text size="sm" c="dimmed">{t('measuredQuantities')}</Text><PricingCoverageNotice coverage={rowCoverage(usage)}/>
         <SimpleGrid cols={{ base: 1, xs: 2, sm: 3, lg: 6 }}>
           <Usage label={t('inputTokens')} value={count(totals.input)} />
           <Usage label={t('outputTokens')} value={count(totals.output)} />
           <Usage label={t('cacheReadTokens')} value={count(totals.cacheRead)} />
           <Usage label={t('cacheWriteTokens')} value={count(totals.cacheWrite)} />
           <Usage label={t('reasoningTokens')} value={count(totals.reasoning)} />
-          <Usage label={t('cost')} value={settled ? formatMicros(totals.cost) : UNMEASURED} />
+          <Usage label={t('cost')} value={formatMicros(totals.cost)} />
         </SimpleGrid>
       </Stack>
     </Card>
@@ -588,17 +578,18 @@ function TraceAttempts({ executions, usage, costItems }: { executions: TraceBund
               <Table.Td>{humanStatus(execution.status, t)}</Table.Td>
               <Table.Td>{execution.retry_reason ? humanDecision(execution.retry_reason, t) : t('noRetry')}</Table.Td>
               <Table.Td className="mono-cell">{execution.latency_ms == null ? UNMEASURED : `${execution.latency_ms} ms`}</Table.Td>
-              <Table.Td className="mono-cell">{row ? formatCount(row.input_tokens) : UNMEASURED}</Table.Td>
-              <Table.Td className="mono-cell">{row ? formatCount(row.output_tokens) : UNMEASURED}</Table.Td>
-              <Table.Td className="mono-cell">{row ? formatCount(row.cache_read_tokens) : UNMEASURED}</Table.Td>
-              <Table.Td className="mono-cell">{row ? formatCount(row.cache_write_tokens) : UNMEASURED}</Table.Td>
-              <Table.Td className="mono-cell">{row ? formatCount(row.reasoning_tokens) : UNMEASURED}</Table.Td>
-              <Table.Td className="mono-cell">{row ? formatMicros(row.total_cost_micros) : UNMEASURED}</Table.Td>
+              <Table.Td className="mono-cell">{row ? quantityText(row,'input_tokens',row.input_tokens) : UNMEASURED}</Table.Td>
+              <Table.Td className="mono-cell">{row ? quantityText(row,'output_tokens',row.output_tokens) : UNMEASURED}</Table.Td>
+              <Table.Td className="mono-cell">{row ? quantityText(row,'cache_read_tokens',row.cache_read_tokens) : UNMEASURED}</Table.Td>
+              <Table.Td className="mono-cell">{row ? quantityText(row,'cache_write_tokens',row.cache_write_tokens) : UNMEASURED}</Table.Td>
+              <Table.Td className="mono-cell">{row ? quantityText(row,'reasoning_tokens',row.reasoning_tokens) : UNMEASURED}</Table.Td>
+              <Table.Td className="mono-cell">{row ? <CostFact row={row}/> : UNMEASURED}</Table.Td>
             </Table.Tr>
           })}</Table.Tbody>
         </Table>
       </TableScrollContainer>}
     </Card>
+    <AttemptDiagnosticList executions={executions}/>
     <Card p={0} mb="lg" style={{ overflow: 'hidden' }}>
       <Title order={2} p="lg">{t('costComponents')}</Title>
       {!costItems.length
@@ -609,9 +600,9 @@ function TraceAttempts({ executions, usage, costItems }: { executions: TraceBund
             <Table.Tbody>{costItems.map((item, index) => <Table.Tr key={`${item.execution_id}-${index}`}>
               <Table.Td className="mono-cell">{attemptLabel(item.execution_id)}</Table.Td>
               <Table.Td>{costKind(item.kind)}</Table.Td>
-              <Table.Td className="mono-cell">{formatCount(item.quantity)}</Table.Td>
+              <Table.Td className="mono-cell">{componentQuantity(usage.find(row=>row.execution_id===item.execution_id),item.kind,item.quantity)}</Table.Td>
               <Table.Td className="mono-cell">{formatMicros(item.unit_price_micros)}</Table.Td>
-              <Table.Td className="mono-cell">{formatMicros(item.subtotal_micros)}</Table.Td>
+              <Table.Td className="mono-cell">{<CostFact row={usage.find(row=>row.execution_id===item.execution_id)??{pricing_status:'unavailable'}} value={item.subtotal_micros}/>} </Table.Td>
             </Table.Tr>)}</Table.Tbody>
           </Table>
         </TableScrollContainer>}
@@ -631,11 +622,10 @@ function humanDecision(value: string, t: (key: string) => string) {
 function TraceFacts({ data, record, traceLink }: { data: RequestDetail; record?: RequestRecord; traceLink?: string }) {
   const { t } = useTranslation()
   const kindLabel = useErrorKindLabel()
-  // A failure the projection settled as zeros was never measured, so its tokens
-  // and cost read `—` instead of an invented `0` next to the alert that says so.
-  const measured = usageMeasured(data)
-  const count = (value: unknown) => measured ? formatCount(value) : UNMEASURED
-  const total = data.input_tokens + data.output_tokens
+  const input=quantityValue(data,'input_tokens',data.input_tokens)
+  const output=quantityValue(data,'output_tokens',data.output_tokens)
+  const count=(key:'input_tokens'|'output_tokens'|'cache_read_tokens',value:unknown)=>quantityText(data,key,value)
+  const total=input==null||output==null?null:input+output
   const attempts = record?.executions ?? []
   const components = record?.cost_items ?? []
   const costKind = (kind: string | null) => kind == null ? UNMEASURED : COST_KIND_KEYS[kind] ? t(COST_KIND_KEYS[kind]) : kind
@@ -662,8 +652,8 @@ function TraceFacts({ data, record, traceLink }: { data: RequestDetail; record?:
     [t('finishedAt'), formatDate(data.finished_at)],
     [t('latency'), data.latency_ms >= 0 ? `${data.latency_ms} ms` : UNMEASURED],
     [t('ttft'), data.ttft_ms == null ? UNMEASURED : `${data.ttft_ms} ms`],
-    [t('tokens'), `${count(data.input_tokens)} / ${count(data.output_tokens)}`],
-    [t('cost'), measured ? formatMicros(data.cost_micros) : UNMEASURED],
+    [t('tokens'), `${count('input_tokens',data.input_tokens)} / ${count('output_tokens',data.output_tokens)}`],
+    [t('cost'), <CostFact key="cost" row={data}/>],
   ]
   return <Stack gap="lg">
     {data.error_kind && <Alert variant="light" color="red" radius="lg" icon={<AlertTriangle />} title={t('requestFailedTitle')}>
@@ -676,21 +666,22 @@ function TraceFacts({ data, record, traceLink }: { data: RequestDetail; record?:
       <Stack gap="md">
         <Title order={2}>{t('usageBreakdown')}</Title>
         <SimpleGrid cols={{ base: 1, sm: 3 }}>
-          <Usage label={t('inputTokens')} value={count(data.input_tokens)} />
-          <Usage label={t('outputTokens')} value={count(data.output_tokens)} />
-          <Usage label={t('cacheTokens')} value={count(data.cached_tokens)} />
+          <Usage label={t('inputTokens')} value={count('input_tokens',data.input_tokens)} />
+          <Usage label={t('outputTokens')} value={count('output_tokens',data.output_tokens)} />
+          <Usage label={t('cacheTokens')} value={count('cache_read_tokens',data.cached_tokens)} />
         </SimpleGrid>
         <Group justify="space-between" align="baseline" wrap="wrap">
-          <Text size="sm" c="dimmed">{`${t('tokens')}: ${measured ? formatCount(total) : UNMEASURED}`}</Text>
-          <Text size="sm" fw={560}>{`${t('cost')}: ${measured ? formatMicros(data.cost_micros) : UNMEASURED}`}</Text>
+          <Text size="sm" c="dimmed">{`${t('tokens')}: ${formatCount(total)}`}</Text>
+          <Text size="sm" fw={560}>{`${t('cost')}: ${formatMicros(amountValue(data))}`}</Text>
         </Group>
+        <CostFact row={data}/><AttemptDiagnosticList executions={attempts}/>
         {components.length > 0 ? <Table>
           <Table.Thead><Table.Tr><Table.Th>{t('costComponents')}</Table.Th><Table.Th>{t('quantity')}</Table.Th><Table.Th>{t('cost')}</Table.Th></Table.Tr></Table.Thead>
           <Table.Tbody>{components.map((item, position) => (
             <Table.Tr key={item.execution_id ? `${item.execution_id}-${position}` : position}>
               <Table.Td>{costKind(item.kind ?? null)}</Table.Td>
-              <Table.Td>{item.quantity == null ? UNMEASURED : formatCount(item.quantity)}</Table.Td>
-              <Table.Td>{item.subtotal_micros == null ? UNMEASURED : formatMicros(item.subtotal_micros)}</Table.Td>
+              <Table.Td>{componentQuantity(record?.usage?.find(row=>row.execution_id===item.execution_id),item.kind,item.quantity)}</Table.Td>
+              <Table.Td>{<CostFact row={record?.usage?.find(row=>row.execution_id===item.execution_id)??{pricing_status:'unavailable'}} value={item.subtotal_micros}/>}</Table.Td>
             </Table.Tr>
           ))}</Table.Tbody>
         </Table> : <Text size="xs" c="dimmed">{record ? t('costEmpty') : t('costComponentUnavailable')}</Text>}
