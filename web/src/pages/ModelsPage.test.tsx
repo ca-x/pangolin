@@ -4,7 +4,8 @@ import userEvent from '@testing-library/user-event'
 import {MemoryRouter} from 'react-router'
 import {afterEach,describe,expect,it,vi} from 'vitest'
 import {ProjectProvider} from '../project'
-import '../i18n'
+import i18n from '../i18n'
+import {buildTheme} from '../mantine'
 import ModelsPage from './ModelsPage'
 const reply=(value:unknown)=>Promise.resolve(new Response(JSON.stringify(value),{status:200,headers:{'Content-Type':'application/json'}}))
 const projects=[{id:'p1',name:'P',slug:'p',owner_user_id:'u',is_default:true,enabled:true}]
@@ -114,4 +115,36 @@ describe('structured prices', () => {
       schedule: { version: 1, rules: [{ priority: 100, timezone: 'America/New_York', start_minute: 0, end_minute: 0, weekdays: [1], from: Math.floor(new Date('2026-09-22T00:00').getTime() / 1000), until: Math.floor(new Date('2026-09-23T00:00').getTime() / 1000), prices: { input: 7 } }] },
     })
   }, 30_000)
+})
+
+
+describe('runtime catalog primary font acceptance',()=>{
+  it.each(['en','zh-CN'])('keeps known, zero and unknown catalog facts readable in table and narrow cards in %s',async language=>{
+    localStorage.clear();await i18n.changeLanguage(language)
+    const base={provider_id:'channel-1',provider_name:'Primary',upstream_name:'gpt-upstream',capabilities:['chat'],enabled:1,lifecycle:'active',catalog_cost_currency:'USD',catalog_cost_unit:'per_million_tokens'}
+    const rows=[{...base,id:'runtime-known',public_name:'runtime-known',catalog_context_limit_tokens:1000000,catalog_output_limit_tokens:384000,catalog_input_cost:0.2,catalog_output_cost:0.4},{...base,id:'runtime-zero',public_name:'runtime-zero',catalog_context_limit_tokens:0,catalog_output_limit_tokens:0,catalog_input_cost:0,catalog_output_cost:0},{...base,id:'runtime-unknown',public_name:'runtime-unknown',catalog_context_limit_tokens:null,catalog_output_limit_tokens:null,catalog_input_cost:null,catalog_output_cost:null}]
+    const fetchMock=vi.fn((input:RequestInfo|URL)=>{const path=String(input);if(path.endsWith('/projects'))return reply(projects);if(path.includes('/permissions'))return reply(['*']);if(path.includes('/operations/models'))return reply({data:rows,total:rows.length});if(path.includes('/operations/channels'))return reply({data:[{id:'channel-1',name:'Primary'}],total:1});return reply({data:[],total:0})})
+    const view=renderPage(fetchMock);await screen.findAllByText('runtime-known')
+    const sizes=buildTheme('default','bronze','light').fontSizes as Record<string,string>
+    const checkValue=(node:HTMLElement)=>{const token=node.dataset.size;expect(token).toBeDefined();expect(Number.parseFloat(sizes[token!])).toBeGreaterThanOrEqual(14)}
+    const table=view.container.querySelector('.desktop-resource-table') as HTMLElement
+    const cards=view.container.querySelector('.mobile-resource-list') as HTMLElement
+    const known=[`${new Intl.NumberFormat(language).format(1000000)} ${i18n.t('tokensUnit')}`,`${new Intl.NumberFormat(language).format(384000)} ${i18n.t('tokensUnit')}`,`0.2 USD / ${i18n.t('millionTokens')}`,`0.4 USD / ${i18n.t('millionTokens')}`]
+    const zero=[`0 ${i18n.t('tokensUnit')}`,`0 USD / ${i18n.t('millionTokens')}`]
+    for(const area of [table,cards]){
+      const region=within(area)
+      for(const value of known)checkValue(region.getByText(value))
+      for(const value of zero){const values=region.getAllByText(value);expect(values).toHaveLength(2);values.forEach(checkValue)}
+      const unknown=region.getByText('runtime-unknown').closest(area===table?'tr':'.mantine-Paper-root') as HTMLElement
+      const primaryUnknown=within(unknown).getAllByText('—').filter(node=>node.classList.contains('mantine-Text-root')&&node.parentElement?.querySelector('[data-size="xs"]'))
+      expect(primaryUnknown).toHaveLength(4);primaryUnknown.forEach(checkValue)
+      for(const label of ['contextLimit','outputLimit','catalogInputCost','catalogOutputCost']){
+        for(const caption of region.getAllByText(i18n.t(label))){expect(caption.dataset.size).toBe('xs');expect(caption.parentElement?.textContent).not.toBe(i18n.t(label))}
+      }
+    }
+    // The same populated facts remain exposed in the existing bounded mobile-card layout.
+    expect(cards.querySelectorAll('.mantine-Paper-root')).toHaveLength(3)
+    for(const value of known){expect(within(cards).getByText(value).closest('.mantine-Paper-root')).toBeInTheDocument()}
+    await i18n.changeLanguage('en')
+  })
 })

@@ -338,7 +338,7 @@ function formattedLimit(value: unknown, language: string, unit: string) {
 
 function ModelLimits({ row }: { row: Document }) {
   const { t, i18n } = useTranslation()
-  return <Stack gap={2}><Group gap={6} wrap="nowrap"><Text size="xs" c="dimmed">{t('contextLimit')}</Text><Text size="sm">{formattedLimit(row.catalog_context_limit_tokens, i18n.language, t('tokensUnit'))}</Text></Group><Group gap={6} wrap="nowrap"><Text size="xs" c="dimmed">{t('outputLimit')}</Text><Text size="sm">{formattedLimit(row.catalog_output_limit_tokens, i18n.language, t('tokensUnit'))}</Text></Group></Stack>
+  return <Stack gap={2}><Group gap={6} wrap="nowrap"><Text size="xs" c="dimmed">{t('contextLimit')}</Text><Text size="md">{formattedLimit(row.catalog_context_limit_tokens, i18n.language, t('tokensUnit'))}</Text></Group><Group gap={6} wrap="nowrap"><Text size="xs" c="dimmed">{t('outputLimit')}</Text><Text size="md">{formattedLimit(row.catalog_output_limit_tokens, i18n.language, t('tokensUnit'))}</Text></Group></Stack>
 }
 
 function formattedCatalogCost(value: unknown, row: Document, language: string, perMillionTokens: string) {
@@ -351,7 +351,7 @@ function formattedCatalogCost(value: unknown, row: Document, language: string, p
 
 function CatalogCosts({ row }: { row: Document }) {
   const { t, i18n } = useTranslation()
-  return <Stack gap={2}><Group gap={6} wrap="nowrap"><Text size="xs" c="dimmed">{t('catalogInputCost')}</Text><Text size="sm">{formattedCatalogCost(row.catalog_input_cost, row, i18n.language, t('millionTokens'))}</Text></Group><Group gap={6} wrap="nowrap"><Text size="xs" c="dimmed">{t('catalogOutputCost')}</Text><Text size="sm">{formattedCatalogCost(row.catalog_output_cost, row, i18n.language, t('millionTokens'))}</Text></Group></Stack>
+  return <Stack gap={2}><Group gap={6} wrap="nowrap"><Text size="xs" c="dimmed">{t('catalogInputCost')}</Text><Text size="md">{formattedCatalogCost(row.catalog_input_cost, row, i18n.language, t('millionTokens'))}</Text></Group><Group gap={6} wrap="nowrap"><Text size="xs" c="dimmed">{t('catalogOutputCost')}</Text><Text size="md">{formattedCatalogCost(row.catalog_output_cost, row, i18n.language, t('millionTokens'))}</Text></Group></Stack>
 }
 
 type ConditionDocument = {
