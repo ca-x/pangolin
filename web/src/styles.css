@@ -175,6 +175,8 @@ button { cursor: pointer; }
 .desktop-resource-table .mantine-Table-th { background: var(--surface-muted); }
 .desktop-resource-table .mantine-Table-td { font-size: 14px; }
 .desktop-resource-table .mantine-ActionIcon-root { min-width: 36px; min-height: 36px; }
+.mantine-TableScrollContainer-scrollContainer { position: relative; }
+.mantine-TableScrollContainer-scrollContainer:has(> .mantine-ScrollArea-viewport:focus-visible)::after { content: ''; position: absolute; inset: 0; z-index: 4; border: 2px solid var(--focus); border-radius: inherit; pointer-events: none; }
 .mantine-Tabs-list { flex-wrap: nowrap; max-width: 100%; overflow-x: auto; overflow-y: hidden; padding-block: 3px; scrollbar-width: thin; }
 .mantine-Tabs-tab { flex-shrink: 0; }
 
