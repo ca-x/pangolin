@@ -105,6 +105,38 @@ release readback remainsv0.7.0; no0.8.0 tag or remote write has been made.
 
 ## Browser evidence
 
+### Final focus-finding correction
+
+The clean committed-source browser pass at `d51c7f8` overrides earlier
+unqualified focus-visibility statements. Computed `2px solid` outlines did not
+prove visible paint: the focused viewport and its clipping scroll parent share
+the same bounds. Natural Tab and a paced recording reproduce SHIP-DQA-001.
+The two-pixel inset-outline prototype remains partially covered by the sticky
+header, so the minimal fix instead paints a noninteractive inset frame on the
+scroll container, above that header, only when the direct viewport has visible
+keyboard focus. It keeps tab order, scrolling, child-control focus and motion
+unchanged. Four new CSS/selector tests reproduce RED and33 focused tests pass
+GREEN. Final rebuilt-paint verification still precedes publication.
+
+A fresh independent review of this two-file product delta is clean. The direct
+viewport selector excludes descendant-control focus; the frame remains outside
+scrolling content, above sticky headers and pointer-transparent. Supported
+selector engines include Chrome/Edge105+, Safari15.4+ and Firefox121+. That
+review does not replace the final real-browser paint check.
+
+The followup is committed separately as822eab9. Fresh full verification on its
+product bytes passes Web90 files/1693 tests in205.77s, Rust603 tests in219.09s,
+fmt, strict all-target Clippy and workflow lint. The chain completed at
+2026-10-22T23:50:28Z (`focus-*` logs). These results supersede the earlier count
+of1689 Web tests; the clean committed artifact still receives a final paint
+recheck before any push/tag.
+
+| Before | After | Why |
+| --- | --- | --- |
+| The table's outer focus outline is clipped, despite correct computed style | A two-pixel inset container frame paints above sticky headers while its viewport has keyboard focus | Make keyboard position visible without intercepting pointer or scroll input |
+
+### Earlier contract and layout evidence
+
 The isolated local release candidate runs against fake QA identities and a mock
 inference upstream; real credentials are not used. A live models.dev metadata
 fetch produced9361 effective catalog entries, retained the one configured

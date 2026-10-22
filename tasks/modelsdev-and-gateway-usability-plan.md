@@ -19,7 +19,8 @@ inventory. Work begins from clean Pangolin `ee89e4b` / v0.7.0.
 - [x] Fresh crate fmt/clippy/tests/docs/package verification and independent review.
 - [x] Publish crate/repository and resolve Pangolin's locked registry dependency.
 - [x] Web install/lint/test/build; Rust fmt/clippy/test/release; actionlint.
-- [x] Release-binary browser QA with populated operational data and mock upstream.
+- [ ] Release-binary browser QA with populated operational data and mock upstream;
+      close the final table-focus visibility finding before publication.
 - [x] Clean final independent review with an available model under the user's
       explicit GPT-6 naming waiver; resolve blocking findings and rerun gates.
 - [x] Prepare 0.8.0 candidate versions and document verified evidence.
@@ -82,3 +83,16 @@ Do not mark an unchecked gate complete without fresh observable evidence.
   lint pass (`ship-*` logs). No source changes follow these checks.
 - Atomic implementation commits: catalog31c080e, protocol49355a2, token
   controlsd4e9d6c. Controller specs/plans/evaluation are committed separately.
+- Clean committed-artifact QA found SHIP-DQA-001: the table viewport's computed
+  2px outer outline was clipped by its same-sized scroll container. Earlier
+  computed-style focus checks were insufficient and do not close this finding.
+  Natural Tab and screenshots reproduce it. A negative-inset outline prototype
+  still loses its top edge beneath sticky headers. The scoped fix paints an
+  inset, noninteractive focus frame on the container above those headers, only
+  while its own viewport has keyboard focus; no new tab stop or motion is added.
+  Four regression tests fail before the fix;33 focused tests then pass. Final
+  independent delta review is clean, including pointer/scroll/child-focus and
+  mature-browser selector support. Fresh full gates pass: Web90 files/1693 tests
+  (205.77s), Rust603 tests (219.09s), fmt, strict Clippy and workflow lint.
+  Focus fix822eab9 is a separate implementation commit. The real committed
+  release-paint recheck remains pending before push/tag.
