@@ -48,6 +48,17 @@ local overrides ───┘                         v
 
 Subscription retries use URL + validator/ETag + revision as the idempotency identity. Invalid, oversized, unsigned-when-required or semantically inconsistent snapshots never move the active pointer. Unknown typed extension fields survive import/export. Local overrides are separate authoritative rows and cannot be deleted by a subscription.
 
+The canonical models.dev subscription adds a normalization step between original
+document/signature validation and snapshot activation. The independent
+`models-dev-rs` parser retains typed nullable facts, exact decimal price data and
+unknown extensions. The source revision hashes the original document; snapshot
+digests cover the normalized document. Network input is bounded to 16 MiB only
+for this official endpoint; ordinary subscriptions retain their 4 MiB network
+bound. Normalized catalogs and merged exports are bounded to 16 MiB. Canonical
+official-source creation is idempotent and never overwrites an existing source's
+policy, proxy, interval or enabled state. Catalog activation does not mutate
+configured project models, routes, credentials, immutable price versions or spend.
+
 ## Request and execution lifecycle
 
 One logical Request may have several immutable RequestExecution attempts. Each attempt records the selected channel credential/config snapshot, actual model, timing, retry/circuit decision and terminal outcome. UsageLog/CostItem facts reference the execution and immutable price version. An operation ID deduplicates finalization. No database transaction stays open during upstream network I/O.

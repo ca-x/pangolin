@@ -4,6 +4,9 @@ Spec: `specs/SPEC-axonhub-parity.md`
 
 Inventory: `docs/axonhub-capability-matrix.md`
 
+Follow-up: `tasks/modelsdev-and-gateway-usability-plan.md` specifies the
+models.dev client/subscription and focused new-api usability release gates.
+
 ## Global constraints
 
 - The software is pre-release: redesign/rebuild the SQLite schema freely. Fresh initialization must remain idempotent; v0.1 experimental data compatibility is not required.

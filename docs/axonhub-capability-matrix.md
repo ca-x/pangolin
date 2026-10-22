@@ -66,6 +66,7 @@ sign-in page; no provider trademark asset is copied into Pangolin.
 | Channel families | OpenAI, Anthropic, Gemini, Azure, Bedrock, Vertex/GCP and compatible presets |
 | Provider preset catalog | Versioned built-ins for display name/category/logo key/default Base URL/auth/default endpoints/model discovery/quota capabilities/source, with admin override and safe fallback |
 | Catalog online maintenance | Local CRUD, import/export, prioritized signed HTTPS subscriptions, ETag refresh, diff/status, atomic activation and last-known-good fallback |
+| models.dev automatic metadata | Explicit official-source connection, idempotent reuse, daily durable refresh, native JSON normalization, bounded/signature-checked snapshots, provenance and last-known-good; reference metadata never rewrites configured billing/adapters |
 | Multiple credentials | Encrypted key list, OAuth/GCP credentials, suffix identification and per-key disable state |
 | Credential recovery | Invalid/encryption recovery path without leaking plaintext |
 | Proxy settings | Direct HTTP/SOCKS policy plus reusable encrypted presets for channels, webhooks and catalog fetches |
