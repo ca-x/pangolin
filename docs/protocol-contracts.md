@@ -56,7 +56,8 @@ Azure uses deployment URLs and API versions, with `/openai/v1/responses` for Res
 Native protocols preserve provider extension fields. Cross-protocol transformations are narrower and reject unknown fields instead of dropping them:
 
 - OpenAI chat → Anthropic: text/system/tool-call/tool-result bridge, with LiteLLM's checked text transformation when applicable; nonstreaming only.
-- OpenAI chat ↔ Gemini and Anthropic Messages → OpenAI chat: text, system and supported sampling/token-limit fields; nonstreaming only. Use native endpoints for tools, multimodal inputs and streaming.
+- OpenAI chat ↔ Gemini: text, system and supported sampling/token-limit fields; nonstreaming only. Use native Gemini for tools, multimodal inputs and streaming.
+- Anthropic Messages → OpenAI chat: nonstreaming text/system and function-tool definitions, calls and text-only results with preserved IDs/JSON arguments; OpenAI tool-call responses return Anthropic `tool_use` blocks. Unsupported block ordering, error/media/server-tool results, malformed arguments and unrepresentable controls fail explicitly rather than silently losing data. Use native Anthropic for streaming and richer content.
 - OpenAI embeddings → Gemini: text/string arrays and dimensions; token-array inputs are rejected.
 - OpenAI chat → Bedrock: the pinned LiteLLM checked text Converse surface; unsupported tools/streaming are rejected.
 - AI SDK: text messages/parts and both stream framing formats; nontext/tool/reasoning parts fail explicitly.

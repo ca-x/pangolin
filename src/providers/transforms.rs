@@ -52,18 +52,7 @@ impl ResponseTransform {
                     json!({"candidates":choices.into_iter().map(|(text,reason)|json!({"content":{"role":"model","parts":[{"text":text}]},"finishReason":if reason=="length"{"MAX_TOKENS"}else{"STOP"}})).collect::<Vec<_>>(),"usageMetadata":{"promptTokenCount":body["usage"]["prompt_tokens"],"candidatesTokenCount":body["usage"]["completion_tokens"],"totalTokenCount":body["usage"]["total_tokens"]}}),
                 )
             }
-            Self::ChatMessages(model) => {
-                let choices = text_choices(&body)?;
-                if choices.len() != 1 {
-                    return Err(invalid(
-                        "Anthropic transformation requires exactly one choice",
-                    ));
-                }
-                let (text, reason) = &choices[0];
-                Ok(
-                    json!({"id":body["id"],"type":"message","role":"assistant","model":model,"content":[{"type":"text","text":text}],"stop_reason":if reason=="length"{"max_tokens"}else{"end_turn"},"stop_sequence":null,"usage":{"input_tokens":body["usage"]["prompt_tokens"],"output_tokens":body["usage"]["completion_tokens"]}}),
-                )
-            }
+            Self::ChatMessages(model) => super::anthropic::chat_response(model, &body),
         }
     }
     pub fn diagnostic_path(&self) -> &'static str {
@@ -100,7 +89,7 @@ fn text_choices(body: &Value) -> Result<Vec<(String, String)>, ApiError> {
         .collect()
 }
 
-fn text_content(value: &Value) -> Result<String, ApiError> {
+pub(super) fn text_content(value: &Value) -> Result<String, ApiError> {
     if let Some(text) = value.as_str() {
         return Ok(text.to_owned());
     }
@@ -278,6 +267,8 @@ pub fn messages_to_chat(body: &Value) -> Result<Value, ApiError> {
             "top_p",
             "stop_sequences",
             "stream",
+            "tools",
+            "tool_choice",
         ],
     )?;
     if body["stream"] == true {
@@ -294,11 +285,7 @@ pub fn messages_to_chat(body: &Value) -> Result<Value, ApiError> {
         .as_array()
         .ok_or_else(|| invalid("messages required"))?
     {
-        ensure_fields(message, &["role", "content"])?;
-        if !matches!(message["role"].as_str(), Some("user" | "assistant")) {
-            return Err(invalid("unsupported Anthropic role"));
-        }
-        messages.push(json!({"role":message["role"],"content":text_content(&message["content"])?}));
+        messages.extend(super::anthropic::message(message)?);
     }
     let mut output = json!({"model":body["model"],"messages":messages});
     for (source, target) in [
@@ -311,6 +298,7 @@ pub fn messages_to_chat(body: &Value) -> Result<Value, ApiError> {
             output[target] = value.clone();
         }
     }
+    super::anthropic::tools(body, &mut output)?;
     Ok(output)
 }
 

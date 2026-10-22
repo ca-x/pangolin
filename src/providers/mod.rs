@@ -1,5 +1,8 @@
 //! Provider implementations are deliberately hidden behind this Pangolin boundary.
 //! No LiteLLM host, Python bridge or callback controls gateway orchestration.
+mod anthropic;
+#[cfg(test)]
+mod anthropic_tests;
 mod cloud;
 pub mod diagnostics;
 pub mod discovery;
