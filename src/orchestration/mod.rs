@@ -756,7 +756,7 @@ fn request_has_image(payload: &Value, endpoint: &str) -> Result<bool> {
 }
 
 /// Shared by admission and protocol adapters; never infer a different output
-/// ceiling after admission. Validate all supplied aliases, including shadowed ones.
+/// ceiling after admission. Validate every alias and reject conflicting ceilings.
 pub fn output_limit(payload: &Value) -> Result<u32> {
     let mut selected = None;
     for field in ["max_completion_tokens", "max_tokens", "max_output_tokens"] {
@@ -768,7 +768,10 @@ pub fn output_limit(payload: &Value) -> Result<u32> {
                 .ok_or(Error::Invalid(
                     "output token limit must be a positive 32-bit integer",
                 ))?;
-            selected.get_or_insert(limit);
+            if selected.is_some_and(|previous| previous != limit) {
+                return Err(Error::Invalid("conflicting output token limits"));
+            }
+            selected = Some(limit);
         }
     }
     Ok(selected.unwrap_or(4096))
@@ -853,7 +856,7 @@ impl Plan {
             validate_token_reservation(&payload)?;
             match crate::providers::capability(&candidate.protocol_endpoint) {
                 kind @ ("chat" | "messages" | "completions" | "responses") => {
-                    let mut limit = output_limit(&payload)?;
+                    let limit = output_limit(&payload)?;
                     let field = if kind == "responses" {
                         "max_output_tokens"
                     } else if kind != "messages" && payload.get("max_completion_tokens").is_some() {
@@ -861,9 +864,6 @@ impl Plan {
                     } else {
                         "max_tokens"
                     };
-                    if let Some(native) = payload.get(field).and_then(Value::as_u64) {
-                        limit = native as u32; // All aliases were validated by output_limit.
-                    }
                     for alias in ["max_tokens", "max_completion_tokens", "max_output_tokens"] {
                         payload
                             .as_object_mut()

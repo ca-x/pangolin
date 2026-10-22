@@ -104,6 +104,21 @@ async fn task5_review_budget_without_tpm_enforces_protocol_output_ceiling() {
         .await
         .unwrap()
         .unwrap();
+    assert!(matches!(
+        orchestration::prepare(
+            &f.state.db,
+            &f.state.orchestrator,
+            &key,
+            orchestration::load_profile(&f.state.db, &key)
+                .await
+                .unwrap(),
+            json!({"model":"public","input":"hi","max_tokens":17,"max_output_tokens":9}),
+            &HeaderMap::new(),
+            "/v1/responses",
+        )
+        .await,
+        Err(orchestration::Error::Invalid(_))
+    ));
     for (endpoint, body, pointer, expected) in [
         (
             "/v1/chat/completions",
@@ -128,12 +143,6 @@ async fn task5_review_budget_without_tpm_enforces_protocol_output_ceiling() {
             json!({"model":"public","input":"hi","max_tokens":17}),
             "/max_output_tokens",
             17,
-        ),
-        (
-            "/v1/responses",
-            json!({"model":"public","input":"hi","max_tokens":17,"max_output_tokens":9}),
-            "/max_output_tokens",
-            9,
         ),
         (
             "/v1beta/models:generateContent",

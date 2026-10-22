@@ -50,6 +50,17 @@ Limits are process-local, intended for Pangolin's single-process deployment. RPM
 
 API-key RPM counts logical requests; channel RPM counts every upstream attempt. Each retry reserves API-key TPM again. Token reservations use UTF-8 request bytes plus an output ceiling; this is intentionally conservative for text. Missing output ceilings are set to 4096 for TPM-limited requests. Media requests under TPM policy fail explicitly until a provider-aware estimator is installed. Reservations are not refunded for failures. Quotas may conservatively consume token capacity when a later RPM/circuit check rejects admission. No global/distributed rate guarantee is claimed.
 
+Conflicting flat output ceilings (`max_tokens`, `max_completion_tokens`,
+`max_output_tokens`) fail closed before non-Gemini routing/admission; a
+lower-priority alias cannot hide a larger requested cap. Equal aliases remain
+compatible. Gemini independently honors native `generationConfig.maxOutputTokens`
+and `candidateCount`; foreign flat fields are not Gemini aliases. Native reasoning controls and
+extension fields are preserved, not converted into fabricated usage counts.
+Absent caps remain absent unless an existing TPM/hard-budget policy requires a
+conservative native cap. Candidate/output count multiplication uses checked
+arithmetic. Context-limit rejection still requires the configured matching
+tokenizer; byte reservations are not a claimed exact context measurement.
+
 Circuit failures are isolated by channel and resolved upstream model, recorded in a moving failure window. Recovery admits one probe; success closes the circuit, failure reopens it, cancellation releases the probe without classifying client cancellation as a provider failure. Local admission rejection does not create a circuit failure.
 
 Profile budgets aggregate existing SQLite API-key spend and serialize requests sharing the budget. Supported conversational streams use conservative reservations and exact settlement only with valid final source usage; cancellation, interruption or unavailable required usage retains the conservative charge. Persisted `channel_health_state` and `provider_quota_snapshots` are consumed here; scheduled probes, quota collection and durable execution/cost accounting belong to the operations task.

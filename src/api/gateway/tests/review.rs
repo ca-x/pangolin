@@ -40,6 +40,14 @@ async fn review_bridge_reserves_the_actual_output_ceiling_under_key_and_channel_
     body["max_tokens"] = json!(99999);
     assert_eq!(
         request(&f, "/v1/chat/completions", body).await.status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(observed.lock().await.len(), 1);
+    let mut body = chat();
+    body["max_completion_tokens"] = json!(12);
+    body["max_tokens"] = json!(12);
+    assert_eq!(
+        request(&f, "/v1/chat/completions", body).await.status(),
         StatusCode::OK
     );
     assert_eq!(observed.lock().await[1]["max_tokens"], 12);
