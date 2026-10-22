@@ -1,5 +1,6 @@
 //! Versioned declarative catalog. SQLite snapshots are authoritative; bundled
 //! data is a network-independent fallback. No catalog data is executable.
+mod models_dev;
 pub mod refresh;
 pub mod repository;
 pub mod types;
@@ -16,3 +17,6 @@ pub fn builtin() -> &'static Catalog {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod models_dev_tests;

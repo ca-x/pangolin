@@ -1,5 +1,12 @@
 # Catalog data attribution
 
+Optional live metadata is fetched from models.dev (`https://models.dev/api.json`),
+whose data/SDK are MIT-licensed (`https://github.com/anomalyco/models.dev`). The
+independent MIT `models-dev-rs` crate validates the document; Pangolin normalizes
+facts and records the original content digest and source in immutable snapshots.
+Existing bundled setup/endpoints/icon mappings are not replaced by remote code.
+No upstream logos or image assets are downloaded by catalog synchronization.
+
 `builtin.json` contains factual provider/model metadata projected and normalized from AxonHub's Apache-2.0 catalog files:
 
 - Repository: https://github.com/looplj/axonhub

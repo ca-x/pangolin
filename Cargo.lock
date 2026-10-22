@@ -3237,6 +3237,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "models-dev-rs"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "beb8e0c313c43990598987bdac8736cd70f40a702688f7a2927f467bc6c3eb0d"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "url",
+]
+
+[[package]]
 name = "moka"
 version = "0.12.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3566,7 +3578,7 @@ checksum = "1a80800c0488c3a21695ea981a54918fbb37abf04f4d0720c453632255e2ff0e"
 
 [[package]]
 name = "pangolin"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -3603,6 +3615,7 @@ dependencies = [
  "litellm-token-counter",
  "litellm-types",
  "mime_guess",
+ "models-dev-rs",
  "moka",
  "multer",
  "oauth2",

@@ -217,7 +217,7 @@ export function CapabilityTags({ value, max = 3 }: { value: unknown; max?: numbe
   const shown = list.slice(0, max)
   // Mantine's smallest badge is 9px, upper-cased and ellipsised, which turned
   // every capability into a clipped pill. These are reference values, so they
-  // read as text: 12.5px, sentence case, never truncated mid-word.
+  // read as text: 14px, sentence case, never truncated mid-word.
   return (
     <span className="pm-capabilities">
       {shown.map((item) => <span key={item} className="pm-capability">{label(item)}</span>)}

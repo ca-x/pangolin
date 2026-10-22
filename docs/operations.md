@@ -1,5 +1,38 @@
 # Accounting and operations
 
+## Automatic models.dev metadata
+
+Open **Models → Subscriptions** and choose **Connect models.dev**. This explicit
+opt-in creates the official `https://models.dev/api.json` subscription and fetches
+it immediately; the durable scheduler subsequently refreshes daily. Existing
+official subscriptions are reused rather than duplicated. Their configured
+interval, proxy and signature policy are retained. **Disable subscription** stops
+automatic fetches and excludes this source from the effective catalog; saved
+snapshots and configured project models remain intact. **Enable and sync**
+restores the source and requests a fresh update. While enabled, refresh failures
+show an actionable error while retaining the previous validated snapshot and
+last successful update time. Refresh/rollback and local overrides use the
+existing catalog controls.
+
+Disabling remains possible when the assigned proxy has already been disabled;
+the assignment is retained. Re-enabling still requires an enabled proxy or an
+explicit change to that assignment, rather than silently bypassing the proxy.
+
+This source uses models.dev's native JSON rather than Pangolin's versioned
+catalog format. Only the canonical official URL enables that parser. HTTPS,
+public-address/DNS pinning, no redirects, timeouts, validators and signature
+requirements apply before atomic SQLite activation. If a required signature is
+not supplied, refresh fails rather than weakening the configured policy.
+
+Names, capabilities, context/output limits, modalities, dates and advertised
+USD-per-million-token prices are **reference metadata**, not provider tests.
+Unknown facts remain unknown. Unsupported provider SDKs remain catalog-only;
+metadata cannot install adapters. Synchronization does not enable channels,
+change routes or rewrite existing model settings, live prices, historical cost
+or token measurements. Explicit operator billing configuration remains required.
+
+## Accounting invariants
+
 SQLite is authoritative. Requests freeze their log policy and price snapshot before an upstream attempt. A terminal transaction writes execution status, usage, itemized integer micro-USD costs and API-key spend together. Current model input/output configuration is captured as immutable price versions. Applicable operator-confirmed price versions take precedence and support marginal tiers, cache read/write (including 5m/1h variants), reasoning, flat and protocol-unit components. Each item rounds upward to the nearest micro-USD. Service-group ratios are integer millionths and are frozen per request.
 
 Hard budgets reserve a conservative upper bound before contacting a provider. Streams settle provider-reported usage before delivering a terminal event. Cancellation, lost usage or process interruption retain a conservative charge instead of releasing potentially spent budget; `settlement_kind` makes that distinction visible. A definitive HTTP rejection is uncharged. Media unit quantities are image count, explicit video seconds or speech characters. Uploaded media with an unknown duration requires flat pricing for hard-budget keys. Task polling/deletion is uncharged. Repeated provider response IDs are deduplicated within project, API key, provider and endpoint; distinct clients never share a deduplication namespace.

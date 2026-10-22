@@ -145,6 +145,123 @@ async fn catalog_api_is_offline_filterable_versioned_and_authorized() {
 }
 
 #[tokio::test]
+async fn disabling_a_catalog_source_preserves_an_unavailable_proxy_but_cannot_reenable_it() {
+    let fixture_state = fixture(Router::new()).await;
+    let cookie = session(&fixture_state).await;
+    sql(
+        &fixture_state,
+        "INSERT INTO proxy_presets(id,name,url,enabled,created_at,updated_at) VALUES('stopped-catalog-proxy','Catalog proxy','http://proxy.example.test:3128',1,0,0)",
+        vec![],
+    )
+    .await;
+    let mut input = json!({
+        "name":"models.dev", "url":"https://models.dev/api.json",
+        "priority":50, "refresh_interval_secs":86400, "enabled":true,
+        "signature_policy":"none", "public_key":null,
+        "proxy_preset_id":"stopped-catalog-proxy"
+    });
+    let created = admin(
+        &fixture_state,
+        &cookie,
+        http::Method::POST,
+        "/api/admin/v1/catalog/sources",
+        input.clone(),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let created = json_body(created).await;
+    let source_path = format!(
+        "/api/admin/v1/catalog/sources/{}",
+        created["id"].as_str().unwrap()
+    );
+    sql(
+        &fixture_state,
+        "UPDATE proxy_presets SET enabled=0 WHERE id='stopped-catalog-proxy'",
+        vec![],
+    )
+    .await;
+    input["enabled"] = json!(false);
+    let disabled = admin(
+        &fixture_state,
+        &cookie,
+        http::Method::PUT,
+        &source_path,
+        json!({"revision":created["revision"],"source":input}),
+    )
+    .await;
+    assert_eq!(disabled.status(), StatusCode::OK);
+    let saved = json_body(disabled).await;
+    for (field, value) in input.as_object().unwrap() {
+        assert_eq!(&saved[field], value, "{field} must be retained");
+    }
+    assert_eq!(saved["revision"], 2);
+    assert_eq!(audit_count(&fixture_state, "update_source").await, 1);
+
+    input["proxy_preset_id"] = json!("nonexistent-proxy");
+    let unknown = admin(
+        &fixture_state,
+        &cookie,
+        http::Method::PUT,
+        &source_path,
+        json!({"revision":saved["revision"],"source":input}),
+    )
+    .await;
+    assert_eq!(unknown.status(), StatusCode::BAD_REQUEST);
+    input["proxy_preset_id"] = json!("stopped-catalog-proxy");
+    input["enabled"] = json!(true);
+    let refused = admin(
+        &fixture_state,
+        &cookie,
+        http::Method::PUT,
+        &source_path,
+        json!({"revision":saved["revision"],"source":input}),
+    )
+    .await;
+    assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+    let listed = json_body(
+        admin(
+            &fixture_state,
+            &cookie,
+            http::Method::GET,
+            "/api/admin/v1/catalog/sources",
+            Value::Null,
+        )
+        .await,
+    )
+    .await;
+    let unchanged = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|source| source["id"] == created["id"])
+        .unwrap();
+    assert_eq!(unchanged["enabled"], false);
+    assert_eq!(unchanged["revision"], saved["revision"]);
+    assert_eq!(audit_count(&fixture_state, "update_source").await, 1);
+
+    sql(
+        &fixture_state,
+        "UPDATE proxy_presets SET enabled=1 WHERE id='stopped-catalog-proxy'",
+        vec![],
+    )
+    .await;
+    let recovered = admin(
+        &fixture_state,
+        &cookie,
+        http::Method::PUT,
+        &source_path,
+        json!({"revision":saved["revision"],"source":input}),
+    )
+    .await;
+    assert_eq!(recovered.status(), StatusCode::OK);
+    let recovered = json_body(recovered).await;
+    assert_eq!(recovered["enabled"], true);
+    assert_eq!(recovered["proxy_preset_id"], "stopped-catalog-proxy");
+    assert_eq!(recovered["revision"], 3);
+    assert_eq!(audit_count(&fixture_state, "update_source").await, 2);
+}
+
+#[tokio::test]
 async fn provider_presets_install_endpoint_mapping_and_keep_tpm_policy() {
     let seen = Arc::new(Mutex::new(vec![]));
     let copy = seen.clone();

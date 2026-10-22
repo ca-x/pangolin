@@ -132,19 +132,22 @@ pub async fn source(db: &DatabaseConnection, id: &str) -> Result<Source, ApiErro
 
 pub async fn create_source(
     db: &DatabaseConnection,
-    input: SourceInput,
+    mut input: SourceInput,
     audit: Option<CatalogAudit<'_>>,
 ) -> Result<Source, ApiError> {
     input.validate()?;
-    let tx = db.begin().await?;
-    let count = tx
-        .query_one(sql("SELECT COUNT(*) AS count FROM catalog_sources", vec![]))
-        .await?
-        .unwrap()
-        .try_get::<i64>("", "count")?;
-    if count >= 32 {
-        return Err(invalid("catalog source limit reached"));
+    let official = super::models_dev::is_source(&input.url);
+    if official {
+        input.url = super::models_dev::URL.into();
+        if let Some(existing) = sources(db)
+            .await?
+            .into_iter()
+            .find(|source| super::models_dev::is_source(&source.url))
+        {
+            return Ok(existing);
+        }
     }
+    let tx = db.begin().await?;
     let id = Uuid::new_v4().to_string();
     if let Some(preset) = &input.proxy_preset_id
         && tx
@@ -157,7 +160,22 @@ pub async fn create_source(
     {
         return Err(invalid("unknown proxy preset"));
     }
-    tx.execute(sql("INSERT INTO catalog_sources(id,name,url,priority,refresh_interval_secs,enabled,signature_policy,public_key,proxy_preset_id,revision) VALUES(?,?,?,?,?,?,?,?,?,1)",vec![id.clone().into(),input.name.into(),input.url.into(),input.priority.into(),input.refresh_interval_secs.into(),input.enabled.into(),input.signature_policy.into(),input.public_key.into(),input.proxy_preset_id.into()])).await?;
+    let inserted = tx.execute(sql("INSERT INTO catalog_sources(id,name,url,priority,refresh_interval_secs,enabled,signature_policy,public_key,proxy_preset_id,revision) SELECT ?,?,?,?,?,?,?,?,?,1 WHERE (SELECT COUNT(*) FROM catalog_sources)<32 AND (?=0 OR NOT EXISTS(SELECT 1 FROM catalog_sources WHERE url=?))",vec![id.clone().into(),input.name.into(),input.url.into(),input.priority.into(),input.refresh_interval_secs.into(),input.enabled.into(),input.signature_policy.into(),input.public_key.into(),input.proxy_preset_id.into(),official.into(),super::models_dev::URL.into()])).await?;
+    if inserted.rows_affected() == 0 {
+        if official {
+            let existing = Source::find_by_statement(sql(
+                "SELECT * FROM catalog_sources WHERE url=?",
+                vec![super::models_dev::URL.into()],
+            ))
+            .one(&tx)
+            .await?;
+            if let Some(existing) = existing {
+                tx.commit().await?;
+                return Ok(existing);
+            }
+        }
+        return Err(invalid("catalog source limit reached"));
+    }
     record_audit(&tx, &audit, &id).await?;
     tx.commit().await?;
     source(db, &id).await
@@ -167,23 +185,36 @@ pub async fn update_source(
     db: &DatabaseConnection,
     id: &str,
     revision: i64,
-    input: SourceInput,
+    mut input: SourceInput,
     audit: Option<CatalogAudit<'_>>,
 ) -> Result<Source, ApiError> {
     input.validate()?;
+    let official = super::models_dev::is_source(&input.url);
+    if official {
+        input.url = super::models_dev::URL.into();
+        if sources(db)
+            .await?
+            .iter()
+            .any(|source| source.id != id && super::models_dev::is_source(&source.url))
+        {
+            return Err(ApiError::Conflict(
+                "models.dev subscription already exists".into(),
+            ));
+        }
+    }
     let tx = db.begin().await?;
     if let Some(preset) = &input.proxy_preset_id
         && tx
             .query_one(sql(
-                "SELECT id FROM proxy_presets WHERE id=? AND enabled=1",
-                vec![preset.into()],
+                "SELECT id FROM proxy_presets WHERE id=? AND (enabled=1 OR ?=0)",
+                vec![preset.into(), input.enabled.into()],
             ))
             .await?
             .is_none()
     {
         return Err(invalid("unknown proxy preset"));
     }
-    let result=tx.execute(sql("UPDATE catalog_sources SET name=?,url=?,priority=?,refresh_interval_secs=?,enabled=?,signature_policy=?,public_key=?,proxy_preset_id=?,revision=revision+1,etag=NULL,last_modified=NULL WHERE id=? AND revision=?",vec![input.name.into(),input.url.into(),input.priority.into(),input.refresh_interval_secs.into(),input.enabled.into(),input.signature_policy.into(),input.public_key.into(),input.proxy_preset_id.into(),id.into(),revision.into()])).await?;
+    let result=tx.execute(sql("UPDATE catalog_sources SET name=?,url=?,priority=?,refresh_interval_secs=?,enabled=?,signature_policy=?,public_key=?,proxy_preset_id=?,revision=revision+1,etag=NULL,last_modified=NULL WHERE id=? AND revision=? AND (?=0 OR NOT EXISTS(SELECT 1 FROM catalog_sources WHERE url=? AND id<>?))",vec![input.name.into(),input.url.into(),input.priority.into(),input.refresh_interval_secs.into(),input.enabled.into(),input.signature_policy.into(),input.public_key.into(),input.proxy_preset_id.into(),id.into(),revision.into(),official.into(),super::models_dev::URL.into(),id.into()])).await?;
     if result.rows_affected() != 1 {
         return Err(ApiError::Conflict(
             "catalog source changed; reload its revision".into(),

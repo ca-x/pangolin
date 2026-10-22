@@ -19,6 +19,7 @@ Pangolin (Chinese name 鲮鲤) is a single-binary AI API aggregation gateway. It
 - Projects, users, roles, invitations, OIDC, API key profiles, and IP, quota, budget and logging policies
 - Multiple encrypted credentials per channel with priority, rotation, bulk enable/disable, probing, quotas and auto-disable
 - Built-in provider and model catalogue with brand icons, capability and price metadata; import, export, signed subscriptions, refresh and rollback
+- Opt-in models.dev catalogue sync with daily refresh, conditional downloads and last-known-good fallback; reference prices never overwrite configured billing
 - Thread → Trace → Request → Execution → Usage/Cost observability end to end, plus an explainable routing preview
 - SeaORM + SQLite as the authoritative record system, DuckDB as an independent analytical projection; encrypted per-project and whole-instance backup and restore
 - Site-level and API-key-level request logging policy that keeps sensitive bodies out by default, with optional exact session replay and compaction

@@ -1,6 +1,6 @@
 use super::{
     repository::{self, Source},
-    types::{MAX_BYTES, invalid},
+    types::invalid,
 };
 use crate::api::ApiError;
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -130,6 +130,7 @@ impl Transport for HttpsTransport {
     ) -> Pin<Box<dyn Future<Output = Result<Download, ApiError>> + Send + 'a>> {
         Box::pin(async move {
             let url = source_url(&source.url)?;
+            let max_bytes = super::models_dev::download_limit(&source.url);
             let host = url.host_str().unwrap().trim_matches(['[', ']']);
             let addresses =
                 tokio::time::timeout(Duration::from_secs(5), tokio::net::lookup_host((host, 443)))
@@ -188,17 +189,17 @@ impl Transport for HttpsTransport {
             }
             if response
                 .content_length()
-                .is_some_and(|n| n > MAX_BYTES as u64)
+                .is_some_and(|n| n > max_bytes as u64)
             {
-                return Err(invalid("catalog download exceeds 4 MiB"));
+                return Err(invalid("catalog download exceeds source size limit"));
             }
             let mut body = vec![];
             let mut chunks = response.bytes_stream();
             while let Some(chunk) = chunks.next().await {
                 let chunk =
                     chunk.map_err(|_| ApiError::Upstream("catalog download body failed".into()))?;
-                if body.len().saturating_add(chunk.len()) > MAX_BYTES {
-                    return Err(invalid("catalog download exceeds 4 MiB"));
+                if body.len().saturating_add(chunk.len()) > max_bytes {
+                    return Err(invalid("catalog download exceeds source size limit"));
                 }
                 body.extend_from_slice(&chunk);
             }
@@ -455,14 +456,19 @@ pub async fn refresh_with<T: Transport>(
                 download.status
             )));
         }
-        if download.body.len() > MAX_BYTES {
-            return Err(invalid("catalog download exceeds 4 MiB"));
+        if download.body.len() > super::models_dev::download_limit(&source.url) {
+            return Err(invalid("catalog download exceeds source size limit"));
         }
         let verified = verify(&source, &download)?;
+        let body = if super::models_dev::is_source(&source.url) {
+            super::models_dev::normalize(&download.body)?
+        } else {
+            download.body
+        };
         let snapshot = repository::activate(
             db,
             &source,
-            &download.body,
+            &body,
             download.etag,
             download.last_modified,
             verified,

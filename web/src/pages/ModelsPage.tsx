@@ -15,6 +15,7 @@ import { AutoRefreshControl, useAutoRefreshInterval } from './autoRefresh'
 import { PageHeader, QueryError, ResourcePage, displayValue, formatDate } from './shared'
 import { BasePricingConfirmation } from './BasePricingConfirmation'
 import { ModelFacts } from './ModelFacts'
+import { ModelsDevSubscription, type CatalogSource } from './ModelsDevSubscription'
 import { nextModelImportSelection } from './modelImportSelection'
 import { useActiveTabInView, useRoutedTab } from './useRoutedTab'
 
@@ -46,7 +47,7 @@ export default function ModelsPage() {
       <Tabs.Panel value="routing"><UnassociatedModels /><section id="association-editor"><RoutingEditor /></section><RoutingPreview key={project.id} /></Tabs.Panel>
       <Tabs.Panel value="groups"><ServiceGroupsPanel /></Tabs.Panel>
       <Tabs.Panel value="prices"><PricesPanel /></Tabs.Panel>
-      <Tabs.Panel value="catalog"><CatalogPanel canManageCatalog={canManageCatalog} /></Tabs.Panel>
+      <Tabs.Panel value="catalog"><CatalogPanel canManageCatalog={canManageCatalog} onOpenSubscriptions={() => setTab('subscriptions')} /></Tabs.Panel>
       <Tabs.Panel value="subscriptions"><CatalogSubscriptions /></Tabs.Panel>
     </Tabs>
   )
@@ -821,7 +822,7 @@ const CATALOG_MOBILE_PAGE_SIZE = 10
  * Below the shared table breakpoint the list is a compact 10-row mobile list
  * instead of `ResourcePage`'s 25-row cards (audit P2-6).
  */
-function CatalogPanel({ canManageCatalog }: { canManageCatalog: boolean }) {
+function CatalogPanel({ canManageCatalog, onOpenSubscriptions }: { canManageCatalog: boolean; onOpenSubscriptions: () => void }) {
   const { t } = useTranslation()
   const mobile = useMediaQuery(MOBILE_VIEWPORT, undefined, { getInitialValueInEffect: false })
   const client = useQueryClient()
@@ -831,10 +832,11 @@ function CatalogPanel({ canManageCatalog }: { canManageCatalog: boolean }) {
   return (
     <>
       <PageHeader title={t('catalog')} description={t('catalogDescription')} action={<Group gap="xs" className="pm-catalog-header-actions">
+        {canManageCatalog && <Button variant="default" mih={44} leftSection={<RefreshCw size={17} aria-hidden="true" />} style={{ transform: 'none', transition: 'none' }} onClick={onOpenSubscriptions}>{t('modelsDevDiscover')}</Button>}
         <Button component="a" href="/api/admin/v1/catalog/export" download variant="default" leftSection={<Download size={17} />}>{t('export')}</Button>
         {canManageCatalog && <Button variant="default" leftSection={<Upload size={17} />} aria-expanded={importOpen} aria-controls={importOpen ? 'catalog-import-form' : undefined} onClick={() => setImportOpen(!importOpen)}>{t('import')}</Button>}
       </Group>} />
-      {importOpen && <Paper p="lg" withBorder mb="lg">
+      {canManageCatalog && importOpen && <Paper p="lg" withBorder mb="lg">
         <Title order={2}>{t('catalogTransfer')}</Title>
         <Text size="sm" c="dimmed">{t('catalogTransferHint')}</Text>
         <form id="catalog-import-form" className="pm-catalog-import-form" onSubmit={submit}>
@@ -948,22 +950,6 @@ function CatalogOverrideEditor() {
   )
 }
 
-type CatalogSource = {
-  id: string
-  name: string
-  url: string
-  priority: number
-  refresh_interval_secs: number
-  enabled: boolean
-  signature_policy: string
-  public_key: string | null
-  revision: number
-  last_attempt_at: number | null
-  last_success_at: number | null
-  last_error: string | null
-  active_snapshot_id: string | null
-  previous_snapshot_id: string | null
-}
 type CatalogSnapshot = { id: string; version: string; digest: string; source_url: string; signature_verified: boolean; created_at: number }
 /** `POST /refresh` and `POST /refresh-due` answer with this, and the batch form adds `error`. */
 type RefreshOutcome = { source_id: string; status: string; snapshot_id: string | null; error?: string }
@@ -982,10 +968,10 @@ export function nextDueAt(source: CatalogSource, now: number): { dueAt: number |
 
 function CatalogNextDue({ source }: { source: CatalogSource }) {
   const { t } = useTranslation()
-  if (!source.enabled) return <Text size="sm" c="dimmed">—</Text>
+  if (!source.enabled) return <Text size="md" c="dimmed">—</Text>
   const { dueAt, dueNow } = nextDueAt(source, Math.floor(Date.now() / 1000))
-  if (dueNow) return <Text size="sm">{t('catalogDueNow')}</Text>
-  return <Text size="sm">{formatDate(dueAt)}</Text>
+  if (dueNow) return <Text size="md">{t('catalogDueNow')}</Text>
+  return <Text size="md">{formatDate(dueAt)}</Text>
 }
 
 /**
@@ -996,23 +982,23 @@ function CatalogNextDue({ source }: { source: CatalogSource }) {
 function CatalogActiveSnapshot({ source }: { source: CatalogSource }) {
   const { t } = useTranslation()
   const query = useQuery({ queryKey: ['catalog-snapshots', source.id], queryFn: () => api<CatalogSnapshot[]>(`/api/admin/v1/catalog/sources/${source.id}/snapshots`) })
-  if (!source.active_snapshot_id) return <Text size="sm" c="dimmed">—</Text>
+  if (!source.active_snapshot_id) return <Text size="md" c="dimmed">—</Text>
   if (query.isError) {
     return (
       <Group gap={4} wrap="nowrap">
-        <Text size="sm" c="dimmed">{t('catalogSnapshotUnknown')}</Text>
+        <Text size="md" c="dimmed">{t('catalogSnapshotUnknown')}</Text>
         <ActionIcon variant="subtle" color="gray" aria-label={t('retry')} onClick={() => void query.refetch()}><RefreshCw size={15} /></ActionIcon>
       </Group>
     )
   }
   if (query.isLoading) return <Loader size={14} aria-label={t('loading')} />
   const active = (query.data || []).find((snapshot) => snapshot.id === source.active_snapshot_id)
-  if (!active) return <Text size="sm" c="dimmed">—</Text>
+  if (!active) return <Text size="md" c="dimmed">—</Text>
   return (
     <Stack gap={2}>
-      <Text size="sm" className="mono-cell">{active.version}</Text>
-      <Text size="sm" c="dimmed">{t('catalogSnapshotCreated', { time: formatDate(active.created_at) })}</Text>
-      <Text size="sm" c={active.signature_verified ? undefined : 'dimmed'}>{active.signature_verified ? t('catalogSnapshotSignature') : t('catalogSnapshotUnsigned')}</Text>
+      <Text size="md" className="mono-cell">{active.version}</Text>
+      <Text size="md" c="dimmed">{t('catalogSnapshotCreated', { time: formatDate(active.created_at) })}</Text>
+      <Text size="md" c={active.signature_verified ? undefined : 'dimmed'}>{active.signature_verified ? t('catalogSnapshotSignature') : t('catalogSnapshotUnsigned')}</Text>
     </Stack>
   )
 }
@@ -1086,7 +1072,7 @@ function CatalogSubscriptions() {
   })
   const remove = useMutation({ mutationFn: (id: string) => api(`/api/admin/v1/catalog/sources/${id}`, { method: 'DELETE' }), onSuccess: invalidate, onError: (error: Error) => toast.error(error.message) })
   const rollback = useMutation({ mutationFn: ({ source, snapshot }: { source: CatalogSource; snapshot: string }) => api(`/api/admin/v1/catalog/sources/${source.id}/rollback`, { method: 'POST', body: JSON.stringify({ revision: source.revision, snapshot_id: snapshot }) }), onSuccess: () => { invalidate(); void client.invalidateQueries({ queryKey: ['catalog-snapshots'] }); setSnapshots(null) }, onError: (error: Error) => toast.error(error.message) })
-  const submit = (event: FormEvent<HTMLFormElement>) => { event.preventDefault(); const data = new FormData(event.currentTarget); save.mutate({ current: editing, source: { name: String(data.get('name')), url: String(data.get('url')), priority: Number(data.get('priority')), refresh_interval_secs: Number(data.get('refresh_interval_secs')), enabled: data.get('enabled') === 'on', signature_policy: String(data.get('signature_policy')), public_key: String(data.get('public_key') || '') || null } }) }
+  const submit = (event: FormEvent<HTMLFormElement>) => { event.preventDefault(); const data = new FormData(event.currentTarget); save.mutate({ current: editing, source: { name: String(data.get('name')), url: String(data.get('url')), priority: Number(data.get('priority')), refresh_interval_secs: Number(data.get('refresh_interval_secs')), enabled: data.get('enabled') === 'on', signature_policy: String(data.get('signature_policy')), public_key: String(data.get('public_key') || '') || null, ...(editing?.proxy_preset_id === undefined ? {} : { proxy_preset_id: editing.proxy_preset_id }) } }) }
   return (
     <>
       <PageHeader
@@ -1096,13 +1082,14 @@ function CatalogSubscriptions() {
           <Group gap="xs" wrap="wrap" justify="flex-end">
             <AutoRefreshControl interval={interval} onIntervalChange={setInterval} onRefresh={() => query.refetch()} />
             <Button variant="default" leftSection={<RefreshCw size={17} />} loading={refreshDue.isPending} onClick={() => refreshDue.mutate()}>{t('catalogRefreshAllDue')}</Button>
-            <Button leftSection={<Plus size={17} />} onClick={() => { setEditing(null); setOpen(true) }}>{t('addSubscription')}</Button>
+            <Button leftSection={<Plus size={17} />} onClick={() => { save.reset(); setEditing(null); setOpen(true) }}>{t('addSubscription')}</Button>
           </Group>
         }
       />
+      {query.data && <ModelsDevSubscription sources={query.data} onEdit={(source) => { save.reset(); setEditing(source); setOpen(true) }} />}
       {query.isError ? <QueryError retry={() => void query.refetch()} /> : query.isLoading ? <SkeletonRows /> : query.data && query.data.length > 0 ? (
         <TableScrollContainer minWidth={1100} scrollAreaProps={{ viewportProps: { role: 'region', 'aria-label': t('subscriptions'), tabIndex: 0 } }} style={{ maxHeight: 'min(74vh, 900px)' }}>
-          <Table stickyHeader highlightOnHover>
+          <Table stickyHeader highlightOnHover fz="md">
             <Table.Thead>
               <Table.Tr>
                 <Table.Th>{t('name')}</Table.Th>
@@ -1122,11 +1109,11 @@ function CatalogSubscriptions() {
                   <Table.Td>
                     <Stack gap={2}>
                       <strong>{source.name}</strong>
-                      <Text size="sm" c="dimmed" className="mono-cell" style={{ overflowWrap: 'anywhere' }}>{source.url}</Text>
+                      <Text size="md" c="dimmed" className="mono-cell" style={{ overflowWrap: 'anywhere' }}>{source.url}</Text>
                     </Stack>
                   </Table.Td>
                   <Table.Td>{source.priority}</Table.Td>
-                  <Table.Td><EnabledPill enabled={source.enabled} /></Table.Td>
+                  <Table.Td><Badge fz="md" size="lg" variant="light" color={source.enabled ? 'teal' : 'gray'} className="status-badge" leftSection={<span aria-hidden="true" style={{ width: 6, height: 6, borderRadius: '50%', background: 'currentColor' }} />}>{t(source.enabled ? 'enabled' : 'disabled')}</Badge></Table.Td>
                   <Table.Td>{formatDate(source.last_attempt_at)}</Table.Td>
                   <Table.Td>{formatDate(source.last_success_at)}</Table.Td>
                   <Table.Td><CatalogNextDue source={source} /></Table.Td>
@@ -1135,7 +1122,7 @@ function CatalogSubscriptions() {
                   <Table.Td>
                     <Group gap={4} justify="flex-end" wrap="nowrap">
                       <ActionIcon variant="subtle" color="gray" loading={refresh.isPending && refresh.variables === source.id} aria-label={`${t('refresh')} ${source.name}`} onClick={() => refresh.mutate(source.id)}><RefreshCw size={16} /></ActionIcon>
-                      <Button variant="subtle" size="compact-sm" onClick={() => { setEditing(source); setOpen(true) }}>{t('edit')}</Button>
+                      <Button variant="subtle" size="compact-sm" onClick={() => { save.reset(); setEditing(source); setOpen(true) }}>{t('edit')}</Button>
                       <ActionIcon variant="subtle" color="gray" aria-label={`${t('rollback')} ${source.name}`} onClick={() => setSnapshots(source)}><RotateCcw size={16} /></ActionIcon>
                       <ActionIcon variant="subtle" color="red" aria-label={`${t('delete')} ${source.name}`} onClick={() => confirmAction({ title: t('deleteSubscriptionTitle', { name: source.name }), body: t('deleteSubscriptionBody'), onConfirm: () => remove.mutateAsync(source.id) })}><Trash2 size={16} /></ActionIcon>
                     </Group>
@@ -1160,6 +1147,7 @@ function CatalogSubscriptions() {
             <Select name="signature_policy" label={t('signaturePolicy')} defaultValue={editing?.signature_policy || 'none'} data={['none', 'optional', 'required'].map((value) => ({ value, label: t(value) }))} />
             <TextInput name="public_key" label={t('publicKey')} defaultValue={editing?.public_key || ''} />
             <Checkbox name="enabled" label={t('enabled')} defaultChecked={editing?.enabled ?? true} />
+            {save.isError && <Alert color="red" role="alert">{save.error.message}</Alert>}
             <Group justify="flex-end">
               <Button type="submit" loading={save.isPending}>{t('save')}</Button>
             </Group>

@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const MAX_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_BYTES: usize = 16 * 1024 * 1024;
 pub type Extensions = BTreeMap<String, Value>;
 pub fn invalid(message: &str) -> ApiError {
     ApiError::BadRequest(message.into())
@@ -540,10 +540,18 @@ pub fn identifier(value: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || b"-._/:".contains(&c))
 }
 
+fn model_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && value
+            .bytes()
+            .all(|character| character.is_ascii_alphanumeric() || b"-._/:@~".contains(&character))
+}
+
 impl Catalog {
     pub fn parse(bytes: &[u8]) -> Result<Self, ApiError> {
         if bytes.len() > MAX_BYTES {
-            return Err(invalid("catalog exceeds 4 MiB"));
+            return Err(invalid("catalog exceeds 16 MiB"));
         }
         let mut value: Self = serde_json::from_slice(bytes)
             .map_err(|_| invalid("invalid versioned catalog document"))?;
@@ -664,8 +672,8 @@ impl Provider {
 impl Model {
     pub fn validate(&self) -> Result<(), ApiError> {
         self.source.validate()?;
-        if !identifier(&self.id)
-            || !identifier(&self.upstream_id)
+        if !model_identifier(&self.id)
+            || !model_identifier(&self.upstream_id)
             || !identifier(&self.developer)
             || !identifier(&self.model_type)
             || self.name.is_empty()
@@ -674,7 +682,7 @@ impl Model {
             return Err(invalid("invalid model identity"));
         }
         if self.protocols.iter().any(|v| !identifier(v))
-            || self.aliases.iter().any(|v| !identifier(v))
+            || self.aliases.iter().any(|v| !model_identifier(v))
             || self.aliases.len() > 64
         {
             return Err(invalid("invalid model protocol or alias"));
