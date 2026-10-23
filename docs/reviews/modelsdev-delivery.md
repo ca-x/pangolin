@@ -62,17 +62,17 @@ Logs are under `/tmp/pangolin-modelsdev-qa` unless otherwise specified.
 | --- | --- |
 | Library |32tests+2doctests; parser-only17+2; Rust1.94/1.99.1; fmt/clippy/docs/package and dry-run pass |
 | Registry upload | `crate-publish.log`, successful upload/index availability and API readback |
-| Web install/lint | Frozen pnpm11 lock install and TypeScript lint exit0; `frozen-web-install.log`, `frozen-web-lint.log` |
-| Web tests |89files/1689tests pass on frozen followup source, serial244.26s; `frozen-web-tests-serial.log` |
-| Web build |0.8.0 assets built at2026-10-22T18:44:57Z; `frozen-web-build.log` |
+| Web install/lint | Pinned pnpm11 frozen-lock install and TypeScript lint exit0; `focus-web-install.log`, `focus-web-lint.log` |
+| Web tests |90files/1693tests pass, serial205.77s; `focus-web-tests.log` |
+| Web build | Clean focus-qualified0.8.0 console at99ce61ec543c; `focus-web-build-clean.log` |
 | Catalog contracts |25focused tests, including6 new native-source cases, pass |
 | Protocol contracts |37provider tests, including12 Anthropic cases, pass after observed RED |
 | Token contracts |64orchestration+4hard-budget contracts pass, including5 new tests after observed RED |
-| Rust fmt/clippy | Final proxy-followup source: fmt and strict all-target Clippy exit0; `final2-rust-fmt.log`, `final2-clippy.log` |
-| Rust full tests |603passed,0failed,0ignored in234.48s; `final2-rust-tests.log` |
-| Release binary | Optimized locked/offline build exit0 in2m31s; `final2-release-build.log` |
-| Release-binary browser | Final artifact:12/12 populated desktop matrix,375/768px subscription flows, both languages/themes; `desktop-qa/final-report.md`, `final2-*` browser artifacts |
-| Workflow lint | Official latest actionlintv1.7.12 source built from cache; final lint exit0, `final2-actionlint.log` |
+| Rust fmt/clippy | Focus-followup fmt and strict all-target Clippy exit0; `focus-rust-fmt.log`, `focus-clippy.log` |
+| Rust full tests |603passed,0failed,0ignored in219.09s; `focus-rust-tests.log` |
+| Release binary | Focus-qualified optimized locked/offline build exit0 in2m17s; `focus-release-build-clean.log` |
+| Release-binary browser |12/12 actual painted desktop focus states,375/768px EN/light and ZH/dark, no remaining new blocker; `desktop-qa/focus-final-report.md`, `focus-final-*` |
+| Workflow lint | Official actionlintv1.7.12 source built from cache; lint exit0, `focus-actionlint.log` |
 | Independent reviews | Earlier scoped reviews and the fresh whole-diff final independent review are clean; P1 and P2 closed, DQA002 documented/nonblocking |
 | Model-specific review gate | Earlier literal `gpt-6` invocation unavailable; user explicitly approved available-model substitution and continuing publication |
 
@@ -95,7 +95,7 @@ Initial Rust compilation attempts during concurrent Web edits were discarded
 by MBX input-change detection; those are not counted as passing gates. Final
 Rust validation uses frozen source and the published registry dependency.
 
-The final gate chain completed at2026-10-22T19:01:03Z. Local release binary
+The earlier pre-focus gate chain completed at2026-10-22T19:01:03Z. Its local binary
 SHA-256 is `7589d6188c36433c84d46f4dd9cf611d04b35bebbed057549e63676976460d5e`.
 The restarted listener and the file hash match. `/api/v1/version` reports
 backend/console0.8.0, matching `ee89e4bfade0-dirty`, `profile=release` and
@@ -130,6 +130,24 @@ fmt, strict all-target Clippy and workflow lint. The chain completed at
 2026-10-22T23:50:28Z (`focus-*` logs). These results supersede the earlier count
 of1689 Web tests; the clean committed artifact still receives a final paint
 recheck before any push/tag.
+
+That actual-paint recheck now passes on clean99ce61e, SHA-256
+`cfc9a6cb0b9215fa00bee66c851fba3013a89e7ca26fbbc24f4f55f802f698c0`.
+All12 desktop states visibly show all48 frame edges, above sticky headers and
+during internal scrolling;72 bounded hit-target checks and child/next Tab
+behavior pass.234 capability samples stay14px; no page overflow, JavaScript
+errors or axe violations appear.20 contrast nodes remain incomplete, and the
+previously disclosed DQA002 remains nonblocking.375/768px EN/light and ZH/dark
+frames also pass, with real keyboard focus and no pointer interception. An
+initial main-script ArrowRight assertion ran before native scrolling settled;
+waiting for positive scrollLeft resolves the probe without any product edit.
+
+This signoff commit changes controller documentation only, not product/build
+paths. The qualified CSS SHA-256 is
+`2d9acaefe080d352d67a57d4ce1c47f68d29ae8b296a1c8a40bae02890de6ece`.
+The subsequent clean provenance rebuild must retain that digest and matching
+backend/console identity. Remote CI/artifact checks still precede a published
+release claim.
 
 | Before | After | Why |
 | --- | --- | --- |

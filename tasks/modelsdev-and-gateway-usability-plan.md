@@ -19,8 +19,8 @@ inventory. Work begins from clean Pangolin `ee89e4b` / v0.7.0.
 - [x] Fresh crate fmt/clippy/tests/docs/package verification and independent review.
 - [x] Publish crate/repository and resolve Pangolin's locked registry dependency.
 - [x] Web install/lint/test/build; Rust fmt/clippy/test/release; actionlint.
-- [ ] Release-binary browser QA with populated operational data and mock upstream;
-      close the final table-focus visibility finding before publication.
+- [x] Release-binary browser QA with populated operational data and mock upstream;
+      final table-focus visibility finding closed by actual paint verification.
 - [x] Clean final independent review with an available model under the user's
       explicit GPT-6 naming waiver; resolve blocking findings and rerun gates.
 - [x] Prepare 0.8.0 candidate versions and document verified evidence.
@@ -94,5 +94,13 @@ Do not mark an unchecked gate complete without fresh observable evidence.
   independent delta review is clean, including pointer/scroll/child-focus and
   mature-browser selector support. Fresh full gates pass: Web90 files/1693 tests
   (205.77s), Rust603 tests (219.09s), fmt, strict Clippy and workflow lint.
-  Focus fix822eab9 is a separate implementation commit. The real committed
-  release-paint recheck remains pending before push/tag.
+  Focus fix822eab9 is a separate implementation commit. The clean99ce61e
+  release-paint recheck closes SHIP-DQA-001:12 desktop states show all48 frame
+  edges, retained during scrolling;72 hit targets and child/next Tab behavior
+  pass.375/768px EN/light and ZH/dark frames are also visually verified. All
+  source/dist/business data remained unchanged during QA. See the final report
+  under `/tmp/pangolin-modelsdev-qa/desktop-qa/focus-final-report.md`.
+- This prepublication signoff changes controller documentation only. Product
+  paths (`src`, `web`, Cargo manifests, build scripts and workflows) are unchanged
+  from the qualified99ce61e artifact. Rebuilding only provenance metadata must
+  preserve the qualified CSS digest before push/tag.
