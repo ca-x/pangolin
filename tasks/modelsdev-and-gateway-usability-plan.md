@@ -25,7 +25,7 @@ inventory. Work begins from clean Pangolin `ee89e4b` / v0.7.0.
       explicit GPT-6 naming waiver; resolve blocking findings and rerun gates.
 - [x] Prepare 0.8.0 candidate versions and document verified evidence.
 - [x] Create atomic implementation commits after the final-review gate is satisfied.
-- [ ] Push/tag only after preceding gates; verify binary checksums and native
+- [x] Push/tag only after preceding gates; verify binary checksums and native
       linux/amd64 + linux/arm64 GHCR publication.
 
 Do not mark an unchecked gate complete without fresh observable evidence.
@@ -104,3 +104,32 @@ Do not mark an unchecked gate complete without fresh observable evidence.
   paths (`src`, `web`, Cargo manifests, build scripts and workflows) are unchanged
   from the qualified99ce61e artifact. Rebuilding only provenance metadata must
   preserve the qualified CSS digest before push/tag.
+
+## Published delivery receipt
+
+- Stable `v0.8.0` was published at2026-10-23T00:48:03Z:
+  https://github.com/ca-x/pangolin/releases/tag/v0.8.0.
+- Release source is `dbb1ac15ca6b02383550706a5e71788fe2c98e14`; annotated tag
+  object `2fae87c77227e18465ab7d8324f0c24cb3054b69` dereferences to that source.
+  Subsequent documentation receipts do not move the release tag.
+- Source CI39876886640, Release39876936998 and Docker39876936926 all complete
+  successfully. CI verifies the pinned Rust1.98.0 and Node26.9.0 environment,
+  including1693 Web tests,603 Rust tests and the optimized release build.
+- All five Linux/macOS/Windows archives and `SHA256SUMS` were downloaded. Every
+  published digest, expected path, license, executable architecture and embedded
+  source revision passes verification. Release remains stable/non-draft with
+  the same six asset identities after curated release-note readback.
+- The downloaded Linux x86_64 executable starts on a fresh isolated database;
+  liveness/readiness return200, backend/console report0.8.0 at `dbb1ac15ca6b`,
+  and the compiled console CSS retains the qualified digest above. Browser
+  setup renders without JavaScript errors, console messages or page overflow.
+- Native amd64/arm64 jobs and GHCR manifests/configurations are verified.
+  `ghcr.io/ca-x/pangolin:0.8.0` and `:latest` share index digest
+  `sha256:c0de57d238971d16140b5e0f1aa37d565c3401c2632e17d189f0d851e2dcd680`;
+  both image configurations identify the release source. Container runtime,
+  macOS/Windows runtime and live-provider inference are not claimed.
+- Evidence: `docs/reviews/modelsdev-delivery.md`, local
+  `/tmp/pangolin-modelsdev-qa/archives-qa/v0.8.0-1j6f5b/receipt.json`,
+  `official-runtime-smoke.json`, `released-ghcr-0.8.0.json` and
+  `source-final-run-*.json`. Dedicated QA browsers, gateway and mock processes
+  are stopped; no production deployment was changed. DQA002 remains disclosed.

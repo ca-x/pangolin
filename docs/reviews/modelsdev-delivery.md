@@ -1,20 +1,23 @@
-# models.dev / Pangolin 0.8.0 candidate delivery
+# models.dev / Pangolin 0.8.0 delivery
 
 ## Publication status
 
-The independent library is published. Pangolin is a local **0.8.0 candidate**,
-not a published release. The user explicitly approved substituting an available
-model for the literal GPT-6 final-review requirement and continuing publication.
-The fresh whole-diff independent final review is clean. All other verification
-and artifact gates still precede the corresponding delivery actions.
+The independent library and Pangolin **v0.8.0** are published. The stable release
+is https://github.com/ca-x/pangolin/releases/tag/v0.8.0, published at
+2026-10-23T00:48:03Z from `dbb1ac15ca6b02383550706a5e71788fe2c98e14`.
+The user explicitly approved substituting an available model for the literal
+GPT-6 final-review requirement and continuing publication. The fresh whole-diff
+and subsequent focus-delta independent reviews are clean. All required source
+workflows and artifact readbacks now pass; the historical candidate evidence
+later in this report records earlier stages, not the current publication state.
 
-Post-waiver source verification is fresh: Web89 files/1689 tests in215.69s and
+Earlier post-waiver source verification passed Web89 files/1689 tests in215.69s and
 Rust603 tests in215.58s, with fmt, strict Clippy and workflow lint exit0
 (`ship-*` logs). Atomic implementation commits are catalog31c080e,
 protocol49355a2 and token controlsd4e9d6c. Controller documentation is separate.
-The clean committed console/binary is rebuilt and checked before tagging;
-remote publication and artifact readback are not asserted by this preflight
-snapshot.
+The subsequent focus regression increases the final Web count to1693. The
+clean committed console/binary was rebuilt and checked before tagging; the
+published-artifact receipt below supersedes the earlier preflight snapshot.
 
 | Artifact | Observed evidence |
 | --- | --- |
@@ -28,6 +31,61 @@ snapshot.
 Name checks preceded implementation and publication: `models-dev` and
 `modelsdev` were occupied; `models-dev-rs` returned404 from crates.io API and
 sparse index. Availability was rechecked immediately before publication.
+
+## Published release receipt
+
+| Surface | Verified result |
+| --- | --- |
+| Release source | `dbb1ac15ca6b02383550706a5e71788fe2c98e14` |
+| Annotated tag | `v0.8.0`, object `2fae87c77227e18465ab7d8324f0c24cb3054b69`, source unchanged |
+| Stable release | Release421341328, non-draft/non-prerelease, six uploaded assets |
+| Source CI | [39876886640](https://github.com/ca-x/pangolin/actions/runs/39876886640), success, all jobs green |
+| Binary publication | [39876936998](https://github.com/ca-x/pangolin/actions/runs/39876936998), success, five native platform builds |
+| Image publication | [39876936926](https://github.com/ca-x/pangolin/actions/runs/39876936926), success, native amd64/arm64 builds and manifest merge |
+| Published notes | Five user-visible outcomes, output-alias HTTP400 upgrade guidance and existing DQA002 disclosed; body readback matches |
+| Registry recheck | `models-dev-rs`0.1.0 remains non-yanked, MIT, Rust1.94; published checksum unchanged |
+
+Source CI runs Node26.9.0 and Rust1.98.0. It passes frozen install, Web lint,
+90files/1693tests and build, Rust fmt, strict all-target Clippy,603tests,
+optimized locked release build and the prescribed actionlint command.
+
+All six release assets were downloaded and checked against their published
+sizes/digests. The unmodified archive verifier checks exactly five checksum
+entries, safe expected paths, bundled README/license/environment example,
+ELF/Mach-O/PE target architectures and embedded source revision. All pass:
+
+| Archive | SHA-256 |
+| --- | --- |
+| `pangolin-aarch64-apple-darwin.tar.gz` | `1b0218507222c2b286ae8a8a5c40db77386e519d79b34e4bfd19b646132ac197` |
+| `pangolin-aarch64-unknown-linux-gnu.tar.gz` | `b74e0f0d0756ce4fc7fff720f68160cb65e55cd7292a261d8193fd1b2c19e06e` |
+| `pangolin-x86_64-apple-darwin.tar.gz` | `c4eaa6b596c11ed9f73097fa025371487cd87502f65dcaabac06028e2d28f3f3` |
+| `pangolin-x86_64-pc-windows-msvc.zip` | `82b69c7def3fcd24d8b1759417ad82380337013cbdf760e7ee23cd1fc67b8f73` |
+| `pangolin-x86_64-unknown-linux-gnu.tar.gz` | `7eedf6699e0f9c21e10ac1e1f9411419fa5ac187be0c1a5b06b267fdd1d85f9d` |
+
+The downloaded Linux x86_64 executable has SHA-256
+`6c3bccb13fdca4941a8d629933402737f27fa8ce7b08fd58c18982d64f4eb347`.
+It starts against a fresh isolated database on loopback. Liveness/readiness
+return200 with the record and analytical stores ready; backend/console report
+0.8.0 at `dbb1ac15ca6b`, profile release and `console_matches=true`. Its served
+CSS matches the focus-qualified digest
+`2d9acaefe080d352d67a57d4ce1c47f68d29ae8b296a1c8a40bae02890de6ece`.
+The setup screen renders with no page overflow, uncaught JavaScript errors or
+console messages. The full populated-browser matrix is recorded below.
+
+Anonymous GHCR readback verifies matching `0.8.0`/`latest` index digest
+`sha256:c0de57d238971d16140b5e0f1aa37d565c3401c2632e17d189f0d851e2dcd680`.
+Exactly linux/amd64 and linux/arm64 image manifests/configurations are present,
+with source/version/revision labels matching the release and integrity-checked
+attestation manifest references. Runner labels and job logs confirm native
+Ubuntu x86_64/aarch64 builds, not QEMU. Runtime execution inside containers or
+on macOS/Windows is not claimed.
+
+Detailed local evidence is under `/tmp/pangolin-modelsdev-qa`:
+`archives-qa/v0.8.0-1j6f5b/receipt.json`, `official-runtime-smoke.json`,
+`released-ghcr-0.8.0.json`, `docker-native-runners-final.json`,
+`source-final-run-*.json` and `released-v0.8.0-final-api.json`. The published
+release and checksums provide the durable external receipt. Later controller
+documentation commits do not change or retag the released source.
 
 ## Implemented contracts
 
@@ -97,11 +155,12 @@ Rust validation uses frozen source and the published registry dependency.
 
 The earlier pre-focus gate chain completed at2026-10-22T19:01:03Z. Its local binary
 SHA-256 is `7589d6188c36433c84d46f4dd9cf611d04b35bebbed057549e63676976460d5e`.
-The restarted listener and the file hash match. `/api/v1/version` reports
+The restarted listener and the file hash matched. `/api/v1/version` reported
 backend/console0.8.0, matching `ee89e4bfade0-dirty`, `profile=release` and
-`console_matches=true` (`final2-version.json`). This is a local candidate built
-from uncommitted changes, not a published0.8.0 artifact. Last public Pangolin
-release readback remainsv0.7.0; no0.8.0 tag or remote write has been made.
+`console_matches=true` (`final2-version.json`). This historical artifact was a
+local candidate built from uncommitted changes, not the published0.8.0 binary.
+At that preflight stage the public release was stillv0.7.0 and no0.8.0 remote
+write had occurred. The published receipt above supersedes that snapshot.
 
 ## Browser evidence
 
@@ -116,7 +175,7 @@ header, so the minimal fix instead paints a noninteractive inset frame on the
 scroll container, above that header, only when the direct viewport has visible
 keyboard focus. It keeps tab order, scrolling, child-control focus and motion
 unchanged. Four new CSS/selector tests reproduce RED and33 focused tests pass
-GREEN. Final rebuilt-paint verification still precedes publication.
+GREEN. The later rebuilt-paint verification below was required before publication.
 
 A fresh independent review of this two-file product delta is clean. The direct
 viewport selector excludes descendant-control focus; the frame remains outside
@@ -128,7 +187,7 @@ The followup is committed separately as822eab9. Fresh full verification on its
 product bytes passes Web90 files/1693 tests in205.77s, Rust603 tests in219.09s,
 fmt, strict all-target Clippy and workflow lint. The chain completed at
 2026-10-22T23:50:28Z (`focus-*` logs). These results supersede the earlier count
-of1689 Web tests; the clean committed artifact still receives a final paint
+of1689 Web tests; the clean committed artifact then received a final paint
 recheck before any push/tag.
 
 That actual-paint recheck now passes on clean99ce61e, SHA-256
@@ -145,9 +204,9 @@ waiting for positive scrollLeft resolves the probe without any product edit.
 This signoff commit changes controller documentation only, not product/build
 paths. The qualified CSS SHA-256 is
 `2d9acaefe080d352d67a57d4ce1c47f68d29ae8b296a1c8a40bae02890de6ece`.
-The subsequent clean provenance rebuild must retain that digest and matching
-backend/console identity. Remote CI/artifact checks still precede a published
-release claim.
+The subsequent clean provenance rebuild retained that digest and matching
+backend/console identity. The published binary and remote CI/artifact checks
+are verified in the release receipt above.
 
 | Before | After | Why |
 | --- | --- | --- |
@@ -165,7 +224,7 @@ using UI retry recovered the source. These observations do not imply that
 inference providers are live-tested.
 
 The entire desktop matrix was repeated against the final restarted binary at
-19:02:53–19:03:49Z: populated models, catalog, channels, request logs and
+19:02:53 to 19:03:49Z: populated models, catalog, channels, request logs and
 analytics in English/light and Chinese/dark, plus representative crossed
 language/theme combinations. All12 captures have no page overflow, unnamed
 visible icon controls, uncaught JavaScript errors or automated axe violations.
@@ -244,7 +303,7 @@ is not exposed; no literal GPT-6 claim is made.
 
 Targeted Nowledge CLI retrieval: query `Pangolin models catalog pricing`, mode
 `fast_bm25_vector`, scope `default`, no semantic filters, limit1. Rank1 memory
-`dde8d068-e781-4ff8-a7eb-38e2feac49ce`, “Pangolin：计价来源与独立用量测量的边界”,
+`dde8d068-e781-4ff8-a7eb-38e2feac49ce`, `Pangolin：计价来源与独立用量测量的边界`,
 score0.9846565432702229, informs preservation of historical cost and independent
 quantity evidence. Graph rendering is skipped because this CLI host cannot
 verify a matching authenticated browser owner/Space. Durable library-publication
