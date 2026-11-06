@@ -45,32 +45,75 @@ Named providers have default API bases when `base_url` is omitted; Azure/Bedrock
 | OpenAI-compatible | Bearer API key |
 | Anthropic | API key or `sk-ant-oat…` OAuth bearer on native Messages |
 | Gemini | API key via `x-goog-api-key` |
-| Azure | API key, or JSON containing `azure_ad_token`, or LiteLLM Azure tenant/client/credential parameters; optional `api_version` |
-| Bedrock | JSON with `region`, `access_key_id`, `secret_access_key`, optional `session_token`; role/profile resolution also delegates to LiteLLM AWS auth |
+| Azure | API key, explicit `azure_ad_token`, or explicitly configured client-secret, workload or managed identity; optional `api_version`, `azure_scope`, HTTPS `azure_authority_host` |
+| Bedrock | JSON with `region`, `access_key_id`, `secret_access_key`, optional `session_token`; explicit `profile` and optional `role_arn` use the AWS Rust SDK |
 | Vertex/GCP | JSON with `vertex_project`, `vertex_location` and `vertex_credentials` service-account JSON; `access_token` supports externally managed tokens |
 
-Azure uses deployment URLs and API versions, with `/openai/v1/responses` for Responses. Bedrock uses checked Converse transformation and signs the exact serialized JSON with AWS SigV4. Vertex generates project/location/publisher URLs and delegates credential/token refresh to LiteLLM GCP auth. No real cloud credentials are used by the test suite.
+Vertex also accepts the existing `vertex_ai_project`, `vertex_ai_location` and
+`vertex_ai_credentials` aliases. Nonempty canonical values take precedence;
+null/blank values are unset, as is an empty service-account object. Malformed
+canonical types fail rather than selecting an alias. Service-account credentials
+may be a JSON object, a JSON-encoded string or an explicitly configured regular
+file path (64 KiB maximum). File content, not its path, identifies the cached
+account, so replacing a file does not reuse stale credentials. A valid external
+`access_token` can obtain a missing project from that explicit account without
+exchanging the token. An explicitly malformed `access_token` never falls back
+to service-account credentials. No environment or ADC source is selected.
+
+Azure uses deployment URLs and API versions, with `/openai/v1/responses` for Responses. Bedrock uses checked Converse transformation and signs the exact serialized JSON with `aws-sigv4`. Azure tokens use `azure_identity`; Vertex generates project/location/publisher URLs and uses `gcp_auth` for service-account token refresh. Credentials must be explicitly configured; malformed explicit tokens fail rather than falling back to another source. No real cloud credentials are used by the test suite.
+
+### Azure Entra identity selection and migration
+
+API keys retain their separate explicit authentication path. For Entra token
+authentication, a valid `azure_ad_token` is used directly after validating any
+identity selector. Without that token, `azure_credential` chooses exactly one
+SDK-backed identity:
+
+- `ClientSecretCredential` requires explicit `tenant_id`, `client_id` and
+  `client_secret`. An omitted/null/empty selector uses this mode, without
+  discovering credentials from the process environment.
+- `WorkloadIdentityCredential` requires explicit `tenant_id`, `client_id` and
+  `azure_federated_token_file`. The regular token file is read off the async
+  executor, bounded to 64 KiB and reloaded when the SDK needs a new assertion.
+- `ManagedIdentityCredential` uses the configured `client_id`, or explicitly
+  selects the system-assigned identity when it is omitted/null/empty. Only this
+  selected mode consults Azure's managed-identity platform metadata and endpoint
+  settings; it does not try developer CLI logins or client-secret environment
+  variables.
+
+**Migration:** `DefaultAzureCredential` and `DeploymentIdentityCredential`
+chains are intentionally rejected, including when an Entra profile also
+contains a direct token or client secret. Remove the old chain selector for
+direct-token/client-secret profiles, or name the single workload/managed mode
+explicitly. A workload/managed selector is authoritative over an additional
+client secret; failure never switches to another identity. Enabling
+`enable_azure_ad_token_refresh` alone cannot trigger credential discovery.
+Unknown selectors and malformed selected credentials fail closed. This is an
+explicit security tightening of the former automatic-chain behavior, not a
+claim of complete legacy Azure-auth parity.
 
 ## Explicit transformation limits
 
 Native protocols preserve provider extension fields. Cross-protocol transformations are narrower and reject unknown fields instead of dropping them:
 
-- OpenAI chat → Anthropic: text/system/tool-call/tool-result bridge, with LiteLLM's checked text transformation when applicable; nonstreaming only.
+- OpenAI chat → Anthropic: independently checked text/system/tool-call/tool-result bridge; nonstreaming only. A string `stop` is normalized to the native `stop_sequences` array for text and tool requests alike; native Messages remains unchanged.
 - OpenAI chat ↔ Gemini: text, system and supported sampling/token-limit fields; nonstreaming only. Use native Gemini for tools, multimodal inputs and streaming.
 - Anthropic Messages → OpenAI chat: nonstreaming text/system and function-tool definitions, calls and text-only results with preserved IDs/JSON arguments; OpenAI tool-call responses return Anthropic `tool_use` blocks. Unsupported block ordering, error/media/server-tool results, malformed arguments and unrepresentable controls fail explicitly rather than silently losing data. Use native Anthropic for streaming and richer content.
 - OpenAI embeddings → Gemini: text/string arrays and dimensions; token-array inputs are rejected.
-- OpenAI chat → Bedrock: the pinned LiteLLM checked text Converse surface; unsupported tools/streaming are rejected.
+- OpenAI chat → Bedrock: independently checked text-only Converse surface; unsupported tools/streaming are rejected. Normalized gross input includes measured input/cache-read/cache-write components once; absent components remain unmeasured, not zero.
 - AI SDK: text messages/parts and both stream framing formats; nontext/tool/reasoning parts fail explicitly.
 
 Gemini control objects use the canonical camelCase names (`generationConfig`, `systemInstruction`, `toolConfig`); alternate snake_case control shapes fail explicitly. Streaming is limited to conversational protocols; media streaming variants fail before contacting a provider. TPM policies also decline remote cached-context references and multimodal embedding inputs without a provider estimator.
 
-Multipart requests are limited to 64 MiB and 128 fields; duplicate text field names fail explicitly, while repeated file fields retain each file. Buffered upstream responses retain the existing 16 MiB bound. Streaming has a 1 MiB frame bound and never retries after downstream commitment.
+Multipart requests are limited to 64 MiB and 128 fields; duplicate text field names fail explicitly, while repeated file fields retain each file. Buffered upstream responses retain the existing 16 MiB bound. Raw upstream streaming has a 1 MiB frame bound and never retries after downstream commitment. Internal WebSocket/AI SDK reparsing permits 2 MiB to accommodate the gateway's added `data: ` spacing without relaxing the upstream limit.
 
-Supported conversational streams use conservative hard-budget reservations and final source-usage settlement. Hard-budget media requires configured flat/unit prices and trustworthy bounded image/video/speech quantities; uploaded media with unknown duration requires flat pricing. TPM policies still reject unsupported nontext quantities. Nontext TPM requests fail explicitly. Text keeps conservative byte-plus-output reservations; an operator-provided `PANGOLIN_TOKENIZER_CL100K` rank file enables LiteLLM token counting for recognized GPT-4/GPT-3.5 text-chat shapes. Other models and shapes retain the conservative reservation. Token counts use a bounded memory cache containing hashes/counts, not prompt text. Redis caching is not enabled.
+Supported conversational streams use conservative hard-budget reservations and final source-usage settlement. Hard-budget media requires configured flat/unit prices and trustworthy bounded image/video/speech quantities; uploaded media with unknown duration requires flat pricing. TPM policies still reject unsupported nontext quantities. Nontext TPM requests fail explicitly. Text keeps conservative byte-plus-output reservations; an operator-provided `PANGOLIN_TOKENIZER_CL100K` rank file enables `tiktoken-rs` counting for recognized GPT-4/GPT-3.5 text-chat shapes. Other models, tool and multimodal shapes retain the conservative reservation. This optional local estimate is not reported usage and is not a universal hard context-window guarantee. Token counts use a bounded memory cache containing hashes/counts, not prompt text. Redis token-count caching is not enabled.
+
+Analytics displays independently measured input/output/cache-read/cache-write/reasoning subtotals. Total Tokens sums input plus output only within attempts where both are measured; coverage shows those attempts over all attempts. It never adds independently aggregated partial counters or counts cache/reasoning subsets twice. Unknown is `—`; a measured zero stays zero.
 
 ## Upstream reuse and test evidence
 
-`Cargo.toml` and `Cargo.lock` pin the official LiteLLM repository to `8c4c394ecc82c4d6acb5eb371d8781e487894a17`. Pangolin adapters directly consume `litellm-types`, `litellm-core`, `litellm-llms`, `litellm-framing`, `litellm-auth`, AWS/Azure/GCP auth, HTTP settings, token counting and memory-cache interfaces. The transitive `litellm-host` crate contains pure Rust interfaces only. Python bridge, `host-python` and legacy callbacks are absent.
+`Cargo.toml` and `Cargo.lock` pin MIT `arcships/aimux` at `4c0b40c54d689439937155d2c36720a4b3c7454d`. Pangolin implements its `Fetch` interface with the configured reqwest client, consumes `FetchResponse` and the bounded aimux SSE parser, and resolves explicit bearer credentials through `ProviderHeaders`. Native bytes and fields bypass normalized generation APIs. Pangolin still owns proxy/DNS policy, protocol transforms, authorization, retry/admission and terminal accounting. No LiteLLM, Python bridge or legacy host dependency remains. Aimux's wider provider catalog is not a claim of tested Pangolin integration.
 
 The independent fixture table lives at `src/api/gateway/tests/fixtures/axonhub_protocols.json`, with source test/route attribution per row. Composed integration tests cover raw field preservation, upstream model/auth selection, multipart bytes, binary speech, native Anthropic/Gemini stream terminals, task ownership, model formats, Responses WebSocket continuation and AI SDK framing. Provider contract tests cover compatible presets, Azure deployment/version/auth, signed Bedrock requests and Vertex project/auth URLs. Task 3's complete retry/admission/session regression suite remains binding.
 

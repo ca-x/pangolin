@@ -1372,16 +1372,6 @@ async fn call_anthropic_chat(
             request.insert("tool_choice".into(), converted);
         }
     }
-    let mut checked_payload = payload.clone();
-    for name in ["max_completion_tokens", "max_output_tokens", "n"] {
-        checked_payload.as_object_mut().unwrap().remove(name);
-    }
-    checked_payload["max_tokens"] = json!(crate::orchestration::output_limit(payload)?);
-    if let Some(value) =
-        crate::providers::anthropic_text_request(&target.upstream_name, &checked_payload)
-    {
-        request = value.as_object().expect("LiteLLM emits an object").clone();
-    }
     if let Some(accounting) = accounting.as_deref_mut() {
         for diagnostic in diagnostics::normalizations(
             payload,
@@ -1401,7 +1391,18 @@ async fn call_anthropic_chat(
     if let Some(accounting) = accounting.as_deref_mut() {
         accounting.contacted().await?;
     }
-    let upstream = client.execute(request).await?;
+    let upstream = crate::providers::transport::Transport::new(client.clone())
+        .send(
+            request.method().clone(),
+            request.url().as_str(),
+            request.headers().clone(),
+            request
+                .body()
+                .and_then(reqwest::Body::as_bytes)
+                .unwrap_or_default()
+                .to_vec(),
+        )
+        .await?;
     let status = upstream.status();
     if let Some(accounting) = accounting.as_deref_mut() {
         accounting.observed_status(status.as_u16());

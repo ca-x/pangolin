@@ -1,9 +1,8 @@
 //! Rule-driven affinity. Identifiers are scoped and hashed before entering a cache.
+use super::affinity_store::{Memory, Store};
 use super::{Candidate, Error, Result};
 use crate::providers::diagnostics::{AffinityDiagnostic, AffinityReason, safe_identity};
 use crate::{db, models::ApiKeyCredential};
-use litellm_cache::{BaseCache, CacheEntry, CacheKwargs};
-use litellm_cache_memory::InMemoryCache;
 use sea_orm::{ConnectionTrait, DatabaseConnection};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -79,8 +78,8 @@ pub struct Binding {
     pub release_on_failure: bool,
 }
 pub struct Cache {
-    backend: Arc<dyn BaseCache<Value = CacheEntry>>,
-    local: Option<Arc<InMemoryCache<CacheEntry>>>,
+    backend: Arc<dyn Store>,
+    local: Option<Arc<Memory>>,
     sequence: std::sync::atomic::AtomicU64,
     guard_limit: usize,
     pub hits: std::sync::atomic::AtomicU64,
@@ -92,19 +91,14 @@ pub struct Cache {
 }
 impl Default for Cache {
     fn default() -> Self {
-        let local = Arc::new(InMemoryCache::new(
-            Some(10000),
-            Some(Duration::from_secs(1800)),
-        ));
-        let backend: Arc<dyn BaseCache<Value = CacheEntry>> = local.clone();
+        let local = Arc::new(Memory::new());
+        let backend: Arc<dyn Store> = local.clone();
         let local = Some(local);
         #[cfg(feature = "redis-affinity")]
         let (backend, local) = std::env::var("PANGOLIN_AFFINITY_REDIS_URL")
             .ok()
-            .and_then(|url| {
-                litellm_cache_redis::RedisCache::new(&url, Some(Duration::from_secs(1800))).ok()
-            })
-            .map(|v| (Arc::new(v) as Arc<dyn BaseCache<Value = CacheEntry>>, None))
+            .and_then(|url| super::affinity_store::Redis::new(&url).ok())
+            .map(|store| (Arc::new(store) as Arc<dyn Store>, None))
             .unwrap_or((backend, local));
         Self {
             backend,
@@ -121,11 +115,7 @@ impl Default for Cache {
 impl Cache {
     #[cfg(test)]
     pub fn with_test_clock(clock: impl Fn() -> Duration + Send + Sync + 'static) -> Self {
-        let local = Arc::new(InMemoryCache::with_clock(
-            Some(10000),
-            Some(Duration::from_secs(1800)),
-            clock,
-        ));
+        let local = Arc::new(Memory::with_clock(clock));
         Self {
             backend: local.clone(),
             local: Some(local),
@@ -314,9 +304,6 @@ impl Cache {
             )
             .to_hex()
             .to_string();
-            // Snapshot the local cache's own expiry before get removes an expired
-            // entry. Redis does not expose this observation through BaseCache;
-            // do not fabricate an expiry when its backend cannot measure one.
             let expires_at = self.expires_at(&fingerprint);
             let mut diagnostic = AffinityDiagnostic {
                 rule_id: safe_identity(&rule.id),
@@ -325,12 +312,11 @@ impl Cache {
                 provider_id: None,
                 expires_at: None,
             };
-            if let Ok(Some(entry)) = self
-                .backend
-                .async_get_cache(&fingerprint, &CacheKwargs::default())
-                .await
-            {
-                if let Some(index) = candidates.iter().position(|c| entry.response == c.id()) {
+            if let Ok(Some(entry)) = self.backend.get(&fingerprint).await {
+                if let Some(index) = candidates
+                    .iter()
+                    .position(|candidate| entry == candidate.id())
+                {
                     diagnostic.reason = AffinityReason::Hit;
                     diagnostic.provider_id = Some(safe_identity(&candidates[index].provider_id));
                     diagnostic.expires_at = expires_at;
@@ -342,7 +328,7 @@ impl Cache {
                 } else {
                     // Authoritative eligibility overrides every cache observation.
                     diagnostic.reason = AffinityReason::Ineligible;
-                    let _ = self.backend.async_delete_cache(&fingerprint).await;
+                    let _ = self.backend.delete(&fingerprint).await;
                     if rule.mode == Mode::Strict {
                         tracing::debug!(
                             stage = "affinity",
@@ -375,8 +361,6 @@ impl Cache {
         self.local
             .as_ref()?
             .expires_at(key)
-            .ok()
-            .flatten()
             .and_then(|expiry| i64::try_from(expiry.as_secs()).ok())
     }
     pub async fn finish(
@@ -409,37 +393,22 @@ impl Cache {
         else {
             return diagnostics;
         };
-        let current = self
-            .backend
-            .async_get_cache(&binding.fingerprint, &CacheKwargs::default())
-            .await
-            .ok()
-            .flatten();
+        let current = self.backend.get(&binding.fingerprint).await.ok().flatten();
         // Sequence ordering is process-local, not a distributed-consistency claim.
         if *completed > binding.sequence {
             return diagnostics;
         }
-        if success
-            && current
-                .as_ref()
-                .is_some_and(|entry| entry.response == candidate)
-        {
+        if success && current.as_ref().is_some_and(|entry| entry == candidate) {
             *completed = binding.sequence;
             return diagnostics;
         }
         if success {
             if self
                 .backend
-                .async_set_cache(
+                .set(
                     &binding.fingerprint,
-                    CacheEntry {
-                        timestamp: db::now() as f64,
-                        response: json!(candidate),
-                    },
-                    CacheKwargs {
-                        ttl: Some(Duration::from_secs(binding.ttl_secs)),
-                        ..Default::default()
-                    },
+                    candidate,
+                    Duration::from_secs(binding.ttl_secs),
                 )
                 .await
                 .is_ok()
@@ -451,14 +420,8 @@ impl Cache {
                 ));
             }
         } else if binding.release_on_failure
-            && current
-                .as_ref()
-                .is_some_and(|entry| entry.response == candidate)
-            && self
-                .backend
-                .async_delete_cache(&binding.fingerprint)
-                .await
-                .is_ok()
+            && current.as_ref().is_some_and(|entry| entry == candidate)
+            && self.backend.delete(&binding.fingerprint).await.is_ok()
         {
             *completed = binding.sequence;
             diagnostics.push(event(AffinityReason::Released, None));
@@ -516,18 +479,17 @@ mod tests {
         assert_eq!(
             cache
                 .backend
-                .async_get_cache(&binding.fingerprint, &CacheKwargs::default())
+                .get(&binding.fingerprint)
                 .await
                 .unwrap()
-                .unwrap()
-                .response,
+                .unwrap(),
             "b"
         );
         cache.finish(&binding, "b", "provider-b", false).await;
         assert!(
             cache
                 .backend
-                .async_get_cache(&binding.fingerprint, &CacheKwargs::default())
+                .get(&binding.fingerprint)
                 .await
                 .unwrap()
                 .is_none()

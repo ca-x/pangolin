@@ -25,7 +25,7 @@ impl ResponseTransform {
                     .ok_or_else(|| invalid("Antigravity response missing response"))?;
                 inner.apply(response)
             }
-            Self::Bedrock(model) => super::upstream::bedrock_response(model, body),
+            Self::Bedrock(model) => super::bedrock::response(model, body),
             Self::GeminiEmbedding => {
                 let items = body["embeddings"]
                     .as_array()

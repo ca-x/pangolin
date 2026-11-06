@@ -16,7 +16,7 @@ use std::{
 
 pub type Events = Pin<Box<dyn Stream<Item = std::result::Result<Event, std::io::Error>> + Send>>;
 
-pub fn events(response: reqwest::Response) -> Events {
+pub fn events(response: crate::providers::transport::Response) -> Events {
     let buffered = Arc::new(AtomicUsize::new(0));
     let input_buffered = buffered.clone();
     let bytes = response.bytes_stream().map(move |chunk| {

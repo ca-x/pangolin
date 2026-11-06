@@ -303,7 +303,7 @@ async fn azure_api_key_and_entra_token_use_deployment_and_version() {
 }
 
 #[tokio::test]
-async fn bedrock_uses_litellm_converse_and_signed_payload() {
+async fn bedrock_uses_checked_converse_and_aws_signed_payload() {
     let credentials=json!({"access_key_id":"AKIDEXAMPLE","secret_access_key":"mock-secret","session_token":"mock-session","region":"us-east-1"}).to_string();
     let request=prepare(&target("bedrock"),"/v1/chat/completions",&json!({"model":"model","messages":[{"role":"system","content":"brief"},{"role":"user","content":"hello"}],"max_tokens":15}),&credentials,HeaderMap::new(),&HeaderMap::new(),None).await.unwrap();
     assert!(request.url.ends_with("/model/model/converse"));
@@ -325,7 +325,7 @@ async fn bedrock_uses_litellm_converse_and_signed_payload() {
 }
 
 #[tokio::test]
-async fn vertex_uses_litellm_gcp_token_and_project_url() {
+async fn vertex_uses_explicit_gcp_token_and_project_url() {
     let request=prepare(&target("vertex"),"/v1beta/models:generateContent",&json!({"model":"model","contents":[{"parts":[{"text":"hi"}]}]}),&json!({"access_token":"mock-gcp-token","vertex_project":"test-project","vertex_location":"europe-west1"}).to_string(),HeaderMap::new(),&HeaderMap::new(),None).await.unwrap();
     assert_eq!(request.headers["authorization"], "Bearer mock-gcp-token");
     assert_eq!(
@@ -333,6 +333,61 @@ async fn vertex_uses_litellm_gcp_token_and_project_url() {
         "http://localhost:8080/v1/projects/test-project/locations/europe-west1/publishers/google/models/model:generateContent"
     );
     assert!(request.payload.get("model").is_none());
+}
+
+#[tokio::test]
+async fn vertex_legacy_project_and_location_aliases_preserve_routing() {
+    for provider in ["vertex", "gcp"] {
+        for params in [
+            json!({"vertex_ai_project":"test-project","vertex_ai_location":"europe-west1"}),
+            json!({"vertex_project":"test-project","vertex_ai_location":"europe-west1"}),
+            json!({"vertex_ai_project":"test-project","vertex_location":"europe-west1"}),
+            json!({"vertex_project":"test-project","vertex_location":"europe-west1","vertex_ai_project":"ignored","vertex_ai_location":"ignored"}),
+            json!({"vertex_project":null,"vertex_location":"  ","vertex_ai_project":"test-project","vertex_ai_location":"europe-west1"}),
+        ] {
+            let mut params = params;
+            params["access_token"] = json!("mock-gcp-token");
+            let request = prepare(
+                &target(provider),
+                "/v1beta/models:generateContent",
+                &json!({"model":"model","contents":[{"parts":[{"text":"hi"}]}]}),
+                &params.to_string(),
+                HeaderMap::new(),
+                &HeaderMap::new(),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(request.headers["authorization"], "Bearer mock-gcp-token");
+            assert_eq!(
+                request.url,
+                "http://localhost:8080/v1/projects/test-project/locations/europe-west1/publishers/google/models/model:generateContent"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn vertex_malformed_canonical_fields_do_not_fall_through_to_aliases() {
+    for field in ["vertex_project", "vertex_location"] {
+        for malformed in [json!(123), json!([]), json!({})] {
+            let mut params = json!({"access_token":"mock-gcp-token","vertex_project":"test-project","vertex_ai_project":"legacy-project","vertex_ai_location":"europe-west1"});
+            params[field] = malformed;
+            assert!(
+                prepare(
+                    &target("vertex"),
+                    "/v1beta/models:generateContent",
+                    &json!({"model":"model","contents":[{"parts":[{"text":"hi"}]}]}),
+                    &params.to_string(),
+                    HeaderMap::new(),
+                    &HeaderMap::new(),
+                    None,
+                )
+                .await
+                .is_err()
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -397,7 +452,6 @@ fn join_handles_version_prefixes_without_losing_model_slashes() {
         "https://api.example/v1/embeddings"
     );
     assert_eq!(segment("org/model?secret#"), "org%2Fmodel%3Fsecret%23");
-    assert!(anthropic_text_request("claude-test",&json!({"model":"claude-test","messages":[{"role":"user","content":"hello"}],"max_tokens":32})).is_some());
 }
 
 /// The stream decision is the protocol's own, taken once at admission. A client

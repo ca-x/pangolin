@@ -522,6 +522,9 @@ async fn execute_inner(
                             ));
                         }
                         if error.downcast_ref::<reqwest::Error>().is_some()
+                            || error
+                                .downcast_ref::<aimux_provider_utils::FetchError>()
+                                .is_some()
                             || error.downcast_ref::<std::io::Error>().is_some()
                         {
                             if error.downcast_ref::<std::io::Error>().is_some_and(|cause| {
@@ -630,12 +633,12 @@ async fn execute_inner(
                 HeaderValue::from_str(&content_type)
                     .map_err(|_| ApiError::BadRequest("invalid content type".into()))?,
             );
-            let request = upstream_client
-                .request(method, &prepared.url)
-                .headers(prepared.headers);
             attempt.contacted().await?;
             contacted = true;
-            let upstream = match request.body(outbound).send().await {
+            let upstream = match crate::providers::transport::Transport::new(upstream_client)
+                .send(method, &prepared.url, prepared.headers, outbound)
+                .await
+            {
                 Ok(upstream) => upstream,
                 Err(_) => {
                     attempt.finish(AttemptOutcome::UpstreamFailure).await?;
@@ -1039,7 +1042,7 @@ fn error_response(
 }
 
 pub(super) async fn read_body(
-    response: reqwest::Response,
+    response: crate::providers::transport::Response,
 ) -> std::result::Result<Vec<u8>, std::io::Error> {
     let mut stream = response.bytes_stream();
     let mut output = vec![];

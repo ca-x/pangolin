@@ -229,7 +229,7 @@ async fn process(
             .map_err(|_| ApiError::Upstream("WebSocket disconnected".into()))?;
         return Ok(());
     }
-    let events = providers::framing::frames(response.into_body().into_data_stream());
+    let events = providers::framing::internal_frames(response.into_body().into_data_stream());
     futures_util::pin_mut!(events);
     while let Some(event) = events.next().await {
         let event = event.map_err(|_| ApiError::Upstream("invalid Responses stream".into()))?;

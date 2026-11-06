@@ -1,6 +1,7 @@
 //! Gateway orchestration boundary. Task 4 adapters consume `Plan`/`Candidate`;
 //! observability consumes redacted `Decision`s and terminal attempt outcomes.
 pub mod affinity;
+mod affinity_store;
 pub mod compaction;
 mod inspection;
 pub mod policy;

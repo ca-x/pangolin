@@ -1,8 +1,9 @@
 //! Provider implementations are deliberately hidden behind this Pangolin boundary.
-//! No LiteLLM host, Python bridge or callback controls gateway orchestration.
+//! aimux transport and framing never control authorization or orchestration.
 mod anthropic;
 #[cfg(test)]
 mod anthropic_tests;
+mod bedrock;
 mod cloud;
 pub mod diagnostics;
 pub mod discovery;
@@ -12,6 +13,7 @@ mod tests;
 pub mod timing;
 pub mod tokens;
 mod transforms;
+pub mod transport;
 mod upstream;
 pub mod usage;
 
@@ -19,7 +21,6 @@ use crate::{api::ApiError, models::RouteTarget};
 use http::{HeaderMap, HeaderValue, Method, header};
 use serde_json::Value;
 pub use transforms::ResponseTransform;
-pub use upstream::anthropic_text_request;
 pub use upstream::{ClientPool, ProxySettings, http_client};
 
 pub const KINDS: &[&str] = &[
@@ -345,7 +346,7 @@ pub async fn prepare_routed(
             }
         }
         ("bedrock", _) => {
-            payload = upstream::bedrock_request(&target.upstream_name, &payload)?;
+            payload = bedrock::request(&payload)?;
             response = ResponseTransform::Bedrock(target.public_name.clone());
             path = format!("/model/{}/converse", segment(&target.upstream_name));
         }

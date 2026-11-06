@@ -94,7 +94,7 @@ pub(super) async fn chat(
         .headers
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
     let stream = async_stream::stream! {
-        let events=providers::framing::frames(body.into_data_stream());futures_util::pin_mut!(events);
+        let events=providers::framing::internal_frames(body.into_data_stream());futures_util::pin_mut!(events);
         let mut reason="stop".to_owned();let mut usage=json!({"promptTokens":0,"completionTokens":0});
         let text_id=format!("text_{}",Uuid::new_v4().simple());
         if ui_stream {
