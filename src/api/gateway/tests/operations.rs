@@ -705,6 +705,82 @@ fn performance_confidence_matches_reference_boundaries() {
 }
 
 #[tokio::test]
+async fn aimux_core_analytics_totals_pair_counters_per_attempt_without_double_counting_subsets() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let upstream_calls = calls.clone();
+    let test_fixture = fixture(Router::new().route("/v1/chat/completions", post(move || {
+        let calls = upstream_calls.clone();
+        async move {
+            let usage = match calls.fetch_add(1, Ordering::Relaxed) {
+                0 => json!({"prompt_tokens":10,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":2,"cache_write_tokens":3},"completion_tokens_details":{"reasoning_tokens":1}}),
+                1 => json!({"prompt_tokens":7}),
+                2 => json!({"completion_tokens":11}),
+                _ => json!({"prompt_tokens":0,"completion_tokens":0,"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":0},"completion_tokens_details":{"reasoning_tokens":0}}),
+            };
+            Json(json!({"id":"measured","choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":usage}))
+        }
+    }))).await;
+    for _ in 0..4 {
+        assert_eq!(
+            request(&test_fixture, "/v1/chat/completions", chat())
+                .await
+                .status(),
+            StatusCode::OK
+        );
+    }
+    let cookie = owner(&test_fixture).await;
+    let response = admin(
+        &test_fixture,
+        &cookie,
+        http::Method::GET,
+        &format!(
+            "/api/admin/v1/projects/{}/analytics?dimension=model",
+            db::DEFAULT_PROJECT_ID
+        ),
+        Value::Null,
+        false,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(body["source"], "sqlite");
+    let row = &body["data"][0];
+    assert_eq!(row["attempts"], 4);
+    assert_eq!(row["input_tokens"], 17);
+    assert_eq!(row["output_tokens"], 16);
+    assert_eq!(row["total_tokens"], 15);
+    assert_eq!(row["total_tokens_samples"], 2);
+    assert_eq!(row["cache_hit_tokens"], 2);
+    assert_eq!(row["cache_write_tokens"], 3);
+    assert_eq!(row["reasoning_tokens"], 1);
+    sql(
+        &test_fixture,
+        "UPDATE usage_logs SET input_tokens=2305843009213693952,output_tokens=2305843009213693952 WHERE (input_tokens=10 AND output_tokens=5) OR (input_tokens=0 AND output_tokens=0)",
+        vec![],
+    ).await;
+    let response = admin(
+        &test_fixture,
+        &cookie,
+        http::Method::GET,
+        &format!(
+            "/api/admin/v1/projects/{}/analytics?dimension=model",
+            db::DEFAULT_PROJECT_ID
+        ),
+        Value::Null,
+        false,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    let row = &body["data"][0];
+    assert_eq!(row["input_tokens"], 4_611_686_018_427_387_911_i64);
+    assert_eq!(row["output_tokens"], 4_611_686_018_427_387_915_i64);
+    assert!(row["total_tokens"].is_null());
+    assert_eq!(row["total_tokens_samples"], 2);
+    assert!(row.get("paired_input_tokens").is_none());
+}
+
+#[tokio::test]
 async fn provider_and_model_analytics_report_performance_sample_confidence() {
     let f = fixture(success()).await;
     assert_eq!(
@@ -14035,9 +14111,9 @@ async fn reference_conversion_diagnostics_anthropic_string_stop_is_actual_and_na
         request(&f, "/v1/chat/completions", text).await.status(),
         StatusCode::OK
     );
-    assert!(
-        seen.lock().await[1]["stop_sequences"].is_string(),
-        "retain existing checked adapter bytes"
+    assert_eq!(
+        seen.lock().await[1]["stop_sequences"],
+        json!(["private text-only stop"])
     );
     let mut native = chat();
     native["stop_sequences"] = json!(["private native stop"]);
@@ -14064,8 +14140,8 @@ async fn reference_conversion_diagnostics_anthropic_string_stop_is_actual_and_na
             .iter()
             .filter(|row| row["conversion_diagnostics"] == json!([]))
             .count(),
-        2,
-        "native and text-only checked adapters must not invent normalization"
+        1,
+        "only native Messages bypasses stop normalization"
     );
     assert!(!rows.to_string().contains("private"));
 }

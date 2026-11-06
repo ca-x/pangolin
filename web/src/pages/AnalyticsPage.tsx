@@ -11,6 +11,7 @@ import { formatCount, formatMicros, UNMEASURED } from '../observability'
 import { aggregateAmount, PricingCoverageNotice } from '../measurement'
 import { useProject } from '../project'
 import { PageHeader, QueryError } from './shared'
+import { TokenUsagePanel } from './TokenUsagePanel'
 
 const RANGES = ['24h', '7d', '30d', 'all', 'custom'] as const
 type Range = typeof RANGES[number]
@@ -76,6 +77,7 @@ export default function AnalyticsPage() {
     </Card>
     {query.isError ? <QueryError retry={() => void query.refetch()} /> : query.isLoading || names.query.isLoading ? <SkeletonRows count={4} /> : !bounds || !rows.length ? <EmptyState icon={<BarChart3 />} title={t('analytics')} copy={t(!bounds ? 'analyticsRangeInvalid' : 'analyticsEmpty')} /> : <>
       {names.query.isError && <Stack mb="lg"><QueryError retry={() => void names.query.refetch()} /></Stack>}
+      <TokenUsagePanel rows={rows} label={names.resolve} />
       <SimpleGrid cols={{ base: 1, md: 2 }} mb="lg">
         <MetricBars title={t('throughput')} rows={rows} label={names.resolve} value={(row) => row.tokens_per_second} format={(value) => `${new Intl.NumberFormat(undefined, { maximumFractionDigits: 1 }).format(value)} ${t('tokensPerSecond')}`} showConfidence={showConfidence} />
         <MetricBars title={t('measuredSubtotal')} rows={rows} label={names.resolve} value={(row) => aggregateAmount(row,row.cost_micros)} format={formatMicros} />

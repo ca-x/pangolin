@@ -58,7 +58,7 @@ export type RequestItem = { pricing_status?:string; usage_measurement?:UsageMeas
  * and model rows also carry the measured throughput sample count and its
  * reference-compatible confidence classification.
  */
-export type AnalyticsRow = PricingCoverage & { dimension: string | null; requests: number; attempts: number; errors: number; sample_count?: number; confidence_level?: 'low' | 'medium' | 'high'; usage_measured?: boolean; input_tokens: number | null; output_tokens: number | null; cache_hit_tokens: number | null; cache_savings_micros: number | null; cost_micros: number | null; latency_ms: number | null; ttft_ms: number | null; tokens_per_second?: number | null }
+export type AnalyticsRow = PricingCoverage & { dimension: string | null; requests: number; attempts: number; errors: number; sample_count?: number; confidence_level?: 'low' | 'medium' | 'high'; usage_measured?: boolean; input_tokens: number | null; output_tokens: number | null; total_tokens?: number | null; total_tokens_samples?: number; cache_hit_tokens: number | null; cache_write_tokens?: number | null; reasoning_tokens?: number | null; cache_savings_micros: number | null; cost_micros: number | null; latency_ms: number | null; ttft_ms: number | null; tokens_per_second?: number | null }
 export type LiveRequest = { model: string; channel_id: string; api_key_id: string; started_at: number }
 /**
  * The projection's detail document for one request: the same facts as a list row plus

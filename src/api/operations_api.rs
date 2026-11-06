@@ -2737,8 +2737,53 @@ async fn analytics(
         _ => return Err(ApiError::BadRequest("unknown analytics dimension".into())),
     };
     let measurement_valid = pricing::UsageMeasurement::valid_sql("usage_measurement_json");
-    let rows=state.db.query_all(sql(format!("SELECT json_object('dimension',{dimension},'requests',COUNT(DISTINCT r.id),'attempts',COUNT(e.id),'errors',SUM(e.status!='succeeded'),'sample_count',COUNT(DISTINCT CASE WHEN e.status='succeeded' AND x.latency_ms>0 AND json_extract(u.trusted_measurement_json,'$.version')=1 AND json_type(u.trusted_measurement_json,'$.output_tokens')='true' THEN r.id END),'usage_measured',CASE WHEN SUM(CASE WHEN json_extract(u.trusted_measurement_json,'$.version')=1 AND (json_type(u.trusted_measurement_json,'$.input_tokens')='true' OR json_type(u.trusted_measurement_json,'$.output_tokens')='true') THEN 1 ELSE 0 END)>0 THEN json('true') ELSE json('false') END,'input_tokens',SUM(CASE WHEN json_type(u.trusted_measurement_json,'$.input_tokens')='true' AND json_extract(u.trusted_measurement_json,'$.version')=1 THEN u.input_tokens END),'output_tokens',SUM(CASE WHEN json_type(u.trusted_measurement_json,'$.output_tokens')='true' AND json_extract(u.trusted_measurement_json,'$.version')=1 THEN u.output_tokens END),'cache_hit_tokens',SUM(CASE WHEN json_type(u.trusted_measurement_json,'$.cache_read_tokens')='true' AND json_extract(u.trusted_measurement_json,'$.version')=1 THEN u.cache_read_tokens END),'cache_savings_micros',SUM(CASE WHEN u.pricing_status IN ('priced','explicit_free') THEN u.cache_savings_micros END),'missing_pricing_count',SUM(CASE WHEN u.pricing_status='missing_price' THEN 1 ELSE 0 END),'incomplete_usage_count',SUM(CASE WHEN u.pricing_status='incomplete_usage' THEN 1 ELSE 0 END),'measured_cost_count',SUM(CASE WHEN u.pricing_status IN ('priced','explicit_free') THEN 1 ELSE 0 END),'cost_measured',json(CASE WHEN SUM(CASE WHEN u.pricing_status IN ('priced','explicit_free') THEN 1 ELSE 0 END)>0 THEN 'true' ELSE 'false' END),'cost_micros',SUM(CASE WHEN u.pricing_status IN ('priced','explicit_free') THEN u.total_cost_micros END),'settled_cost_micros',COALESCE(SUM(u.total_cost_micros),0),'latency_ms',AVG(x.latency_ms),'ttft_ms',AVG(x.first_text_ms),'tokens_per_second',AVG(CASE WHEN json_extract(u.trusted_measurement_json,'$.version')=1 AND json_type(u.trusted_measurement_json,'$.output_tokens')='true' AND x.latency_ms>0 THEN CAST(u.output_tokens AS REAL)*1000.0/x.latency_ms END)) AS document FROM request_facts r JOIN execution_facts e ON e.request_id=r.id LEFT JOIN (SELECT *,CASE WHEN {measurement_valid} THEN usage_measurement_json ELSE '{{}}' END AS trusted_measurement_json FROM usage_logs) u ON u.execution_id=e.id LEFT JOIN request_executions x ON x.id=e.id WHERE r.project_id=? AND r.started_at>=? AND r.started_at<? AND (? IS NULL OR e.model_id=?) AND (? IS NULL OR e.provider_id=?) AND (? IS NULL OR r.api_key_id=?) GROUP BY {dimension} ORDER BY {dimension} LIMIT 500"),vec![project.into(),filter.from.unwrap_or(db::now()-86400*30).into(),filter.until.unwrap_or(db::now()+1).into(),filter.model.clone().into(),filter.model.into(),filter.provider.clone().into(),filter.provider.into(),filter.api_key.clone().into(),filter.api_key.into()])).await?;
+    let paired_tokens = "json_extract(u.trusted_measurement_json,'$.version')=1 AND json_type(u.trusted_measurement_json,'$.input_tokens')='true' AND json_type(u.trusted_measurement_json,'$.output_tokens')='true'";
+    let rows = state.db.query_all(sql(format!(r#"
+        SELECT json_object(
+            'dimension',{dimension},
+            'requests',COUNT(DISTINCT r.id),'attempts',COUNT(e.id),'errors',SUM(e.status!='succeeded'),
+            'sample_count',COUNT(DISTINCT CASE WHEN e.status='succeeded' AND x.latency_ms>0 AND json_extract(u.trusted_measurement_json,'$.version')=1 AND json_type(u.trusted_measurement_json,'$.output_tokens')='true' THEN r.id END),
+            'usage_measured',CASE WHEN SUM(CASE WHEN json_extract(u.trusted_measurement_json,'$.version')=1 AND (json_type(u.trusted_measurement_json,'$.input_tokens')='true' OR json_type(u.trusted_measurement_json,'$.output_tokens')='true') THEN 1 ELSE 0 END)>0 THEN json('true') ELSE json('false') END,
+            'input_tokens',SUM(CASE WHEN json_type(u.trusted_measurement_json,'$.input_tokens')='true' AND json_extract(u.trusted_measurement_json,'$.version')=1 THEN u.input_tokens END),
+            'output_tokens',SUM(CASE WHEN json_type(u.trusted_measurement_json,'$.output_tokens')='true' AND json_extract(u.trusted_measurement_json,'$.version')=1 THEN u.output_tokens END),
+            'paired_input_tokens',SUM(CASE WHEN {paired_tokens} THEN u.input_tokens END),
+            'paired_output_tokens',SUM(CASE WHEN {paired_tokens} THEN u.output_tokens END),
+            'total_tokens_samples',COUNT(CASE WHEN {paired_tokens} THEN 1 END),
+            'cache_hit_tokens',SUM(CASE WHEN json_type(u.trusted_measurement_json,'$.cache_read_tokens')='true' AND json_extract(u.trusted_measurement_json,'$.version')=1 THEN u.cache_read_tokens END),
+            'cache_write_tokens',SUM(CASE WHEN json_type(u.trusted_measurement_json,'$.cache_write_tokens')='true' AND json_extract(u.trusted_measurement_json,'$.version')=1 THEN u.cache_write_tokens END),
+            'reasoning_tokens',SUM(CASE WHEN json_type(u.trusted_measurement_json,'$.reasoning_tokens')='true' AND json_extract(u.trusted_measurement_json,'$.version')=1 THEN u.reasoning_tokens END),
+            'cache_savings_micros',SUM(CASE WHEN u.pricing_status IN ('priced','explicit_free') THEN u.cache_savings_micros END),
+            'missing_pricing_count',SUM(CASE WHEN u.pricing_status='missing_price' THEN 1 ELSE 0 END),
+            'incomplete_usage_count',SUM(CASE WHEN u.pricing_status='incomplete_usage' THEN 1 ELSE 0 END),
+            'measured_cost_count',SUM(CASE WHEN u.pricing_status IN ('priced','explicit_free') THEN 1 ELSE 0 END),
+            'cost_measured',json(CASE WHEN SUM(CASE WHEN u.pricing_status IN ('priced','explicit_free') THEN 1 ELSE 0 END)>0 THEN 'true' ELSE 'false' END),
+            'cost_micros',SUM(CASE WHEN u.pricing_status IN ('priced','explicit_free') THEN u.total_cost_micros END),
+            'settled_cost_micros',COALESCE(SUM(u.total_cost_micros),0),
+            'latency_ms',AVG(x.latency_ms),'ttft_ms',AVG(x.first_text_ms),
+            'tokens_per_second',AVG(CASE WHEN json_extract(u.trusted_measurement_json,'$.version')=1 AND json_type(u.trusted_measurement_json,'$.output_tokens')='true' AND x.latency_ms>0 THEN CAST(u.output_tokens AS REAL)*1000.0/x.latency_ms END)
+        ) AS document
+        FROM request_facts r JOIN execution_facts e ON e.request_id=r.id
+        LEFT JOIN (SELECT *,CASE WHEN {measurement_valid} THEN usage_measurement_json ELSE '{{}}' END AS trusted_measurement_json FROM usage_logs) u ON u.execution_id=e.id
+        LEFT JOIN request_executions x ON x.id=e.id
+        WHERE r.project_id=? AND r.started_at>=? AND r.started_at<?
+            AND (? IS NULL OR e.model_id=?) AND (? IS NULL OR e.provider_id=?) AND (? IS NULL OR r.api_key_id=?)
+        GROUP BY {dimension} ORDER BY {dimension} LIMIT 500
+    "#),vec![project.into(),filter.from.unwrap_or(db::now()-86400*30).into(),filter.until.unwrap_or(db::now()+1).into(),filter.model.clone().into(),filter.model.into(),filter.provider.clone().into(),filter.provider.into(),filter.api_key.clone().into(),filter.api_key.into()])).await?;
     let mut rows = documents(rows)?;
+    for row in &mut rows {
+        if let Some(object) = row.as_object_mut() {
+            let input = object
+                .remove("paired_input_tokens")
+                .and_then(|value| value.as_i64());
+            let output = object
+                .remove("paired_output_tokens")
+                .and_then(|value| value.as_i64());
+            let total = input
+                .zip(output)
+                .and_then(|(input, output)| input.checked_add(output));
+            object.insert("total_tokens".into(), json!(total));
+        }
+    }
     if matches!(dimension_name, "provider" | "model") {
         add_performance_confidence(&mut rows);
     } else {

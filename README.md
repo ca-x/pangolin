@@ -32,6 +32,18 @@ Pangolin (Chinese name 鲮鲤) is a single-binary AI API aggregation gateway. It
 
 ## Screenshots
 
+### Core API and Token usage
+
+Release-binary captures use sanitized mock traffic. Build provenance and delivery evidence are recorded in `docs/reviews/aimux-delivery.md`.
+
+| Token breakdown · 1440px | Usage records · 1440px | Requests · 1440px |
+| --- | --- | --- |
+| ![Input, output, paired totals and cache/reasoning Token measurements](docs/screenshots/aimux-analytics-desktop-light-en.png) | ![Measured, zero, partial and unreported usage records](docs/screenshots/aimux-usage-desktop-light-en.png) | ![Requests forwarded through the aimux gateway](docs/screenshots/aimux-requests-desktop-light-en.png) |
+
+| Token breakdown · 375px · 中文 | Usage records · 375px · 中文 | Requests · 375px · 中文 |
+| --- | --- | --- |
+| ![Mobile Token measurements in Chinese dark mode](docs/screenshots/aimux-analytics-mobile-dark-zh.png) | ![Mobile usage records in Chinese dark mode](docs/screenshots/aimux-usage-mobile-dark-zh.png) | ![Mobile request records in Chinese dark mode](docs/screenshots/aimux-requests-mobile-dark-zh.png) |
+
 ### v0.6.2 management console
 
 These screenshots use the v0.6.2 release binary and test data.
@@ -162,10 +174,10 @@ Protocol and provider adaptation runs through one orchestrator, and fields a cro
 These open source projects were studied deliberately during design and implementation:
 
 - [looplj/axonhub](https://github.com/looplj/axonhub) (Apache/LGPL as scoped by its LICENSE; evaluated at commit `276ee9fcc84f8d519e3ef5c2b31f5c5451efeaf4`): reference for enterprise access control, channel/model routing, observability, cost and backup product behaviour and test invariants.
-- [BerriAI/litellm's litellm-rust](https://github.com/BerriAI/litellm/tree/main/litellm-rust) (MIT; evaluated at commit `8c4c394ecc82c4d6acb5eb371d8781e487894a17`): compatible types, core, llms, framing, auth, HTTP, token counter and cache crates are reused directly, with Pangolin adapter boundaries covering orchestration and the missing protocols.
+- [arcships/aimux](https://github.com/arcships/aimux) (MIT; evaluated at commit `4c0b40c54d689439937155d2c36720a4b3c7454d`): pinned Fetch/FetchResponse, explicit bearer headers and SSE interfaces behind Pangolin's native-protocol boundary. Pangolin retains egress policy, checked transforms, routing and accounting; LiteLLM is no longer a dependency. See the [core API comparison](docs/new-api-core-capability-matrix.md) for the scoped new-api reference.
 - [traceloop/hub](https://github.com/traceloop/hub) (Apache-2.0; evaluated at commit `e1be468f87de077ce066fbdebc858e913dc889a1`): reference for Rust gateway provider registry, pipeline, Prometheus and OpenTelemetry organisation.
 - [ca-x/raindrop](https://github.com/ca-x/raindrop) (MIT; evaluated at commit `73948bd650d2aa6b117b4ad63af6aff8b24e2938`): reference for embedded React, native multi-platform binaries, immutable backup target snapshots, fencing, retention policies and the GitHub Actions release chain.
-- [QuantumNous/new-api](https://github.com/QuantumNous/new-api) (AGPL-3.0; evaluated at commit `972aed1972820389ea0b603ca58f03f846fbf790`): studied channel/model presets, group multipliers, token management, affinity rules and operational interactions only; no AGPL source code or assets were copied.
+- [QuantumNous/new-api](https://github.com/QuantumNous/new-api) (AGPL-3.0; core API rechecked at local commit `e03439033238722c0b8d4437a052445f3aeeed83`): studied API routing, channel/model/key management, affinity and Token statistics only; no AGPL source code or assets were copied. Membership, recharge and payments are outside this scope.
 - [farion1231/cc-switch](https://github.com/farion1231/cc-switch/tree/main/src-tauri/src/proxy) (MIT; evaluated at commit `06082e189d65e6d6dbadc35dacdac1ce6c79d89a`): reference for Rust proxy pipeline, failover, usage, media and session handling design.
 - [yetone/magpie](https://github.com/yetone/magpie) (MIT; evaluated at commit `ea20c2db594187540b11c3a4c1821eab8dd571f2`): reference for explaining model routing and conversion as a visible path, and for brief, purposeful route feedback. Pangolin's implementation uses its own components and motion rules.
 

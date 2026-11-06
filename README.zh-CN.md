@@ -32,6 +32,20 @@ Pangolin（中文正式名称“鲮鲤”）是一款单二进制 AI API 聚合�
 
 ## 界面预览
 
+### 基础 API 与 Token 用量
+
+以下截图来自 release 构建，数据由本地模拟请求生成且已脱敏。构建来源和交付记录见 `docs/reviews/aimux-delivery.md`。
+
+| Token 分项 · 1440px | 用量记录 · 1440px | 请求记录 · 1440px |
+| --- | --- | --- |
+| ![鲮鲤输入输出、配对总量和缓存推理 Token 统计](docs/screenshots/aimux-analytics-desktop-light-en.png) | ![鲮鲤实测、零值、部分测量和未上报的用量记录](docs/screenshots/aimux-usage-desktop-light-en.png) | ![鲮鲤通过 aimux 转发的请求记录](docs/screenshots/aimux-requests-desktop-light-en.png) |
+
+| Token 分项 · 375px · 中文深色 | 用量记录 · 375px · 中文深色 | 请求记录 · 375px · 中文深色 |
+| --- | --- | --- |
+| ![鲮鲤移动端 Token 用量分项](docs/screenshots/aimux-analytics-mobile-dark-zh.png) | ![鲮鲤移动端用量记录](docs/screenshots/aimux-usage-mobile-dark-zh.png) | ![鲮鲤移动端请求记录](docs/screenshots/aimux-requests-mobile-dark-zh.png) |
+
+以下为历史版本界面截图，保留作工作流与主题参考。
+
 ### 桌面端
 
 | 概览（浅色） | 概览（深色） | 渠道 |
@@ -146,10 +160,10 @@ pnpm --dir web dev
 本项目在设计和实现时明确研究了以下开源项目：
 
 - [looplj/axonhub](https://github.com/looplj/axonhub)（按其仓库 LICENSE 的适用范围，主要为 Apache-2.0；评估 commit `cb29b65d9adfb06f89bb1b467418e0816988f36c`）：参考企业访问控制、渠道/模型路由、可观测性、成本与备份的公开产品能力和测试不变量。
-- [BerriAI/litellm 的 litellm-rust](https://github.com/BerriAI/litellm/tree/main/litellm-rust)（MIT；评估 commit `8c4c394ecc82c4d6acb5eb371d8781e487894a17`）：直接复用兼容的 types、core、llms、framing、auth、HTTP、token counter 与 cache crates，并通过 Pangolin 适配边界承接编排和缺失协议。
+- [arcships/aimux](https://github.com/arcships/aimux)（MIT；评估 commit `4c0b40c54d689439937155d2c36720a4b3c7454d`）：在鲮鲤原生协议边界内复用 Fetch/FetchResponse、显式 Bearer 认证头与 SSE 接口；出口策略、严格协议转换、路由和统计仍由鲮鲤负责，不再依赖 LiteLLM。new-api 的限定对齐范围见[基础 API 能力核对表](docs/new-api-core-capability-matrix.md)。
 - [traceloop/hub](https://github.com/traceloop/hub)（Apache-2.0；评估 commit `e1be468f87de077ce066fbdebc858e913dc889a1`）：参考 Rust 网关的 provider registry、pipeline、Prometheus 和 OpenTelemetry 组织方式。
 - [ca-x/raindrop](https://github.com/ca-x/raindrop)（MIT；评估 commit `73948bd650d2aa6b117b4ad63af6aff8b24e2938`）：参考嵌入式 React、原生多平台二进制、不可变备份目标快照、fencing、保留策略和 GitHub Actions 发布链路。
-- [QuantumNous/new-api](https://github.com/QuantumNous/new-api)（AGPL-3.0；评估 commit `972aed1972820389ea0b603ca58f03f846fbf790`）：仅研究渠道/模型预设、分组倍率、令牌管理、亲和规则与运维交互；没有复制其 AGPL 源代码或资源。
+- [QuantumNous/new-api](https://github.com/QuantumNous/new-api)（AGPL-3.0；基础 API 重新核对本地 commit `e03439033238722c0b8d4437a052445f3aeeed83`）：仅研究 API 路由、渠道/模型/Key 管理、亲和规则与 Token 统计；没有复制其 AGPL 源代码或资源，不引入会员、充值和支付功能。
 - [farion1231/cc-switch](https://github.com/farion1231/cc-switch/tree/main/src-tauri/src/proxy)（MIT；评估 commit `06082e189d65e6d6dbadc35dacdac1ce6c79d89a`）：参考 Rust 代理流水线、故障切换、用量、媒体和会话处理设计。
 - [yetone/magpie](https://github.com/yetone/magpie)（MIT；评估 commit `ea20c2db594187540b11c3a4c1821eab8dd571f2`）：参考协议探测、路由说明和有目的的状态反馈，使用鲮鲤自己的组件与动效规则。
 - [Calcium-Ion/AstrLink](https://github.com/Calcium-Ion/AstrLink)（根目录 Apache-2.0；评估 commit `5f6da6bbf84aa860118fd2ce39acf2f0ebde8f47`）：参考客户端配置、结构化隐私决策、协议探测和计价说明。排除 Core/RelayKit AGPL 模块，没有导入项目代码或图片资源。
