@@ -31,9 +31,10 @@ ordinary agent review is supplemental, not an implicit waiver.
 
 ## Verification record
 
-Verified 2026-11-06. Implementation and the following checks are recorded;
-overall final acceptance/release readiness is **not** marked complete because
-the required GPT-6 gate remains unavailable. No commit/push/tag/publication.
+Historical snapshot verified 2026-11-06, before the compatibility repairs.
+At that point the required GPT-6 alias was unavailable and no commit, push,
+tag or publication had occurred. The final qualification and published release
+record below supersedes this snapshot; it is not a current blocker.
 
 | Gate | Fresh evidence |
 | --- | --- |
@@ -103,7 +104,7 @@ The scoped behavior comparison is `../docs/new-api-core-capability-matrix.md`.
 The pre-existing AxonHub inventory remains intact, including out-of-scope
 capabilities; no merchant functionality was added.
 
-## Review follow-up — 2026-11-07
+## Review follow-up: 2026-11-07
 
 The subsequent independent whole-diff audit found one confirmed P2 regression:
 Vertex legacy credential aliases were no longer recognized. Canonical project
@@ -126,13 +127,13 @@ configured region. The release-binary/local-mock reproduction confirmed both.
       Final scoped read-only review found no remaining blocker in the fixes or
       sibling credential boundaries; its independent focused binary run passed
       ten Vertex/token/URL tests. It is supplemental, not GPT-6 review.
-- [ ] Requalify the final version candidate with full Web/Rust/release/actionlint
+- [x] Requalify the final version candidate with full Web/Rust/release/actionlint
       verification and release-binary QA after the Azure identity repair.
 - [x] Satisfy required GPT-6 final review: `gpt-6-astra` completed the whole
       47-file review and its six-file repair re-review with no remaining blocker.
 - [x] Review the version-only/README/status delta: the same GPT-6 model checked
       all 48 current hashes and the seven-file delta without a blocker. The
-      committed main candidate still needs full qualification before any push.
+      committed main candidate subsequently passed full qualification before push.
 - [x] Prepare current bilingual README screenshot sections with three desktop
       and three mobile operational captures from the qualified release binary.
       Record screenshot provenance, a release-note draft and the explicit
@@ -140,9 +141,9 @@ configured region. The release-binary/local-mock reproduction confirmed both.
       review of this documentation delta found no actionable blocker; complete
       image hashes, PNG dimensions, README references and QA cleanup were
       verified without changing the qualified runtime/frontend sources.
-- [ ] Prepare atomic implementation/documentation commits and the next version;
+- [x] Prepare atomic implementation/documentation commits and the next version;
       push reviewed main only after local gates, then require remote CI green.
-- [ ] Publish a new immutable version tag, verify checksummed five-platform
+- [x] Publish a new immutable version tag, verify checksummed five-platform
       archives and native amd64/arm64 GHCR manifests, and record delivery.
 
 The 2026-11-06 verification table is historical evidence for the pre-fix tree,
@@ -161,7 +162,8 @@ isolated ambient-environment child probe). The targeted GPT-6 repair review
 then passed, covering all six changed files and inheriting the unchanged 41
 files from the whole-scope review. Rust 1.98 strict all-feature Clippy and all
 16 focused cloud tests also passed on the exact repaired source. Version-only
-delta review also passed; full committed-candidate qualification remains pending.
+delta review also passed; the final committed-candidate qualification below
+subsequently passed.
 
 Workload identity now uses Azure's `ClientAssertionCredential` with a bounded,
 regular-file assertion source; managed identity uses its dedicated SDK class.
@@ -171,7 +173,7 @@ considered and explicitly declined because they can switch to CLI credentials
 or a different managed identity; their migration is documented in the protocol
 contract and scoped capability matrix. No AxonHub inventory row was removed.
 
-Release tooling has also been prepared without publication: Rust 1.98 strict
+At this pre-publication stage, release tooling was prepared: Rust 1.98 strict
 all-feature Clippy and Node 26.9/pnpm 11 frozen install/lint passed on the
 pre-Azure tree; archive/OCI validators accept the existing published v0.8.0
 artifacts and reject known-bad checksums, paths, architectures, source/version
@@ -208,3 +210,33 @@ The initial browser-runner drafts waited only for navigation and used an obsolet
 Usage URL; correcting the waits and using `/operations?tab=usage` produced the
 successful run. These were automation corrections, not product changes. Browser
 coverage is contract-tested, not live-provider, full-WCAG or physical-touch QA.
+
+## Final qualification and release
+
+Release source G is `14e3e4f42d2d2ffd607864575dbff3a7e7989b0a`, version `0.9.0`.
+Atomic commits separate controller/spec/plan (`e227a39`), gateway/auth
+(`96b65a8`) and Token analytics/UI/docs (`14e3e4f`). All local qualification
+gates passed on exact G before pushing; remote source CI passed before tagging.
+
+| Final gate | Evidence |
+| --- | --- |
+| Web | Node 26.9.0/pnpm 11 frozen install, lint and embedding build; 91 files/1694 tests passed |
+| Rust | Rust 1.98 fmt, strict all-target/all-feature Clippy, default and all-feature suites 630 each, release build passed; no live Redis claim |
+| Workflows | actionlint passed; source CI `42289926405`, binary publication `42298501078` and native image publication `42298500609` all completed/success at G |
+| Qualified runtime | Local release binary, 13 Vertex mock cases, five gateway JSON/SSE requests and 20 populated browser combinations passed |
+| Required review | Actual GPT-6 Astra whole-scope, Azure repair, version/README/status delta and qualification-evidence reviews found no remaining blocker; no waiver |
+| Public release | `v0.9.0`, release `437086345`, public/non-draft/non-prerelease, published `2026-11-06T22:10:52Z` |
+| Archives | Five public platform archives plus `SHA256SUMS` downloaded; API size/digest, archive safety, source documents, architecture and G marker checks passed; Windows documents differ only by exact LF-to-CRLF conversion |
+| Public runtime/browser | Downloaded Linux x86_64 binary starts with fresh stores, health 200, backend/console `0.9.0`/G agree; 13 Vertex cases and all 20 browser combinations repeated successfully |
+| GHCR | Anonymous `0.9.0`/`latest` readback agrees; native linux/amd64 and linux/arm64 manifests/configs, source/version, nonroot and healthcheck verified |
+
+The immutable annotated tag object is
+`2265086a02a820d130ab28812b3c6849081cca0c`, dereferencing to G. The prior
+`v0.8.0` tag is unchanged. This documentation receipt does not move either tag
+or alter released product files. The full archive hashes, image index/child
+digests, runtime identities and scope limits are in
+`docs/reviews/aimux-delivery.md`. Cloud behavior remains contract-tested, not
+live-tested; no container, macOS/Windows runtime, full-WCAG or physical-touch
+coverage is claimed. Owned QA processes are stopped and temporary credentials
+removed. Memberships, recharge, wallets, payments and merchant plans remain
+out of scope.
