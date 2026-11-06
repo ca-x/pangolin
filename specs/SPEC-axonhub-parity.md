@@ -38,7 +38,7 @@ Success means each supported behavior has a Rust contract test derived from Axon
 - Provider families include OpenAI-compatible, Anthropic, Gemini, Azure OpenAI, Bedrock and Vertex/GCP credential strategies, plus named compatible presets (OpenRouter, DeepSeek, Moonshot, Zhipu, Doubao, xAI, Groq, Ollama, NanoGPT, Jina).
 - Provider setup helpers include Codex, xAI, Claude Code, Antigravity and GitHub Copilot OAuth/device flows.
 - Cross-protocol transformations fail explicitly for unsupported shapes; they never silently drop fields.
-- Pin and directly reuse the compatible `litellm-rust` crates at an exact Git commit for provider transformations they implement. Pangolin keeps an adapter boundary and owns orchestration, authorization, observability and missing protocols.
+- Pin aimux at evaluated Git commit `4c0b40c54d689439937155d2c36720a4b3c7454d` behind Pangolin's adapter boundary; remove LiteLLM dependencies per `SPEC-aimux-core-api.md`. Pangolin owns orchestration, authorization, observability and lossless native protocol handling.
 
 ### Trace, cost and operations
 

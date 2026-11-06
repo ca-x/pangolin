@@ -23,7 +23,7 @@ Full-parity continuation order: `identity-access` → `request-orchestrator` →
 
 - Single-node is the supported v0.1 deployment. The database model and APIs avoid assumptions that prevent a future PostgreSQL/control-plane mode.
 - SQLite is the authoritative OLTP store. DuckDB is a separate, disposable/rebuildable analytical store for request observations.
-- Pangolin pins compatible LiteLLM Rust crates at one evaluated Git commit behind a local adapter boundary. Pangolin owns authorization, orchestration, observability and protocol shapes the upstream crates do not provide; unsupported conversions fail explicitly rather than dropping fields.
+- The current continuation replaces LiteLLM with aimux pinned at evaluated commit `4c0b40c54d689439937155d2c36720a4b3c7454d` behind a local adapter boundary. Pangolin owns authorization, orchestration, observability and lossless native protocol handling; unsupported conversions fail explicitly rather than dropping fields. See `specs/SPEC-aimux-core-api.md` and `tasks/aimux-core-api-plan.md` for implementation status.
 - OIDC SSO and single-node rate/admission controls are included. Distributed multi-node coordination, billing invoices and multi-region consensus remain outside this release.
 
 ## Full-parity continuation

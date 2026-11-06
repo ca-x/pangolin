@@ -16,6 +16,7 @@ This file is the repository-level operating contract for coding agents.
 - Reference synthesis: `docs/adr/0002-axonhub-new-api-design-synthesis.md`.
 - Visual rules: `design-system/pangolin/MASTER.md`.
 - Active implementation plan: `tasks/axonhub-parity-plan.md`.
+- Current continuation: `specs/SPEC-aimux-core-api.md` and `tasks/aimux-core-api-plan.md`; new-api alignment covers core API behavior and Token usage, not memberships, recharge or payments.
 
 ## Architecture invariants
 
@@ -40,7 +41,7 @@ This file is the repository-level operating contract for coding agents.
 ## Dependency and reference policy
 
 - Prefer mature maintained license-compatible crates over hand-rolled protocol/infrastructure code. Wrap them behind Pangolin interfaces.
-- LiteLLM Rust dependencies are pinned to exact commit `8c4c394ecc82c4d6acb5eb371d8781e487894a17`; use pure-Rust crates and exclude Python bridge/legacy host paths.
+- Use aimux behind Pangolin's API adapter boundary, pinned to evaluated commit `4c0b40c54d689439937155d2c36720a4b3c7454d`. Remove LiteLLM dependencies, including auxiliary authentication, framing, token-counting and cache crates. Native pass-through must not be forced through a lossy SDK generation DTO.
 - [looplj/axonhub](https://github.com/looplj/axonhub) is an Apache/LGPL behavior/test reference. Port observable contracts, not Go implementation.
 - [QuantumNous/new-api](https://github.com/QuantumNous/new-api) is AGPL-3.0. Study product behavior/design only; never copy code or image assets.
 - [ca-x/raindrop](https://github.com/ca-x/raindrop) is a Rust engineering reference for embedded assets, releases and backup job/target safety.
@@ -57,6 +58,7 @@ This file is the repository-level operating contract for coding agents.
 
 ## Frontend conventions
 
+- Apply `ui-ux-pro-max`, `emil-design-eng`, `frontend-design` and `apple-design` to frontend and interaction work, constrained by `design-system/pangolin/MASTER.md`. Preserve Pangolin's existing visual identity rather than copying new-api's UI.
 - React UI is bilingual (`zh-CN`, `en`), supports system/light/dark and bronze/slate/jade accents, and must remain usable at 375/768/1440px.
 - Use Radix primitives for dialogs/selects/tooltips and Lucide for structural icons. Provider brands use the catalog icon map.
 - Normal operational table text is at least 14px. Show `—`, not invented zero values, when telemetry is unmeasured.

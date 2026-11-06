@@ -19,7 +19,7 @@
 
 ## Risks and mitigations
 
-- LiteLLM Rust is pre-1.0 and lives in a larger unpublished workspace: document the evaluated commit and keep Pangolin's adapter boundary replaceable without making every build fetch the entire repository.
+- Aimux is pinned to an evaluated Git commit: keep the adapter boundary replaceable and verify native protocol, stream and credential contracts rather than assuming normalized SDK parity.
 - DuckDB bundled builds are heavy: use native release runners, cache Cargo artifacts and keep extensions disabled.
 - Cross-protocol streaming translation is easy to get subtly wrong: prefer transparent streaming passthrough in v0.1 and test SSE framing.
 - Payload observation can leak sensitive data: default off, redact known secret fields and make capture state visible.

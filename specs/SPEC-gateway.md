@@ -19,7 +19,7 @@ Offer a drop-in AI API endpoint with manageable providers, model aliases and vir
 - Retry only safe pre-response failures; never replay a streaming response after bytes have been sent.
 - Preserve upstream status codes and OpenAI-shaped error envelopes where applicable.
 - Track token usage and integer micro-USD cost without floating-point accounting.
-- Keep protocol transformation behind a replaceable adapter modeled after LiteLLM Rust. v0.1 implements the supported non-streaming Anthropic bridge locally because the upstream crates are not independently published and force full-repository Git resolution; use protocol-compatible passthrough for streaming and unsupported endpoints.
+- Keep protocol transformation behind a replaceable adapter. The current aimux boundary and core API scope are defined in `SPEC-aimux-core-api.md`; native protocols pass through losslessly and unsupported cross-protocol shapes fail explicitly.
 - Support OpenAI-compatible, Anthropic and custom OpenAI-compatible upstream definitions in v0.1.
 
 ## Data model

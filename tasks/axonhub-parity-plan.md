@@ -4,6 +4,11 @@ Spec: `specs/SPEC-axonhub-parity.md`
 
 Inventory: `docs/axonhub-capability-matrix.md`
 
+Current continuation (2026-11-06): `tasks/aimux-core-api-plan.md` replaces the
+LiteLLM dependency choice below with aimux and limits additional new-api
+alignment to core API behavior and Token usage. Merchant features are excluded.
+Existing capabilities and historical verification evidence remain in place.
+
 Follow-up: `tasks/modelsdev-and-gateway-usability-plan.md` specifies the
 models.dev client/subscription and focused new-api usability release gates.
 
@@ -48,7 +53,7 @@ Verify: strategy simulations, race tests and mock-upstream retry/stream tests.
 
 Add OpenAI chat/responses/embeddings/images/audio/moderations/models, Anthropic Messages, Gemini generate/stream, rerank and provider auth/URL strategies for OpenAI-compatible, Anthropic, Gemini, Azure, Bedrock and Vertex plus compatible presets. Add request/response transformations and mock contract fixtures.
 
-Pin the reusable pure-Rust crates from `https://github.com/BerriAI/litellm.git` at exact evaluated commit `8c4c394ecc82c4d6acb5eb371d8781e487894a17`: `litellm-types`, `litellm-core`, `litellm-llms`, `litellm-framing`, `litellm-auth`, `litellm-auth-aws`, `litellm-auth-azure`, `litellm-auth-gcp`, `litellm-http`, `litellm-token-counter`, `litellm-cache`, `litellm-cache-memory`, and optional `litellm-cache-redis`. Route them through Pangolin adapters; do not fork internals. Exclude Python bridge/host-python/legacy callbacks from the pure-Rust binary. Pangolin implements missing Gemini/image/rerank/video shapes and remains responsible for orchestration and tracing.
+Pin aimux at evaluated commit `4c0b40c54d689439937155d2c36720a4b3c7454d` through Pangolin's raw Fetch/FetchResponse, explicit credential and bounded SSE adapters. Remove the former LiteLLM dependency family completely. Use maintained Rust cloud-auth/signing, tokenizer and cache libraries behind Pangolin interfaces. Native fields, configured egress clients, checked protocol transforms, orchestration, tracing and terminal accounting remain Pangolin responsibilities. See `aimux-core-api-plan.md` for the current scope and verification.
 
 Add a versioned embedded provider/model catalog derived from public metadata and behavior in AxonHub plus design study of `QuantumNous/new-api`. Provider presets include default URL/auth/endpoints/discovery/quota capability and a license-safe logo key. Model cards include developer/type/modalities/reasoning/tool/temperature/vision/context/output/knowledge/release/cost defaults. Preserve source/version and operator overrides; do not copy AGPL code or trademark assets.
 
@@ -68,7 +73,7 @@ Implement thread/trace/request/execution/usage lifecycle, immutable price versio
 
 Add optional session compaction: exact encrypted replay remains default; at configured token/window thresholds use provider-native Responses compact when supported, otherwise a configured summarizer model; persist immutable summary version, covered history range/hash, model and usage; failure falls back to exact history. Preserve tool-call ordering and project/key isolation. Define a pluggable semantic-memory interface but do not inject long-term vector memory by default.
 
-Add declarative channel-affinity rules inspired by new-api: match model/path/User-Agent; key sources limited to trusted header, JSON Pointer, trace/thread/session; `off/prefer/strict`; bounded TTL/capacity; switch-on-success and release-on-failure; hashed fingerprints only; Codex `prompt_cache_key` and Claude `metadata.user_id` safe defaults; cache-hit-token savings metrics. Use the LiteLLM cache interface with memory default and optional Redis. Explicitly disabled channels always invalidate affinity and WebSocket channel pin changes require reconnect.
+Add declarative channel-affinity rules inspired by new-api: match model/path/User-Agent; key sources limited to trusted header, JSON Pointer, trace/thread/session; `off/prefer/strict`; bounded TTL/capacity; switch-on-success and release-on-failure; hashed fingerprints only; Codex `prompt_cache_key` and Claude `metadata.user_id` safe defaults; cache-hit-token savings metrics. Use Pangolin's bounded Moka memory store with optional redis-rs. Explicitly disabled channels always invalidate affinity and WebSocket channel pin changes require reconnect.
 
 Implement site-level request logging settings (`enabled`, default level, key override enabled, key disable allowed) and per-key `inherit/off/metadata/redacted_body/full_body`. Resolve one immutable effective policy at admission. `off` suppresses browsable request/trace/execution/content logs while preserving minimal authoritative usage/quota/cost and security-audit facts. Even `full_body` always strips credentials/cookies/authorization. Add policy matrix, mid-request setting-change and no-derived-event tests.
 
@@ -94,7 +99,7 @@ Verify: TypeScript/Vitest plus browser workflows at 375/768/1440px in both theme
 
 Create an AxonHub capability/test mapping document with implemented/tested status and external-validation notes. Generate at least six sanitized release-binary screenshots and add them to README: at least three desktop and at least three mobile, covering representative operational workflows. Update operator/API docs, migrations, environment variables and CI. Run GPT-6 final review, fix findings, merge and push only after green verification.
 
-README references must include AxonHub, LiteLLM Rust, Traceloop Hub, Raindrop, new-api and cc-switch with URLs, licenses, evaluated commits, exact borrowed design ideas and an independent-implementation/no-affiliation statement.
+README references must include AxonHub, aimux, Traceloop Hub, Raindrop, new-api and cc-switch with URLs, licenses, evaluated commits, exact borrowed design ideas and an independent-implementation/no-affiliation statement. Preserve former LiteLLM attribution in historical evidence where applicable, not as an active dependency.
 
 After green local/remote verification, bump the pre-release version, create and push the release tag, publish GitHub binary archives/checksums, build and publish native `linux/amd64` + `linux/arm64` Docker images to GHCR, and verify the multi-architecture manifest. The user explicitly authorized these external publishing actions.
 

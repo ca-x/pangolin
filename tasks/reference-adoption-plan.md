@@ -6,7 +6,7 @@
 
 **Architecture:** Extend existing services with additive SQLite migrations29–31 and bounded typed metadata. Keep DuckDB derived, provider network I/O outside transactions, and project/key policy before routing. Existing native forwarding, stream commitment, budgets and immutable price references remain authoritative.
 
-**Tech Stack:** Rust 1.98/edition 2024, Axum 0.8, SeaORM/SQLite, bundled DuckDB, existing LiteLLM Rust pin; React 19, Mantine/Radix, TanStack Query/Table, pnpm 11. No new dependencies required.
+**Tech Stack:** Rust 1.98/edition 2024, Axum 0.8, SeaORM/SQLite, bundled DuckDB; React 19, Mantine/Radix, TanStack Query/Table, pnpm 11. Provider dependency selection is superseded by `aimux-core-api-plan.md`.
 
 **Spec:** `specs/SPEC-reference-adoption.md` and its seven `specs/reference-adoption/SPEC-*.md` module specifications.
 
@@ -24,7 +24,7 @@
 - Money is integer micro-USD; historical amounts and immutable price versions are not rewritten.
 - React is bilingual zh-CN/en, light/dark/system, existing accents; usable at 375/768/1440px; operational text >=14px; unknown telemetry is a dash.
 - Reuse existing house components, Radix dialogs/selects/tooltips and Lucide structural icons; motion <=300ms transform/opacity and reduced-motion aware.
-- LiteLLM Rust stays at commit 8c4c394ecc82c4d6acb5eb371d8781e487894a17; do not import Go RelayKit/AGPL code or project-owned assets.
+- Follow `aimux-core-api-plan.md` for the pinned aimux boundary; do not import Go RelayKit/AGPL code or project-owned assets.
 - Release embedding requires fresh web/dist before Rust verification. No push/tag/publish/release action.
 
 ## Review Focus
