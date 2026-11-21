@@ -132,9 +132,10 @@ function MetricBars({ title, rows, label, value, format, showConfidence = false 
       const amount = value(row)
       const cell = label(row.dimension)
       const measuredAmount = typeof amount === 'number' && Number.isFinite(amount) && amount >= 0
+      const percent = measuredAmount && max > 0 ? amount / max * 100 : 0
       return <div className="analytics-bar-row" key={`${row.dimension ?? 'unmeasured'}-${index}`}>
-        <div className="analytics-bar-facts"><Text size="sm" className={cell.opaque ? 'mono-cell' : undefined}>{cell.text}</Text><Stack gap={0} align="flex-end"><Text size="sm" className="analytics-bar-value">{measuredAmount ? format(amount as number) : UNMEASURED}</Text>{showConfidence && <ConfidenceFact row={row} compact />}</Stack></div>
-        <div className="analytics-bar-track" aria-hidden="true"><span data-confidence={showConfidence ? row.confidence_level : undefined} style={{ width: `${measuredAmount && max > 0 ? Math.max(2, (amount as number) / max * 100) : 0}%` }} /></div>
+        <div className="analytics-bar-facts"><Text size="sm" className={cell.opaque ? 'mono-cell' : undefined}>{cell.text}</Text><Stack gap={0} align="flex-end"><Text size="sm" className="analytics-bar-value">{measuredAmount ? format(amount) : UNMEASURED}</Text>{showConfidence && <ConfidenceFact row={row} compact />}</Stack></div>
+        <div className="analytics-bar-track" aria-hidden="true"><span data-confidence={showConfidence ? row.confidence_level : undefined} style={{ width: `${percent}%` }} /></div>
       </div>
     })}</Stack>
   </Card>

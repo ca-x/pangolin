@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { render, screen, waitFor } from '@testing-library/react'
+import { render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter, useLocation } from 'react-router'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
@@ -42,7 +42,7 @@ describe('live requests and dedicated analytics', () => {
       if (path.includes('/permissions')) return json(['*'])
       if (path.includes('/analytics?')) return json({ data: [
         { dimension: 'model-alpha', requests: 700, attempts: 701, errors: 1, sample_count: 700, confidence_level: 'high', usage_measured: true, input_tokens: 120, output_tokens: 30, cache_hit_tokens: 4, cache_savings_micros: 12, cost_micros: 3456, latency_ms: 820, ttft_ms: 95, tokens_per_second: 36.5 },
-        { dimension: 'model-low', requests: 1, attempts: 1, errors: 0, sample_count: 1, confidence_level: 'low', usage_measured: true, input_tokens: 8, output_tokens: 2, cache_hit_tokens: 0, cache_savings_micros: 0, cost_micros: 25, latency_ms: 900, ttft_ms: 120, tokens_per_second: 2.2 },
+        { dimension: 'model-low', requests: 1, attempts: 1, errors: 0, sample_count: 1, confidence_level: 'low', usage_measured: true, input_tokens: 8, output_tokens: 0, cache_hit_tokens: 0, cache_savings_micros: 0, cost_micros: 25, latency_ms: 900, ttft_ms: 120, tokens_per_second: 0 },
         { dimension: 'model-unmeasured', requests: 1, attempts: 1, errors: 1, sample_count: 0, confidence_level: 'low', usage_measured: false, input_tokens: 0, output_tokens: 0, cache_hit_tokens: 0, cache_savings_micros: 0, cost_micros: 0, latency_ms: null, ttft_ms: null, tokens_per_second: null },
       ] })
       return json({})
@@ -54,7 +54,11 @@ describe('live requests and dedicated analytics', () => {
     const performanceRegion = await screen.findByRole('region', { name: 'Performance and cost breakdown' })
     expect(performanceRegion).toHaveAttribute('data-scrollarea-viewport')
     expect(performanceRegion).toHaveAttribute('tabindex', '0')
-    expect(screen.getByRole('region', { name: i18n.t('throughput') })).toHaveTextContent('700 samples')
+    const throughput = screen.getByRole('region', { name: i18n.t('throughput') })
+    expect(throughput).toHaveTextContent('700 samples')
+    const zero = within(throughput).getByText('model-low').closest('.analytics-bar-row')!
+    expect(zero).toHaveTextContent('0 Tokens/s')
+    expect(zero.querySelector('.analytics-bar-track span')).toHaveStyle({ width: '0%' })
     expect((await screen.findAllByText('model-alpha')).length).toBeGreaterThan(0)
     expect((await screen.findAllByText('model-unmeasured')).length).toBeGreaterThan(0)
     expect(screen.getAllByText('700 samples').length).toBeGreaterThan(0)
