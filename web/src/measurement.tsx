@@ -249,6 +249,25 @@ export const costQuantityKey: Partial<Record<string, MeasurementKey>> = {
   unit: 'request_units',
   flat: 'request_units',
 }
+const costKindKeys: Record<string, string> = {
+  input: 'costKindInput', output: 'costKindOutput', cache_read: 'costKindCacheRead',
+  cache_write: 'costKindCacheWrite', reasoning: 'costKindReasoning', flat: 'costKindFlat', unit: 'costKindUnit',
+}
+
+export function cacheDurationLabel(ttl: string, t: (key: string) => string) {
+  if (ttl === '5m') return t('cacheDurationFiveMinutes')
+  if (ttl === '1h') return t('cacheDurationOneHour')
+  return ttl
+}
+
+export function priceComponentLabel(kind: unknown, ttl: unknown, t: (key: string, values?: Record<string, string>) => string) {
+  if (kind === 'cache_write' && typeof ttl === 'string' && ttl) {
+    return t('cacheWriteWithDuration', { duration: cacheDurationLabel(ttl, t) })
+  }
+  if (typeof kind !== 'string' || !kind) return UNMEASURED
+  return Object.hasOwn(costKindKeys, kind) ? t(costKindKeys[kind]) : kind
+}
+
 export type QuantityComponent = { [key: string]: unknown; kind?: unknown; cache_ttl?: unknown }
 /** The stored component quantity may subtract child counters, even at zero rates. */
 export function componentQuantity(

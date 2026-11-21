@@ -12,7 +12,7 @@ import { projectOperationPath, useProject } from '../project'
 import { PageHeader, QueryError, ResourcePage, displayValue, formatDate } from './shared'
 import { CostItemsPanel } from './CostItemsPanel'
 import { AttemptDiagnosticList, ExecutionDiagnosticsButton, type DiagnosticAttempt } from './ExecutionDiagnostics'
-import { CostFact, Settlement, quantityText, quantityValue, sumQuantity, sumAmounts, rowCoverage, PricingCoverageNotice, componentQuantity, amountValue, type PricingFacts } from '../measurement'
+import { CostFact, Settlement, quantityText, quantityValue, sumQuantity, sumAmounts, rowCoverage, PricingCoverageNotice, componentQuantity, priceComponentLabel, amountValue, type PricingFacts } from '../measurement'
 import { PayloadViewer } from './PayloadViewer'
 import { useActiveTabInView, useRoutedTab } from './useRoutedTab'
 
@@ -373,7 +373,7 @@ type RequestNavigation = { from?: string; tab?: string; ids?: string[]; index?: 
 type RequestRecord = {
   executions?: Array<DiagnosticAttempt & { id?: string; attempt?: number | null; provider_id?: string | null; provider_name?: string | null; model?: string | null; status?: string | null; latency_ms?: number | null; retry_reason?: string | null; http_status?: number | null; error_kind?: string | null }>
   usage?: Array<PricingFacts & { cache_read_tokens?:number; cache_write_tokens?:number; reasoning_tokens?:number; execution_id?: string; input_tokens?: number; output_tokens?: number; total_cost_micros?: number }>
-  cost_items?: Array<{ execution_id?: string; kind?: string | null; quantity?: number | null; unit_price_micros?: number | null; subtotal_micros?: number | null }>
+  cost_items?: Array<{ execution_id?: string; kind?: string | null; cache_ttl?: string | null; quantity?: number | null; unit_price_micros?: number | null; subtotal_micros?: number | null }>
 }
 
 export function RequestDetailPage() {
@@ -430,11 +430,8 @@ export function RequestDetailPage() {
 }
 
 type TraceUsage = PricingFacts & { execution_id: string; model_id: string | null; input_tokens: number; output_tokens: number; cache_read_tokens: number; cache_write_tokens: number; reasoning_tokens: number; total_cost_micros: number; created_at: number }
-type TraceCostItem = { execution_id: string; kind: string | null; quantity: number; unit_price_micros: number; subtotal_micros: number }
+type TraceCostItem = { execution_id: string; kind: string | null; cache_ttl?: string | null; quantity: number; unit_price_micros: number; subtotal_micros: number }
 type TraceBundle = { trace: { id: string; status: string; started_at: number; finished_at: number | null; thread_id: string | null }; requests: Array<{ id: string; public_id: string; status: string; endpoint: string; model: string; started_at: number; finished_at: number | null }>; executions: Array<DiagnosticAttempt & { id: string; request_id: string; status: string; provider_id: string | null; provider_name?: string | null; model: string | null; attempt: number; latency_ms: number | null; retry_reason: string | null; started_at: number; finished_at: number | null }>; usage?: TraceUsage[]; cost_items?: TraceCostItem[] }
-
-/** The price components a charge can be made of, localized; an unknown kind is shown verbatim. */
-const COST_KIND_KEYS: Record<string, string> = { input: 'costKindInput', output: 'costKindOutput', cache_read: 'costKindCacheRead', cache_write: 'costKindCacheWrite', reasoning: 'costKindReasoning', flat: 'costKindFlat', unit: 'costKindUnit' }
 
 export function TraceDetailPage() {
   const { id } = useParams()
@@ -539,7 +536,6 @@ function TraceAttempts({ executions, usage, costItems }: { executions: TraceBund
     const attempt = executions.find((item) => item.id === executionId)?.attempt
     return attempt == null ? UNMEASURED : `#${attempt}`
   }
-  const costKind = (kind: string | null) => kind == null ? UNMEASURED : COST_KIND_KEYS[kind] ? t(COST_KIND_KEYS[kind]) : kind
   return <>
     <Card p="lg" mb="lg" role="region" aria-label={t('traceUsage')}>
       <Stack gap="md">
@@ -599,7 +595,7 @@ function TraceAttempts({ executions, usage, costItems }: { executions: TraceBund
             <Table.Thead><Table.Tr><Table.Th>{t('attempt')}</Table.Th><Table.Th>{t('component')}</Table.Th><Table.Th>{t('quantity')}</Table.Th><Table.Th>{t('unitPrice')}</Table.Th><Table.Th>{t('subtotal')}</Table.Th></Table.Tr></Table.Thead>
             <Table.Tbody>{costItems.map((item, index) => <Table.Tr key={`${item.execution_id}-${index}`}>
               <Table.Td className="mono-cell">{attemptLabel(item.execution_id)}</Table.Td>
-              <Table.Td>{costKind(item.kind)}</Table.Td>
+              <Table.Td>{priceComponentLabel(item.kind, item.cache_ttl, t)}</Table.Td>
               <Table.Td className="mono-cell">{componentQuantity(usage.find(row=>row.execution_id===item.execution_id),item,item.quantity,costItems.filter(sibling=>sibling.execution_id===item.execution_id))}</Table.Td>
               <Table.Td className="mono-cell">{formatMicros(item.unit_price_micros)}</Table.Td>
               <Table.Td className="mono-cell">{<CostFact row={usage.find(row=>row.execution_id===item.execution_id)??{pricing_status:'unavailable'}} value={item.subtotal_micros}/>} </Table.Td>
@@ -628,7 +624,6 @@ function TraceFacts({ data, record, traceLink }: { data: RequestDetail; record?:
   const total=input==null||output==null?null:input+output
   const attempts = record?.executions ?? []
   const components = record?.cost_items ?? []
-  const costKind = (kind: string | null) => kind == null ? UNMEASURED : COST_KIND_KEYS[kind] ? t(COST_KIND_KEYS[kind]) : kind
   // The upstream status the record system stored for the attempt that failed. The
   // card used to state this was never persisted, which stopped being true when
   // `lifecycle.rs` started writing it — the console was denying data it held.
@@ -679,7 +674,7 @@ function TraceFacts({ data, record, traceLink }: { data: RequestDetail; record?:
           <Table.Thead><Table.Tr><Table.Th>{t('costComponents')}</Table.Th><Table.Th>{t('quantity')}</Table.Th><Table.Th>{t('cost')}</Table.Th></Table.Tr></Table.Thead>
           <Table.Tbody>{components.map((item, position) => (
             <Table.Tr key={item.execution_id ? `${item.execution_id}-${position}` : position}>
-              <Table.Td>{costKind(item.kind ?? null)}</Table.Td>
+              <Table.Td>{priceComponentLabel(item.kind, item.cache_ttl, t)}</Table.Td>
               <Table.Td>{componentQuantity(record?.usage?.find(row=>row.execution_id===item.execution_id),item,item.quantity,components.filter(sibling=>sibling.execution_id===item.execution_id))}</Table.Td>
               <Table.Td>{<CostFact row={record?.usage?.find(row=>row.execution_id===item.execution_id)??{pricing_status:'unavailable'}} value={item.subtotal_micros}/>}</Table.Td>
             </Table.Tr>

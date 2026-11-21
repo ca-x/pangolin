@@ -8733,6 +8733,86 @@ async fn request_with_external_id(f: &Fixture, request_id: &str) -> Response {
         .unwrap()
 }
 
+#[tokio::test]
+async fn request_and_trace_keep_the_recorded_cache_write_durations() {
+    let upstream = Router::new().route(
+        "/v1/chat/completions",
+        post(|| async {
+            Json(json!({
+                "choices":[{"message":{"content":"ok"}}],
+                "usage":{"prompt_tokens":100,"completion_tokens":10,
+                    "prompt_tokens_details":{"cache_write_tokens":20},
+                    "cache_creation":{"ephemeral_1h_input_tokens":7}}
+            }))
+        }),
+    );
+    let f = fixture(upstream).await;
+    let cookie = owner(&f).await;
+    let base = format!(
+        "/api/admin/v1/projects/{}/operations",
+        db::DEFAULT_PROJECT_ID
+    );
+    let model: String = f
+        .state
+        .db
+        .query_one(ops::sql(
+            "SELECT id FROM models WHERE provider_id=?",
+            vec![f.providers[0].clone().into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "id")
+        .unwrap();
+    let components = json!([
+        {"kind":"cache_write","cache_ttl":"5m","unit_size":1,"unit_price_micros":1},
+        {"kind":"cache_write","cache_ttl":"1h","unit_size":1,"unit_price_micros":2}
+    ]);
+    assert_eq!(
+        admin(
+            &f,
+            &cookie,
+            http::Method::POST,
+            &format!("{base}/prices"),
+            json!({"model_id":model,"components":components}),
+            true
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        request_with_external_id(&f, "cache-facts").await.status(),
+        StatusCode::OK
+    );
+    assert_eq!(admin(&f, &cookie, http::Method::POST, &format!("{base}/prices"),
+        json!({"model_id":model,"components":[{"kind":"output","unit_size":1,"unit_price_micros":5}]}), true).await.status(), StatusCode::OK);
+
+    for path in ["requests/cache-facts", "trace-detail/trace-test"] {
+        let response = admin(
+            &f,
+            &cookie,
+            http::Method::GET,
+            &format!("{base}/{path}"),
+            Value::Null,
+            false,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        let rows = body["cost_items"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        for (duration, quantity) in [("5m", 13), ("1h", 7)] {
+            assert!(
+                rows.iter().any(|row| row["kind"] == "cache_write"
+                    && row["cache_ttl"] == duration
+                    && row["quantity"] == quantity),
+                "{path} lost the original {duration} cache charge: {rows:?}"
+            );
+        }
+    }
+}
+
 /// Resolving the external id was not enough: the detail route bound the *raw path
 /// segment* to the executions, usage and cost queries, so opening a request through
 /// the `public_id` the console links with returned the row with no attempts, no

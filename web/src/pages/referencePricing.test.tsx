@@ -330,6 +330,8 @@ it.each(['trace', 'request'])(
       { execution_id: 'e1', kind: 'output', quantity: 3, unit_price_micros: 0, subtotal_micros: 0 },
       { execution_id: 'e1', kind: 'reasoning', quantity: 0, unit_price_micros: 0, subtotal_micros: 0 },
       { execution_id: 'e1', kind: 'cache_write', quantity: 4, unit_price_micros: 0, subtotal_micros: 0 },
+      { execution_id: 'e1', kind: 'cache_write', cache_ttl: '5m', quantity: 4, unit_price_micros: 0, subtotal_micros: 0 },
+      { execution_id: 'e1', kind: 'cache_write', cache_ttl: '1h', quantity: 0, unit_price_micros: 0, subtotal_micros: 0 },
       { execution_id: 'e1', kind: 'flat', quantity: 1, unit_price_micros: 3, subtotal_micros: 3 },
     ]
     const record = {
@@ -373,6 +375,8 @@ it.each(['trace', 'request'])(
       view === 'trace'
         ? within(screen.getByRole('region', { name: i18n.t('costComponents') })).getByRole('table')
         : screen.getByRole('columnheader', { name: i18n.t('costComponents') }).closest('table')!
+    expect(within(costTable).getByText('Cache write (5 minutes)')).toBeInTheDocument()
+    expect(within(costTable).getByText('Cache write (1 hour)')).toBeInTheDocument()
     const costRows = within(costTable).getAllByRole('row').slice(1)
     for (const row of costRows) {
       expect(within(row).getAllByRole('cell')[view === 'trace' ? 2 : 1]).toHaveTextContent('—')
