@@ -668,7 +668,7 @@ function KeysPanel() {
                       <Group gap={6} wrap="nowrap">
                         {/* The state is what admission enforces, so an enabled but
                             expired key never reads as "Enabled". */}
-                        <Badge variant="light" color={KEY_STATE_LABELS[state].color}>{t(KEY_STATE_LABELS[state].key)}</Badge>
+                        <Badge className="status-badge" variant="light" color={KEY_STATE_LABELS[state].color}>{t(KEY_STATE_LABELS[state].key)}</Badge>
                         {key.lifecycle !== 'archived' && <Button
                           variant="subtle"
                           size="compact-sm"

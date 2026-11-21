@@ -86,7 +86,7 @@ describe('the key table reports the state admission enforces', () => {
     expect(within(exhausted).getByText('$1.000000 / $1.000000')).toBeInTheDocument()
 
     const usable = screen.getByRole('row', { name: /usable-key/ })
-    expect(within(usable).getByText('Usable')).toBeInTheDocument()
+    expect(within(usable).getByText('Usable').closest('.mantine-Badge-root')).toHaveClass('status-badge')
     expect(within(usable).getByText('$0.500000 / $2.000000')).toBeInTheDocument()
 
     const off = screen.getByRole('row', { name: /off-key/ })
