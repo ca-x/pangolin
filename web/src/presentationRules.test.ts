@@ -60,6 +60,13 @@ describe('operational table text', () => {
   })
 })
 
+it('switches visibility immediately so reduced-motion navigation can transfer focus', () => {
+  const source = css('styles.css')
+  const reduced = source.slice(source.lastIndexOf('@media (prefers-reduced-motion: reduce)'))
+  const reset = rules(reduced).find((rule) => rule.selector === '*, *::before, *::after')
+  expect(reset?.body).toMatch(/transition:\s*none\s*!important/)
+})
+
 describe('the loading shimmer', () => {
   it('animates only composited properties, in every stylesheet', () => {
     const offenders: string[] = []

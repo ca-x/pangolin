@@ -718,7 +718,8 @@ input:not([type='checkbox']):not([type='radio']):not(.mantine-Input-input):focus
 }
 
 @media (prefers-reduced-motion: reduce) {
-  *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
+  /* Visibility must update before a dialog or its trigger receives focus. */
+  *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition: none !important; }
   .sidebar, .request-drawer, .select-content { transform: none; }
   /* The skeleton stays as a static placeholder rather than sweeping. */
   .skeleton::after { animation: none; }
