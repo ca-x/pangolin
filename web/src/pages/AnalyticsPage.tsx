@@ -86,7 +86,7 @@ export default function AnalyticsPage() {
       <Card p="lg">
         <Group justify="space-between" mb="sm"><Stack gap={2}><Title order={2}>{t('performanceBreakdown')}</Title><Text size="sm" c="dimmed">{t('analyticsMeasuredHint')}</Text></Stack></Group>
         <TableScrollContainer minWidth={showConfidence ? 1080 : 940} scrollAreaProps={{ viewportProps: { role: 'region', 'aria-label': t('performanceBreakdown'), tabIndex: 0 } }}>
-          <Table stickyHeader highlightOnHover>
+          <Table className="analytics-metrics" stickyHeader highlightOnHover>
             <Table.Thead><Table.Tr><Table.Th>{t('dimension')}</Table.Th><Table.Th>{t('requests')}</Table.Th><Table.Th>{t('errorsLabel')}</Table.Th><Table.Th>{t('latency')}</Table.Th><Table.Th>{t('ttft')}</Table.Th><Table.Th>{t('throughput')}</Table.Th>{showConfidence && <Table.Th>{t('confidence')}</Table.Th>}<Table.Th>{t('cost')}</Table.Th></Table.Tr></Table.Thead>
             <Table.Tbody>{rows.map((row, index) => {
               const cell = names.resolve(row.dimension)

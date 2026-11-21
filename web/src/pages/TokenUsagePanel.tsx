@@ -21,7 +21,7 @@ export function TokenUsagePanel({ rows, label }: { rows: AnalyticsRow[]; label: 
       <Text size="md" c="dimmed">{t('tokenUsageMeasuredHint')}</Text>
     </Stack>
     <TableScrollContainer minWidth={960} scrollAreaProps={{ viewportProps: { role: 'region', 'aria-label': t('tokenUsage'), tabIndex: 0 } }}>
-      <Table stickyHeader highlightOnHover>
+      <Table className="analytics-metrics" stickyHeader highlightOnHover>
         <Table.Thead><Table.Tr><Table.Th>{t('dimension')}</Table.Th>{fields.map(([field, name]) => <Table.Th key={field}>{t(name)}</Table.Th>)}</Table.Tr></Table.Thead>
         <Table.Tbody>{rows.map((row, index) => {
           const name = label(row.dimension)
