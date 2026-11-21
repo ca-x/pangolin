@@ -416,12 +416,12 @@ td code { color: var(--ink); font-size: 14px; }
 /* -------------------------------------------------------------- forms ---- */
 .field { display: grid; gap: 7px; min-width: 0; }
 .field-hint { min-height: 18px; color: var(--faint); font-size: 12px; }
-input:not([type='checkbox']):not([type='radio']):not(.mantine-Input-input), textarea:not(.mantine-Input-input) { width: 100%; min-height: var(--control-height); border: 1px solid var(--control-border); border-radius: var(--radius-control); background: var(--surface); color: var(--ink); }
+input:not([type='checkbox']):not([type='radio']):not(.mantine-Input-input, .mantine-Input-input *), textarea:not(.mantine-Input-input) { width: 100%; min-height: var(--control-height); border: 1px solid var(--control-border); border-radius: var(--radius-control); background: var(--surface); color: var(--ink); }
 select:not([aria-hidden='true']) { width: 100%; min-height: var(--control-height); padding: 0 10px; border: 1px solid var(--control-border); border-radius: var(--radius-control); background: var(--surface); color: var(--ink); transition: border-color 140ms ease, box-shadow 140ms ease; }
-input:not([type='checkbox']):not([type='radio']):not(.mantine-Input-input), textarea:not(.mantine-Input-input) { padding: 0 12px; transition: border-color 140ms ease, box-shadow 140ms ease; }
-input:not([type='checkbox']):not([type='radio']):not(.mantine-Input-input)::placeholder, textarea:not(.mantine-Input-input)::placeholder { color: var(--faint); }
+input:not([type='checkbox']):not([type='radio']):not(.mantine-Input-input, .mantine-Input-input *), textarea:not(.mantine-Input-input) { padding: 0 12px; transition: border-color 140ms ease, box-shadow 140ms ease; }
+input:not([type='checkbox']):not([type='radio']):not(.mantine-Input-input, .mantine-Input-input *)::placeholder, textarea:not(.mantine-Input-input)::placeholder { color: var(--faint); }
 textarea { min-height: 104px; padding-block: 10px; line-height: 1.55; resize: vertical; }
-input:not([type='checkbox']):not([type='radio']):not(.mantine-Input-input):focus, textarea:not(.mantine-Input-input):focus, select:not([aria-hidden='true']):not(.mantine-Input-input):focus { border-color: var(--focus); outline: 0; box-shadow: 0 0 0 3px color-mix(in srgb, var(--focus) 18%, transparent); }
+input:not([type='checkbox']):not([type='radio']):not(.mantine-Input-input, .mantine-Input-input *):focus, textarea:not(.mantine-Input-input):focus, select:not([aria-hidden='true']):not(.mantine-Input-input):focus { border-color: var(--focus); outline: 0; box-shadow: 0 0 0 3px color-mix(in srgb, var(--focus) 18%, transparent); }
 .permission-picker { min-width: 0; margin: 0; padding: 0; border: 0; }
 .permission-picker legend { margin-bottom: 4px; padding: 0; color: var(--ink); font-size: 14px; font-weight: 500; }
 .permission-options { min-width: 0; margin-top: 8px; }
@@ -687,7 +687,7 @@ input:not([type='checkbox']):not([type='radio']):not(.mantine-Input-input):focus
 
 /* Touch devices get a full-size hit target even though desktop controls are denser. */
 @media (pointer: coarse) {
-  .button, input, textarea, select:not([aria-hidden='true']) { min-height: 44px; }
+  .button, .mantine-Input-input, input:not(.mantine-Input-input *), textarea, select:not([aria-hidden='true']) { min-height: 44px; }
   .pm-nav-section-toggle { min-height: 44px; }
   .pm-nav-disclosure { flex-basis: 44px; width: 44px; height: 44px; }
   .pm-shell-navigation .mantine-NavLink-root, .pm-shell-navbar .mantine-AppShell-section:last-child .mantine-UnstyledButton-root, .pm-workspace-bar .mantine-ActionIcon-root { min-height: 44px; }

@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { MantineProvider } from '@mantine/core'
+import { MantineProvider, MultiSelect } from '@mantine/core'
 import { render, screen } from '@testing-library/react'
 import { describe, expect, it } from 'vitest'
 import { EnabledPill, InlineQueryError, Status } from './components'
@@ -36,6 +36,16 @@ const mediaRules = (query: string, selector: string) => {
 }
 const declarations = (bodies: string[], property: string) => bodies.flatMap((body) => [...body.matchAll(new RegExp(`(?:^|;)\\s*${property}\\s*:\\s*([^;]+)`, 'g'))].map((match) => match[1].trim()))
 const declaration = (selector: string, property: string) => declarations(rules(selector), property)
+
+it('keeps the native field border off the editable part of a multi-select', () => {
+  render(<><input aria-label="Native field" /><MultiSelect label="Status" data={['200']} /></>)
+  const native = screen.getByRole('textbox', { name: 'Native field' })
+  const nested = screen.getByRole('combobox', { name: 'Status' })
+  const borderSelector = css.match(/(?:^|\})\s*(input[^{}]+)\{[^{}]*border:\s*1px solid var\(--control-border\)/m)?.[1]
+  expect(borderSelector).toBeDefined()
+  expect(native.matches(borderSelector!)).toBe(true)
+  expect(nested.matches(borderSelector!)).toBe(false)
+})
 
 /** Relative luminance and the WCAG contrast ratio, so the header colour is judged, not trusted. */
 const luminance = (hex: string) => {
