@@ -173,7 +173,7 @@ button { cursor: pointer; }
 .resource-search { flex: 1 1 16rem; min-width: 0; max-width: 32rem; }
 .page-header > .mantine-Stack-root { flex: 1 1 20rem; min-width: 0; gap: 4px; }
 .page-header > .mantine-Stack-root > p { max-width: 72ch; text-wrap: pretty; }
-.mantine-Table-td { height: 44px; font-size: 14px; }
+.mantine-Table-td { font-size: 14px; }
 .mantine-Tabs-tab:focus-visible { outline-offset: -3px; }
 .mantine-Tabs-tab { min-height: 40px; }
 .mantine-Combobox-option, .mantine-Menu-item { min-height: 36px; }
