@@ -295,6 +295,7 @@ export function ResourcePage({ resource, title, description, empty, columns, fie
         placeholder={t('search')} aria-label={t('search')} value={filter}
         onChange={(event) => updateSearch(event.currentTarget.value)}
         onKeyDown={(event) => { if (event.key === 'Escape' && filter) clearSearch() }}
+        rightSectionPointerEvents="auto"
         rightSection={filter && <ActionIcon variant="subtle" color="gray" aria-label={t('clearSelection')} onClick={clearSearch}><X size={16} /></ActionIcon>} />
       {query.isSuccess && <Text size="sm" c="dimmed">{t('rowCount', { count: total })}</Text>}
     </div>}
