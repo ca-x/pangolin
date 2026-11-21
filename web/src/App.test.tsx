@@ -16,6 +16,15 @@ function renderApp(path: string) {
 describe('application routing', () => {
   beforeEach(() => { void i18n.changeLanguage('en'); vi.restoreAllMocks() })
 
+  it('recovers from a bootstrap failure without reloading', async () => {
+    vi.stubGlobal('fetch', vi.fn()
+      .mockImplementationOnce(() => response({}, 503))
+      .mockImplementation(() => response({ initialized: false, authenticated: false })))
+    renderApp('/setup')
+    await userEvent.click(await screen.findByRole('button', { name: 'Retry' }))
+    expect(await screen.findByRole('heading', { name: 'Initialize Pangolin' })).toBeInTheDocument()
+  })
+
   it('keeps direct /login outside the authenticated admin shell', async () => {
     vi.stubGlobal('fetch', vi.fn(() => response({ initialized: true, authenticated: false, user: null, capture_payloads: false })))
     renderApp('/login')

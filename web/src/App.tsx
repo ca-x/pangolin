@@ -1,4 +1,4 @@
-import { Alert, Center, Code, Stack, Title } from '@mantine/core'
+import { Center, Stack, Title } from '@mantine/core'
 import { useQuery } from '@tanstack/react-query'
 import { lazy, Suspense, useEffect } from 'react'
 import { Navigate, Route, Routes, useLocation } from 'react-router'
@@ -6,7 +6,7 @@ import { useTranslation } from 'react-i18next'
 import { api, type Bootstrap } from './api'
 import { InvitationAccept, Login, Setup } from './Auth'
 import Shell from './Shell'
-import { SkeletonRows } from './components'
+import { InlineQueryError, SkeletonRows } from './components'
 const AccessPage = lazy(() => import('./pages/AccessPage'))
 const AccountPage = lazy(() => import('./pages/AccountPage'))
 const AnalyticsPage = lazy(() => import('./pages/AnalyticsPage'))
@@ -43,7 +43,7 @@ const ROUTE_TABS: Record<string, readonly string[]> = {
 }
 
 export default function App() {
-  const { i18n } = useTranslation()
+  const { i18n, t } = useTranslation()
   const location = useLocation()
   const bootstrap = useQuery({ queryKey: ['bootstrap'], queryFn: () => api<Bootstrap>('/api/v1/bootstrap'), retry: false })
   useEffect(() => {
@@ -73,9 +73,7 @@ export default function App() {
     <Center h="100vh" p="md">
       <Stack align="center" gap="md" style={{ maxWidth: 420 }}>
         <Title order={1}>Pangolin / 鲮鲤</Title>
-        <Alert variant="light" color="red" style={{ width: '100%' }}>
-          <Code block>{bootstrap.error.message}</Code>
-        </Alert>
+        <InlineQueryError message={t('networkError')} onRetry={() => void bootstrap.refetch()} />
       </Stack>
     </Center>
   )

@@ -154,7 +154,7 @@ button { cursor: pointer; }
   .pm-workspace-bar { justify-content: flex-end; }
   .pm-workspace-bar .pm-workspace-context { display: none; }
 }
-.resource-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 14px; }
+.resource-toolbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 14px; }
 .pm-route-journey { padding: 16px; border: 1px solid var(--border); border-radius: var(--radius-panel); background: var(--surface-muted); }
 .pm-route-flow { display: grid; grid-template-columns: minmax(0, 1fr) 28px minmax(0, 1fr) 28px minmax(0, 1fr); align-items: center; gap: 8px; }
 .pm-route-node { display: grid; min-width: 0; gap: 4px; padding: 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); }
@@ -170,7 +170,23 @@ button { cursor: pointer; }
 .pm-route-journey[data-animate='true'][data-visible='false'] .pm-route-node { opacity: 0; transform: translateY(4px); }
 .pm-empty-state { min-height: 210px; justify-content: center; border: 1px solid var(--border); border-radius: var(--radius-panel); background: var(--surface); text-align: center; }
 .mantine-Card-root .pm-empty-state { min-height: 0; border: 0; background: transparent; }
-.resource-search { flex: 1; max-width: 560px; }
+.resource-search { flex: 1 1 16rem; min-width: 0; max-width: 32rem; }
+.page-header > .mantine-Stack-root { flex: 1 1 20rem; min-width: 0; gap: 4px; }
+.page-header > .mantine-Stack-root > p { max-width: 72ch; text-wrap: pretty; }
+.mantine-Table-td { height: 44px; font-size: 14px; }
+.mantine-Tabs-tab:focus-visible { outline-offset: -3px; }
+.mantine-Tabs-tab { min-height: 40px; }
+.mantine-Combobox-option, .mantine-Menu-item { min-height: 36px; }
+.mantine-Combobox-dropdown, .mantine-Menu-dropdown, .mantine-Popover-dropdown { box-shadow: var(--shadow-overlay); }
+.inline-query-error .mantine-Button-root, .query-error .mantine-Button-root { min-height: 36px; flex-shrink: 0; }
+.auth-frame { min-height: 100svh; padding: clamp(16px, 4vw, 40px); background: var(--canvas); }
+.auth-frame-content { width: min(420px, 100%); }
+@media (pointer: coarse) {
+  .mantine-Menu-item, .mantine-Combobox-option, .mantine-Tabs-tab { min-height: 44px; }
+  .mantine-Input-input { font-size: max(16px, var(--input-fz)); }
+}
+.resource-mobile-fact { display: grid; grid-template-columns: minmax(5.5rem, 35%) minmax(0, 1fr); gap: 8px; align-items: baseline; overflow-wrap: anywhere; }
+.mobile-resource-list .mantine-Button-root { min-height: 36px; }
 .desktop-resource-table { overflow: hidden; border: 1px solid var(--border); border-radius: var(--radius-panel); background: var(--surface); }
 .desktop-resource-table .mantine-Table-th { background: var(--surface-muted); }
 .desktop-resource-table .mantine-Table-td { font-size: 14px; }
@@ -205,7 +221,7 @@ p { color: var(--muted); line-height: 1.5; }
 code { overflow-wrap: anywhere; }
 :focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
 .sr-only { position: fixed; width: 1px; max-width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
-.skip-link { position: fixed; left: 16px; top: 12px; z-index: 100; padding: 10px 14px; border-radius: var(--radius-control); background: var(--elevated); color: var(--ink); box-shadow: var(--shadow-overlay); transform: translateY(-180%); transition: transform 160ms var(--ease-out); }
+.skip-link { position: fixed; left: 16px; top: 12px; z-index: 150; padding: 10px 14px; border-radius: var(--radius-control); background: var(--elevated); color: var(--ink); box-shadow: var(--shadow-overlay); transform: translateY(-180%); transition: transform 160ms var(--ease-out); }
 .skip-link:focus { transform: translateY(0); }
 
 /* -------------------------------------------------------------- shell ---- */
@@ -314,6 +330,12 @@ code { overflow-wrap: anywhere; }
 .chart-spark-dot { fill: var(--surface); stroke: var(--accent); stroke-width: 2; }
 
 .analytics-bars { min-width: 0; }
+.analytics-confidence { display: grid; gap: 2px; min-width: 9em; white-space: normal; font-variant-numeric: tabular-nums; }
+.analytics-confidence > :last-child { color: var(--muted); }
+.analytics-confidence > .confidence-low { color: var(--warning); }
+.analytics-bar-facts { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; gap: 4px 12px; }
+.analytics-bar-facts > :first-child { min-width: 0; overflow-wrap: anywhere; }
+.analytics-bar-facts > :last-child { margin-inline-start: auto; text-align: end; }
 .analytics-bar-row { display: grid; gap: 7px; }
 .analytics-bar-value { flex: 0 0 auto; font-variant-numeric: tabular-nums; }
 .analytics-bar-track { height: 8px; overflow: hidden; border-radius: 999px; background: var(--surface-muted); }
@@ -527,6 +549,8 @@ input:not([type='checkbox']):not([type='radio']):not(.mantine-Input-input):focus
 .pm-channel-url svg { flex: none; }
 .compact-list { display: grid; }
 .compact-list a { display: grid; grid-template-columns: max-content minmax(0,1fr) auto; gap: 10px; align-items: center; min-height: 50px; border-bottom: 1px solid var(--border-subtle); text-decoration: none; font-size: 14px; transition: background-color 120ms ease; }
+.compact-list a > .mantine-Text-root { overflow-wrap: anywhere; }
+.compact-list a:focus-visible { outline-offset: -2px; }
 .compact-list a:last-child { border-bottom: 0; }
 .compact-list small { color: var(--muted); font-variant-numeric: tabular-nums; }
 .routing-preview { display: grid; gap: 18px; margin-top: 24px; padding: 20px; border: 1px solid var(--border); border-radius: var(--radius-panel); background: var(--surface); }
@@ -608,7 +632,7 @@ input:not([type='checkbox']):not([type='radio']):not(.mantine-Input-input):focus
   .pm-onboarding .pm-onboarding-row > :first-child { flex-basis: 100%; }
   .pm-workspace-bar { margin-bottom: 16px; }
   .resource-toolbar { align-items: flex-start; flex-direction: column; gap: 6px; }
-  .resource-search { width: 100%; max-width: none; }
+  .resource-search { flex: none; width: 100%; max-width: none; }
   .pm-route-flow { grid-template-columns: minmax(0, 1fr); }
   .pm-route-link { width: 1px; height: 16px; margin-inline: auto; }
   .pm-route-link::after { right: -3px; top: auto; bottom: 0; transform: rotate(135deg); }

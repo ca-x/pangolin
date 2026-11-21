@@ -1,4 +1,4 @@
-import { Badge, Card, Group, Select, SimpleGrid, Stack, Table, TableScrollContainer, Text, TextInput, Title } from '@mantine/core'
+import { Card, Group, Select, SimpleGrid, Stack, Table, TableScrollContainer, Text, TextInput, Title } from '@mantine/core'
 import { useQuery } from '@tanstack/react-query'
 import { BarChart3 } from 'lucide-react'
 import { useMemo } from 'react'
@@ -18,8 +18,9 @@ type Range = typeof RANGES[number]
 const RANGE_SECONDS: Record<Exclude<Range, 'all' | 'custom'>, number> = { '24h': 86_400, '7d': 604_800, '30d': 2_592_000 }
 
 const epoch = (value: string | null) => {
+  if (!value?.trim()) return null
   const parsed = Number(value)
-  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : null
+  return Number.isSafeInteger(parsed) && parsed >= 0 && parsed <= 253402300799 ? parsed : null
 }
 const localDateTime = (value: number | null) => {
   if (value == null) return ''
@@ -116,20 +117,23 @@ function ConfidenceFact({ row, compact = false }: { row: AnalyticsRow; compact?:
   if (typeof row.sample_count !== 'number' || !row.confidence_level) return <>{UNMEASURED}</>
   const sample = t('analyticsSampleCount', { count: row.sample_count })
   if (compact) return <Text size="xs" c={row.confidence_level === 'low' ? undefined : 'dimmed'} className={row.confidence_level === 'low' ? 'confidence-low' : undefined}>{sample} · {confidenceLabel(row.confidence_level, t)}</Text>
-  return <Group gap="xs" wrap="nowrap"><Text size="sm" className="analytics-bar-value">{sample}</Text><Badge variant="light" color={{ low: 'gray', medium: 'yellow', high: 'green' }[row.confidence_level]}>{confidenceLabel(row.confidence_level, t)}</Badge></Group>
+  return <div className="analytics-confidence">
+    <span>{sample}</span>
+    <span className={row.confidence_level === 'low' ? 'confidence-low' : undefined}>{confidenceLabel(row.confidence_level, t)}</span>
+  </div>
 }
 
 function MetricBars({ title, rows, label, value, format, showConfidence = false }: { title: string; rows: AnalyticsRow[]; label: (value: string | null) => { text: string; opaque: boolean }; value: (row: AnalyticsRow) => number | null | undefined; format: (value: number) => string; showConfidence?: boolean }) {
   const measured = rows.map(value).filter((item): item is number => typeof item === 'number' && Number.isFinite(item) && item >= 0)
   const max = Math.max(...measured, 0)
-  return <Card p="lg" className="analytics-bars" role="img" aria-label={title}>
+  return <Card p="lg" className="analytics-bars" role="region" aria-label={title}>
     <Title order={2} mb="md">{title}</Title>
     <Stack gap="sm">{rows.map((row, index) => {
       const amount = value(row)
       const cell = label(row.dimension)
       const measuredAmount = typeof amount === 'number' && Number.isFinite(amount) && amount >= 0
       return <div className="analytics-bar-row" key={`${row.dimension ?? 'unmeasured'}-${index}`}>
-        <Group justify="space-between" gap="md" wrap="nowrap"><Text size="sm" className={cell.opaque ? 'mono-cell' : undefined}>{cell.text}</Text><Stack gap={0} align="flex-end"><Text size="sm" className="analytics-bar-value">{measuredAmount ? format(amount as number) : UNMEASURED}</Text>{showConfidence && <ConfidenceFact row={row} compact />}</Stack></Group>
+        <div className="analytics-bar-facts"><Text size="sm" className={cell.opaque ? 'mono-cell' : undefined}>{cell.text}</Text><Stack gap={0} align="flex-end"><Text size="sm" className="analytics-bar-value">{measuredAmount ? format(amount as number) : UNMEASURED}</Text>{showConfidence && <ConfidenceFact row={row} compact />}</Stack></div>
         <div className="analytics-bar-track" aria-hidden="true"><span data-confidence={showConfidence ? row.confidence_level : undefined} style={{ width: `${measuredAmount && max > 0 ? Math.max(2, (amount as number) / max * 100) : 0}%` }} /></div>
       </div>
     })}</Stack>

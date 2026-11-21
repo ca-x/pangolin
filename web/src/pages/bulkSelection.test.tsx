@@ -67,6 +67,19 @@ describe('rows can be selected and acted on together', () => {
     })
   })
 
+  it('clears hidden selections when searching and restores focus when clearing the query', async () => {
+    renderPage(mockApi())
+    await userEvent.click(await screen.findByRole('checkbox', { name: 'Select openai-prod' }))
+    const search = screen.getByRole('textbox', { name: i18n.t('search') })
+    await userEvent.type(search, 'anthropic')
+    expect(screen.queryByRole('region', { name: i18n.t('bulkActions') })).not.toBeInTheDocument()
+    await userEvent.click(screen.getByRole('button', { name: i18n.t('clearSelection') }))
+    expect(search).toHaveValue('')
+    expect(search).toHaveFocus()
+    await userEvent.type(search, 'openai{Escape}')
+    expect(search).toHaveValue('')
+  })
+
   it('selects every row on the page from the header, and clears again', async () => {
     renderPage(mockApi())
 

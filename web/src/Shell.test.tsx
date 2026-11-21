@@ -37,6 +37,7 @@ const renderShell = (permissions: string[], path = '/', displayedBranding = bran
             <Route path="/" element={<div>Overview body</div>} />
             <Route path="/access" element={<div>Access body</div>} />
             <Route path="/system" element={<div>System body</div>} />
+            <Route path="/operations" element={<div>Operations body</div>} />
             <Route path="/operations/requests/:id" element={<div>Request detail</div>} />
             <Route path="/operations/traces/:id" element={<div>Trace detail</div>} />
           </Route>
@@ -93,6 +94,12 @@ describe('sidebar gating', () => {
     expect(screen.getByRole('link', { name: 'Credentials' })).toHaveAttribute('href', '/channels?tab=credentials')
     await userEvent.click(screen.getByRole('button', { name: 'Show Models & routes subpages' }))
     expect(screen.getByRole('link', { name: 'Model routing' })).toHaveAttribute('href', '/models?tab=routing')
+  })
+
+  it('keeps Observe expanded when opening cost items directly', async () => {
+    renderShell(['project:read'], '/operations?tab=costItems')
+    expect(await screen.findByRole('link', { name: i18n.t('costItems') })).toHaveAttribute('data-active', 'true')
+    expect(screen.getByRole('button', { name: 'Observe' })).toHaveAttribute('aria-expanded', 'true')
   })
 
   it('keeps the matching operational link active on detail pages', async () => {

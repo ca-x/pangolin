@@ -110,9 +110,12 @@ function ShellContent({ user, branding }: { user: User; branding: Branding }) {
     ...(adminLinks.length ? [{ id: 'administration', label: t('administration'), links: adminLinks }] : []),
     ...(canReadProject ? [{ id: 'observe', label: t('observe'), links: [
       { to: '/operations', label: t('requests'), icon: Activity },
+      { to: '/operations?tab=executions', label: t('executions'), icon: Activity },
       { to: '/operations?tab=traces', label: t('traces'), icon: ListTree },
       { to: '/operations?tab=threads', label: t('threads'), icon: MessageSquareText },
       { to: '/operations?tab=usage', label: t('usage'), icon: FileText },
+      { to: '/operations?tab=costItems', label: t('costItems'), icon: FileText },
+      { to: '/operations?tab=audit', label: t('audit'), icon: ListTree },
       { to: '/analytics', label: t('analytics'), icon: BarChart3 },
     ] }] : []),
   ]
@@ -133,17 +136,7 @@ function ShellContent({ user, branding }: { user: User; branding: Branding }) {
       }}
       padding="md"
     >
-      {/* Skip link */}
-      <a href="#main-content" style={{
-        position: 'fixed', left: 16, top: 12, zIndex: 150,
-        padding: '10px 14px', borderRadius: 'var(--mantine-radius-md)',
-        background: 'var(--mantine-color-body)', color: 'var(--mantine-color-text)',
-        boxShadow: 'var(--mantine-shadow-lg)', transform: 'translateY(-200%)',
-        transition: 'transform 160ms ease',
-      }} onFocus={(e) => { (e.currentTarget as HTMLElement).style.transform = 'translateY(0)' }}
-        onBlur={(e) => { (e.currentTarget as HTMLElement).style.transform = 'translateY(-200%)' }}>
-        {t('skipToContent')}
-      </a>
+      <a href="#main-content" className="skip-link">{t('skipToContent')}</a>
 
       {/* Mobile header */}
       <AppShell.Header hiddenFrom="md" px="sm">
@@ -218,7 +211,7 @@ function ShellContent({ user, branding }: { user: User; branding: Branding }) {
         <button type="button" className="nav-scrim" aria-label={t('close')} onClick={closeMobile} />
       )}
 
-      <AppShell.Main id="main-content" inert={mobile && mobileOpen ? true : undefined}>
+      <AppShell.Main id="main-content" tabIndex={-1} inert={mobile && mobileOpen ? true : undefined}>
         <div className="pm-workspace-bar">
           <div className="pm-workspace-context">
             <Text size="xs" c="dimmed">{t('project')}</Text>

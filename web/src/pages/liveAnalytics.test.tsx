@@ -28,6 +28,13 @@ describe('live requests and dedicated analytics', () => {
     vi.clearAllMocks()
   })
 
+  it('leaves missing custom range dates empty until entered', async () => {
+    vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => json(String(input).endsWith('/projects') ? [project] : [])))
+    renderPage(<AnalyticsPage />, '/analytics?range=custom')
+    expect(await screen.findByLabelText(i18n.t('from'))).toHaveValue('')
+    expect(screen.getByLabelText(i18n.t('until'))).toHaveValue('')
+  })
+
   it('keeps analytics filters in the URL and renders nullable performance, throughput and cost facts', async () => {
     const fetchMock = vi.fn((input: RequestInfo | URL) => {
       const path = String(input)
@@ -47,6 +54,7 @@ describe('live requests and dedicated analytics', () => {
     const performanceRegion = await screen.findByRole('region', { name: 'Performance and cost breakdown' })
     expect(performanceRegion).toHaveAttribute('data-scrollarea-viewport')
     expect(performanceRegion).toHaveAttribute('tabindex', '0')
+    expect(screen.getByRole('region', { name: i18n.t('throughput') })).toHaveTextContent('700 samples')
     expect((await screen.findAllByText('model-alpha')).length).toBeGreaterThan(0)
     expect((await screen.findAllByText('model-unmeasured')).length).toBeGreaterThan(0)
     expect(screen.getAllByText('700 samples').length).toBeGreaterThan(0)

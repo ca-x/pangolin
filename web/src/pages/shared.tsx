@@ -1,7 +1,7 @@
 import { ActionIcon, Alert, Button, Checkbox, Collapse, Group, Loader, Modal, NumberInput, Pagination, Paper, Radio, Select, SimpleGrid, Stack, Switch, Table, TableScrollContainer, Text, Textarea, TextInput, Title, Tooltip } from '@mantine/core'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { createColumnHelper, flexRender, getCoreRowModel, getFilteredRowModel, useReactTable } from '@tanstack/react-table'
-import { AlertTriangle, ChevronRight, Copy, Inbox, Plus, Search, Trash2 } from 'lucide-react'
+import { AlertTriangle, ChevronRight, Copy, Inbox, Plus, Search, Trash2, X } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
@@ -157,6 +157,15 @@ function readForm(form: HTMLFormElement, fields: FormField[]) {
   return output
 }
 
+async function copyResourceId(id: string) {
+  try {
+    await navigator.clipboard.writeText(id)
+    toast.success(i18n.t('copied'))
+  } catch {
+    toast.error(i18n.t('copyFailed'))
+  }
+}
+
 export function ResourcePage({ resource, title, description, empty, columns, fields = [], createLabel, canCreate = true, immutable, appendOnly, editDisabled = false, endpoint, itemEndpoint, createMethod = 'POST', updateMethod = 'POST', canDelete = true, rowActions, mobileStatus, filters, listQuery, normalize, notice, selectable, bulkDelete = false, headerAction, hideHeader = false, headerExtra, secondaryAction, bulkActions, emptyAction, mobilePrimary, mobilePrimaryKey, mobileHiddenKeys, tableMinWidth = 700, mobileColumnLimit = 3, mobileValueSize = 'sm' }: ResourcePageProps) {
   const { t } = useTranslation()
   const { project } = useProject()
@@ -165,6 +174,7 @@ export function ResourcePage({ resource, title, description, empty, columns, fie
   const [editing, setEditing] = useState<Document | null>(null)
   const [selected, setSelected] = useState<string[]>([])
   const [filter, setFilter] = useState('')
+  const searchInput = useRef<HTMLInputElement>(null)
   const [offset, setOffset] = useState(0)
   const [limit, setLimit] = useState(25)
   const [invalidFields, setInvalidFields] = useState<Set<string>>(() => new Set())
@@ -235,7 +245,7 @@ export function ResourcePage({ resource, title, description, empty, columns, fie
       cell: ({ row }) => <Checkbox aria-label={`${t('selectRow')} ${displayValue(row.original.name || row.original.public_name || row.original.id)}`} checked={selected.includes(String(row.original.id))} onChange={(event) => setSelected((current) => event.currentTarget.checked ? [...current, String(row.original.id)] : current.filter((id) => id !== String(row.original.id)))} />,
     })] : []),
     ...columns.map((column) => columnHelper.accessor((row) => row[column.key], { id: column.key, header: column.label, cell: (info) => <span className={column.mono ? 'mono-cell' : ''}>{column.render ? column.render(info.getValue(), info.row.original) : displayValue(info.getValue())}</span> })),
-    ...((!immutable && !appendOnly && fields.length) || rowActions ? [columnHelper.display({ id: 'actions', header: () => <span className="sr-only">{t('actions')}</span>, cell: ({ row }) => <Group gap={4} justify="flex-end" wrap="nowrap">{!immutable && !appendOnly && !forbids(editDisabled, row.original) && fields.length > 0 && <Button variant="subtle" size="compact-sm" onClick={(event) => { lastTrigger.current = event.currentTarget as HTMLButtonElement; setInvalidFields(new Set()); setEditing(row.original); setOpen(true) }}>{t('edit')}</Button>}<Tooltip label={t('copyId')}><ActionIcon variant="subtle" color="gray" aria-label={`${t('copyId')} ${displayValue(row.original.name || row.original.id)}`} onClick={() => void navigator.clipboard?.writeText(String(row.original.id))}><Copy size={15} /></ActionIcon></Tooltip>{!immutable && !appendOnly && allows(canDelete, row.original) && <Tooltip label={t('delete')}><ActionIcon variant="subtle" color="red" aria-label={`${t('delete')} ${displayValue(row.original.name || row.original.id)}`} onClick={() => confirmRemove(row.original)}><Trash2 size={16} /></ActionIcon></Tooltip>}{rowActions?.(row.original)}</Group> })] : []),
+    ...((!immutable && !appendOnly && fields.length) || rowActions ? [columnHelper.display({ id: 'actions', header: () => <span className="sr-only">{t('actions')}</span>, cell: ({ row }) => <Group gap={4} justify="flex-end" wrap="nowrap">{!immutable && !appendOnly && !forbids(editDisabled, row.original) && fields.length > 0 && <Button variant="subtle" size="compact-sm" onClick={(event) => { lastTrigger.current = event.currentTarget as HTMLButtonElement; setInvalidFields(new Set()); setEditing(row.original); setOpen(true) }}>{t('edit')}</Button>}<Tooltip label={t('copyId')}><ActionIcon variant="subtle" color="gray" aria-label={`${t('copyId')} ${displayValue(row.original.name || row.original.id)}`} onClick={() => void copyResourceId(String(row.original.id))}><Copy size={15} /></ActionIcon></Tooltip>{!immutable && !appendOnly && allows(canDelete, row.original) && <Tooltip label={t('delete')}><ActionIcon variant="subtle" color="red" aria-label={`${t('delete')} ${displayValue(row.original.name || row.original.id)}`} onClick={() => confirmRemove(row.original)}><Trash2 size={16} /></ActionIcon></Tooltip>}{rowActions?.(row.original)}</Group> })] : []),
   ], [appendOnly, canDelete, columns, editDisabled, fields.length, rowActions, rows, selectable, selected, t])
   const table = useReactTable({ data: rows, columns: tableColumns, getCoreRowModel: getCoreRowModel(), getFilteredRowModel: getFilteredRowModel() })
   const submit = (event: FormEvent<HTMLFormElement>) => {
@@ -262,6 +272,15 @@ export function ResourcePage({ resource, title, description, empty, columns, fie
     if (input instanceof HTMLInputElement) input.value = baseUrl
   }
   const handleClose = () => { setOpen(false); setEditing(null); requestAnimationFrame(() => lastTrigger.current?.focus()) }
+  const updateSearch = (value: string) => {
+    setFilter(value)
+    setOffset(0)
+    setSelected([])
+  }
+  const clearSearch = () => {
+    updateSearch('')
+    searchInput.current?.focus()
+  }
   const createAction = canCreate && !immutable && fields.length ? <Button leftSection={<Plus size={17} />} onClick={(event) => beginCreate(event.currentTarget)}>{createLabel || t('add')}</Button> : undefined
   const defaultActions = (headerExtra || secondaryAction || createAction) ? <Group gap="xs" wrap="wrap" justify="flex-end">{headerExtra}{secondaryAction}{createAction}</Group> : undefined
   const emptyActions = (secondaryAction || createAction) ? <Group gap="xs" wrap="wrap" justify="flex-end">{secondaryAction}{createAction}</Group> : undefined
@@ -271,7 +290,14 @@ export function ResourcePage({ resource, title, description, empty, columns, fie
         carries its own spacing so an empty slot leaves no gap. */}
     {notice}
     {filters && <Group gap="sm" mb="md" className="resource-filters">{filters}</Group>}
-    {(total > 0 || filter) && <div className="resource-toolbar"><TextInput className="resource-search" leftSection={<Search size={17} />} placeholder={t('search')} value={filter} onChange={(event) => { setFilter(event.target.value); setOffset(0) }} aria-label={t('search')} /><Text size="sm" c="dimmed">{t('rowCount', { count: total })}</Text></div>}
+    {(total > 0 || filter) && <div className="resource-toolbar">
+      <TextInput ref={searchInput} className="resource-search" leftSection={<Search size={17} />}
+        placeholder={t('search')} aria-label={t('search')} value={filter}
+        onChange={(event) => updateSearch(event.currentTarget.value)}
+        onKeyDown={(event) => { if (event.key === 'Escape' && filter) clearSearch() }}
+        rightSection={filter && <ActionIcon variant="subtle" color="gray" aria-label={t('clearSelection')} onClick={clearSearch}><X size={16} /></ActionIcon>} />
+      {query.isSuccess && <Text size="sm" c="dimmed">{t('rowCount', { count: total })}</Text>}
+    </div>}
     {selectable && selected.length > 0 && <Group gap="sm" mb="md" role="region" aria-label={t('bulkActions')} className="selection-bar">
       <Text size="sm" fw={540}>{t('selectedCount', { count: selected.length })}</Text>
       {bulkActions ? bulkActions(selected, () => setSelected([])) : <>
@@ -308,7 +334,7 @@ function MobileResources({ rows, columns, onEdit, onDelete, rowActions, mobileSt
   // value only where no owner asked for one.
   const state = (row: Document) => mobileStatus ? mobileStatus(row) : row.enabled != null ? <EnabledPill enabled={row.enabled} /> : displayValue(row.status)
   const visible = columns.filter((column) => column.key !== 'id' && column.key !== primaryKey && !hiddenKeys.includes(column.key)).slice(0, columnLimit)
-  return <Stack gap="sm" className="mobile-resource-list">{rows.map((row) => <Paper key={row.id} p="md" withBorder><Group justify="space-between" align="flex-start" mb="sm"><Stack gap={4} style={{ minWidth: 0 }}><Text component="div" fw={600} style={{ overflowWrap: 'anywhere' }}>{primary(row)}</Text><Button variant="subtle" size="compact-xs" c="dimmed" style={{ alignSelf: 'flex-start' }} onClick={() => void navigator.clipboard?.writeText(String(row.id))}>{t('copyId')}</Button></Stack><Text component="div" size={valueSize}>{state(row)}</Text></Group><Stack gap="xs" mb={onEdit || onDelete || rowActions ? 'sm' : undefined} style={{ minWidth: 0 }}>{visible.filter((column) => primaryKey || String(row[column.key] ?? '') !== primaryText(row)).map((column) => <Group key={column.key} gap="xs" wrap="nowrap" style={{ minWidth: 0 }}><Text size={valueSize} c="dimmed" style={{ minWidth: '88px', flex: '0 0 auto' }}>{column.label}</Text><Text component="div" size={valueSize} className={column.mono ? 'mono-cell' : undefined} style={{ flex: 1, minWidth: 0 }}>{column.render ? column.render(row[column.key], row) : displayValue(row[column.key])}</Text></Group>)}</Stack>{(onEdit || onDelete || rowActions) && <Group gap="xs">{onEdit && !forbids(editDisabled, row) && <Button variant="subtle" size="compact-sm" onClick={(event) => onEdit(row, event.currentTarget)}>{t('edit')}</Button>}{onDelete && allows(canDelete, row) && <Button variant="subtle" color="red" size="compact-sm" onClick={() => onDelete(row)}>{t('delete')}</Button>}{rowActions?.(row)}</Group>}</Paper>)}</Stack>
+  return <Stack gap="sm" className="mobile-resource-list">{rows.map((row) => <Paper key={row.id} p="md" withBorder><Group justify="space-between" align="flex-start" mb="sm"><Stack gap={4} style={{ minWidth: 0 }}><Text component="div" fw={600} style={{ overflowWrap: 'anywhere' }}>{primary(row)}</Text><Button variant="subtle" size="compact-xs" c="dimmed" style={{ alignSelf: 'flex-start' }} onClick={() => void copyResourceId(String(row.id))}>{t('copyId')}</Button></Stack><Text component="div" size={valueSize}>{state(row)}</Text></Group><Stack gap="xs" mb={onEdit || onDelete || rowActions ? 'sm' : undefined} style={{ minWidth: 0 }}>{visible.filter((column) => primaryKey || String(row[column.key] ?? '') !== primaryText(row)).map((column) => <div key={column.key} className="resource-mobile-fact"><Text size={valueSize} c="dimmed">{column.label}</Text><Text component="div" size={valueSize} className={column.mono ? 'mono-cell' : undefined} style={{ flex: 1, minWidth: 0 }}>{column.render ? column.render(row[column.key], row) : displayValue(row[column.key])}</Text></div>)}</Stack>{(onEdit || onDelete || rowActions) && <Group gap="xs">{onEdit && !forbids(editDisabled, row) && <Button variant="subtle" size="compact-sm" onClick={(event) => onEdit(row, event.currentTarget)}>{t('edit')}</Button>}{onDelete && allows(canDelete, row) && <Button variant="subtle" color="red" size="compact-sm" onClick={() => onDelete(row)}>{t('delete')}</Button>}{rowActions?.(row)}</Group>}</Paper>)}</Stack>
 }
 
 function permissionValues(value: unknown): string[] {

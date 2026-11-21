@@ -274,17 +274,8 @@ export function InvitationAccept({ authenticated }: { authenticated: boolean }) 
 
 function AuthFrame({ children }: { children: React.ReactNode }) {
   return (
-    <Center h="100vh" pos="relative" style={{ overflow: 'hidden' }}>
-      {/* Decorative accent panel */}
-      <div aria-hidden="true" style={{
-        position: 'absolute', inset: 0, opacity: 0.55,
-        background: 'var(--mantine-primary-color-light)',
-        clipPath: 'polygon(0 0, 26% 0, 8% 100%, 0 100%)',
-        pointerEvents: 'none',
-      }} />
-      <div style={{ position: 'relative', width: 'min(440px, 100%)', padding: 'var(--mantine-spacing-md)' }}>
-        {children}
-      </div>
+    <Center component="main" className="auth-frame">
+      <div className="auth-frame-content">{children}</div>
     </Center>
   )
 }
