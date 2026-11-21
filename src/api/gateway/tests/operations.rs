@@ -781,6 +781,53 @@ async fn aimux_core_analytics_totals_pair_counters_per_attempt_without_double_co
 }
 
 #[tokio::test]
+async fn analytics_keeps_attempts_with_missing_usage_and_latency() {
+    let f = fixture(success()).await;
+    assert_eq!(
+        request(&f, "/v1/chat/completions", chat()).await.status(),
+        StatusCode::OK
+    );
+    sql(&f, "DELETE FROM usage_logs", vec![]).await;
+    sql(
+        &f,
+        "UPDATE request_executions SET latency_ms=NULL,first_text_ms=NULL",
+        vec![],
+    )
+    .await;
+    let response = admin(
+        &f,
+        &owner(&f).await,
+        http::Method::GET,
+        &format!(
+            "/api/admin/v1/projects/{}/analytics?dimension=project",
+            db::DEFAULT_PROJECT_ID
+        ),
+        Value::Null,
+        false,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    let row = &body["data"][0];
+    assert_eq!(row["dimension"], db::DEFAULT_PROJECT_ID);
+    assert_eq!(row["requests"], 1);
+    assert_eq!(row["attempts"], 1);
+    assert_eq!(row["usage_measured"], false);
+    assert_eq!(row["cost_measured"], false);
+    assert_eq!(row["settled_cost_micros"], 0);
+    for field in [
+        "input_tokens",
+        "total_tokens",
+        "cost_micros",
+        "latency_ms",
+        "ttft_ms",
+        "tokens_per_second",
+    ] {
+        assert_eq!(row.get(field), Some(&Value::Null), "{field}");
+    }
+}
+
+#[tokio::test]
 async fn provider_and_model_analytics_report_performance_sample_confidence() {
     let f = fixture(success()).await;
     assert_eq!(
